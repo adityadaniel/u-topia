@@ -1,0 +1,5 @@
+/target
+**/*.trellis
+**/*.trellis-wal
+**/*.trellis-shm
+.DS_Store

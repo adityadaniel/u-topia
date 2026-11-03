@@ -1,0 +1,323 @@
+//! v1.1 (P1) acceptance scripts: §4.2 P1 list, FR-2.18/2.19, FR-3.9/3.11, AC-3.7, W2, W7.
+
+use chrono::NaiveDate;
+use trellis_core::outline;
+use trellis_core::{BlockId, BlockKind, PageId};
+use trellis_store::Store;
+
+fn today() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()
+}
+
+fn store() -> (Store, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path().join("g.trellis")).unwrap();
+    s.set_today(Some(today()));
+    (s, dir)
+}
+
+fn write(s: &mut Store, page: &PageId, text: &str) -> BlockId {
+    let plan = outline::append_block(s.page_state(page).unwrap(), None);
+    let id = s.execute_plan(page, plan, None).unwrap().unwrap().block;
+    s.set_block_text(page, &id, text, None, None).unwrap();
+    s.commit_block(page, &id).unwrap();
+    id
+}
+
+fn texts(s: &mut Store, page: &PageId) -> Vec<(String, usize)> {
+    let st = s.page_state(page).unwrap().clone();
+    st.live_preorder()
+        .into_iter()
+        .map(|(id, d)| (st.block(&id).unwrap().text.clone(), d))
+        .collect()
+}
+
+fn doctor_ok(s: &mut Store) {
+    let r = s.doctor().unwrap();
+    assert!(r.is_ok(), "{:#?}", r.problems);
+}
+
+#[test]
+fn ac_3_7_promote_mention_to_link_and_undo() {
+    let (mut s, _d) = store();
+    let m = s.create_page("Mindfulness").unwrap();
+    let a = s.create_page("Reading").unwrap();
+    let b1 = write(&mut s, &a, "the mindfulness of the thing");
+    write(&mut s, &a, "a [[Mindfulness]] practice");
+    write(&mut s, &a, "`mindfulness` in code and unmindfulness");
+    let mentions = s.unlinked_references(&m).unwrap();
+    assert_eq!(mentions.len(), 1, "{mentions:?}");
+    assert_eq!(&mentions[0].text[mentions[0].range.clone()], "mindfulness");
+    s.promote_mention(&b1, mentions[0].range.clone(), &m)
+        .unwrap();
+    assert_eq!(
+        texts(&mut s, &a)[0].0,
+        "the [[Mindfulness]] of the thing",
+        "no other character altered"
+    );
+    assert!(s.unlinked_references(&m).unwrap().is_empty());
+    assert_eq!(s.backlink_count(&m).unwrap(), 2);
+    s.undo().unwrap();
+    assert_eq!(
+        s.unlinked_references(&m).unwrap().len(),
+        1,
+        "Cmd+Z restores both views"
+    );
+    assert_eq!(s.backlink_count(&m).unwrap(), 1);
+    assert!(
+        s.promote_mention(&b1, 0..3, &m).is_err(),
+        "only real mentions can be promoted"
+    );
+    doctor_ok(&mut s);
+}
+
+#[test]
+fn aliases_ui_rules() {
+    let (mut s, _d) = store();
+    let p = s.create_page("Dana Smith").unwrap();
+    s.create_page("Other").unwrap();
+    s.add_alias(&p, "Dana").unwrap();
+    assert_eq!(s.find_page("dana").unwrap(), Some(p.clone()));
+    assert!(
+        s.add_alias(&p, "Other").is_err(),
+        "cannot shadow another page"
+    );
+    assert!(
+        s.add_alias(&p, "2026-11-02").is_err(),
+        "aliases are never dates"
+    );
+    s.remove_alias(&p, "dana").unwrap();
+    assert_eq!(s.find_page("Dana").unwrap(), None);
+    doctor_ok(&mut s);
+}
+
+#[test]
+fn journal_and_page_templates() {
+    let (mut s, _d) = store();
+    let t = s.create_page("templates/journal").unwrap();
+    write(&mut s, &t, "Gratitude::");
+    write(&mut s, &t, "Top 3 today");
+    let st = s.page_state(&t).unwrap();
+    let parent = st.live_roots()[1].clone();
+    let plan = outline::split_block(st, &parent, "Top 3 today".len(), false).unwrap();
+    let child = s.execute_plan(&t, plan, None).unwrap().unwrap().block;
+    let plan = outline::indent(s.page_state(&t).unwrap(), &child).unwrap();
+    s.execute_plan(&t, plan, None).unwrap();
+    s.set_block_text(&t, &child, "1.", None, None).unwrap();
+    let (day, first) = s.open_daily(today()).unwrap();
+    assert_eq!(
+        texts(&mut s, &day),
+        vec![
+            ("Gratitude::".into(), 0),
+            ("Top 3 today".into(), 0),
+            ("1.".into(), 1)
+        ]
+    );
+    assert_ne!(first, BlockId::from("x"));
+    // A page template inserted after a block, one undo step.
+    let meeting = s.create_page("templates/meeting").unwrap();
+    write(&mut s, &meeting, "Attendees::");
+    assert_eq!(s.template_pages().unwrap().len(), 2);
+    let notes = s.create_page("Standup").unwrap();
+    let b = write(&mut s, &notes, "intro");
+    s.apply_template(&notes, None, Some(&b), &meeting).unwrap();
+    assert_eq!(
+        texts(&mut s, &notes),
+        vec![("intro".into(), 0), ("Attendees::".into(), 0)]
+    );
+    s.undo().unwrap();
+    assert_eq!(texts(&mut s, &notes), vec![("intro".into(), 0)]);
+    doctor_ok(&mut s);
+}
+
+#[test]
+fn fr_2_18_extract_block_to_page() {
+    let (mut s, _d) = store();
+    let src = s.create_page("Notes").unwrap();
+    write(&mut s, &src, "before");
+    let b = write(&mut s, &src, "a big idea");
+    let st = s.page_state(&src).unwrap();
+    let plan = outline::split_block(st, &b, "a big idea".len(), false).unwrap();
+    let c = s.execute_plan(&src, plan, None).unwrap().unwrap().block;
+    let plan = outline::indent(s.page_state(&src).unwrap(), &c).unwrap();
+    s.execute_plan(&src, plan, None).unwrap();
+    s.set_block_text(&src, &c, "supporting detail", None, None)
+        .unwrap();
+    write(&mut s, &src, "after");
+    let other = s.create_page("Elsewhere").unwrap();
+    write(&mut s, &other, &format!("quoting (({b}))"));
+    let dst = s.extract_block_to_page(&src, &b, "Big Idea").unwrap();
+    assert_eq!(
+        texts(&mut s, &src),
+        vec![
+            ("before".into(), 0),
+            ("[[Big Idea]]".into(), 0),
+            ("after".into(), 0)
+        ]
+    );
+    assert_eq!(
+        texts(&mut s, &dst),
+        vec![("a big idea".into(), 0), ("supporting detail".into(), 1)]
+    );
+    assert_eq!(
+        s.block_page(&b).unwrap(),
+        dst,
+        "ids kept, so ((refs)) still resolve"
+    );
+    assert_eq!(s.block_backlinks(&b).unwrap().len(), 1);
+    assert_eq!(s.backlink_count(&dst).unwrap(), 1);
+    doctor_ok(&mut s);
+    s.undo().unwrap();
+    assert_eq!(texts(&mut s, &src).len(), 4, "one undo step");
+    assert_eq!(s.block_page(&b).unwrap(), src);
+    doctor_ok(&mut s);
+}
+
+#[test]
+fn drag_block_across_pages() {
+    let (mut s, _d) = store();
+    let a = s.create_page("A").unwrap();
+    let b = s.create_page("B").unwrap();
+    let x = write(&mut s, &a, "moving");
+    let y = write(&mut s, &b, "target");
+    s.move_block_to_page(&a, &x, &b, None, Some(&y)).unwrap();
+    assert!(texts(&mut s, &a).is_empty());
+    assert_eq!(
+        texts(&mut s, &b),
+        vec![("target".into(), 0), ("moving".into(), 0)]
+    );
+    doctor_ok(&mut s);
+}
+
+#[test]
+fn block_types_and_capture() {
+    let (mut s, _d) = store();
+    let (page, first) = s.capture("call [[Dana]] about #invoices").unwrap();
+    assert_eq!(
+        texts(&mut s, &page),
+        vec![("call [[Dana]] about #invoices".into(), 0)]
+    );
+    assert!(s.find_page("Dana").unwrap().is_some());
+    s.capture("second thought").unwrap();
+    assert_eq!(texts(&mut s, &page).len(), 2, "appends to today");
+    s.set_block_kind(&page, &first, BlockKind::Todo, true)
+        .unwrap();
+    let b = s.page_state(&page).unwrap().block(&first).unwrap().clone();
+    assert_eq!((b.kind, b.checked), (BlockKind::Todo, true));
+    assert_eq!(s.block_row(&first).unwrap().unwrap().kind, BlockKind::Todo);
+    s.undo().unwrap();
+    assert_eq!(
+        s.page_state(&page).unwrap().block(&first).unwrap().kind,
+        BlockKind::Bullet
+    );
+}
+
+#[test]
+fn roam_json_import() {
+    let (mut s, _d) = store();
+    let json = r#"[
+      {"title": "November 1st, 2026", "children": [
+        {"string": "{{[[TODO]]}} read about [[Zettelkasten]]", "uid": "abcDEF123"},
+        {"string": "Met __Dana__", "uid": "ghiJKL456", "children": [
+          {"string": "see ((abcDEF123))", "uid": "mnoPQR789"}
+        ]}
+      ]},
+      {"title": "Zettelkasten", "children": [{"string": "{{[[DONE]]}} set up", "uid": "stuVWX000", "heading": 2}]}
+    ]"#;
+    let r = s.import_roam_json(json).unwrap();
+    assert_eq!((r.pages, r.blocks), (2, 4));
+    let day = s
+        .find_page("2026-11-01")
+        .unwrap()
+        .expect("dates become daily pages");
+    assert_eq!(
+        texts(&mut s, &day),
+        vec![
+            ("read about [[Zettelkasten]]".into(), 0),
+            ("Met _Dana_".into(), 0),
+            ("see ((abcDEF123))".into(), 1)
+        ]
+    );
+    let todo = s.block_row(&BlockId::from("abcDEF123")).unwrap().unwrap();
+    assert_eq!(todo.kind, BlockKind::Todo);
+    assert_eq!(
+        s.block_backlinks(&BlockId::from("abcDEF123"))
+            .unwrap()
+            .len(),
+        1,
+        "uids preserved"
+    );
+    let z = s.find_page("Zettelkasten").unwrap().unwrap();
+    assert_eq!(s.backlink_count(&z).unwrap(), 1);
+    let done = s.block_row(&BlockId::from("stuVWX000")).unwrap().unwrap();
+    assert_eq!((done.kind, done.checked), (BlockKind::Heading(2), true));
+    // Importing again does not duplicate blocks (uids taken → fresh ids, pages reused).
+    s.import_roam_json(json).unwrap();
+    assert_eq!(s.list_pages(true).unwrap().len(), 2);
+    doctor_ok(&mut s);
+}
+
+#[test]
+fn opml_export() {
+    let (mut s, dir) = store();
+    let p = s.create_page("Outline").unwrap();
+    write(&mut s, &p, "A & B");
+    let path = dir.path().join("out.opml");
+    s.export_opml(&path).unwrap();
+    let x = std::fs::read_to_string(path).unwrap();
+    assert!(x.contains("<outline text=\"Outline\">") && x.contains("A &amp; B"));
+}
+
+#[test]
+fn w7_people_crm_attributes() {
+    let (mut s, _d) = store();
+    let dana = s.create_page("Dana").unwrap();
+    write(&mut s, &dana, "Email:: dana@example.com");
+    write(&mut s, &dana, "Company:: [[Acme]]");
+    let (day, b) = s.open_daily(today()).unwrap();
+    s.set_block_text(&day, &b, "lunch with [[Dana]]", None, None)
+        .unwrap();
+    s.commit_block(&day, &b).unwrap();
+    let attrs: Vec<(String, String)> = s
+        .page_state(&dana)
+        .unwrap()
+        .live_roots()
+        .iter()
+        .filter_map(|r| {
+            let t = s.block_row(r).unwrap().unwrap().text;
+            trellis_core::inline::attribute(&t).map(|(k, v)| (k, t[v].to_string()))
+        })
+        .collect();
+    assert_eq!(attrs[0], ("Email".into(), "dana@example.com".into()));
+    assert!(
+        s.find_page("Acme").unwrap().is_some(),
+        "attribute values link like any text"
+    );
+    assert_eq!(
+        s.linked_references(&dana, &Default::default())
+            .unwrap()
+            .shown(),
+        1
+    );
+}
+
+#[test]
+fn date_filter_on_linked_references() {
+    let (mut s, _d) = store();
+    let topic = s.create_page("Topic").unwrap();
+    for (y, m, d) in [(2026, 10, 1), (2026, 10, 30), (2026, 11, 2)] {
+        let (day, b) = s
+            .open_daily(NaiveDate::from_ymd_opt(y, m, d).unwrap())
+            .unwrap();
+        s.set_block_text(&day, &b, "on [[Topic]]", None, None)
+            .unwrap();
+        s.commit_block(&day, &b).unwrap();
+    }
+    let all = s.linked_references(&topic, &Default::default()).unwrap();
+    assert_eq!(all.shown(), 3);
+    let q = trellis_store::RefQuery {
+        since: NaiveDate::from_ymd_opt(2026, 10, 27),
+        ..Default::default()
+    };
+    assert_eq!(s.linked_references(&topic, &q).unwrap().shown(), 2);
+}

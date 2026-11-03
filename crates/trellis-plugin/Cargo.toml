@@ -1,0 +1,20 @@
+[package]
+name = "trellis-plugin"
+description = "Trellis plugin runtime (P2): sandboxed WebAssembly commands over the automation API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+trellis-api.workspace = true
+trellis-core.workspace = true
+trellis-store.workspace = true
+wasmi = "0.46.0"
+wat = "1.258.3"
+
+[dev-dependencies]
+chrono.workspace = true
+tempfile.workspace = true

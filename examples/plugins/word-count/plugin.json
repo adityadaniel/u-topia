@@ -1,0 +1,8 @@
+{
+  "name": "Word count",
+  "version": "1.0.0",
+  "description": "Counts the words in the block you are editing.",
+  "commands": [{ "id": "count", "title": "Count words in this block" }],
+  "permissions": [],
+  "module": "plugin.wat"
+}

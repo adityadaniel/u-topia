@@ -1,0 +1,30 @@
+[package]
+name = "trellis-app"
+description = "Trellis desktop app: window, keymap, menus, CLI (doctor, export)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "trellis"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+trellis-api.workspace = true
+trellis-core.workspace = true
+trellis-store.workspace = true
+trellis-sync.workspace = true
+trellis-syncd = { path = "../trellis-syncd" }
+trellis-ui.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+objc = "0.2"
+png = "0.17"
+raw-window-handle = "0.6"
+
+[dev-dependencies]
+tempfile.workspace = true

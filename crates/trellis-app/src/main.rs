@@ -1,0 +1,713 @@
+//! Trellis desktop app (§13.1 `trellis-app`): window, menus, keymap, onboarding, and the
+//! headless `doctor` / `export` commands.
+
+mod cli;
+mod hotkey;
+mod paths;
+mod shot;
+
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use gpui::{
+    div, prelude::*, px, size, App, Application, Bounds, Context, Entity, EntityInputHandler, Menu,
+    MenuItem, Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions,
+};
+use trellis_store::Store;
+use trellis_ui::actions::*;
+use trellis_ui::app_state::AppState;
+use trellis_ui::line_input::{LineInput, LineInputEvent};
+use trellis_ui::theme::{theme, Theme};
+use trellis_ui::workspace::Workspace;
+
+/// `trellis://` links delivered by the OS (or argv), drained on the main thread.
+static PENDING_URLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Act on one `trellis://` link.
+fn follow_link(url: &str, ws: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
+    use trellis_api::UrlAction;
+    let Some(action) = trellis_api::parse_url(url) else {
+        eprintln!("trellis: unsupported link {url}");
+        return;
+    };
+    ws.update(cx, |w, cx| match action {
+        UrlAction::Page(t) => w.open_title(&t, window, cx),
+        UrlAction::Journal(d) => {
+            let d = d.unwrap_or_else(|| w.app().read(cx).store.today());
+            w.open_date(d, false, true, window, cx)
+        }
+        UrlAction::Block(uid) => w.open_block(&uid, window, cx),
+        UrlAction::Search(q) => w.search_for(&q, window, cx),
+        UrlAction::Capture(text) => w.capture_text(&text, cx),
+    });
+}
+
+/// Workspace commands for `TRELLIS_SHOT_SCRIPT`.
+struct ScriptHooks(gpui::WeakEntity<Root>);
+
+impl ScriptHooks {
+    fn workspace(&self, cx: &App) -> Option<Entity<Workspace>> {
+        match &self.0.upgrade()?.read(cx).state {
+            RootState::Ready(ws) => Some(ws.clone()),
+            _ => None,
+        }
+    }
+}
+
+impl shot::Hooks for ScriptHooks {
+    fn drop_files(&self, paths: &[PathBuf], window: &mut Window, cx: &mut App) {
+        if let Some(ws) = self.workspace(cx) {
+            ws.update(cx, |w, cx| w.drop_files(paths, window, cx));
+        }
+    }
+
+    fn ws(&self, args: &[String], window: &mut Window, cx: &mut App) {
+        let Some(ws) = self.workspace(cx) else {
+            return;
+        };
+        let this = ScriptWs(ws);
+        this.run(args, window, cx);
+    }
+}
+
+struct ScriptWs(Entity<Workspace>);
+
+impl ScriptWs {
+    fn run(&self, args: &[String], window: &mut Window, cx: &mut App) {
+        let num = |i: usize| args.get(i).and_then(|v| v.parse::<f32>().ok());
+        match args.first().map(String::as_str) {
+            // The first PDF attached on the open page.
+            Some("open-pdf") => self.0.update(cx, |w, cx| {
+                let found = w.main_page(cx).and_then(|p| {
+                    let store = &mut w.app().clone();
+                    store.update(cx, |a, _| {
+                        let st = a.store.page_state(&p).ok()?.clone();
+                        st.live_preorder().into_iter().find_map(|(id, _)| {
+                            trellis_core::attach::blob_refs(&st.block(&id)?.text)
+                                .into_iter()
+                                .find(|b| b.kind == trellis_core::attach::BlobKind::Pdf)
+                                .map(|b| (b, id))
+                        })
+                    })
+                });
+                if let Some((b, host)) = found {
+                    let name = w
+                        .app()
+                        .read(cx)
+                        .store
+                        .attachment(&b.hash)
+                        .ok()
+                        .flatten()
+                        .map_or(b.name, |a| a.name);
+                    w.open_pdf(b.hash, name, None, Some(host), window, cx);
+                }
+            }),
+            Some("highlight") => {
+                if let (Some(p), Some(x), Some(y), Some(wd), Some(h)) =
+                    (num(1), num(2), num(3), num(4), num(5))
+                {
+                    if let Some(view) = self.0.read(cx).pdf_view() {
+                        view.update(cx, |v, cx| v.highlight_area(p as usize, [x, y, wd, h], cx));
+                    }
+                }
+            }
+            // `ws select <page> <x0> <y0> <x1> <y1>`: a text-selection highlight.
+            Some("select") => {
+                if let (Some(p), Some(x0), Some(y0), Some(x1), Some(y1)) =
+                    (num(1), num(2), num(3), num(4), num(5))
+                {
+                    if let Some(view) = self.0.read(cx).pdf_view() {
+                        view.update(cx, |v, cx| {
+                            v.highlight_text(p as usize, (x0, y0), (x1, y1), cx);
+                        });
+                    }
+                }
+            }
+            other => eprintln!("shot: unknown ws command {other:?}"),
+        }
+    }
+}
+
+/// Process start, for the startup probe (§15.1 cold start budget).
+static START: OnceLock<Instant> = OnceLock::new();
+
+/// `TRELLIS_PROBE=1`: measure time to the first frame and keystroke → frame cost, print
+/// them, and quit. Each keystroke goes through the editor's platform input handler and is
+/// followed by a full synchronous render, layout and paint of the window.
+fn run_probe(ws: Entity<Workspace>, window: &mut Window) {
+    window.on_next_frame(move |window, cx| {
+        let first_frame = START.get().map_or(Duration::ZERO, |s| s.elapsed());
+        let editor = ws.read(cx).editor();
+        let mut samples = Vec::new();
+        for _ in 0..80 {
+            let t = Instant::now();
+            editor.update(cx, |e, cx| e.replace_text_in_range(None, "x", window, cx));
+            window.draw(cx).clear();
+            samples.push(t.elapsed());
+        }
+        samples.sort();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let p = |q: f64| ms(samples[((samples.len() - 1) as f64 * q).round() as usize]);
+        println!(
+            "probe first_frame_ms={:.1} key_to_frame_p50_ms={:.2} key_to_frame_p95_ms={:.2} hotkey={}",
+            ms(first_frame),
+            p(0.5),
+            p(0.95),
+            u8::from(hotkey::register())
+        );
+        cx.quit();
+    });
+}
+
+enum RootState {
+    Onboarding {
+        input: Entity<LineInput>,
+        error: Option<String>,
+        _sub: Subscription,
+    },
+    /// The graph is encrypted at rest and no stored passphrase opened it (P2).
+    Locked {
+        path: PathBuf,
+        input: Entity<LineInput>,
+        error: Option<String>,
+        _sub: Subscription,
+    },
+    Ready(Entity<Workspace>),
+    Failed(String),
+}
+
+/// Top-level view: onboarding when there is no graph yet (§9.3), else the workspace.
+struct Root {
+    state: RootState,
+    config: PathBuf,
+    _appearance: Subscription,
+    _hotkey: Option<gpui::Task<()>>,
+    _discovery: Option<gpui::Task<()>>,
+    _lan: Option<trellis_syncd::lan::LanRelay>,
+    _inbox: Option<gpui::Task<()>>,
+}
+
+impl Root {
+    fn new(
+        graph: Option<PathBuf>,
+        config: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let appearance = cx.observe_window_appearance(window, |_, window, cx| {
+            cx.set_global(Theme::for_appearance(window.appearance()));
+            cx.notify();
+        });
+        let mut root = Self {
+            state: RootState::Failed(String::new()),
+            config,
+            _appearance: appearance,
+            _hotkey: None,
+            _discovery: None,
+            _lan: None,
+            _inbox: None,
+        };
+        match graph {
+            Some(p) => root.open_graph(p, window, cx),
+            None => root.onboard(window, cx),
+        }
+        if let Ok(script) = std::env::var("TRELLIS_SHOT_SCRIPT") {
+            match shot::parse(&script) {
+                Ok(steps) => {
+                    let handle = window.window_handle();
+                    let hooks = Box::new(ScriptHooks(cx.entity().downgrade()));
+                    cx.spawn(async move |_, cx| shot::run(steps, handle, hooks, cx).await)
+                        .detach();
+                }
+                Err(e) => eprintln!("trellis: TRELLIS_SHOT_SCRIPT: {e}"),
+            }
+        }
+        root
+    }
+
+    fn onboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| LineInput::new("Name your graph", cx));
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            |this, input, e: &LineInputEvent, window, cx| {
+                if let LineInputEvent::Submit { .. } = e {
+                    let name = input.read(cx).text().to_string();
+                    match paths::graph_file_name(&name) {
+                        Some(file) => this.open_graph(paths::graphs_dir().join(file), window, cx),
+                        None => {
+                            if let RootState::Onboarding { error, .. } = &mut this.state {
+                                *error = Some("Please enter a name.".into());
+                            }
+                            cx.notify();
+                        }
+                    }
+                }
+            },
+        );
+        input.update(cx, |i, _| i.focus(window));
+        self.state = RootState::Onboarding {
+            input,
+            error: None,
+            _sub: sub,
+        };
+    }
+
+    fn open_graph(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let key = trellis_store::is_encrypted(&path)
+            .then(|| paths::db_passphrase(&path))
+            .flatten();
+        self.open_graph_with(path, key, window, cx);
+    }
+
+    /// Ask for the passphrase of an encrypted graph.
+    fn lock(
+        &mut self,
+        path: PathBuf,
+        error: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| {
+            let mut i = LineInput::new("Passphrase", cx);
+            i.set_masked(true, cx);
+            i
+        });
+        let p2 = path.clone();
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            move |this, input, e: &LineInputEvent, window, cx| {
+                if let LineInputEvent::Submit { .. } = e {
+                    let pass = input.read(cx).text().to_string();
+                    this.open_graph_with(p2.clone(), Some(pass), window, cx);
+                }
+            },
+        );
+        input.update(cx, |i, _| i.focus(window));
+        self.state = RootState::Locked {
+            path,
+            input,
+            error,
+            _sub: sub,
+        };
+        cx.notify();
+    }
+
+    fn open_graph_with(
+        &mut self,
+        path: PathBuf,
+        key: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match Store::open_with_key(&path, key.as_deref()) {
+            Err(trellis_store::StoreError::Encrypted) => {
+                let error = key.map(|_| "That passphrase does not open this graph.".to_string());
+                self.lock(path, error, window, cx);
+            }
+            Ok(store) => {
+                paths::remember_graph(&self.config, &path);
+                let plugins = self.config.join("plugins");
+                let app = cx.new(|_| {
+                    let mut a = AppState::new(store);
+                    a.load_plugins(&plugins);
+                    a
+                });
+                let ws = cx.new(|cx| Workspace::new(app.clone(), window, cx));
+                ws.update(cx, |w, cx| w.open_launch_page(window, cx));
+                if std::env::var_os("TRELLIS_SHOT_SCRIPT").is_some() {
+                    // A scripted run (started in `Root::new`) registers no global hotkey.
+                } else if std::env::var_os("TRELLIS_PROBE").is_some() {
+                    run_probe(ws.clone(), window);
+                } else {
+                    // FR-2.19: the system-wide hotkey brings the app forward into capture.
+                    let registered = hotkey::register();
+                    if !registered {
+                        eprintln!("trellis: global quick-capture hotkey unavailable; Cmd+Shift+Space works in-app");
+                    }
+                    let ws2 = ws.clone();
+                    self._hotkey = Some(cx.spawn_in(window, async move |_, cx| loop {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(150))
+                            .await;
+                        if hotkey::take_fired() {
+                            let r = cx.update(|window, cx| {
+                                cx.activate(true);
+                                ws2.update(cx, |w, cx| w.quick_capture(&QuickCapture, window, cx));
+                            });
+                            if r.is_err() {
+                                break;
+                            }
+                        }
+                    }));
+                }
+                // LAN direct (§12.7.4): host the relay for this graph and sync through it.
+                if let Ok(bind) = std::env::var("TRELLIS_LAN_SERVE") {
+                    let graph = paths::graph_id(&path);
+                    let db = path.with_extension("lan-relay.db");
+                    match trellis_syncd::lan::serve_lan(
+                        &db,
+                        &bind,
+                        &graph,
+                        Default::default(),
+                        true,
+                    ) {
+                        Ok(relay) => {
+                            eprintln!("trellis: LAN relay for {graph} on {}", relay.addr);
+                            let cfg = trellis_ui::sync_runner::SyncConfig {
+                                target: trellis_ui::sync_runner::SyncTarget::Relay {
+                                    url: format!("http://127.0.0.1:{}", relay.addr.port()),
+                                    token: None,
+                                },
+                                graph,
+                                passphrase: std::env::var("TRELLIS_SYNC_PASSPHRASE").ok(),
+                            };
+                            ws.update(cx, |w, cx| w.enable_sync(cfg, cx));
+                            self._lan = Some(relay);
+                        }
+                        Err(e) => eprintln!("trellis: LAN relay failed: {e}"),
+                    }
+                } else if let Some(cfg) = paths::sync_config(&path) {
+                    let lan = matches!(&cfg.target, trellis_ui::sync_runner::SyncTarget::Relay { url, .. } if url == "lan");
+                    if lan {
+                        // Discover on a background thread; startup never waits on the network.
+                        let ws2 = ws.clone();
+                        self._discovery = Some(cx.spawn_in(window, async move |_, cx| {
+                            let graph = cfg.graph.clone();
+                            let found = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    trellis_syncd::lan::discover(&graph, Duration::from_secs(5))
+                                })
+                                .await;
+                            let _ = cx.update(|_, cx| match found {
+                                Some(url) => {
+                                    let mut cfg = cfg;
+                                    if let trellis_ui::sync_runner::SyncTarget::Relay {
+                                        url: u,
+                                        ..
+                                    } = &mut cfg.target
+                                    {
+                                        *u = url;
+                                    }
+                                    ws2.update(cx, |w, cx| w.enable_sync(cfg, cx));
+                                }
+                                None => eprintln!("trellis: no LAN relay found for {}", cfg.graph),
+                            });
+                        }));
+                    } else {
+                        ws.update(cx, |w, cx| w.enable_sync(cfg, cx));
+                    }
+                }
+                // Links and the automation API run on the main thread against the same
+                // store the UI uses (P2: local HTTP API + trellis://).
+                let api = match std::env::var("TRELLIS_API").ok().filter(|v| !v.is_empty()) {
+                    Some(v) => {
+                        let addr = if v == "1" {
+                            "127.0.0.1:0".to_string()
+                        } else {
+                            v
+                        };
+                        match trellis_api::serve(&addr, trellis_api::new_token()) {
+                            Ok(server) => {
+                                let file = self.config.join("api.json");
+                                if let Err(e) = server.write_discovery(&file) {
+                                    eprintln!("trellis: could not write {}: {e}", file.display());
+                                }
+                                eprintln!("trellis: automation API on {}", server.url());
+                                Some(server)
+                            }
+                            Err(e) => {
+                                eprintln!("trellis: automation API failed: {e}");
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                let (ws2, app2) = (ws.clone(), app.clone());
+                self._inbox = Some(cx.spawn_in(window, async move |_, cx| loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(30))
+                        .await;
+                    let urls = std::mem::take(&mut *PENDING_URLS.lock().expect("url queue"));
+                    let r = cx.update(|window, cx| {
+                        for url in &urls {
+                            cx.activate(true);
+                            follow_link(url, &ws2, window, cx);
+                        }
+                        if let Some(server) = &api {
+                            while let Some(call) = server.try_recv() {
+                                app2.update(cx, |a, cx| {
+                                    let changed = call.run(&mut a.store);
+                                    if !changed.is_empty() {
+                                        a.changed(changed, true, cx);
+                                    }
+                                });
+                            }
+                        }
+                    });
+                    if r.is_err() {
+                        break;
+                    }
+                }));
+                self.state = RootState::Ready(ws);
+            }
+            Err(e) => {
+                self.state = RootState::Failed(format!("Could not open {}: {e}", path.display()))
+            }
+        }
+        cx.notify();
+    }
+}
+
+impl Render for Root {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let th = theme(cx).clone();
+        let shell = div()
+            .size_full()
+            .bg(th.bg)
+            .text_color(th.text)
+            .text_size(px(trellis_ui::theme::TEXT_SIZE))
+            .line_height(px(trellis_ui::theme::LINE_HEIGHT));
+        match &self.state {
+            RootState::Ready(ws) => shell.child(ws.clone()),
+            RootState::Onboarding { input, error, .. } => {
+                shell.flex().justify_center().items_center().child(
+                    div()
+                        .w(px(420.))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(24.))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child("Welcome to Trellis"),
+                        )
+                        .child(
+                            div()
+                                .text_color(th.muted)
+                                .child("Name your graph. It is a single file you own."),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .border_1()
+                                .border_color(th.accent)
+                                .rounded_md()
+                                .child(input.clone()),
+                        )
+                        .child(div().text_xs().text_color(th.faint).child(format!(
+                            "Creates {}/<name>.trellis",
+                            paths::graphs_dir().display()
+                        )))
+                        .children(
+                            error
+                                .clone()
+                                .map(|e| div().text_color(th.missing_text).child(e)),
+                        ),
+                )
+            }
+            RootState::Locked {
+                path, input, error, ..
+            } => shell.flex().justify_center().items_center().child(
+                div()
+                    .debug_selector(|| "unlock".into())
+                    .w(px(420.))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(24.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("This graph is locked"),
+                    )
+                    .child(div().text_color(th.muted).child(format!(
+                        "{} is encrypted at rest. Enter its passphrase.",
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    )))
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .border_1()
+                            .border_color(th.accent)
+                            .rounded_md()
+                            .child(input.clone()),
+                    )
+                    .child(div().text_xs().text_color(th.faint).child(
+                        "Tip: store it in the keychain (service trellis-db) to unlock automatically.",
+                    ))
+                    .children(
+                        error
+                            .clone()
+                            .map(|e| div().text_color(th.missing_text).child(e)),
+                    ),
+            ),
+            RootState::Failed(msg) => shell
+                .flex()
+                .justify_center()
+                .items_center()
+                .child(div().text_color(th.missing_text).child(msg.clone())),
+        }
+    }
+}
+
+fn menus() -> Vec<Menu> {
+    vec![
+        Menu {
+            name: "Trellis".into(),
+            items: vec![
+                MenuItem::action("Quick Jump", QuickJump),
+                MenuItem::separator(),
+                MenuItem::action("Quit Trellis", Quit),
+            ],
+        },
+        Menu {
+            name: "Edit".into(),
+            items: vec![
+                MenuItem::action("Undo", Undo),
+                MenuItem::action("Redo", Redo),
+                MenuItem::separator(),
+                MenuItem::action("Cut", Cut),
+                MenuItem::action("Copy", Copy),
+                MenuItem::action("Paste", Paste),
+                MenuItem::action("Copy Block Reference", CopyBlockRef),
+            ],
+        },
+        Menu {
+            name: "Go".into(),
+            items: vec![
+                MenuItem::action("Today", GoToday),
+                MenuItem::action("Previous Day", PrevDay),
+                MenuItem::action("Next Day", NextDay),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Right Sidebar", ToggleRightSidebar),
+                MenuItem::action("Toggle References", ToggleReferences),
+            ],
+        },
+    ]
+}
+
+fn run_app(graph: Option<PathBuf>) {
+    let config = paths::config_dir();
+    let keymap = std::fs::read_to_string(config.join("keymap.json")).ok();
+    let application = Application::new();
+    application.on_open_urls(|urls| {
+        PENDING_URLS.lock().expect("url queue").extend(urls);
+    });
+    application.run(move |cx: &mut App| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, keymap.as_deref());
+        cx.set_menus(menus());
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Trellis".into()),
+                ..Default::default()
+            }),
+            window_min_size: Some(size(px(720.), px(480.))),
+            ..Default::default()
+        };
+        let opened = cx.open_window(options, move |window, cx| {
+            cx.set_global(Theme::for_appearance(window.appearance()));
+            cx.new(|cx| Root::new(graph, config, window, cx))
+        });
+        if let Err(e) = opened {
+            eprintln!("trellis: could not open a window: {e}");
+            cx.quit();
+            return;
+        }
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        cx.activate(true);
+    });
+}
+
+fn main() -> anyhow::Result<()> {
+    START.get_or_init(Instant::now);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("doctor") => {
+            let Some(graph) = args.get(1) else {
+                anyhow::bail!("{}", cli::USAGE);
+            };
+            let rebuild = args.iter().any(|a| a == "--rebuild");
+            let ok = cli::doctor(graph.as_ref(), rebuild)?;
+            std::process::exit(if ok { 0 } else { 1 });
+        }
+        Some("export") => {
+            let (Some(graph), Some(dir)) = (args.get(1), args.get(2)) else {
+                anyhow::bail!("{}", cli::USAGE);
+            };
+            cli::export(graph.as_ref(), dir.as_ref())
+        }
+        Some("import-roam") => {
+            let (Some(graph), Some(file)) = (args.get(1), args.get(2)) else {
+                anyhow::bail!("{}", cli::USAGE);
+            };
+            cli::import_roam(graph.as_ref(), file.as_ref())
+        }
+        Some("capture") => {
+            let text = args[1..].join(" ");
+            let graph = paths::resolve_graph(None, &paths::config_dir(), &paths::graphs_dir())
+                .ok_or_else(|| anyhow::anyhow!("no graph found; set TRELLIS_GRAPH"))?;
+            cli::capture(&graph, &text)
+        }
+        Some("encrypt") => {
+            let Some(graph) = args.get(1) else {
+                anyhow::bail!("{}", cli::USAGE);
+            };
+            cli::encrypt(graph.as_ref())
+        }
+        Some("decrypt") => {
+            let Some(graph) = args.get(1) else {
+                anyhow::bail!("{}", cli::USAGE);
+            };
+            cli::decrypt(graph.as_ref())
+        }
+        Some("serve-api") => {
+            let Some(graph) = args.get(1) else {
+                anyhow::bail!("{}", cli::USAGE);
+            };
+            let addr = args.get(2).map_or("127.0.0.1:0", String::as_str);
+            cli::serve_api(graph.as_ref(), addr, &paths::config_dir().join("api.json"))
+        }
+        Some(url) if url.starts_with("trellis://") => {
+            PENDING_URLS
+                .lock()
+                .expect("url queue")
+                .push(url.to_string());
+            let graph = paths::resolve_graph(None, &paths::config_dir(), &paths::graphs_dir());
+            run_app(graph);
+            Ok(())
+        }
+        Some("-h" | "--help" | "help") => {
+            println!("{}", cli::USAGE);
+            Ok(())
+        }
+        _ => {
+            let explicit = args
+                .iter()
+                .position(|a| a == "--graph")
+                .and_then(|i| args.get(i + 1))
+                .map(PathBuf::from);
+            let graph = paths::resolve_graph(explicit, &paths::config_dir(), &paths::graphs_dir());
+            run_app(graph);
+            Ok(())
+        }
+    }
+}

@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = ["crates/trellis-core", "crates/trellis-doc", "crates/trellis-store", "crates/trellis-sync", "crates/trellis-ui", "crates/trellis-app", "crates/trellis-proto", "crates/trellis-syncd", "crates/trellis-api", "crates/trellis-plugin", "crates/trellis-ffi", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+trellis-core = { path = "crates/trellis-core" }
+trellis-doc = { path = "crates/trellis-doc" }
+trellis-store = { path = "crates/trellis-store" }
+trellis-sync = { path = "crates/trellis-sync" }
+trellis-ui = { path = "crates/trellis-ui" }
+trellis-api = { path = "crates/trellis-api" }
+trellis-plugin = { path = "crates/trellis-plugin" }
+trellis-proto = { path = "crates/trellis-proto" }
+
+anyhow = "1.0"
+argon2 = "0.5"
+axum = { version = "0.8", features = ["ws"] }
+caseless = "0.2"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+# Pinned exactly: GPUI is pre-1.0 (PRD risk R1). runtime_shaders avoids needing the Metal toolchain.
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+loro = "1.17"
+mdns-sd = "0.21"
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3"
+thiserror = "2.0"
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+ulid = "1.1"
+ureq = "2.12"
+zstd = "0.13"
+unicode-normalization = "0.1"
+unicode-segmentation = "1.12"
+uuid = { version = "1.10", features = ["v5"] }
+
+[profile.dev.package."*"]
+opt-level = 1

@@ -1,0 +1,17 @@
+//! Trellis GPUI components (§13). Every GPUI touch lives in this crate (risk R1).
+
+pub mod actions;
+pub mod app_state;
+pub mod calendar;
+pub mod editor;
+pub mod field;
+pub mod graph_view;
+pub mod line_input;
+pub mod page_view;
+pub mod pdf;
+pub mod pdf_view;
+pub mod quick_jump;
+pub mod rich;
+pub mod sync_runner;
+pub mod theme;
+pub mod workspace;

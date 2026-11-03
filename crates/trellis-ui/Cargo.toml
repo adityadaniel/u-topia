@@ -1,0 +1,29 @@
+[package]
+name = "trellis-ui"
+description = "Trellis GPUI components: block editor, outline view, panels, sidebars"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+gpui.workspace = true
+# Same major as GPUI's, so page images are handed over as `RenderImage` frames.
+image = { version = "0.25", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+trellis-core.workspace = true
+trellis-plugin.workspace = true
+trellis-store.workspace = true
+trellis-sync.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+foreign-types = "0.5"
+objc = "0.2"
+png = "0.17"
+
+[dev-dependencies]
+tempfile.workspace = true
+gpui = { workspace = true, features = ["test-support"] }

@@ -1,0 +1,291 @@
+//! Display rendering of a block body (§6.2): marks and reference chips become styled runs
+//! inside one shaped text, never child widgets (§13.4). The focused block shows its
+//! source instead; see [`source_highlights`].
+
+use std::ops::Range;
+
+use gpui::{
+    px, FontStyle, FontWeight, HighlightStyle, SharedString, StrikethroughStyle, UnderlineStyle,
+};
+use trellis_core::inline::{extract_refs, parse, Inline, Mark, RefKind};
+
+use crate::theme::Theme;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTarget {
+    /// Page title as typed; resolution happens in the store.
+    Page(String),
+    Block(String),
+    Url(String),
+}
+
+/// How a `((uid))` chip should look (FR-4.3, FR-4.7, AC-4.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChipState {
+    Live(String),
+    Deleted,
+    Missing,
+    Cyclic,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Rendered {
+    pub text: SharedString,
+    pub highlights: Vec<(Range<usize>, HighlightStyle)>,
+    pub links: Vec<(Range<usize>, LinkTarget)>,
+}
+
+impl Rendered {
+    pub fn link_at(&self, ix: usize) -> Option<&LinkTarget> {
+        self.links
+            .iter()
+            .find(|(r, _)| r.start <= ix && ix < r.end)
+            .map(|(_, l)| l)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Marks {
+    bold: bool,
+    italic: bool,
+    strike: bool,
+    highlight: bool,
+}
+
+fn chip_label(text: &str) -> String {
+    let plain = trellis_core::inline::plain_text(text).replace('\n', " ");
+    let mut label: String = plain.chars().take(40).collect();
+    if plain.chars().count() > 40 {
+        label.push('…');
+    }
+    label
+}
+
+struct Builder<'a> {
+    theme: &'a Theme,
+    chip: &'a mut dyn FnMut(&str) -> ChipState,
+    text: String,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+    links: Vec<(Range<usize>, LinkTarget)>,
+}
+
+impl Builder<'_> {
+    fn style(&self, m: Marks) -> HighlightStyle {
+        HighlightStyle {
+            font_weight: m.bold.then_some(FontWeight::BOLD),
+            font_style: m.italic.then_some(FontStyle::Italic),
+            strikethrough: m.strike.then_some(StrikethroughStyle {
+                thickness: px(1.),
+                color: None,
+            }),
+            background_color: m.highlight.then_some(self.theme.highlight_bg),
+            ..Default::default()
+        }
+    }
+
+    fn push(&mut self, s: &str, style: HighlightStyle) -> Range<usize> {
+        let start = self.text.len();
+        self.text.push_str(s);
+        let range = start..self.text.len();
+        if !s.is_empty() && style != HighlightStyle::default() {
+            self.highlights.push((range.clone(), style));
+        }
+        range
+    }
+
+    fn walk(&mut self, nodes: &[Inline], m: Marks) {
+        for n in nodes {
+            match n {
+                Inline::Text(t) => {
+                    let st = self.style(m);
+                    self.push(t, st);
+                }
+                Inline::Emph { mark, children, .. } => {
+                    let mut m2 = m;
+                    match mark {
+                        Mark::Bold => m2.bold = true,
+                        Mark::Italic => m2.italic = true,
+                        Mark::Strike => m2.strike = true,
+                        Mark::Highlight => m2.highlight = true,
+                    }
+                    self.walk(children, m2);
+                }
+                Inline::Code { text, .. } => {
+                    let mut st = self.style(m);
+                    st.background_color = Some(self.theme.code_bg);
+                    self.push(text, st);
+                }
+                Inline::PageRef { title, .. } => {
+                    let mut st = self.style(m);
+                    st.color = Some(self.theme.accent);
+                    let r = self.push(title, st);
+                    self.links.push((r, LinkTarget::Page(title.clone())));
+                }
+                Inline::Tag { title, .. } => {
+                    let mut st = self.style(m);
+                    st.color = Some(self.theme.tag);
+                    let r = self.push(&format!("#{title}"), st);
+                    self.links.push((r, LinkTarget::Page(title.clone())));
+                }
+                Inline::BlockRef { uid, .. } => {
+                    let state = (self.chip)(uid);
+                    let (label, bg, fg) = match state {
+                        ChipState::Live(t) => {
+                            (format!(" {} ›", chip_label(&t)), self.theme.chip_bg, None)
+                        }
+                        ChipState::Deleted => (
+                            " deleted block ".to_string(),
+                            self.theme.chip_bg,
+                            Some(self.theme.muted),
+                        ),
+                        ChipState::Missing => (
+                            format!(" Missing block (({uid})) "),
+                            self.theme.missing_bg,
+                            Some(self.theme.missing_text),
+                        ),
+                        ChipState::Cyclic => (
+                            " ↻ cyclic reference ".to_string(),
+                            self.theme.chip_bg,
+                            Some(self.theme.muted),
+                        ),
+                    };
+                    let st = HighlightStyle {
+                        background_color: Some(bg),
+                        color: fg,
+                        ..Default::default()
+                    };
+                    let r = self.push(&label, st);
+                    self.links.push((r, LinkTarget::Block(uid.clone())));
+                }
+                Inline::Embed { uid, .. } => {
+                    // The embedded block renders below the row; the chip marks where.
+                    let label = match (self.chip)(uid) {
+                        ChipState::Live(t) => format!(" ⧉ {} ", chip_label(&t)),
+                        ChipState::Deleted => " ⧉ deleted block ".to_string(),
+                        ChipState::Missing => format!(" Missing block (({uid})) "),
+                        ChipState::Cyclic => " ↻ cyclic reference ".to_string(),
+                    };
+                    let st = HighlightStyle {
+                        background_color: Some(self.theme.chip_bg),
+                        color: Some(self.theme.muted),
+                        ..Default::default()
+                    };
+                    let r = self.push(&label, st);
+                    self.links.push((r, LinkTarget::Block(uid.clone())));
+                }
+                Inline::Link { text, url, .. } if url.starts_with("blob:") => {
+                    // An attachment: shown as a file token; the preview sits under the block.
+                    let mut st = self.style(m);
+                    st.color = Some(self.theme.muted);
+                    let r = self.push(&format!("📎 {text}"), st);
+                    self.links.push((r, LinkTarget::Url(url.clone())));
+                }
+                Inline::Link { text, url, .. } => {
+                    let mut st = self.style(m);
+                    st.color = Some(self.theme.accent);
+                    st.underline = Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(self.theme.accent),
+                        wavy: false,
+                    });
+                    let r = self.push(text, st);
+                    self.links.push((r, LinkTarget::Url(url.clone())));
+                }
+            }
+        }
+    }
+}
+
+/// Render a block body for display.
+pub fn render(src: &str, theme: &Theme, chip: &mut dyn FnMut(&str) -> ChipState) -> Rendered {
+    let mut b = Builder {
+        theme,
+        chip,
+        text: String::new(),
+        highlights: Vec::new(),
+        links: Vec::new(),
+    };
+    // `Key:: value` shows the key as a label (P1 attributes).
+    let body = match trellis_core::inline::attribute(src) {
+        Some((key, value)) => {
+            let st = HighlightStyle {
+                font_weight: Some(FontWeight::BOLD),
+                color: Some(theme.muted),
+                ..Default::default()
+            };
+            b.push(&format!("{key}: "), st);
+            &src[value]
+        }
+        None => src,
+    };
+    b.walk(&parse(body), Marks::default());
+    Rendered {
+        text: b.text.into(),
+        highlights: b.highlights,
+        links: b.links,
+    }
+}
+
+/// Syntax colouring for the focused block's source text: references are coloured, the
+/// characters themselves are untouched so caret offsets map 1:1.
+pub fn source_highlights(src: &str, theme: &Theme) -> Vec<(Range<usize>, HighlightStyle)> {
+    extract_refs(src)
+        .into_iter()
+        .map(|r| {
+            let color = match r.kind {
+                RefKind::Tag => theme.tag,
+                _ => theme.accent,
+            };
+            (
+                r.range,
+                HighlightStyle {
+                    color: Some(color),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_refs_as_links_without_brackets() {
+        let t = Theme::light();
+        let r = render(
+            "Met [[Dana]] re #proj and ((abc)) **now**",
+            &t,
+            &mut |uid| {
+                if uid == "abc" {
+                    ChipState::Live("a block".into())
+                } else {
+                    ChipState::Missing
+                }
+            },
+        );
+        assert_eq!(r.text.as_ref(), "Met Dana re #proj and  a block › now");
+        assert_eq!(r.links.len(), 3);
+        assert_eq!(r.link_at(5), Some(&LinkTarget::Page("Dana".into())));
+        assert_eq!(r.link_at(13), Some(&LinkTarget::Page("proj".into())));
+        assert!(matches!(r.link_at(24), Some(LinkTarget::Block(u)) if u == "abc"));
+        assert_eq!(r.link_at(0), None);
+        // Highlights are sorted and non-overlapping (StyledText requirement).
+        for w in r.highlights.windows(2) {
+            assert!(w[0].0.end <= w[1].0.start);
+        }
+    }
+
+    #[test]
+    fn missing_chip_is_explicit() {
+        let t = Theme::light();
+        let r = render("((zzz))", &t, &mut |_| ChipState::Missing);
+        assert!(r.text.contains("Missing block ((zzz))"));
+    }
+
+    #[test]
+    fn long_chip_is_truncated() {
+        assert_eq!(chip_label(&"x".repeat(50)).chars().count(), 41);
+    }
+}

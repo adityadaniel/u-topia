@@ -1,0 +1,26 @@
+[package]
+name = "trellis-store"
+description = "Trellis SQLite store: shards, projections, references, backlinks, merge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+sha2 = "0.10"
+serde_json.workspace = true
+thiserror.workspace = true
+trellis-core.workspace = true
+trellis-doc.workspace = true
+ulid.workspace = true
+
+# Encryption at rest (P2, §15.6): SQLCipher on macOS uses CommonCrypto, so it needs no
+# OpenSSL. Elsewhere the plain bundled SQLite is used and encryption reports unavailable.
+[target.'cfg(target_os = "macos")'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher"] }
+
+[dev-dependencies]
+tempfile.workspace = true
