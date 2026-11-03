@@ -64,6 +64,9 @@ pub struct Workspace {
     panes: Vec<Entity<PageView>>,
     splits: Vec<Entity<PageView>>,
     right_open: bool,
+    /// Left sidebar and its month grid; local UI state (rule 9), kept in `local_state`.
+    left_open: bool,
+    calendar_open: bool,
     inspector_open: bool,
     tab: InspectorTab,
     jump: Option<(Entity<JumpPalette>, JumpMode)>,
@@ -117,6 +120,15 @@ impl Workspace {
             cx.observe(&app, |_, _, cx| cx.notify()),
         ];
         app.update(cx, |a, cx| a.install_quit_hook(cx));
+        let flag = |key: &str, default: bool| {
+            app.read(cx)
+                .store
+                .local_get(key)
+                .ok()
+                .flatten()
+                .map_or(default, |v| v == "1")
+        };
+        let (left_open, calendar_open) = (flag("left_sidebar", true), flag("calendar", false));
         let mut me = Self {
             app,
             editor,
@@ -124,6 +136,8 @@ impl Workspace {
             panes: Vec::new(),
             splits: Vec::new(),
             right_open: false,
+            left_open,
+            calendar_open,
             inspector_open: true,
             tab: InspectorTab::Incoming,
             jump: None,
@@ -770,10 +784,40 @@ impl Workspace {
     }
 
     fn go_today(&mut self, _: &GoToday, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_journal(window, cx);
+    }
+
+    /// The Daily Notes feed in the main pane, caret in today's first block (FR-1.1).
+    /// Creates today's page on the visit (FR-1.2); older days only if they exist.
+    pub fn open_journal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.new_day = false;
         let today = self.app.read(cx).store.today();
         self.today = today;
-        self.open_date(today, false, true, window, cx);
+        let page = self.app.update(cx, |app, cx| {
+            let r = app.store.ensure_daily_page(today);
+            let p = app.report(r);
+            app.changed(Vec::new(), true, cx);
+            p
+        });
+        let Some(page) = page else { return };
+        self.editor.update(cx, |e, cx| e.end(cx));
+        self.graph = None;
+        self.pdf = None;
+        self.main
+            .update(cx, |m, cx| m.open_journal(page.clone(), cx));
+        let _ = self
+            .app
+            .read(cx)
+            .store
+            .local_set("last_page", page.as_str());
+        window.set_window_title("Daily Notes — Trellis");
+        self.main.update(cx, |m, cx| m.focus_first(window, cx));
+        cx.notify();
+    }
+
+    /// Days shown in the main pane's Daily Notes feed, newest first (empty otherwise).
+    pub fn journal_days(&self, cx: &gpui::App) -> Vec<PageId> {
+        self.main.read(cx).journal_days()
     }
 
     pub fn open_date(
@@ -818,6 +862,26 @@ impl Workspace {
     fn toggle_right(&mut self, _: &ToggleRightSidebar, _: &mut Window, cx: &mut Context<Self>) {
         self.right_open = !self.right_open;
         cx.notify();
+    }
+
+    fn toggle_left(&mut self, _: &ToggleLeftSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.left_open = !self.left_open;
+        let _ = (self.app.read(cx).store).local_set("left_sidebar", flag(self.left_open));
+        cx.notify();
+    }
+
+    fn toggle_calendar(&mut self, cx: &mut Context<Self>) {
+        self.calendar_open = !self.calendar_open;
+        let _ = (self.app.read(cx).store).local_set("calendar", flag(self.calendar_open));
+        cx.notify();
+    }
+
+    pub fn left_sidebar_open(&self) -> bool {
+        self.left_open
+    }
+
+    pub fn calendar_open(&self) -> bool {
+        self.calendar_open
     }
 
     fn toggle_refs(&mut self, _: &ToggleReferences, _: &mut Window, cx: &mut Context<Self>) {
@@ -952,7 +1016,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let th = theme(cx).clone();
-        let active = page.is_some() && self.main.read(cx).page == page;
+        let main = self.main.read(cx);
+        let active = page.is_some() && !main.is_journal() && main.page == page;
         div()
             .id(id)
             .px_2()
@@ -1019,20 +1084,49 @@ impl Workspace {
                     .child(div().font_weight(gpui::FontWeight::BOLD).child("Trellis"))
                     .child(
                         div()
-                            .id("open-jump")
-                            .px_1()
-                            .rounded_sm()
-                            .text_xs()
-                            .text_color(th.muted)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(th.hover))
-                            .child("⌘K")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.start_jump(JumpMode::Open, window, cx)
-                            })),
+                            .flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("open-jump")
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_xs()
+                                    .text_color(th.muted)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(th.hover))
+                                    .child("⌘K")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.start_jump(JumpMode::Open, window, cx)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("collapse-left")
+                                    .debug_selector(|| "collapse-left".into())
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_xs()
+                                    .text_color(th.muted)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(th.hover))
+                                    .child("«")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_left(&ToggleLeftSidebar, window, cx)
+                                    })),
+                            ),
                     ),
             )
             .child(section("JOURNAL"))
+            .child({
+                let active = self.main.read(cx).is_journal();
+                self.nav_item("daily-notes", "Daily Notes", None, cx)
+                    .when(active, |d| d.text_color(th.accent).bg(th.hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.open_journal(window, cx)),
+                    )
+            })
             .child(day_link(self, "today", "Today", today, cx))
             .child(day_link(
                 self,
@@ -1048,14 +1142,37 @@ impl Workspace {
                 today.succ_opt().unwrap_or(today),
                 cx,
             ))
-            .child(div().px_1().py_2().child(crate::calendar::render(
-                cx,
-                self.month,
-                today,
-                &self.sidebar.days,
-                Self::pick_date,
-                Self::shift_month,
-            )));
+            .child(
+                self.nav_item(
+                    "toggle-calendar",
+                    if self.calendar_open {
+                        "▾ Calendar"
+                    } else {
+                        "▸ Calendar"
+                    },
+                    None,
+                    cx,
+                )
+                .text_color(th.muted)
+                .debug_selector(|| "toggle-calendar".into())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_calendar(cx))),
+            )
+            .when(self.calendar_open, |col| {
+                col.child(
+                    div()
+                        .debug_selector(|| "left-calendar".into())
+                        .px_1()
+                        .py_2()
+                        .child(crate::calendar::render(
+                            cx,
+                            self.month,
+                            today,
+                            &self.sidebar.days,
+                            Self::pick_date,
+                            Self::shift_month,
+                        )),
+                )
+            });
         let mut scroll = div()
             .id("left-scroll")
             .flex_1()
@@ -1344,7 +1461,38 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh(cx);
         let th = theme(cx).clone();
-        let left = self.render_left(cx);
+        let left = if self.left_open {
+            self.render_left(cx)
+        } else {
+            // Collapsed: a thin rail that brings the sidebar back (Cmd+\).
+            div()
+                .debug_selector(|| "left-rail".into())
+                .w(px(32.))
+                .h_full()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt_2()
+                .bg(th.sidebar_bg)
+                .border_r_1()
+                .border_color(th.border)
+                .child(
+                    div()
+                        .id("expand-left")
+                        .px_1()
+                        .rounded_sm()
+                        .text_xs()
+                        .text_color(th.muted)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(th.hover))
+                        .child("»")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_left(&ToggleLeftSidebar, window, cx)
+                        })),
+                )
+                .into_any_element()
+        };
         let mut main_col = div().flex_1().min_w_0().h_full().flex().flex_col();
         if self.new_day {
             main_col = main_col.child(
@@ -1477,6 +1625,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::prev_day))
             .on_action(cx.listener(Self::next_day))
             .on_action(cx.listener(Self::toggle_right))
+            .on_action(cx.listener(Self::toggle_left))
             .on_action(cx.listener(Self::toggle_refs))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
@@ -1494,5 +1643,13 @@ impl Render for Workspace {
             .child(main_col)
             .children(right)
             .children(overlay)
+    }
+}
+
+fn flag(on: bool) -> &'static str {
+    if on {
+        "1"
+    } else {
+        "0"
     }
 }

@@ -64,6 +64,9 @@ UI behaviour is tested without a screen: `crates/trellis-ui/tests/workspace.rs` 
 `Workspace` through GPUI's test platform (`gpui` `test-support` dev-feature) with simulated
 keystrokes and asserts on store state; `crates/trellis-ui/tests/layout.rs` asserts layout
 geometry via `debug_selector` bounds. Add a script there for any new interaction or region.
+GPUI's test frames never clear debug bounds, so an element that stops rendering still reports
+its old bounds: assert on what replaced it (or on view state), never on `debug_bounds(..).is_none()`
+after it was once drawn.
 
 Performance budgets (§15.1 and the timed ACs) — run in release, fails on any miss:
 
@@ -184,10 +187,16 @@ Dependency direction is one-way: `app → ui → (plugin → api) → store → 
 ## Scope
 
 Implemented:
-- **v1 / P0 (§4.2):** daily notes, outliner, backlinks (linked references, "Scheduled for this
+- **v1 / P0 (§4.2):** daily notes (the launch view is Roam's Daily Notes feed: today, then
+  every older journal page, editable in place, older days load as you scroll; days are never
+  created by scrolling, FR-1.2), outliner, backlinks (linked references, "Scheduled for this
   day"), reference nodes (page/block refs, transclusion, inspector, unresolved intents),
   tags-as-pages, date links, rename/merge, right sidebar, local persistence, undo/redo, quick
-  jump, Markdown/JSON export, rolling backups.
+  jump, Markdown/JSON export, rolling backups. Relative date links: `[[tomorrow]]`,
+  `[[next sunday]]`, `[[2 weeks ago]]` (`trellis_core::date::relative_date`) are offered in `[[`
+  autocomplete and rewritten to the day's title when the block commits; the resolver never sees
+  them (their meaning changes daily, §10.3.1) and a real page with that title wins. The left
+  sidebar collapses (Cmd+\) and its month grid is behind a "Calendar" toggle (local state).
 - **v1.1 / P1 (§4.2, §4.1 v1.1 column):** full-text search UI (Cmd+Shift+F), block types
   (to-do, H1–H3, quote, code, numbered; Alt+Enter cycles to-dos), slash menu, unlinked references
   + one-click Link, co-reference and date filters, attributes + page metadata header, aliases UI,
@@ -212,16 +221,18 @@ Known limits (pick these up deliberately, don't paper over them):
   compilation, because the Metal toolchain is not installed); later launches draw in ~150 ms.
 - Screenshots come from the app capturing its own window (`TRELLIS_SHOT_SCRIPT`); colours and
   typography are checked by eye, not by tests.
-- Mobile has not run on an iOS device or simulator here (no iOS runtime or Rust iOS target is
-  installed); the Swift bindings run against the real core on macOS and the SwiftUI shell
+- Mobile has not run on an iOS device or simulator here. `aarch64-apple-ios-sim` is installed and
+  the core builds for it; the iOS Simulator runtime is not (download stopped: the user chose to
+  focus on desktop first). The Swift bindings run against the real core on macOS and the SwiftUI shell
   type-checks against the iOS SDK. Android: Kotlin bindings generate; no Compose shell (the PRD
   ships iOS first, §14.2, M4) and no kotlinc here to compile them.
 - PDF highlights select text the way a reader does (per-line rectangles + quoted text); Option-drag
   highlights an area instead. New highlights go under the block the PDF was opened from. PDF
   viewing needs macOS (elsewhere PDFs open in the system viewer).
-- Needs the user's permission, so not done here: installing `aarch64-apple-ios-sim` and an iOS
-  Simulator runtime (to run the mobile app), and opening `target/Trellis.app` (registers the
-  `trellis://` handler with LaunchServices). Both were refused by the sandbox in this session.
+- `trellis://` was verified once with the user's permission: `target/Trellis.app` registered,
+  links sent with `open` and AppleScript `open location` against a scratch graph, then the bundle
+  was unregistered (`lsregister -u`). A link brings the window to the front, so anything typed
+  meanwhile lands in the focused block.
 - Plugins run in an interpreter (wasmi): fine for commands, slow for heavy computation.
 - Query `{attr: …}` matches the attribute block itself, not the page or parent that owns it.
 - LAN direct uses the HTTP relay protocol over TCP, not QUIC as sketched in §12.7.4.

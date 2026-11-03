@@ -497,6 +497,7 @@ impl BlockEditor {
     pub fn commit(&mut self, cx: &mut Context<Self>) {
         let Some(t) = self.target.clone() else { return };
         self.idle = None;
+        self.expand_relative_dates(&t, cx);
         let before = self.field.text.clone();
         let caret = self.field.cursor();
         let after = self.app.update(cx, |app, cx| {
@@ -517,6 +518,33 @@ impl BlockEditor {
                 (caret as isize + shift.min(0)).max(0) as usize
             };
             self.field.set_text(&after, c);
+            cx.notify();
+        }
+    }
+
+    /// `[[yesterday]]`, `[[next sunday]]` → a link to that day's page, once the link is
+    /// closed and the caret has left it. The phrase is replaced, not resolved later,
+    /// because its meaning changes every day (§10.3.1).
+    fn expand_relative_dates(&mut self, t: &EditTarget, cx: &mut Context<Self>) {
+        let caret = self.field.cursor();
+        let expanded = self.app.update(cx, |app, cx| {
+            let store = &app.store;
+            let (text, caret) = trellis_core::date::expand_relative_date_links(
+                &self.field.text,
+                caret,
+                store.today(),
+                store.date_format(),
+                |title| store.find_page(title).ok().flatten().is_some(),
+            )?;
+            let r = app
+                .store
+                .set_block_text(&t.page, &t.block, &text, None, Some(caret));
+            app.report(r)?;
+            app.changed(vec![t.page.clone()], false, cx);
+            Some((text, caret))
+        });
+        if let Some((text, caret)) = expanded {
+            self.field.set_text(&text, caret);
             cx.notify();
         }
     }
@@ -582,6 +610,15 @@ impl BlockEditor {
                             alias: h.alias,
                         })
                         .collect();
+                    // `[[tomorrow` offers tomorrow's page first (after an exact title
+                    // match, so a page really called "Today" still wins).
+                    if let Some(d) = trellis_core::date::relative_date(&query, app.store.today()) {
+                        let title = app.store.date_format().format(d);
+                        items
+                            .retain(|i| !matches!(i, AcItem::Page { title: t, .. } if *t == title));
+                        let at = usize::from(exact);
+                        items.insert(at.min(items.len()), AcItem::Page { title, alias: None });
+                    }
                     // A bare `#tag` is already a complete link (created on commit), so it
                     // offers no "Create" row; Enter then splits the block as usual.
                     if !key.is_empty() && !exact && kind != AcKind::Tag {

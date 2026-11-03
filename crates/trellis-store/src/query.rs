@@ -328,16 +328,7 @@ impl Store {
 
     /// The last `limit` journal pages up to `today`, with a 2-line preview (FR-1.3).
     pub fn journal(&self, limit: usize) -> Result<Vec<JournalEntry>> {
-        self.read_barrier()?;
-        let today = trellis_core::date::iso(self.today());
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {PAGE_COLS} FROM page WHERE kind='daily' AND deleted_at IS NULL
-               AND daily_date <= ?1 ORDER BY daily_date DESC LIMIT ?2"
-        ))?;
-        let pages = stmt
-            .query_map(params![today, limit as i64], page_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        pages
+        self.journal_pages(limit)?
             .into_iter()
             .map(|page| {
                 let preview = self
@@ -348,6 +339,21 @@ impl Store {
                 Ok(JournalEntry { page, preview })
             })
             .collect()
+    }
+
+    /// Live daily pages up to today, newest first: the Daily Notes feed. Days nobody
+    /// visited have no page and are skipped (FR-1.2).
+    pub fn journal_pages(&self, limit: usize) -> Result<Vec<PageRow>> {
+        self.read_barrier()?;
+        let today = trellis_core::date::iso(self.today());
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PAGE_COLS} FROM page WHERE kind='daily' AND deleted_at IS NULL
+               AND daily_date <= ?1 ORDER BY daily_date DESC LIMIT ?2"
+        ))?;
+        let pages = stmt
+            .query_map(params![today, limit as i64], page_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(pages)
     }
 
     /// Quick jump (Cmd+K): fuzzy match over live titles and aliases (v1: no bodies).

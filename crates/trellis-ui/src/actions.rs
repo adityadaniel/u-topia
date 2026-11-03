@@ -65,7 +65,10 @@ actions!(
     ]
 );
 
-actions!(trellis, [FullSearch, QuickCapture, ShowGraph]);
+actions!(
+    trellis,
+    [FullSearch, QuickCapture, ShowGraph, ToggleLeftSidebar]
+);
 
 pub const EDITOR_CONTEXT: &str = "BlockEditor";
 pub const INPUT_CONTEXT: &str = "LineInput";
@@ -77,6 +80,7 @@ const DEFAULTS: &[(&str, &str, Option<&str>)] = &[
     ("cmd-[", "PrevDay", None),
     ("cmd-]", "NextDay", None),
     ("cmd-shift-\\", "ToggleRightSidebar", None),
+    ("cmd-\\", "ToggleLeftSidebar", None),
     ("cmd-shift-b", "ToggleReferences", None),
     ("cmd-z", "Undo", None),
     ("cmd-shift-z", "Redo", None),
@@ -179,6 +183,7 @@ pub fn binding(name: &str, keys: &str, context: Option<&str>) -> Option<KeyBindi
             FullSearch,
             QuickCapture,
             ShowGraph,
+            ToggleLeftSidebar,
             ToggleTodo,
             Newline,
             SoftBreak,

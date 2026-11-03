@@ -29,6 +29,8 @@ const MAX_QUERY_HITS: usize = 50;
 const MAX_EMBED_BLOCKS: usize = 100;
 /// Groups show this many references before "+N more" (FR-3.2).
 const GROUP_PREVIEW: usize = 3;
+/// The Daily Notes feed loads this many more days whenever its end comes into view.
+const JOURNAL_BATCH: usize = 10;
 
 #[derive(Debug, Clone)]
 pub enum PageViewEvent {
@@ -124,6 +126,29 @@ enum Item {
         open: bool,
     },
     Mention(Mention),
+    /// A day's title in the Daily Notes feed.
+    DayHeader {
+        page: PageId,
+        title: SharedString,
+        first: bool,
+    },
+    /// A day in the feed with no blocks.
+    DayEmpty {
+        page: PageId,
+    },
+    /// The end of the feed; older days load when it comes into view.
+    JournalEnd {
+        more: bool,
+    },
+}
+
+/// The Daily Notes feed: today, then older journal pages, as one editable outline.
+#[derive(Debug, Clone)]
+struct Journal {
+    /// How many days to show; grows as the end of the feed comes into view.
+    limit: usize,
+    days: Vec<PageId>,
+    loading: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -186,6 +211,8 @@ pub struct PageView {
     unlinked: Option<(u64, Vec<Mention>)>,
     alias_input: Option<Entity<LineInput>>,
     calendar_month: NaiveDate,
+    /// Set while showing the Daily Notes feed; `page` is then today's page.
+    journal: Option<Journal>,
     dirty: bool,
     _subs: Vec<Subscription>,
 }
@@ -203,7 +230,11 @@ impl PageView {
         let filter = cx.new(|cx| LineInput::new("Filter references…", cx));
         let subs = vec![
             cx.subscribe(&app, |this, _, e: &Changed, cx| {
-                let shown = this.page.as_ref().is_some_and(|p| e.pages.contains(p));
+                let shown = this.page.as_ref().is_some_and(|p| e.pages.contains(p))
+                    || this
+                        .journal
+                        .as_ref()
+                        .is_some_and(|j| j.days.iter().any(|d| e.pages.contains(d)));
                 if e.structural || e.pages.is_empty() || shown || this.has_embeds() {
                     this.dirty = true;
                     cx.notify();
@@ -247,6 +278,7 @@ impl PageView {
             unlinked: None,
             alias_input: None,
             calendar_month: today,
+            journal: None,
             dirty: true,
             _subs: subs,
         }
@@ -262,6 +294,36 @@ impl PageView {
 
     /// Show `page` (optionally zoomed into a block).
     pub fn open(&mut self, page: PageId, zoom: Option<BlockId>, cx: &mut Context<Self>) {
+        self.journal = None;
+        self.show(page, zoom, cx);
+    }
+
+    /// The Daily Notes feed (Roam's default view): `today` first, then every older journal
+    /// page newest first, each editable in place. Days are never created by scrolling past
+    /// them (FR-1.2).
+    pub fn open_journal(&mut self, today: PageId, cx: &mut Context<Self>) {
+        self.journal = Some(Journal {
+            limit: JOURNAL_BATCH,
+            days: Vec::new(),
+            loading: false,
+        });
+        self.page = None;
+        self.show(today, None, cx);
+    }
+
+    pub fn is_journal(&self) -> bool {
+        self.journal.is_some()
+    }
+
+    /// Days in the Daily Notes feed, newest first (empty outside the feed).
+    pub fn journal_days(&self) -> Vec<PageId> {
+        self.journal
+            .as_ref()
+            .map(|j| j.days.clone())
+            .unwrap_or_default()
+    }
+
+    fn show(&mut self, page: PageId, zoom: Option<BlockId>, cx: &mut Context<Self>) {
         let changed_page = self.page.as_ref() != Some(&page);
         self.page = Some(page.clone());
         self.zoom = zoom;
@@ -296,8 +358,9 @@ impl PageView {
         let Some(page) = self.page.clone() else {
             return;
         };
+        // `r.page == page`: in the Daily Notes feed the next rows belong to older days.
         let first = self.items.iter().find_map(|i| match i {
-            Item::Row(r) if r.embed == 0 => Some(r.block.clone()),
+            Item::Row(r) if r.embed == 0 && r.page == page => Some(r.block.clone()),
             _ => None,
         });
         let block = match first {
@@ -395,14 +458,28 @@ impl PageView {
         }
     }
 
+    /// Tell the list every item changed, keeping the scroll position (a rebuild after an
+    /// edit, or older days loading into the feed, must not jump back to the top).
+    fn replace_items(&mut self, items: Vec<Item>) {
+        let old_len = self.items.len();
+        let top = self.list.logical_scroll_top();
+        self.items = items;
+        self.list.splice(0..old_len, self.items.len());
+        if top.item_ix > 0 || top.offset_in_item > px(0.) {
+            self.list.scroll_to(top);
+        }
+    }
+
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.dirty = false;
-        let old_len = self.items.len();
         let Some(page) = self.page.clone() else {
-            self.items.clear();
-            self.list.splice(0..old_len, 0);
+            self.replace_items(Vec::new());
             return;
         };
+        if let Some(limit) = self.journal.as_ref().map(|j| j.limit) {
+            self.rebuild_journal(page, limit, cx);
+            return;
+        }
         let zoom = self.zoom.clone();
         let open_embeds = self.open_embeds.clone();
         let refs_version = self.app.read(cx).refs_version;
@@ -506,8 +583,7 @@ impl PageView {
         self.header = header;
         let mut items = vec![Item::Header];
         if self.header.missing {
-            self.items = items;
-            self.list.splice(0..old_len, self.items.len());
+            self.replace_items(items);
             return;
         }
         if rows.is_empty() {
@@ -544,8 +620,113 @@ impl PageView {
                 items.push(Item::Mention(m));
             }
         }
-        self.items = items;
-        self.list.splice(0..old_len, self.items.len());
+        self.replace_items(items);
+    }
+
+    fn rebuild_journal(&mut self, today: PageId, limit: usize, cx: &mut Context<Self>) {
+        let open_embeds = self.open_embeds.clone();
+        let (header, days, more) = self.app.update(cx, |app, _| {
+            let collapsed = app.store.collapsed_set().clone();
+            // Today comes from the caller, not the index, which may lag by one flush.
+            let listed = app.store.journal_pages(limit + 1).unwrap_or_default();
+            let more = listed.len() > limit;
+            let mut pages = vec![today.clone()];
+            for p in listed.into_iter().take(limit) {
+                if p.id != today {
+                    pages.push(p.id);
+                }
+            }
+            let fmt = app.store.date_format().clone();
+            let mut header = Header::default();
+            let mut days = Vec::new();
+            for page in pages {
+                let Ok(st) = app.store.page_state(&page).cloned() else {
+                    continue;
+                };
+                if st.meta.deleted_at.is_some() {
+                    continue;
+                }
+                let title = trellis_store::display_title(&st, &fmt);
+                if page == today {
+                    header.title = title.clone();
+                    header.kind = st.meta.kind;
+                    header.date = st.meta.daily_date;
+                }
+                let mut rows = Vec::new();
+                for (id, depth) in st.visible_rows(None, &|b| collapsed.contains(b)) {
+                    let b = st.block(&id).expect("visible row exists");
+                    let item = RowItem {
+                        page: page.clone(),
+                        block: id.clone(),
+                        text: b.text.clone(),
+                        depth,
+                        has_children: st.has_live_children(&id),
+                        collapsed: collapsed.contains(&id),
+                        embed: 0,
+                        kind: b.kind,
+                        checked: b.checked,
+                        number: st.index_in_parent(&id, true).map_or(1, |i| i + 1),
+                    };
+                    push_with_embeds(
+                        app,
+                        item,
+                        &open_embeds,
+                        &collapsed,
+                        &mut vec![id.clone()],
+                        &mut rows,
+                    );
+                }
+                days.push((page, title, rows));
+            }
+            (header, days, more)
+        });
+        self.header = header;
+        let mut items = Vec::new();
+        let mut ids = Vec::new();
+        for (i, (page, title, rows)) in days.into_iter().enumerate() {
+            items.push(Item::DayHeader {
+                page: page.clone(),
+                title: title.into(),
+                first: i == 0,
+            });
+            if rows.is_empty() {
+                items.push(Item::DayEmpty { page: page.clone() });
+            }
+            items.extend(rows);
+            ids.push(page);
+        }
+        items.push(Item::JournalEnd { more });
+        if let Some(j) = &mut self.journal {
+            j.days = ids;
+            j.loading = false;
+        }
+        self.replace_items(items);
+    }
+
+    /// Load the next batch of older days into the feed (once per batch).
+    fn load_older_days(&mut self, cx: &mut Context<Self>) {
+        if let Some(j) = &mut self.journal {
+            if !j.loading {
+                j.loading = true;
+                j.limit += JOURNAL_BATCH;
+                self.dirty = true;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Start writing on a feed day that has no blocks.
+    fn start_day(&mut self, page: PageId, window: &mut Window, cx: &mut Context<Self>) {
+        let block = self.app.update(cx, |app, cx| {
+            let r = app.store.ensure_first_block(&page);
+            let b = app.report(r);
+            app.changed(vec![page.clone()], true, cx);
+            b
+        });
+        self.rebuild(cx);
+        if let Some(b) = block {
+            self.edit(page, b, Some(0), None, window, cx);
+        }
     }
 
     fn push_refs(&self, page: &PageId, items: &mut Vec<Item>) {
@@ -2060,6 +2241,68 @@ impl PageView {
                 .child("Click to start writing")
                 .on_click(cx.listener(|this, _, window, cx| this.focus_first(window, cx)))
                 .into_any_element(),
+            Item::DayHeader { page, title, first } => div()
+                .debug_selector(|| "day-title".into())
+                .when(!first, |d| d.mt_8().border_t_1().border_color(th.border))
+                .px_4()
+                .pt_4()
+                .pb_2()
+                .child(
+                    div()
+                        .id(("day-title", ix))
+                        .text_size(px(if self.compact { 20. } else { 28. }))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(th.accent))
+                        .child(title)
+                        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                            this.editor.update(cx, |ed, cx| ed.end(cx));
+                            cx.emit(PageViewEvent::Open {
+                                page: page.clone(),
+                                zoom: None,
+                                focus: None,
+                                sidebar: e.modifiers().shift,
+                            });
+                        })),
+                )
+                .into_any_element(),
+            Item::DayEmpty { page } => {
+                div()
+                    .id(("day-empty", ix))
+                    .px_4()
+                    .py_1()
+                    .pl(px(32.))
+                    .text_color(th.faint)
+                    .cursor_text()
+                    .child("Click to start writing")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.start_day(page.clone(), window, cx)
+                    }))
+                    .into_any_element()
+            }
+            Item::JournalEnd { more } => {
+                if more {
+                    // Coming into view (the list renders a margin past the viewport)
+                    // loads older days, so the feed scrolls on without a button.
+                    let this = cx.weak_entity();
+                    cx.defer(move |cx| {
+                        let _ = this.update(cx, |v, cx| v.load_older_days(cx));
+                    });
+                }
+                div()
+                    .debug_selector(|| "journal-end".into())
+                    .px_4()
+                    .pt_8()
+                    .pb(px(120.))
+                    .text_sm()
+                    .text_color(th.faint)
+                    .child(if more {
+                        "Loading older days…"
+                    } else {
+                        "No older daily notes."
+                    })
+                    .into_any_element()
+            }
             Item::RefsHeader { title, count } => div()
                 .debug_selector(|| "refs-header".into())
                 .mt_6()

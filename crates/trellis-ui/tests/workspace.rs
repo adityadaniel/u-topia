@@ -911,3 +911,116 @@ fn pdf_viewer_drag_creates_highlight_block(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(view.update(cx, |v, _| v.highlights().len()), 3);
 }
+
+/// Text of every live block on the daily page for `d`.
+fn day_texts(app: &Entity<AppState>, d: NaiveDate, cx: &mut VisualTestContext) -> Vec<String> {
+    let page = app.update(cx, |app, _| {
+        app.store
+            .find_page(&trellis_core::date::iso(d))
+            .unwrap()
+            .expect("daily page exists")
+    });
+    rows(app, &page, cx).into_iter().map(|(t, _)| t).collect()
+}
+
+#[gpui::test]
+fn daily_notes_feed_scrolls_into_older_days(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // Notes on every other day before today: 25 older days.
+    app.update(cx, |app, _| {
+        for i in 1..=25 {
+            let d = today() - chrono::Duration::days(i * 2);
+            let (p, b) = app.store.open_daily(d).unwrap();
+            app.store
+                .set_block_text(&p, &b, &format!("note {i}"), None, None)
+                .unwrap();
+            app.store.commit_block(&p, &b).unwrap();
+        }
+        app.store.sync_index().unwrap();
+    });
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    let days = ws.update(cx, |w, cx| w.journal_days(cx));
+    let today_id = today_page(&app, cx);
+    assert_eq!(days[0], today_id, "today comes first");
+    // Batches load until the end of the feed is out of view, not all at once.
+    assert!(
+        (10..26).contains(&days.len()),
+        "a screenful of days, not all 26: {}",
+        days.len()
+    );
+    let dates: Vec<NaiveDate> = app.update(cx, |app, _| {
+        days.iter()
+            .map(|p| app.store.page_row(p).unwrap().unwrap().daily_date.unwrap())
+            .collect()
+    });
+    assert!(
+        dates.windows(2).all(|w| w[0] > w[1]),
+        "newest first: {dates:?}"
+    );
+    // The caret starts in today; Down crosses into the next day, editable in place.
+    cx.simulate_input("hello");
+    cx.simulate_keystrokes("down cmd-right");
+    cx.simulate_input(" edited");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(day_texts(&app, today(), cx), ["hello"]);
+    assert_eq!(
+        day_texts(&app, today() - chrono::Duration::days(2), cx),
+        ["note 1 edited"]
+    );
+    // Scrolling to the end loads the remaining days; none are created (FR-1.2).
+    let main = cx.debug_bounds("main-pane").expect("main pane");
+    for _ in 0..6 {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: main.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-4000.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+    }
+    let days = ws.update(cx, |w, cx| w.journal_days(cx));
+    assert_eq!(days.len(), 26, "every journal page, and only those");
+    let daily = app.update(cx, |app, _| {
+        app.store
+            .list_pages(true)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.is_daily())
+            .count()
+    });
+    assert_eq!(daily, 26);
+}
+
+#[gpui::test]
+fn relative_date_links(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    // Autocomplete offers tomorrow's page first.
+    cx.simulate_input("Pay rent [[tomorrow");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    // A closed link is replaced once the caret leaves it.
+    cx.simulate_keystrokes("cmd-right enter");
+    cx.simulate_input("Met Ana [[Yesterday]] and #[[next friday]] too");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        day_texts(&app, today(), cx),
+        [
+            "Pay rent [[November 3rd, 2026]]",
+            "Met Ana [[November 1st, 2026]] and #[[November 6th, 2026]] too",
+        ]
+    );
+    app.update(cx, |app, _| {
+        let s = &mut app.store;
+        s.sync_index().unwrap();
+        for iso in ["2026-11-03", "2026-11-01", "2026-11-06"] {
+            let p = s.find_page(iso).unwrap().expect(iso);
+            assert_eq!(s.backlink_count(&p).unwrap(), 1, "{iso}");
+        }
+        assert!(
+            s.find_page("Yesterday").unwrap().is_none(),
+            "no page named Yesterday"
+        );
+    });
+}

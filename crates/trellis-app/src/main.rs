@@ -589,6 +589,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Previous Day", PrevDay),
                 MenuItem::action("Next Day", NextDay),
                 MenuItem::separator(),
+                MenuItem::action("Toggle Left Sidebar", ToggleLeftSidebar),
                 MenuItem::action("Toggle Right Sidebar", ToggleRightSidebar),
                 MenuItem::action("Toggle References", ToggleReferences),
             ],

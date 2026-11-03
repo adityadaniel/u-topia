@@ -27,6 +27,27 @@ fn setup(cx: &mut TestAppContext) -> &mut VisualTestContext {
     cx
 }
 
+/// Today's page on its own (the calendar's "Today"), not the Daily Notes feed.
+fn setup_page(cx: &mut TestAppContext) -> &mut VisualTestContext {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape");
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(
+            NaiveDate::from_ymd_opt(2026, 11, 2).unwrap(),
+            false,
+            true,
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx
+}
+
 fn bounds(cx: &mut VisualTestContext, sel: &'static str) -> Bounds<Pixels> {
     cx.run_until_parked();
     cx.debug_bounds(sel)
@@ -79,7 +100,7 @@ fn three_column_window(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn outline_rows_indent_and_stack(cx: &mut TestAppContext) {
-    let cx = setup(cx);
+    let cx = setup_page(cx);
     cx.simulate_input("parent");
     cx.simulate_keystrokes("enter");
     cx.simulate_input("child");
@@ -179,4 +200,44 @@ fn minimum_window_size_still_lays_out(cx: &mut TestAppContext) {
         row.origin.x + row.size.width <= px(720.) + px(0.5),
         "rows wrap inside the window"
     );
+}
+
+#[gpui::test]
+fn daily_notes_feed_stacks_days(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    // Launch shows the feed: today's title, then its first block.
+    cx.simulate_input("today's note");
+    cx.simulate_keystrokes("escape");
+    let title = bounds(cx, "day-title");
+    let row = bounds(cx, "content-1");
+    assert!(title.origin.y + title.size.height <= row.origin.y + px(0.5));
+    let end = bounds(cx, "journal-end");
+    assert!(end.origin.y > row.origin.y, "the feed ends below today");
+    assert!(
+        cx.debug_bounds("refs-header").is_none(),
+        "no references inside the feed"
+    );
+}
+
+#[gpui::test]
+fn left_sidebar_collapses_to_a_rail(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    // FR-1.3's date picker is one click away, not always open.
+    assert!(cx.debug_bounds("left-calendar").is_none());
+    // (Debug bounds of elements no longer drawn linger, so check what replaced them.)
+    cx.simulate_keystrokes("escape cmd-\\");
+    let rail = bounds(cx, "left-rail");
+    let main = bounds(cx, "main-pane");
+    assert!(approx(rail.size.width, 32.), "{rail:?}");
+    assert!(
+        approx(main.origin.x, 32.) && approx(main.size.width, W - 32.),
+        "{main:?}"
+    );
+    cx.simulate_keystrokes("cmd-\\");
+    let main = bounds(cx, "main-pane");
+    assert!(approx(main.origin.x, 250.), "{main:?}");
+    let toggle = bounds(cx, "toggle-calendar");
+    cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+    let cal = bounds(cx, "left-calendar");
+    assert!(cal.origin.y > toggle.origin.y);
 }

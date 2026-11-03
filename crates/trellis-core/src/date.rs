@@ -182,6 +182,133 @@ pub fn parse_unambiguous_date(s: &str, graph_format: &DateFormat) -> Option<Naiv
         .find_map(|f| f.parse(s))
 }
 
+/// A relative date phrase, as people type it into a link: `today`, `yesterday`,
+/// `tomorrow`, `day after tomorrow`, `next week`, `last month`, `next sunday`,
+/// `last fri`, `in 3 days`, `2 weeks ago`. Case and spacing don't matter.
+///
+/// `next <weekday>` is the first such day after today and `last <weekday>` the most
+/// recent one before it. A bare weekday (`Monday`) is not a date: it is too likely to
+/// be a page title.
+///
+/// This is never used by the resolver: what "tomorrow" means changes every day, so a
+/// stored link to it could not be rebuilt (§10.3.1). The editor replaces the phrase
+/// with the day's title as it is typed instead.
+pub fn relative_date(phrase: &str, today: NaiveDate) -> Option<NaiveDate> {
+    let lower = phrase.to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let days = |n: i64| today.checked_add_signed(chrono::Duration::days(n));
+    let months = |n: i32| {
+        if n >= 0 {
+            today.checked_add_months(chrono::Months::new(n as u32))
+        } else {
+            today.checked_sub_months(chrono::Months::new(n.unsigned_abs()))
+        }
+    };
+    let weekday = |w: &str| {
+        WEEKDAYS
+            .iter()
+            .position(|name| {
+                let name = name.to_lowercase();
+                w == name || (w.len() >= 3 && name.starts_with(w))
+            })
+            .and_then(|i| Weekday::try_from(i as u8).ok())
+    };
+    // `n` units after (sign 1) or before (sign -1) today.
+    let offset = |n: &str, unit: &str, sign: i64| -> Option<NaiveDate> {
+        let n: i64 = match n {
+            "a" | "an" | "one" => 1,
+            _ => n.parse().ok().filter(|n| *n <= 3660)?,
+        };
+        match unit.trim_end_matches('s') {
+            "day" => days(sign * n),
+            "week" => days(sign * 7 * n),
+            "month" => months((sign * n) as i32),
+            "year" => months((sign * 12 * n) as i32),
+            _ => None,
+        }
+    };
+    match words.as_slice() {
+        ["today"] => Some(today),
+        ["tomorrow"] => days(1),
+        ["yesterday"] => days(-1),
+        ["day", "after", "tomorrow"] => days(2),
+        ["day", "before", "yesterday"] => days(-2),
+        [dir @ ("next" | "last"), unit] => {
+            let sign = if *dir == "next" { 1 } else { -1 };
+            match *unit {
+                "week" => days(7 * sign),
+                "month" => months(sign as i32),
+                "year" => months(12 * sign as i32),
+                w => {
+                    let target = weekday(w)?;
+                    let mut d = days(sign)?;
+                    while d.weekday() != target {
+                        d = d.checked_add_signed(chrono::Duration::days(sign))?;
+                    }
+                    Some(d)
+                }
+            }
+        }
+        ["in", n, unit] => offset(n, unit, 1),
+        [n, unit, "ago"] => offset(n, unit, -1),
+        [n, unit, "from", "now"] => offset(n, unit, 1),
+        _ => None,
+    }
+}
+
+/// Replace relative date links (`[[tomorrow]]`, `#[[next friday]]`) with links to that
+/// day's page, as titled by `format`. A link the caret is inside is left alone (still
+/// being typed), as is one whose phrase names an existing page or alias (`exists`), so
+/// a graph with a page called "Today" keeps its links. Returns the new text and caret.
+pub fn expand_relative_date_links(
+    text: &str,
+    caret: usize,
+    today: NaiveDate,
+    format: &DateFormat,
+    exists: impl Fn(&str) -> bool,
+) -> Option<(String, usize)> {
+    let mut out = String::with_capacity(text.len());
+    let mut new_caret = caret;
+    let mut last = 0;
+    for r in crate::inline::extract_refs(text) {
+        let Some(span) = text.get(r.range.clone()) else {
+            continue;
+        };
+        let prefix = if span.starts_with("#[[") {
+            "#[["
+        } else if span.starts_with("[[") {
+            "[["
+        } else {
+            continue;
+        };
+        if !span.ends_with("]]") || r.target.contains("[[") {
+            continue;
+        }
+        let inside = r.range.start < caret && caret < r.range.end;
+        if inside || r.range.start < last {
+            continue;
+        }
+        let Some(d) = relative_date(&r.target, today) else {
+            continue;
+        };
+        if exists(&r.target) {
+            continue;
+        }
+        let link = format!("{prefix}{}]]", format.format(d));
+        if r.range.end <= caret {
+            new_caret = (new_caret + link.len()).saturating_sub(span.len());
+        }
+        out.push_str(&text[last..r.range.start]);
+        out.push_str(&link);
+        last = r.range.end;
+    }
+    if last == 0 {
+        return None;
+    }
+    out.push_str(&text[last..]);
+    Some((out, new_caret))
+}
+
 pub fn parse_iso(s: &str) -> Option<NaiveDate> {
     let b = s.as_bytes();
     if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
@@ -393,6 +520,85 @@ mod tests {
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn relative_phrases() {
+        // Tuesday, November 3rd, 2026.
+        let t = d(2026, 11, 3);
+        let r = |p: &str| relative_date(p, t);
+        assert_eq!(r("Today"), Some(t));
+        assert_eq!(r("yesterday"), Some(d(2026, 11, 2)));
+        assert_eq!(r("  Tomorrow "), Some(d(2026, 11, 4)));
+        assert_eq!(r("day after tomorrow"), Some(d(2026, 11, 5)));
+        assert_eq!(r("day before yesterday"), Some(d(2026, 11, 1)));
+        assert_eq!(r("next week"), Some(d(2026, 11, 10)));
+        assert_eq!(r("last week"), Some(d(2026, 10, 27)));
+        assert_eq!(r("next month"), Some(d(2026, 12, 3)));
+        assert_eq!(r("last year"), Some(d(2025, 11, 3)));
+        assert_eq!(r("next Sunday"), Some(d(2026, 11, 8)));
+        assert_eq!(r("next tuesday"), Some(d(2026, 11, 10)));
+        assert_eq!(r("next wed"), Some(d(2026, 11, 4)));
+        assert_eq!(r("last friday"), Some(d(2026, 10, 30)));
+        assert_eq!(r("last tuesday"), Some(d(2026, 10, 27)));
+        assert_eq!(r("in 3 days"), Some(d(2026, 11, 6)));
+        assert_eq!(r("in a week"), Some(d(2026, 11, 10)));
+        assert_eq!(r("2 weeks ago"), Some(d(2026, 10, 20)));
+        assert_eq!(r("1 day from now"), Some(d(2026, 11, 4)));
+        assert_eq!(
+            relative_date("next month", d(2026, 1, 31)),
+            Some(d(2026, 2, 28))
+        );
+        for no in [
+            "Monday",
+            "next",
+            "next thing",
+            "in 3 parsecs",
+            "tomorrow's plan",
+            "today and tomorrow",
+            "",
+            "in 99999999 days",
+        ] {
+            assert_eq!(r(no), None, "{no:?}");
+        }
+    }
+
+    #[test]
+    fn expands_relative_links_outside_the_caret() {
+        let t = d(2026, 11, 3);
+        let f = DateFormat::default();
+        let none = |_: &str| false;
+        let text = "call [[Yesterday]] and #[[next sunday]]";
+        let (out, caret) = expand_relative_date_links(text, text.len(), t, &f, none).unwrap();
+        assert_eq!(
+            out,
+            "call [[November 2nd, 2026]] and #[[November 8th, 2026]]"
+        );
+        assert_eq!(caret, out.len());
+        // Still typing inside the link: untouched.
+        let text = "see [[tomorrow]]";
+        assert_eq!(expand_relative_date_links(text, 10, t, &f, none), None);
+        // Caret before the link stays put.
+        let (out, caret) = expand_relative_date_links(text, 2, t, &f, none).unwrap();
+        assert_eq!((out.as_str(), caret), ("see [[November 4th, 2026]]", 2));
+        // A real page called "Today" keeps its links.
+        assert_eq!(
+            expand_relative_date_links("[[Today]]", 9, t, &f, |p| p == "Today"),
+            None
+        );
+        // Not links, or not relative: nothing to do.
+        for text in [
+            "tomorrow",
+            "`[[tomorrow]]`",
+            "[[Project]] #tomorrow",
+            "[[a [[b]]]]",
+        ] {
+            assert_eq!(
+                expand_relative_date_links(text, text.len(), t, &f, none),
+                None,
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
