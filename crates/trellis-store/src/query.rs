@@ -341,14 +341,20 @@ impl Store {
             .collect()
     }
 
-    /// Live daily pages up to today, newest first: the Daily Notes feed. Days nobody
-    /// visited have no page and are skipped (FR-1.2).
+    /// Daily pages up to today with something on them, newest first: the Daily Notes
+    /// feed. A day counts once it has a non-empty block or a linked reference (a date
+    /// pre-created by a link, FR-1.10); days that were only visited are skipped (FR-1.2).
     pub fn journal_pages(&self, limit: usize) -> Result<Vec<PageRow>> {
         self.read_barrier()?;
         let today = trellis_core::date::iso(self.today());
-        let mut stmt = self.conn.prepare(&format!(
+        let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {PAGE_COLS} FROM page WHERE kind='daily' AND deleted_at IS NULL
-               AND daily_date <= ?1 ORDER BY daily_date DESC LIMIT ?2"
+               AND daily_date <= ?1
+               AND (EXISTS(SELECT 1 FROM block b WHERE b.page_id=page.id
+                             AND b.deleted_at IS NULL AND trim(b.text) <> '')
+                    OR EXISTS(SELECT 1 FROM ref r JOIN block b ON b.id=r.src_block_id
+                               WHERE r.dst_page_id=page.id AND b.deleted_at IS NULL))
+             ORDER BY daily_date DESC LIMIT ?2"
         ))?;
         let pages = stmt
             .query_map(params![today, limit as i64], page_row)?

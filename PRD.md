@@ -194,10 +194,10 @@ A daily note is a `page` with `kind = 'daily'` and a canonical `daily_date` (`YY
 | ID | Requirement |
 |---|---|
 | FR-1.1 | On launch, the app opens today's daily note (configurable: last-open page / today / a pinned page). |
-| FR-1.2 | The daily note is created **lazily, on first visit** — never eagerly at startup. An untouched graph stays empty. |
+| FR-1.2 | The daily note is created **lazily, on first write** — never eagerly at startup, and never by looking at it. Visiting a date shows a draft held only in memory (one empty block, or the journal template) with the caret in it; its first edit writes the page to the graph and the outbox. An untouched graph stays empty. The Daily Notes feed lists every calendar day from today backwards, loading older days as it scrolls; a day without a page shows "Click to start writing" and becomes a draft when clicked. Each day shows its Linked References, and no Unlinked References. |
 | FR-1.3 | Sidebar "Journal" section shows: Today, Yesterday, Tomorrow, a date picker, and the last 14 journal pages with a 2-line preview. |
 | FR-1.4 | A daily note's title is **display-only**: it renders the date format and is never free-text edited. Clicking it opens the date picker (or, with `Cmd`, the graph's date-format setting). This keeps a daily page permanently bound to its date identity. |
-| FR-1.5 | Opening any date (including past/future) via the calendar, `Cmd+Shift+D` ("go to date"), or `[` / `]` navigation creates it if absent. |
+| FR-1.5 | Opening any date (including past/future) via the calendar, `Cmd+Shift+D` ("go to date"), or `[` / `]` navigation shows it, as a draft if absent (FR-1.2). |
 | FR-1.6 | Daily notes behave exactly like normal pages: they can be referenced by any accepted date form (FR-1.9), receive backlinks, host block refs, and be transcluded. A *normal* page may also be merged into a daily page by renaming it to that date's title (§8.6). |
 | FR-1.7 | "Today" recomputes at local midnight and on system timezone change; an open page never auto-navigates on rollover. A non-blocking banner offers "It's a new day → open today". |
 | FR-1.8 | A graph setting controls whether journal pages appear in the page list (default: yes, grouped separately). |
@@ -211,7 +211,7 @@ A daily note is a `page` with `kind = 'daily'` and a canonical `daily_date` (`YY
 - **AC-1.1** Fresh install → launch → cursor is in the first block of today's note → typing `hello` → quit → relaunch → same page, text intact. Total elapsed from hot launch to first keystroke ≤ 2 s on a 2020-era laptop.
 - **AC-1.2** Set system clock to 23:59, write a block, wait for rollover: the block stays on the old date, the banner appears, "open today" creates the new date without duplicating anything.
 - **AC-1.3** Two devices with different timezones both open "2026-11-02": they see the **same** page (identity is the calendar date string, not the title).
-- **AC-1.4** Backfilling 30 days from the calendar creates 30 pages, each with exactly one empty block, in under 300 ms total.
+- **AC-1.4** Visiting 30 days from the calendar creates no pages; writing one character on each creates 30 pages, each with exactly one block, in under 300 ms total.
 - **AC-1.5** Deleting a daily page and revisiting the date re-creates it as a new page; the old page remains recoverable from trash for 30 days.
 - **AC-1.6** On a page dated 2026-11-02, type `Pay rent [[2026-12-01]]`. Create/open 2026-12-01: the "Scheduled for this day" group shows that block, and clicking it navigates to the source block's page, not the daily page.
 - **AC-1.7** Type the same date three ways (`2026-12-01`, `December 1st, 2026`, and the configured format) in three different pages: all three render as the same page chip, and that daily page lists three backlinks — not three duplicate pages.

@@ -106,11 +106,42 @@ fn ac_1_4_backfill_thirty_days() {
     let mut s = store();
     for i in 0..30 {
         let d = date(2026, 10, 1) + chrono::Days::new(i);
-        let (p, _) = s.open_daily(d).unwrap();
+        let (p, b) = s.open_daily(d).unwrap();
         assert_eq!(s.page_state(&p).unwrap().live_count(), 1);
+        // The feed and sidebar list days with entries (FR-1.2).
+        s.set_block_text(&p, &b, "x", None, None).unwrap();
     }
     assert_eq!(s.list_pages(true).unwrap().len(), 30);
     assert_eq!(s.journal(14).unwrap().len(), 14);
+}
+
+#[test]
+fn fr_1_2_visited_day_is_a_draft_until_written() {
+    let mut s = store();
+    let d = date(2026, 11, 2);
+    let p = s.draft_daily(d).unwrap();
+    assert_eq!(p, PageId::for_date(d));
+    assert_eq!(s.draft_daily(d).unwrap(), p, "one draft per day");
+    assert!(s.is_draft(&p));
+    assert_eq!(s.page_state(&p).unwrap().live_count(), 1);
+    assert!(s.find_page("2026-11-02").unwrap().is_none());
+    assert!(s.list_pages(true).unwrap().is_empty());
+    assert!(s.outbox_pending(10).unwrap().is_empty(), "nothing to sync");
+    assert_doctor(&mut s);
+    // The first edit writes the whole page: meta, first block and the edit.
+    let b = s.page_state(&p).unwrap().live_roots()[0].clone();
+    s.set_block_text(&p, &b, "hello", None, None).unwrap();
+    assert!(!s.is_draft(&p));
+    assert_eq!(s.find_page("2026-11-02").unwrap(), Some(p.clone()));
+    assert!(!s.outbox_pending(10).unwrap().is_empty());
+    assert_eq!(live_texts(&mut s, &p), [("hello".to_string(), 0)]);
+    assert_doctor(&mut s);
+    // A link to a drafted day writes that draft instead of a second page (FR-1.10).
+    let next = s.draft_daily(date(2026, 11, 3)).unwrap();
+    write(&mut s, &p, "see [[2026-11-03]]");
+    assert_eq!(s.find_page("2026-11-03").unwrap(), Some(next.clone()));
+    assert!(!s.is_draft(&next));
+    assert_doctor(&mut s);
 }
 
 #[test]

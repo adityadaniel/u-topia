@@ -1,12 +1,13 @@
 //! A page (or zoomed block) as a virtualized outline plus its Linked References
 //! (§6, §7, §8). Used for the main pane and for every right-sidebar pane.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::NaiveDate;
 use gpui::{
-    div, list, prelude::*, px, AnyElement, Context, Entity, EventEmitter, ListAlignment, ListState,
-    MouseButton, MouseDownEvent, SharedString, StyledText, Subscription, Window,
+    div, list, prelude::*, px, AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, SharedString, StyledText, Subscription,
+    Window,
 };
 use trellis_core::inline::{extract_refs, plain_text};
 use trellis_core::outline::{self, Focus, Plan};
@@ -31,6 +32,8 @@ const MAX_EMBED_BLOCKS: usize = 100;
 const GROUP_PREVIEW: usize = 3;
 /// The Daily Notes feed loads this many more days whenever its end comes into view.
 const JOURNAL_BATCH: usize = 10;
+/// Widest the page column gets (about 95 characters of body text per line).
+const READABLE_WIDTH: f32 = 760.;
 
 #[derive(Debug, Clone)]
 pub enum PageViewEvent {
@@ -126,29 +129,39 @@ enum Item {
         open: bool,
     },
     Mention(Mention),
-    /// A day's title in the Daily Notes feed.
+    /// A day's title in the Daily Notes feed (`page` is None for a blank day).
     DayHeader {
-        page: PageId,
+        date: NaiveDate,
+        page: Option<PageId>,
         title: SharedString,
         first: bool,
     },
     /// A day in the feed with no blocks.
     DayEmpty {
-        page: PageId,
+        date: NaiveDate,
     },
-    /// The end of the feed; older days load when it comes into view.
-    JournalEnd {
-        more: bool,
-    },
+    /// The end of the loaded days; older ones load when it comes into view.
+    JournalEnd,
 }
 
-/// The Daily Notes feed: today, then older journal pages, as one editable outline.
+/// One calendar day of the feed while it is being built.
+struct FeedDay {
+    date: NaiveDate,
+    page: Option<PageId>,
+    title: String,
+    rows: Vec<Item>,
+}
+
+/// The Daily Notes feed: today, then every older calendar day, as one editable outline.
 #[derive(Debug, Clone)]
 struct Journal {
     /// How many days to show; grows as the end of the feed comes into view.
     limit: usize,
     days: Vec<PageId>,
     loading: bool,
+    /// Each day's Linked References, valid for one `refs_version`.
+    refs: HashMap<PageId, LinkedRefs>,
+    refs_version: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -159,6 +172,8 @@ struct Header {
     aliases: Vec<String>,
     deleted: bool,
     missing: bool,
+    /// A day that is shown but not written yet (FR-1.2): nothing to delete.
+    draft: bool,
     zoom_path: Vec<(BlockId, String)>,
     /// `Key:: value` root blocks: the page metadata header (P1, W7).
     attributes: Vec<(String, String)>,
@@ -306,6 +321,8 @@ impl PageView {
             limit: JOURNAL_BATCH,
             days: Vec::new(),
             loading: false,
+            refs: HashMap::new(),
+            refs_version: 0,
         });
         self.page = None;
         self.show(today, None, cx);
@@ -440,6 +457,7 @@ impl PageView {
                 cx,
             )
         });
+        self.splice_items(self.items.len(), cx);
         if let Some(ix) = self.row_index(&block) {
             self.list.scroll_to_reveal_item(ix);
         }
@@ -460,11 +478,30 @@ impl PageView {
 
     /// Tell the list every item changed, keeping the scroll position (a rebuild after an
     /// edit, or older days loading into the feed, must not jump back to the top).
-    fn replace_items(&mut self, items: Vec<Item>) {
+    fn replace_items(&mut self, items: Vec<Item>, cx: &mut Context<Self>) {
         let old_len = self.items.len();
-        let top = self.list.logical_scroll_top();
         self.items = items;
-        self.list.splice(0..old_len, self.items.len());
+        self.splice_items(old_len, cx);
+    }
+
+    /// Re-register every item with the list. The row being edited carries the editor's
+    /// focus handle, so the list keeps rendering it after it scrolls out of view: a
+    /// focused element that is not rendered receives no keystrokes, and every shortcut
+    /// (Cmd+[, Cmd+K, undo) would stop working until something was clicked.
+    fn splice_items(&mut self, old_len: usize, cx: &mut Context<Self>) {
+        let top = self.list.logical_scroll_top();
+        let host = cx.entity_id();
+        let editor = self.editor.read(cx);
+        let handle = editor.focus_handle(cx);
+        let handles: Vec<Option<FocusHandle>> = self
+            .items
+            .iter()
+            .map(|i| match i {
+                Item::Row(r) if editor.is_editing(host, &r.page, &r.block) => Some(handle.clone()),
+                _ => None,
+            })
+            .collect();
+        self.list.splice_focusable(0..old_len, handles);
         if top.item_ix > 0 || top.offset_in_item > px(0.) {
             self.list.scroll_to(top);
         }
@@ -473,7 +510,7 @@ impl PageView {
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.dirty = false;
         let Some(page) = self.page.clone() else {
-            self.replace_items(Vec::new());
+            self.replace_items(Vec::new(), cx);
             return;
         };
         if let Some(limit) = self.journal.as_ref().map(|j| j.limit) {
@@ -496,6 +533,7 @@ impl PageView {
             header.title = trellis_store::display_title(&st, app.store.date_format());
             header.deleted = st.meta.deleted_at.is_some();
             header.kind = st.meta.kind;
+            header.draft = app.store.is_draft(&page);
             header.attributes = st
                 .live_roots()
                 .iter()
@@ -583,7 +621,7 @@ impl PageView {
         self.header = header;
         let mut items = vec![Item::Header];
         if self.header.missing {
-            self.replace_items(items);
+            self.replace_items(items, cx);
             return;
         }
         if rows.is_empty() {
@@ -620,87 +658,123 @@ impl PageView {
                 items.push(Item::Mention(m));
             }
         }
-        self.replace_items(items);
+        self.replace_items(items, cx);
     }
 
     fn rebuild_journal(&mut self, today: PageId, limit: usize, cx: &mut Context<Self>) {
         let open_embeds = self.open_embeds.clone();
-        let (header, days, more) = self.app.update(cx, |app, _| {
+        let refs_version = self.app.read(cx).refs_version;
+        let mut refs_cache = match &mut self.journal {
+            Some(j) if j.refs_version == refs_version => std::mem::take(&mut j.refs),
+            _ => HashMap::new(),
+        };
+        let (header, days) = self.app.update(cx, |app, _| {
             let collapsed = app.store.collapsed_set().clone();
-            // Today comes from the caller, not the index, which may lag by one flush.
-            let listed = app.store.journal_pages(limit + 1).unwrap_or_default();
-            let more = listed.len() > limit;
-            let mut pages = vec![today.clone()];
-            for p in listed.into_iter().take(limit) {
-                if p.id != today {
-                    pages.push(p.id);
-                }
-            }
             let fmt = app.store.date_format().clone();
-            let mut header = Header::default();
+            let today_date = app.store.today();
+            let from = today_date
+                .checked_sub_days(chrono::Days::new(limit.saturating_sub(1) as u64))
+                .unwrap_or(today_date);
+            let mut pages = app.store.days_between(from, today_date).unwrap_or_default();
+            // Today comes from the caller (its draft), not the index, which may lag.
+            pages.insert(today_date, today.clone());
+            let mut header = Header {
+                kind: PageKind::Daily,
+                date: Some(today_date),
+                ..Default::default()
+            };
             let mut days = Vec::new();
-            for page in pages {
-                let Ok(st) = app.store.page_state(&page).cloned() else {
-                    continue;
+            let mut date = today_date;
+            loop {
+                let mut day = FeedDay {
+                    date,
+                    page: None,
+                    title: fmt.format(date),
+                    rows: Vec::new(),
                 };
-                if st.meta.deleted_at.is_some() {
-                    continue;
+                let st = pages
+                    .get(&date)
+                    .and_then(|p| Some((p.clone(), app.store.page_state(p).ok()?.clone())))
+                    .filter(|(_, st)| st.meta.deleted_at.is_none());
+                if let Some((page, st)) = st {
+                    day.title = trellis_store::display_title(&st, &fmt);
+                    for (id, depth) in st.visible_rows(None, &|b| collapsed.contains(b)) {
+                        let b = st.block(&id).expect("visible row exists");
+                        let item = RowItem {
+                            page: page.clone(),
+                            block: id.clone(),
+                            text: b.text.clone(),
+                            depth,
+                            has_children: st.has_live_children(&id),
+                            collapsed: collapsed.contains(&id),
+                            embed: 0,
+                            kind: b.kind,
+                            checked: b.checked,
+                            number: st.index_in_parent(&id, true).map_or(1, |i| i + 1),
+                        };
+                        push_with_embeds(
+                            app,
+                            item,
+                            &open_embeds,
+                            &collapsed,
+                            &mut vec![id.clone()],
+                            &mut day.rows,
+                        );
+                    }
+                    if !refs_cache.contains_key(&page) {
+                        let refs = app
+                            .store
+                            .linked_references(&page, &RefQuery::default())
+                            .unwrap_or_default();
+                        refs_cache.insert(page.clone(), refs);
+                    }
+                    day.page = Some(page);
                 }
-                let title = trellis_store::display_title(&st, &fmt);
-                if page == today {
-                    header.title = title.clone();
-                    header.kind = st.meta.kind;
-                    header.date = st.meta.daily_date;
+                if date == today_date {
+                    header.title = day.title.clone();
                 }
-                let mut rows = Vec::new();
-                for (id, depth) in st.visible_rows(None, &|b| collapsed.contains(b)) {
-                    let b = st.block(&id).expect("visible row exists");
-                    let item = RowItem {
-                        page: page.clone(),
-                        block: id.clone(),
-                        text: b.text.clone(),
-                        depth,
-                        has_children: st.has_live_children(&id),
-                        collapsed: collapsed.contains(&id),
-                        embed: 0,
-                        kind: b.kind,
-                        checked: b.checked,
-                        number: st.index_in_parent(&id, true).map_or(1, |i| i + 1),
-                    };
-                    push_with_embeds(
-                        app,
-                        item,
-                        &open_embeds,
-                        &collapsed,
-                        &mut vec![id.clone()],
-                        &mut rows,
-                    );
+                days.push(day);
+                match date.pred_opt() {
+                    Some(d) if date > from => date = d,
+                    _ => break,
                 }
-                days.push((page, title, rows));
             }
-            (header, days, more)
+            (header, days)
         });
         self.header = header;
         let mut items = Vec::new();
         let mut ids = Vec::new();
-        for (i, (page, title, rows)) in days.into_iter().enumerate() {
+        for (i, day) in days.into_iter().enumerate() {
             items.push(Item::DayHeader {
-                page: page.clone(),
-                title: title.into(),
+                date: day.date,
+                page: day.page.clone(),
+                title: day.title.into(),
                 first: i == 0,
             });
-            if rows.is_empty() {
-                items.push(Item::DayEmpty { page: page.clone() });
+            if day.rows.is_empty() {
+                items.push(Item::DayEmpty { date: day.date });
             }
-            items.extend(rows);
+            items.extend(day.rows);
+            let Some(page) = day.page else { continue };
+            // Like Roam's feed: Linked References under the day when it has any, and no
+            // Unlinked References (those stay on the day's own page).
+            if let Some(refs) = refs_cache.get(&page).filter(|r| !r.groups.is_empty()) {
+                items.push(Item::RefsHeader {
+                    title: "Linked References".into(),
+                    count: refs.shown(),
+                });
+                self.push_ref_groups(&page, refs, true, &mut items);
+            }
             ids.push(page);
         }
-        items.push(Item::JournalEnd { more });
+        items.push(Item::JournalEnd);
         if let Some(j) = &mut self.journal {
             j.days = ids;
             j.loading = false;
+            j.refs = refs_cache;
+            j.refs_version = refs_version;
         }
-        self.replace_items(items);
+        self.replace_items(items, cx);
     }
 
     /// Load the next batch of older days into the feed (once per batch).
@@ -715,17 +789,25 @@ impl PageView {
         }
     }
 
-    /// Start writing on a feed day that has no blocks.
-    fn start_day(&mut self, page: PageId, window: &mut Window, cx: &mut Context<Self>) {
-        let block = self.app.update(cx, |app, cx| {
-            let r = app.store.ensure_first_block(&page);
-            let b = app.report(r);
-            app.changed(vec![page.clone()], true, cx);
-            b
+    /// Start writing on a feed day with nothing on it: a draft until the first keystroke
+    /// (FR-1.2), or the first block of a page that so far only has references.
+    fn start_day(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.app.update(cx, |app, cx| {
+            let r = app.store.draft_daily(date).and_then(|page| {
+                let first = app.store.page_state(&page)?.live_roots().first().cloned();
+                let block = match first {
+                    Some(b) => b,
+                    None => app.store.ensure_first_block(&page)?,
+                };
+                Ok((page, block))
+            });
+            let t = app.report(r);
+            app.changed(Vec::new(), true, cx);
+            t
         });
         self.rebuild(cx);
-        if let Some(b) = block {
-            self.edit(page, b, Some(0), None, window, cx);
+        if let Some((page, block)) = target {
+            self.edit(page, block, Some(0), None, window, cx);
         }
     }
 
@@ -748,7 +830,18 @@ impl PageView {
             return;
         }
         let daily = self.header.kind == PageKind::Daily;
-        for g in &self.refs.groups {
+        self.push_ref_groups(page, &self.refs, daily, items);
+    }
+
+    /// One header per referencing page, then its hits (folded past `GROUP_PREVIEW`).
+    fn push_ref_groups(
+        &self,
+        page: &PageId,
+        refs: &LinkedRefs,
+        daily: bool,
+        items: &mut Vec<Item>,
+    ) {
+        for g in &refs.groups {
             let scheduled = daily && g.page.id != *page;
             items.push(Item::GroupHeader {
                 page: g.page.clone(),
@@ -1369,7 +1462,7 @@ impl PageView {
     fn pick_date(&mut self, d: NaiveDate, sidebar: bool, _w: &mut Window, cx: &mut Context<Self>) {
         self.show_calendar = false;
         let page = self.app.update(cx, |app, cx| {
-            let r = app.store.ensure_daily_page(d);
+            let r = app.store.draft_daily(d);
             let p = app.report(r);
             app.changed(Vec::new(), true, cx);
             p
@@ -1725,7 +1818,7 @@ impl PageView {
                         .on_click(cx.listener(|this, _, _, cx| this.page_action("restore", cx))),
                 )
             })
-            .when(!h.deleted && self.zoom.is_none(), |d| {
+            .when(!h.deleted && !h.draft && self.zoom.is_none(), |d| {
                 d.child(
                     self.button("delete", "Delete page", cx)
                         .on_click(cx.listener(|this, _, _, cx| this.page_action("delete", cx))),
@@ -2241,8 +2334,13 @@ impl PageView {
                 .child("Click to start writing")
                 .on_click(cx.listener(|this, _, window, cx| this.focus_first(window, cx)))
                 .into_any_element(),
-            Item::DayHeader { page, title, first } => div()
-                .debug_selector(|| "day-title".into())
+            Item::DayHeader {
+                date,
+                page,
+                title,
+                first,
+            } => div()
+                .debug_selector(move || if first { "today-title" } else { "day-title" }.into())
                 .when(!first, |d| d.mt_8().border_t_1().border_color(th.border))
                 .px_4()
                 .pt_4()
@@ -2257,38 +2355,41 @@ impl PageView {
                         .child(title)
                         .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                             this.editor.update(cx, |ed, cx| ed.end(cx));
-                            cx.emit(PageViewEvent::Open {
-                                page: page.clone(),
-                                zoom: None,
-                                focus: None,
-                                sidebar: e.modifiers().shift,
+                            let page = page.clone().or_else(|| {
+                                this.app.update(cx, |app, _| {
+                                    let r = app.store.draft_daily(date);
+                                    app.report(r)
+                                })
                             });
+                            if let Some(page) = page {
+                                cx.emit(PageViewEvent::Open {
+                                    page,
+                                    zoom: None,
+                                    focus: None,
+                                    sidebar: e.modifiers().shift,
+                                });
+                            }
                         })),
                 )
                 .into_any_element(),
-            Item::DayEmpty { page } => {
-                div()
-                    .id(("day-empty", ix))
-                    .px_4()
-                    .py_1()
-                    .pl(px(32.))
-                    .text_color(th.faint)
-                    .cursor_text()
-                    .child("Click to start writing")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.start_day(page.clone(), window, cx)
-                    }))
-                    .into_any_element()
-            }
-            Item::JournalEnd { more } => {
-                if more {
-                    // Coming into view (the list renders a margin past the viewport)
-                    // loads older days, so the feed scrolls on without a button.
-                    let this = cx.weak_entity();
-                    cx.defer(move |cx| {
-                        let _ = this.update(cx, |v, cx| v.load_older_days(cx));
-                    });
-                }
+            Item::DayEmpty { date } => div()
+                .id(("day-empty", ix))
+                .debug_selector(|| "day-empty".into())
+                .px_4()
+                .py_1()
+                .pl(px(32.))
+                .text_color(th.faint)
+                .cursor_text()
+                .child("Click to start writing")
+                .on_click(cx.listener(move |this, _, window, cx| this.start_day(date, window, cx)))
+                .into_any_element(),
+            Item::JournalEnd => {
+                // Coming into view (the list renders a margin past the viewport) loads
+                // older days, so the feed scrolls on without a button, like Roam's.
+                let this = cx.weak_entity();
+                cx.defer(move |cx| {
+                    let _ = this.update(cx, |v, cx| v.load_older_days(cx));
+                });
                 div()
                     .debug_selector(|| "journal-end".into())
                     .px_4()
@@ -2296,11 +2397,7 @@ impl PageView {
                     .pb(px(120.))
                     .text_sm()
                     .text_color(th.faint)
-                    .child(if more {
-                        "Loading older days…"
-                    } else {
-                        "No older daily notes."
-                    })
+                    .child("Loading older days…")
                     .into_any_element()
             }
             Item::RefsHeader { title, count } => div()
@@ -2659,10 +2756,18 @@ impl Render for PageView {
         div().size_full().bg(th.bg).child(
             list(self.list.clone(), move |ix, window, cx| {
                 // List items are laid out as roots, which shrink to their content; a
-                // full-width wrapper gives margins, spacers and rules the pane's width.
+                // full-width wrapper gives margins, spacers and rules the column's width.
+                // The column stops at a readable line length and stays centred, like Roam.
                 div()
                     .w_full()
-                    .child(view.update(cx, |this, cx| this.render_item(ix, window, cx)))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(READABLE_WIDTH))
+                            .child(view.update(cx, |this, cx| this.render_item(ix, window, cx))),
+                    )
                     .into_any_element()
             })
             .size_full(),

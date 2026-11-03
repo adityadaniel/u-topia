@@ -223,7 +223,7 @@ impl Store {
     }
 
     /// Commands copying `template`'s live blocks (fresh ids) under `parent` after `after`.
-    fn template_cmds(
+    pub(crate) fn template_cmds(
         &mut self,
         template: &PageId,
         parent: Option<&BlockId>,

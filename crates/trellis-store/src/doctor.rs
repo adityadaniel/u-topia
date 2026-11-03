@@ -63,7 +63,13 @@ impl Store {
         };
         let mut work = ResolutionWork::default();
         // Tombstoned pages first, as in a normal commit.
-        let mut states: Vec<_> = self.docs.values().map(|e| e.doc_state()).collect();
+        // Draft days (FR-1.2) live only in memory and have nothing to project.
+        let mut states: Vec<_> = self
+            .docs
+            .iter()
+            .filter(|(p, _)| !self.is_draft(p))
+            .map(|(_, e)| e.doc_state())
+            .collect();
         states.sort_by_key(|s| s.meta.deleted_at.is_none());
         for st in &states {
             projector.project(st, None, &mut work)?;

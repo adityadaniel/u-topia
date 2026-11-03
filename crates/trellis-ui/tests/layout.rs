@@ -142,11 +142,13 @@ fn outline_rows_indent_and_stack(cx: &mut TestAppContext) {
         "Linked References sit below the outline"
     );
     // List items shrink to their content unless wrapped; the header's rule and count
-    // must span the pane inside its 16px margins (found by screenshot).
+    // must span the column inside its 16px margins (found by screenshot). The column is
+    // a readable width, centred in the pane.
+    let column = f32::from(main.size.width).min(760.);
+    let left = (f32::from(main.size.width) - column) / 2.;
     assert!(
-        approx(refs.origin.x - main.origin.x, 16.)
-            && approx(refs.size.width, f32::from(main.size.width) - 32.),
-        "refs header spans the pane: {refs:?} {main:?}"
+        approx(refs.origin.x - main.origin.x, left + 16.) && approx(refs.size.width, column - 32.),
+        "refs header spans the column: {refs:?} {main:?}"
     );
 }
 
@@ -208,11 +210,11 @@ fn daily_notes_feed_stacks_days(cx: &mut TestAppContext) {
     // Launch shows the feed: today's title, then its first block.
     cx.simulate_input("today's note");
     cx.simulate_keystrokes("escape");
-    let title = bounds(cx, "day-title");
+    let title = bounds(cx, "today-title");
     let row = bounds(cx, "content-1");
+    let older = bounds(cx, "day-title");
+    assert!(older.origin.y > row.origin.y, "older days follow today");
     assert!(title.origin.y + title.size.height <= row.origin.y + px(0.5));
-    let end = bounds(cx, "journal-end");
-    assert!(end.origin.y > row.origin.y, "the feed ends below today");
     assert!(
         cx.debug_bounds("refs-header").is_none(),
         "no references inside the feed"

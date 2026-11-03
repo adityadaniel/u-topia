@@ -6,6 +6,8 @@
 //! - `keys <k1> <k2> …` dispatches keystrokes in GPUI syntax (`cmd-k`, `escape`, `tab`)
 //! - `type <text>` types text into whatever has focus
 //! - `wait <ms>` lets the app run (sync, debounce, animations)
+//! - `scroll <dy>` scrolls the wheel by `dy` pixels at the centre of the window (negative
+//!   moves the content up, i.e. scrolls down, as a trackpad does)
 //! - `shot <path.png>` captures the window
 //! - `drop <file>` drops a file on the window, as from Finder
 //! - `ws <command> [args…]` runs a workspace command the app exposes for scripts
@@ -23,6 +25,7 @@ pub enum Step {
     Keys(Vec<String>),
     Type(String),
     Wait(u64),
+    Scroll(f32),
     Shot(String),
     Drop(String),
     Ws(Vec<String>),
@@ -51,6 +54,11 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                     .parse()
                     .map(Step::Wait)
                     .map_err(|_| format!("bad wait: {line}")),
+                "scroll" => rest
+                    .trim()
+                    .parse()
+                    .map(Step::Scroll)
+                    .map_err(|_| format!("bad scroll: {line}")),
                 "shot" if !rest.trim().is_empty() => Ok(Step::Shot(rest.trim().to_string())),
                 "drop" if !rest.trim().is_empty() => Ok(Step::Drop(rest.trim().to_string())),
                 "ws" if !rest.trim().is_empty() => Ok(Step::Ws(
@@ -88,6 +96,15 @@ pub async fn run(
                 hooks.drop_files(&[std::path::PathBuf::from(&path)], window, cx)
             }),
             Step::Ws(args) => handle.update(cx, |_, window, cx| hooks.ws(&args, window, cx)),
+            Step::Scroll(dy) => {
+                // A real wheel event through AppKit, sent outside any window update because
+                // GPUI handles it synchronously.
+                let target = handle.update(cx, |_, window, _| scroll_target(window));
+                if let Ok(Some((w, at))) = target {
+                    scroll_wheel(w, at, dy);
+                }
+                Ok(())
+            }
             Step::Keys(keys) => handle.update(cx, |_, window, cx| {
                 for k in keys {
                     match Keystroke::parse(&k) {
@@ -203,6 +220,74 @@ fn raise(window: &Window) {
 
 #[cfg(not(target_os = "macos"))]
 fn raise(_: &Window) {}
+
+/// The NSWindow and the screen point (top-left origin) a scripted scroll goes to: the
+/// middle of the main pane.
+#[cfg(target_os = "macos")]
+fn scroll_target(window: &Window) -> Option<(usize, (f64, f64))> {
+    // An NSEvent made from a CGEvent has no window, so AppKit hands GPUI the event's
+    // screen point (bottom-left origin) as if it were the window location. Place it so
+    // that reading lands in the middle of the main pane.
+    let size = window.viewport_size();
+    let screen_h = core_graphics::display::CGDisplay::main()
+        .bounds()
+        .size
+        .height;
+    let x = f64::from(f32::from(size.width * 0.6));
+    let y_in_window = f64::from(f32::from(size.height * 0.5));
+    let at = (
+        x,
+        screen_h - (f64::from(f32::from(size.height)) - y_in_window),
+    );
+    ns_window(window).map(|w| (w as usize, at))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn scroll_target(_: &Window) -> Option<(usize, (f64, f64))> {
+    None
+}
+
+/// Post a pixel scroll of `dy` at screen point `at` (top-left origin) to the window.
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+fn scroll_wheel(window: usize, at: (f64, f64), dy: f32) {
+    use core_graphics::geometry::CGPoint;
+    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    use std::ffi::c_void;
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventCreateScrollWheelEvent(
+            source: *const c_void,
+            units: u32,
+            wheel_count: u32,
+            wheel1: i32,
+            ...
+        ) -> *mut c_void;
+        fn CGEventSetLocation(event: *mut c_void, location: CGPoint);
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(cf: *const c_void);
+    }
+    // SAFETY: the event is created, used and released here; `window` is the live
+    // NSWindow of this app, and no GPUI window is borrowed while it handles the event.
+    unsafe {
+        // 0 = kCGScrollEventUnitPixel.
+        let event = CGEventCreateScrollWheelEvent(std::ptr::null(), 0, 1, dy as i32);
+        if event.is_null() {
+            return;
+        }
+        CGEventSetLocation(event, CGPoint::new(at.0, at.1));
+        let ns: *mut Object = msg_send![class!(NSEvent), eventWithCGEvent: event];
+        if !ns.is_null() {
+            let _: () = msg_send![window as *mut Object, sendEvent: ns];
+        }
+        CFRelease(event);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn scroll_wheel(_: usize, _: (f64, f64), _: f32) {}
 
 #[cfg(target_os = "macos")]
 // objc 0.2's `msg_send!` checks a cfg this crate does not declare.

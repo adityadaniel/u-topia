@@ -76,11 +76,19 @@ impl Store {
         Ok(id)
     }
 
-    /// The live daily page for `date`, created empty if absent (FR-1.5, FR-1.10).
+    /// The live daily page for `date`, created empty if absent (FR-1.5, FR-1.10). A draft
+    /// of that date is written out instead, so the date never gets two pages.
     pub fn ensure_daily_page(&mut self, date: NaiveDate) -> Result<PageId> {
         self.sync_index()?;
         if let Some(p) = self.live_daily(date)? {
             return Ok(p);
+        }
+        if let Some(p) = self.drafts.get(&date).cloned() {
+            if self.docs.contains_key(&p) {
+                self.queue(&[(p.clone(), None)], true)?;
+                return Ok(p);
+            }
+            self.drafts.remove(&date);
         }
         let mut id = PageId::for_date(date);
         if self.id_taken(&id)? {
@@ -100,6 +108,101 @@ impl Store {
         self.queue(&[(id.clone(), None)], true)?;
         self.flush()?;
         Ok(id)
+    }
+
+    /// Visiting a date (FR-1.2): its live page, or else a draft held only in memory — one
+    /// empty block, or the journal template — that is written to the graph (and synced)
+    /// by its first edit. A day that is only looked at never becomes a page.
+    pub fn draft_daily(&mut self, date: NaiveDate) -> Result<PageId> {
+        self.sync_index()?;
+        if let Some(p) = self.live_daily(date)? {
+            return Ok(p);
+        }
+        if let Some(p) = self.drafts.get(&date) {
+            if self.docs.contains_key(p) {
+                return Ok(p.clone());
+            }
+        }
+        let mut id = PageId::for_date(date);
+        if self.id_taken(&id)? {
+            id = PageId::fresh();
+        }
+        let template = self.find_page(&format!("{}journal", crate::TEMPLATE_PREFIX))?;
+        let mut cmds = match template {
+            Some(t) => self.template_cmds(&t, None, None)?,
+            None => Vec::new(),
+        };
+        if cmds.is_empty() {
+            cmds.push(Command::InsertBlock {
+                id: BlockId::new(),
+                parent: None,
+                after: None,
+                text: String::new(),
+                kind: BlockKind::Bullet,
+            });
+        }
+        let now = self.now();
+        let entry = self.new_doc(&id);
+        entry.doc.apply(
+            &Command::SetPageMeta(PageMetaPatch {
+                kind: Some(PageKind::Daily),
+                daily_date: Some(Some(date)),
+                created_at: Some(now),
+                ..Default::default()
+            }),
+            now,
+        )?;
+        for cmd in &cmds {
+            if let Err(e) = entry.doc.apply(cmd, now) {
+                self.docs.remove(&id);
+                return Err(e.into());
+            }
+        }
+        self.drafts.insert(date, id.clone());
+        Ok(id)
+    }
+
+    /// Daily pages dated `from..=to`, drafts included: what the Daily Notes feed shows for
+    /// those days (the rest are blank days, written only if you type on them).
+    pub fn days_between(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<std::collections::BTreeMap<NaiveDate, PageId>> {
+        self.read_barrier()?;
+        let mut out = std::collections::BTreeMap::new();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT daily_date, id FROM page WHERE kind='daily' AND deleted_at IS NULL
+               AND daily_date BETWEEN ?1 AND ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![iso(from), iso(to)], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (d, id) in rows {
+            if let Ok(d) = NaiveDate::parse_from_str(&d, "%Y-%m-%d") {
+                out.insert(d, PageId(id));
+            }
+        }
+        for (d, p) in &self.drafts {
+            if (from..=to).contains(d) && self.docs.contains_key(p) {
+                out.entry(*d).or_insert_with(|| p.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether `page` is a draft day (shown, never written).
+    pub fn is_draft(&self, page: &PageId) -> bool {
+        self.drafts.values().any(|p| p == page)
+    }
+
+    /// Stop tracking `page` as a draft; true if it was one.
+    pub(crate) fn take_draft(&mut self, page: &PageId) -> bool {
+        let before = self.drafts.len();
+        self.drafts.retain(|_, p| p != page);
+        self.drafts.len() != before
     }
 
     /// Visiting a page: make sure there is a block to type into (§9.3) and return the
@@ -607,6 +710,11 @@ impl Store {
         self.sync_index()?;
         let mut changed: Vec<PageId> = Vec::new();
         for (page, bytes) in batch {
+            // Another device wrote this day first: drop the local draft so its unsent
+            // empty block never merges into theirs.
+            if self.take_draft(page) {
+                self.docs.remove(page);
+            }
             let did = if self.page_exists(page)? {
                 self.load_doc(page)?.doc.import(bytes)?
             } else {

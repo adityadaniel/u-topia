@@ -501,15 +501,14 @@ impl Workspace {
                 .read(cx)
                 .store
                 .local_set("last_page", page.as_str());
-            let title = self
-                .app
-                .read(cx)
-                .store
-                .page_row(&page)
-                .ok()
-                .flatten()
-                .map(|r| r.title)
-                .unwrap_or_default();
+            // From the shard: a draft day has no index row yet.
+            let title = self.app.update(cx, |app, _| {
+                let fmt = app.store.date_format().clone();
+                app.store
+                    .page_state(&page)
+                    .map(|st| trellis_store::display_title(st, &fmt))
+                    .unwrap_or_default()
+            });
             window.set_window_title(&format!("{title} — Trellis"));
             match focus {
                 Some(b) => self
@@ -788,13 +787,13 @@ impl Workspace {
     }
 
     /// The Daily Notes feed in the main pane, caret in today's first block (FR-1.1).
-    /// Creates today's page on the visit (FR-1.2); older days only if they exist.
+    /// Today is a draft until it is written (FR-1.2); older days only if they exist.
     pub fn open_journal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.new_day = false;
         let today = self.app.read(cx).store.today();
         self.today = today;
         let page = self.app.update(cx, |app, cx| {
-            let r = app.store.ensure_daily_page(today);
+            let r = app.store.draft_daily(today);
             let p = app.report(r);
             app.changed(Vec::new(), true, cx);
             p
@@ -829,7 +828,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let page = self.app.update(cx, |app, cx| {
-            let r = app.store.ensure_daily_page(d);
+            let r = app.store.draft_daily(d);
             let p = app.report(r);
             app.changed(Vec::new(), true, cx);
             p
@@ -844,9 +843,11 @@ impl Workspace {
 
     fn current_date(&self, cx: &mut Context<Self>) -> NaiveDate {
         let page = self.main.read(cx).page.clone();
-        page.and_then(|p| self.app.read(cx).store.page_row(&p).ok().flatten())
-            .and_then(|r| r.daily_date)
-            .unwrap_or(self.today)
+        page.and_then(|p| {
+            self.app
+                .update(cx, |app, _| app.store.page_state(&p).ok()?.meta.daily_date)
+        })
+        .unwrap_or(self.today)
     }
 
     fn prev_day(&mut self, _: &PrevDay, window: &mut Window, cx: &mut Context<Self>) {

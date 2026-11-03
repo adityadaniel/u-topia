@@ -116,6 +116,8 @@ pub struct Store {
     persister: Persister,
     /// Pages with in-memory changes not yet handed to the writer.
     pending: Vec<(PageId, Option<DocDelta>, bool)>,
+    /// Daily pages shown but never written: in memory only until their first edit (FR-1.2).
+    drafts: HashMap<NaiveDate, PageId>,
     debounced: bool,
     /// Attachment bytes for in-memory graphs (file graphs use the blob directory).
     mem_blobs: HashMap<String, Vec<u8>>,
@@ -181,6 +183,7 @@ impl Store {
             today: None,
             persister: Persister::Inline,
             pending: Vec::new(),
+            drafts: HashMap::new(),
             debounced: false,
             mem_blobs: HashMap::new(),
         })
@@ -284,6 +287,7 @@ impl Store {
             // The disk lags the in-memory shards: drop them so they reload consistently.
             self.docs.clear();
             self.pending.clear();
+            self.drafts.clear();
         }
         r
     }
@@ -299,22 +303,30 @@ impl Store {
 
     /// Queue shard commits; strict mode ships them immediately.
     fn queue(&mut self, pages: &[(PageId, Option<DocDelta>)], enqueue: bool) -> Result<()> {
+        let mut promoted = false;
         for (page, delta) in pages {
+            // A draft's first edit writes the whole page (meta, first block, the edit).
+            let delta = if self.take_draft(page) {
+                promoted = true;
+                None
+            } else {
+                delta.clone()
+            };
             match self.pending.iter_mut().find(|(p, _, _)| p == page) {
                 Some((_, d, e)) => {
                     *d = match (d.take(), delta) {
                         (Some(mut a), Some(b)) => {
-                            a.merge(b.clone());
+                            a.merge(b);
                             Some(a)
                         }
                         _ => None,
                     };
                     *e |= enqueue;
                 }
-                None => self.pending.push((page.clone(), delta.clone(), enqueue)),
+                None => self.pending.push((page.clone(), delta, enqueue)),
             }
         }
-        if self.debounced {
+        if self.debounced && !promoted {
             Ok(())
         } else {
             self.flush()

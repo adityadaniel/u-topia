@@ -29,9 +29,20 @@ fn setup(cx: &mut TestAppContext) -> (Entity<AppState>, Entity<Workspace>, &mut 
     (app, ws, cx)
 }
 
+/// Today's page as shown: live once written, a draft before that (FR-1.2).
 fn today_page(app: &Entity<AppState>, cx: &mut VisualTestContext) -> PageId {
+    app.update(cx, |app, _| app.store.draft_daily(today()).unwrap())
+}
+
+fn daily_count(app: &Entity<AppState>, cx: &mut VisualTestContext) -> usize {
     app.update(cx, |app, _| {
-        app.store.find_page("2026-11-02").unwrap().unwrap()
+        app.store.sync_index().unwrap();
+        app.store
+            .list_pages(true)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.is_daily())
+            .count()
     })
 }
 
@@ -257,11 +268,15 @@ fn query_blocks_list_results(cx: &mut TestAppContext) {
 #[gpui::test]
 fn day_navigation(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);
-    cx.simulate_keystrokes("escape cmd-[");
+    // From the feed, with the caret still in today's block.
+    cx.simulate_keystrokes("cmd-[");
     cx.run_until_parked();
     let shown = ws.update(cx, |w, cx| w.main_page(cx)).unwrap();
-    let row = app.update(cx, |app, _| app.store.page_row(&shown).unwrap().unwrap());
-    assert_eq!(row.daily_date, NaiveDate::from_ymd_opt(2026, 11, 1));
+    // A draft until written (FR-1.2), so read the shard, not the index.
+    let date = app.update(cx, |app, _| {
+        app.store.page_state(&shown).unwrap().meta.daily_date
+    });
+    assert_eq!(date, NaiveDate::from_ymd_opt(2026, 11, 1));
     cx.simulate_keystrokes("cmd-shift-d");
     cx.run_until_parked();
     let shown = ws.update(cx, |w, cx| w.main_page(cx)).unwrap();
@@ -943,15 +958,16 @@ fn daily_notes_feed_scrolls_into_older_days(cx: &mut TestAppContext) {
     let days = ws.update(cx, |w, cx| w.journal_days(cx));
     let today_id = today_page(&app, cx);
     assert_eq!(days[0], today_id, "today comes first");
-    // Batches load until the end of the feed is out of view, not all at once.
+    // Every calendar day is listed, written or blank; batches load until the end of the
+    // feed is out of view, not all at once.
     assert!(
-        (10..26).contains(&days.len()),
-        "a screenful of days, not all 26: {}",
+        (2..26).contains(&days.len()),
+        "a screenful of days, not all 26 pages: {}",
         days.len()
     );
     let dates: Vec<NaiveDate> = app.update(cx, |app, _| {
         days.iter()
-            .map(|p| app.store.page_row(p).unwrap().unwrap().daily_date.unwrap())
+            .map(|p| app.store.page_state(p).unwrap().meta.daily_date.unwrap())
             .collect()
     });
     assert!(
@@ -969,27 +985,142 @@ fn daily_notes_feed_scrolls_into_older_days(cx: &mut TestAppContext) {
         day_texts(&app, today() - chrono::Duration::days(2), cx),
         ["note 1 edited"]
     );
-    // Scrolling to the end loads the remaining days; none are created (FR-1.2).
-    let main = cx.debug_bounds("main-pane").expect("main pane");
-    for _ in 0..6 {
-        cx.simulate_event(gpui::ScrollWheelEvent {
-            position: main.center(),
-            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-4000.))),
-            ..Default::default()
-        });
-        cx.run_until_parked();
+    // Scrolling on loads older days, blank ones included; none are created (FR-1.2).
+    for _ in 0..40 {
+        if ws.update(cx, |w, cx| w.journal_days(cx)).len() == 26 {
+            break;
+        }
+        scroll_main(cx, -4000.);
     }
     let days = ws.update(cx, |w, cx| w.journal_days(cx));
-    assert_eq!(days.len(), 26, "every journal page, and only those");
-    let daily = app.update(cx, |app, _| {
+    assert_eq!(days.len(), 26, "every journal page");
+    assert_eq!(daily_count(&app, cx), 26);
+}
+
+fn scroll_main(cx: &mut VisualTestContext, dy: f32) {
+    let main = cx.debug_bounds("main-pane").expect("main pane");
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: main.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(dy))),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn feed_blank_day_is_written_by_typing(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape");
+    let blank = cx.debug_bounds("day-empty").expect("a blank day");
+    cx.simulate_click(blank.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(daily_count(&app, cx), 0, "clicking is not writing");
+    cx.simulate_input("filled in later");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let written: Vec<NaiveDate> = app.update(cx, |app, _| {
         app.store
             .list_pages(true)
             .unwrap()
             .into_iter()
-            .filter(|p| p.is_daily())
-            .count()
+            .filter_map(|p| p.daily_date)
+            .collect()
     });
-    assert_eq!(daily, 26);
+    assert_eq!(written.len(), 1);
+    assert!(written[0] < today(), "an older day: {written:?}");
+    assert_eq!(day_texts(&app, written[0], cx), ["filled in later"]);
+}
+
+#[gpui::test]
+fn shortcuts_work_after_scrolling_the_caret_away(cx: &mut TestAppContext) {
+    let (_app, ws, cx) = setup(cx);
+    // The caret stays in today's block while the feed scrolls far past it.
+    for _ in 0..5 {
+        scroll_main(cx, -4000.);
+    }
+    cx.simulate_keystrokes("cmd-[");
+    cx.run_until_parked();
+    let shown = ws.update(cx, |w, cx| w.main_page(cx)).unwrap();
+    assert_eq!(shown, PageId::for_date(today().pred_opt().unwrap()));
+}
+
+#[gpui::test]
+fn fr_1_2_a_day_becomes_a_page_when_written(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // Launch shows today with the caret in its block (AC-1.1), but writes nothing.
+    assert_eq!(daily_count(&app, cx), 0);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(daily_count(&app, cx), 0, "looking is not writing");
+    // Visiting other days (calendar, previous day) writes nothing either.
+    let yesterday = today().pred_opt().unwrap();
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(yesterday, false, true, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-[");
+    cx.run_until_parked();
+    assert_eq!(daily_count(&app, cx), 0);
+    // The first keystroke writes the day, under its date identity (§10.3).
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(yesterday, false, true, window, cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_input("x");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(daily_count(&app, cx), 1);
+    assert_eq!(day_texts(&app, yesterday, cx), ["x"]);
+    let id = app.update(cx, |app, _| app.store.find_page("2026-11-01").unwrap());
+    assert_eq!(id, Some(PageId::for_date(yesterday)));
+    app.update(cx, |app, _| {
+        let report = app.store.doctor().unwrap();
+        assert!(report.is_ok(), "{report:?}");
+    });
+}
+
+#[gpui::test]
+fn daily_notes_feed_shows_linked_references_not_unlinked(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        let d = today() - chrono::Duration::days(1);
+        let (p, b) = app.store.open_daily(d).unwrap();
+        // Pre-creates Oct 30 (FR-1.10): empty, but it has a linked reference.
+        app.store
+            .set_block_text(&p, &b, "Follow up on [[October 30th, 2026]]", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        // Visited once before this build created pages on visit: empty, no references.
+        app.store
+            .open_daily(today() - chrono::Duration::days(5))
+            .unwrap();
+        app.store.sync_index().unwrap();
+    });
+    cx.update(|window, cx| {
+        let ws = window.root::<Workspace>().flatten().expect("workspace");
+        ws.update(cx, |w, cx| w.open_journal(window, cx));
+    });
+    cx.run_until_parked();
+    let days: Vec<NaiveDate> = app.update(cx, |app, _| {
+        let s = &mut app.store;
+        s.journal_pages(10)
+            .unwrap()
+            .into_iter()
+            .filter_map(|p| p.daily_date)
+            .collect()
+    });
+    assert_eq!(
+        days,
+        [
+            NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 10, 30).unwrap()
+        ],
+        "days with entries or references; the empty visited day is skipped"
+    );
+    assert!(
+        cx.debug_bounds("refs-header").is_some(),
+        "Oct 30's references"
+    );
+    assert!(cx.debug_bounds("unlinked-header").is_none());
 }
 
 #[gpui::test]

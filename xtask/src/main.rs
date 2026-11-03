@@ -438,10 +438,12 @@ fn bench(ui: bool) -> Result<()> {
             durable,
         );
 
-        // AC-1.4: backfill 30 days.
+        // AC-1.4: backfill 30 days; a day is written by its first character (FR-1.2).
         let (res, d) = time(|| -> Result<()> {
             for i in 0..30 {
-                s.open_daily(today() - chrono::Days::new(40 + i))?;
+                let page = s.draft_daily(today() - chrono::Days::new(40 + i))?;
+                let block = s.page_state(&page)?.live_roots()[0].clone();
+                s.set_block_text(&page, &block, "x", None, None)?;
             }
             s.sync_index()?;
             Ok(())

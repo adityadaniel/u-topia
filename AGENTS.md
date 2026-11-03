@@ -23,7 +23,9 @@ export DEVELOPER_DIR=/Applications/Xcode-27.2.0.app/Contents/Developer
 
 ## Commands (definition of done)
 
-A change is finished only when all of these pass from the repo root:
+`make` lists the everyday tasks (`make check`, `make dev` for a throwaway graph, `make app` /
+`make zip` / `make install` for a signed release bundle). A change is finished only when all of
+these pass from the repo root (`make check` runs them):
 
 ```bash
 cargo build --workspace
@@ -55,7 +57,8 @@ TRELLIS_CONFIG_DIR=/tmp/t TRELLIS_SHOT_SCRIPT="type Met [[Ana]]; keys escape; wa
 ```
 
 Steps (`;` or newline separated): `keys <k…>`, `type <text>` (lines are trimmed; a second space
-after `type` keeps a leading one), `wait <ms>`, `shot <png>`, `drop <file>` (as from Finder),
+after `type` keeps a leading one), `wait <ms>`, `scroll <dy>` (a real AppKit wheel event in the
+main pane; negative scrolls down), `shot <png>`, `drop <file>` (as from Finder),
 `ws open-pdf` / `ws highlight <page> <x> <y> <w> <h>` (area) / `ws select <page> <x0> <y0> <x1> <y1>`
 (text selection). Then read the PNG. Do this for any visible
 change: it has caught bugs the geometry tests could not.
@@ -64,6 +67,9 @@ UI behaviour is tested without a screen: `crates/trellis-ui/tests/workspace.rs` 
 `Workspace` through GPUI's test platform (`gpui` `test-support` dev-feature) with simulated
 keystrokes and asserts on store state; `crates/trellis-ui/tests/layout.rs` asserts layout
 geometry via `debug_selector` bounds. Add a script there for any new interaction or region.
+The list keeps rendering the row being edited when it scrolls out of view (`splice_items`
+passes the editor's focus handle to `ListState::splice_focusable`): a focused element that is
+not rendered gets no keystrokes, so every shortcut would die. Keep that when touching the list.
 GPUI's test frames never clear debug bounds, so an element that stops rendering still reports
 its old bounds: assert on what replaced it (or on view state), never on `debug_bounds(..).is_none()`
 after it was once drawn.
@@ -187,9 +193,14 @@ Dependency direction is one-way: `app → ui → (plugin → api) → store → 
 ## Scope
 
 Implemented:
-- **v1 / P0 (§4.2):** daily notes (the launch view is Roam's Daily Notes feed: today, then
-  every older journal page, editable in place, older days load as you scroll; days are never
-  created by scrolling, FR-1.2), outliner, backlinks (linked references, "Scheduled for this
+- **v1 / P0 (§4.2):** daily notes (the launch view is Roam's Daily Notes feed: every calendar
+  day from today backwards, editable in place, each with its Linked References and no Unlinked
+  References; older days load as you scroll; the sidebar's recent days list only days with an
+  entry or a linked reference). A day becomes a page
+  on its first write, not on a visit (FR-1.2): `Store::draft_daily` keeps it in memory only
+  (never projected, synced or seen by `doctor`) and the first `queue` of it writes the whole
+  shard; a link to the date writes the draft, a remote copy of the day replaces it. Pages sit in a centred
+  column of readable width (760 px). Outliner, backlinks (linked references, "Scheduled for this
   day"), reference nodes (page/block refs, transclusion, inspector, unresolved intents),
   tags-as-pages, date links, rename/merge, right sidebar, local persistence, undo/redo, quick
   jump, Markdown/JSON export, rolling backups. Relative date links: `[[tomorrow]]`,
