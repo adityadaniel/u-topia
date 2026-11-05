@@ -7561,10 +7561,12 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "core-graphics 0.24.0",
+ "core-text",
  "foreign-types",
  "gpui",
  "image",
  "objc",
+ "pathfinder_geometry",
  "png 0.17.16",
  "serde",
  "serde_json",
@@ -7573,6 +7575,7 @@ dependencies = [
  "utopia-plugin",
  "utopia-store",
  "utopia-sync",
+ "zed-font-kit",
 ]
 
 [[package]]
@@ -8862,8 +8865,6 @@ dependencies = [
 [[package]]
 name = "zed-font-kit"
 version = "0.14.1-zed"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3898e450f36f852edda72e3f985c34426042c4951790b23b107f93394f9bff5"
 dependencies = [
  "bitflags 2.13.2",
  "byteorder",

@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/utopia-core", "crates/utopia-doc", "crates/utopia-store", "crates/utopia-sync", "crates/utopia-ui", "crates/utopia-app", "crates/utopia-proto", "crates/utopia-syncd", "crates/utopia-api", "crates/utopia-plugin", "crates/utopia-ffi", "xtask"]
+# Patched third-party crates (see [patch.crates-io]); not ours to lint or test.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -44,3 +46,10 @@ uuid = { version = "1.10", features = ["v5"] }
 
 [profile.dev.package."*"]
 opt-level = 1
+
+# gpui 0.2.2 measures each glyph's bitmap from a 16 pt instance of the font, scaled; the
+# system font changes shape with size (optical sizing), so headings and titles drew with
+# their left edge cut off. The vendored copy measures at the drawn size. Drop this when
+# gpui moves past it (upstream Zed has since padded the bounds instead).
+[patch.crates-io]
+zed-font-kit = { path = "vendor/zed-font-kit" }
