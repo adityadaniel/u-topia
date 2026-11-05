@@ -62,7 +62,10 @@ UTOPIA_CONFIG_DIR=/tmp/t UTOPIA_SHOT_SCRIPT="type Met [[Ana]]; keys escape; wait
 
 Steps (`;` or newline separated): `keys <k…>`, `type <text>` (lines are trimmed; a second space
 after `type` keeps a leading one), `wait <ms>`, `scroll <dy>` (a real AppKit wheel event in the
-main pane; negative scrolls down), `shot <png>`, `drop <file>` (as from Finder),
+main pane; negative scrolls down), `click <x> <y>` (a real AppKit left click in points
+from the top left of the content, so halve a Retina PNG's pixels and take off the 28 pt title
+bar), `shot <png>`, `drop <file>` (as
+from Finder),
 `ws open-pdf` / `ws highlight <page> <x> <y> <w> <h>` (area) / `ws select <page> <x0> <y0> <x1> <y1>`
 (text selection), `target main|last` (which window the steps after it drive and capture —
 `last` is the most recently opened, which is how the Settings window is reached:
