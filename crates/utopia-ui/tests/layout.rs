@@ -2,7 +2,8 @@
 //! painted headlessly and element bounds are read back by `debug_selector`.
 
 use chrono::NaiveDate;
-use gpui::{px, size, AppContext as _, Bounds, Pixels, TestAppContext, VisualTestContext};
+use gpui::{px, size, AppContext as _, Bounds, Entity, Pixels, TestAppContext, VisualTestContext};
+use utopia_core::PageId;
 use utopia_store::Store;
 use utopia_ui::actions::install_keymap;
 use utopia_ui::app_state::AppState;
@@ -219,6 +220,117 @@ fn daily_notes_feed_stacks_days(cx: &mut TestAppContext) {
         cx.debug_bounds("refs-header").is_none(),
         "no references inside the feed"
     );
+}
+
+/// Several hundred characters with no newline: a referencing block that must wrap.
+const LONG: &str = "A deliberately long note that keeps going without any newline so that \
+    it has to wrap at the readable column: the beta needs twenty testers invited by hand, \
+    the import path has to stay unchanged so that old files still open, and the migration \
+    notes must reach the reviewer before the end of the month so that nothing slips.";
+
+/// Like `setup`, but the store first gets a long block on "Source" that links to the
+/// "Target" page or, with `daily`, to today.
+fn setup_refs(
+    cx: &mut TestAppContext,
+    daily: bool,
+) -> (&mut VisualTestContext, Entity<Workspace>, PageId) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let target = store.create_page("Target").unwrap();
+    let src = store.create_page("Source").unwrap();
+    let b = store.ensure_first_block(&src).unwrap();
+    let link = if daily {
+        "[[November 2nd, 2026]]"
+    } else {
+        "[[Target]]"
+    };
+    store
+        .set_block_text(&src, &b, &format!("{LONG} {link}"), None, None)
+        .unwrap();
+    store.commit_block(&src, &b).unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    (cx, ws, target)
+}
+
+/// The first Linked References hit drawn (its list index depends on what sits above it).
+/// Each test opens a fresh window, so no stale bounds from an earlier frame can match.
+fn first_hit(cx: &mut VisualTestContext) -> Bounds<Pixels> {
+    cx.run_until_parked();
+    (0..40)
+        .find_map(|ix| {
+            // `debug_bounds` takes a `&'static str`; leaking a few test strings is fine.
+            let sel: &'static str = Box::leak(format!("hit-{ix}").into_boxed_str());
+            cx.debug_bounds(sel)
+        })
+        .expect("a linked reference was rendered")
+}
+
+/// The readable column (760 px, centred) inside the main pane.
+fn column(cx: &mut VisualTestContext) -> (f32, f32) {
+    let main = bounds(cx, "main-pane");
+    let width = f32::from(main.size.width).min(760.);
+    let left = f32::from(main.origin.x) + (f32::from(main.size.width) - width) / 2.;
+    (left, left + width)
+}
+
+fn assert_wraps_within(hit: Bounds<Pixels>, left: f32, right: f32) {
+    let (x0, x1) = (
+        f32::from(hit.origin.x),
+        f32::from(hit.origin.x + hit.size.width),
+    );
+    assert!(
+        x0 >= left && x1 <= right + 0.5,
+        "the reference stays inside [{left}, {right}]: {hit:?}"
+    );
+    assert!(
+        hit.size.height >= px(40.),
+        "long text wraps onto several lines instead of running wide: {hit:?}"
+    );
+}
+
+/// FR-3.1: a long referencing block wraps at the page's readable width, like the outline
+/// above it, instead of running past the column (found by screenshot).
+#[gpui::test]
+fn linked_reference_wraps_at_readable_width(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_refs(cx, false);
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, None, false, window, cx)
+    });
+    let hit = first_hit(cx);
+    let (left, right) = column(cx);
+    assert_wraps_within(hit, left, right);
+}
+
+/// FR-1.2: each day in the Daily Notes feed shows its Linked References, wrapped the same way.
+#[gpui::test]
+fn feed_linked_reference_wraps_at_readable_width(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_refs(cx, true);
+    let hit = first_hit(cx);
+    let (left, right) = column(cx);
+    assert_wraps_within(hit, left, right);
+}
+
+/// §9.2: a page shift-opened in the right sidebar wraps its references at the sidebar's edge.
+#[gpui::test]
+fn sidebar_linked_reference_wraps(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_refs(cx, false);
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, None, true, window, cx)
+    });
+    let hit = first_hit(cx);
+    let side = bounds(cx, "right-sidebar");
+    let left = f32::from(side.origin.x);
+    assert_wraps_within(hit, left, left + f32::from(side.size.width));
 }
 
 #[gpui::test]

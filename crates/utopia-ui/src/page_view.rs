@@ -2495,7 +2495,15 @@ impl PageView {
                         div()
                             .flex()
                             .child(div().w(px(14.)).text_color(th.bullet).child("•"))
-                            .child(text),
+                            // As in `render_row`: a flex item's minimum width is its
+                            // unwrapped text unless `min_w_0`, so it would run wide.
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .debug_selector(|| format!("hit-{ix}"))
+                                    .child(text),
+                            ),
                     )
                     .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                         this.editor.update(cx, |ed, cx| ed.end(cx));
