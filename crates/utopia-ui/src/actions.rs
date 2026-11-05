@@ -74,6 +74,7 @@ actions!(
         Escape,
         ShowCharacterPalette,
         ToggleTodo,
+        AcceptCompletion,
     ]
 );
 
@@ -83,6 +84,8 @@ actions!(
 );
 
 pub const EDITOR_CONTEXT: &str = "BlockEditor";
+/// Added to the editor's context while an autocomplete menu with suggestions is open.
+pub const AUTOCOMPLETE_CONTEXT: &str = "autocomplete";
 pub const INPUT_CONTEXT: &str = "LineInput";
 
 /// Where an action is grouped in the Settings editor and the cheat sheet.
@@ -136,6 +139,9 @@ pub struct ActionDoc {
 
 const EDITOR: Option<&str> = Some("BlockEditor");
 const TEXT: Option<&str> = Some("BlockEditor || LineInput");
+/// Only while a `[[`, `#`, `((` or `/` menu is open, so the same key can keep its
+/// everyday meaning (Tab indents) the rest of the time.
+const COMPLETING: Option<&str> = Some("BlockEditor && autocomplete");
 
 /// Every action that can be bound, in the order the Settings editor lists it.
 pub const CATALOG: &[ActionDoc] = &[
@@ -519,6 +525,16 @@ pub const CATALOG: &[ActionDoc] = &[
         context: TEXT,
         help: "Close the open menu or panel, or leave the block.",
     },
+    // Listed after Indent: for the same keys at the same depth gpui prefers the later
+    // binding, so Tab accepts while a menu is open and indents otherwise.
+    ActionDoc {
+        action: "AcceptCompletion",
+        label: "Accept Suggestion",
+        category: Category::Editing,
+        keys: "tab",
+        context: COMPLETING,
+        help: "In a [[, #, (( or / menu, take the highlighted suggestion (Enter does too).",
+    },
     ActionDoc {
         action: "ShowCharacterPalette",
         label: "Emoji And Symbols",
@@ -787,6 +803,7 @@ pub fn binding(name: &str, keys: &str, context: Option<&str>) -> Option<KeyBindi
             DeleteBlock,
             Escape,
             ShowCharacterPalette,
+            AcceptCompletion,
         ]
     )
 }
@@ -915,20 +932,30 @@ impl Overrides {
     }
 }
 
-/// Install default bindings, then the user's overrides on top.
+/// Install default bindings, then the user's overrides on top. A rebound action loses its
+/// default keys: gpui would otherwise keep both, and the old keys would go on firing while
+/// Settings shows only the new ones. An override that cannot be bound (empty or invalid
+/// keys) is reported and ignored, and its action keeps the default (rule 11).
 pub fn install(cx: &mut App, overrides: &Overrides) {
-    let mut bindings: Vec<KeyBinding> = CATALOG
-        .iter()
-        .filter_map(|d| binding(d.action, &platform_keys(d.keys), d.context))
-        .collect();
-    // Overrides come last: gpui lets a later binding win for the same keys.
+    let mut replaced = std::collections::BTreeSet::new();
+    let mut user = Vec::new();
     for (action, keys) in &overrides.0 {
         let ctx = doc(action).and_then(|d| d.context);
         match binding(action, keys, ctx) {
-            Some(b) => bindings.push(b),
+            Some(b) => {
+                replaced.insert(action.as_str());
+                user.push(b);
+            }
             None => eprintln!("utopia: ignoring keybinding {keys} -> {action}"),
         }
     }
+    let mut bindings: Vec<KeyBinding> = CATALOG
+        .iter()
+        .filter(|d| !replaced.contains(d.action))
+        .filter_map(|d| binding(d.action, &platform_keys(d.keys), d.context))
+        .collect();
+    // Overrides come last: gpui lets a later binding win for the same keys.
+    bindings.extend(user);
     cx.bind_keys(bindings);
 }
 

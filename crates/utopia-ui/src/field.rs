@@ -248,11 +248,29 @@ pub trait FieldHost: EntityInputHandler + 'static {
     fn focus_handle_ref(&self) -> &FocusHandle;
 }
 
+/// For hosts that take typed text as it comes (see [`impl_field_input_handler`]).
+pub fn no_intercept<T>(
+    _: &mut T,
+    _: Range<usize>,
+    _: &str,
+    _: &mut Window,
+    _: &mut gpui::Context<T>,
+) -> bool {
+    false
+}
+
 /// Implements `EntityInputHandler` for a [`FieldHost`] by delegating to its field and
 /// calling `$after(self, window, cx)` after every committed edit.
+///
+/// `$intercept(self, range, text, window, cx)` sees committed typing first (never IME
+/// composition, which arrives through `replace_and_mark_text_in_range`) and returns
+/// `true` when it applied the edit itself.
 #[macro_export]
 macro_rules! impl_field_input_handler {
     ($ty:ty, $after:path) => {
+        $crate::impl_field_input_handler!($ty, $after, $crate::field::no_intercept);
+    };
+    ($ty:ty, $after:path, $intercept:path) => {
         impl gpui::EntityInputHandler for $ty {
             fn text_for_range(
                 &mut self,
@@ -313,8 +331,10 @@ macro_rules! impl_field_input_handler {
                 } else {
                     new_text.replace('\n', " ")
                 };
-                f.replace(range, &text);
-                $after(self, window, cx);
+                if !$intercept(self, range.clone(), &text, window, cx) {
+                    $crate::field::FieldHost::field_mut(self).replace(range, &text);
+                    $after(self, window, cx);
+                }
                 cx.notify();
             }
 

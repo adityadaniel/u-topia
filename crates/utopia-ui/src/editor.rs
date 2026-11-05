@@ -242,7 +242,11 @@ impl FieldHost for BlockEditor {
     }
 }
 
-crate::impl_field_input_handler!(BlockEditor, BlockEditor::after_edit);
+crate::impl_field_input_handler!(
+    BlockEditor,
+    BlockEditor::after_edit,
+    BlockEditor::typed_bracket
+);
 
 impl BlockEditor {
     pub fn new(app: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -273,6 +277,11 @@ impl BlockEditor {
 
     pub fn selection(&self) -> std::ops::Range<usize> {
         self.field.sel.clone()
+    }
+
+    /// The text being edited, as typed (before the block commits).
+    pub fn field_text(&self) -> &str {
+        &self.field.text
     }
 
     /// Start editing `target`, committing the previous block first.
@@ -454,6 +463,55 @@ impl BlockEditor {
         !markup.is_empty() && self.insert_text(&markup.join(" "), window, cx)
     }
 
+    /// Brackets typed at the caret (§13.5). Over a selection, `(`, `[` or `{` surrounds it
+    /// and keeps it selected, so `[` twice turns `word` into `[[word]]` (Roam's link
+    /// idiom). With no selection they pair (`(|)`) and a typed closer steps over the one
+    /// already there; see [`utopia_core::text::auto_pair`]. Each is one text edit, so one
+    /// undo step like any keystroke. Only for plain typing at the selection: never while
+    /// IME text is being composed.
+    fn typed_bracket(
+        &mut self,
+        range: std::ops::Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.target.is_none() || self.field.marked.is_some() || range != self.field.sel {
+            return false;
+        }
+        if range.is_empty() {
+            let Some((paired, caret)) =
+                utopia_core::text::auto_pair(&self.field.text, range.start, text)
+            else {
+                return false;
+            };
+            if paired == self.field.text {
+                self.field.move_to(caret);
+                self.moved(cx);
+            } else {
+                self.field.text = paired;
+                self.field.move_to(caret);
+                self.after_edit(window, cx);
+            }
+            return true;
+        }
+        let Some((wrapped, sel)) = utopia_core::text::wrap_selection(&self.field.text, range, text)
+        else {
+            return false;
+        };
+        let reversed = self.field.reversed;
+        self.field.text = wrapped;
+        self.field.sel = sel;
+        self.field.reversed = reversed;
+        self.after_edit(window, cx);
+        // `[[word` now looks like a link being typed, but the user just made the link;
+        // a menu here would let Enter swap their word for some other page.
+        if let Some(ac) = self.ac.take() {
+            self.ac_dismissed = Some(ac.start);
+        }
+        true
+    }
+
     fn after_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.field.marked.is_some() {
             return;
@@ -480,24 +538,51 @@ impl BlockEditor {
         if changed {
             self.edits += 1;
             let seen = self.edits;
-            self.idle = Some(cx.spawn(async move |this, cx| {
+            self.idle = Some(cx.spawn(async move |this, cx| loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(300))
                     .await;
-                let _ = this.update(cx, |this, cx| {
-                    if this.edits == seen {
-                        this.commit(cx);
+                // `Ok(false)`: still inside a link being typed, so look again later.
+                let done = this.update(cx, |this, cx| {
+                    if this.edits != seen {
+                        return true;
                     }
+                    if this.typing_link() {
+                        return false;
+                    }
+                    this.commit_block(false, cx);
+                    true
                 });
+                if !matches!(done, Ok(false)) {
+                    break;
+                }
             }));
         }
     }
 
+    /// The caret is inside a `[[…]]`/`#[[…]]` still being typed. Auto-pairing closes the
+    /// link before its title is finished, so committing on idle here would create a page
+    /// for every pause (`[[An` → "An"). The idle commit waits until the caret has left
+    /// the link; blur, Enter and Escape commit at once, as before.
+    fn typing_link(&self) -> bool {
+        matches!(
+            detect_trigger(&self.field.text, self.field.cursor()),
+            Some((AcKind::Page | AcKind::BracketTag, ..))
+        )
+    }
+
     /// Commit the current block: NFC, hashtag longest-match, page creation for new links.
+    /// This is the block being finished (blur, Enter, Escape, navigation), so relative
+    /// dates are expanded even in the link the caret is in.
     pub fn commit(&mut self, cx: &mut Context<Self>) {
+        self.commit_block(true, cx);
+    }
+
+    /// `finished: false` is the idle commit, which leaves the link being typed alone.
+    fn commit_block(&mut self, finished: bool, cx: &mut Context<Self>) {
         let Some(t) = self.target.clone() else { return };
         self.idle = None;
-        self.expand_relative_dates(&t, cx);
+        self.expand_relative_dates(&t, finished, cx);
         let before = self.field.text.clone();
         let caret = self.field.cursor();
         let after = self.app.update(cx, |app, cx| {
@@ -523,19 +608,32 @@ impl BlockEditor {
     }
 
     /// `[[yesterday]]`, `[[next sunday]]` → a link to that day's page, once the link is
-    /// closed and the caret has left it. The phrase is replaced, not resolved later,
-    /// because its meaning changes every day (§10.3.1).
-    fn expand_relative_dates(&mut self, t: &EditTarget, cx: &mut Context<Self>) {
+    /// closed and the caret has left it, or the block is `finished` (a wrapped or
+    /// auto-closed link leaves the caret inside it). The phrase is replaced, not resolved
+    /// later, because its meaning changes every day (§10.3.1).
+    fn expand_relative_dates(&mut self, t: &EditTarget, finished: bool, cx: &mut Context<Self>) {
         let caret = self.field.cursor();
         let expanded = self.app.update(cx, |app, cx| {
             let store = &app.store;
-            let (text, caret) = utopia_core::date::expand_relative_date_links(
-                &self.field.text,
-                caret,
-                store.today(),
-                store.date_format(),
-                |title| store.find_page(title).ok().flatten().is_some(),
-            )?;
+            let exists = |title: &str| store.find_page(title).ok().flatten().is_some();
+            let (today, format) = (store.today(), store.date_format());
+            let (text, caret) = if finished {
+                utopia_core::date::finish_relative_date_links(
+                    &self.field.text,
+                    caret,
+                    today,
+                    format,
+                    exists,
+                )
+            } else {
+                utopia_core::date::expand_relative_date_links(
+                    &self.field.text,
+                    caret,
+                    today,
+                    format,
+                    exists,
+                )
+            }?;
             let r = app
                 .store
                 .set_block_text(&t.page, &t.block, &text, None, Some(caret));
@@ -792,8 +890,27 @@ impl BlockEditor {
         if self.ac.as_ref().is_some_and(|a| !a.items.is_empty()) {
             return self.accept(false, None, window, cx);
         }
+        // Split where the caret is once the block is finished: committing can rewrite the
+        // text before it (a relative date link the caret was in, §10.3.1).
+        self.commit(cx);
         let caret = self.field.cursor();
-        self.emit_after_commit(EditorEvent::Split { caret }, cx);
+        cx.emit(EditorEvent::Split { caret });
+    }
+
+    /// Tab in an open menu (FR-2.17): the highlighted suggestion, which is the first one
+    /// unless the user moved the highlight, exactly as Enter takes it. Bound only while
+    /// the menu has suggestions; otherwise the key falls through to its usual action.
+    fn accept_completion(
+        &mut self,
+        _: &AcceptCompletion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ac.as_ref().is_some_and(|a| !a.items.is_empty()) {
+            self.accept(false, None, window, cx);
+        } else {
+            cx.propagate();
+        }
     }
 
     fn insert_above(&mut self, _: &InsertAbove, window: &mut Window, cx: &mut Context<Self>) {
@@ -826,8 +943,23 @@ impl BlockEditor {
                 self.ac = None;
                 return self.emit_after_commit(EditorEvent::MergeBackward, cx);
             }
-            let to = self.field.prev_boundary();
-            self.field.select_to(to);
+            // `(|)` → `|`: the closer was put there by the opener, so it goes with it.
+            let pair = self
+                .field
+                .marked
+                .is_none()
+                .then(|| utopia_core::text::empty_pair_at(&self.field.text, self.field.cursor()))
+                .flatten();
+            match pair {
+                Some(r) => {
+                    self.field.move_to(r.start);
+                    self.field.select_to(r.end);
+                }
+                None => {
+                    let to = self.field.prev_boundary();
+                    self.field.select_to(to);
+                }
+            }
         }
         let sel = self.field.sel.clone();
         self.field.replace(sel, "");
@@ -1185,6 +1317,7 @@ impl BlockEditor {
                 .px_2()
                 .py_1()
                 .rounded_sm()
+                .cursor_pointer()
                 .when(i == ac.selected, |d| d.bg(th.hover))
                 .child(div().text_color(th.text).child(label))
                 .when_some(detail, |d, s| {
@@ -1254,8 +1387,13 @@ impl Render for BlockEditor {
             }
             (StyledText::new(text.clone()).with_highlights(hl), text)
         };
+        let mut key_context = gpui::KeyContext::default();
+        key_context.add(EDITOR_CONTEXT);
+        if self.ac.as_ref().is_some_and(|a| !a.items.is_empty()) {
+            key_context.add(AUTOCOMPLETE_CONTEXT);
+        }
         div()
-            .key_context(EDITOR_CONTEXT)
+            .key_context(key_context)
             .debug_selector(|| "block-editor".into())
             .track_focus(&self.focus)
             .w_full()
@@ -1263,6 +1401,7 @@ impl Render for BlockEditor {
             .cursor_text()
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::insert_above))
+            .on_action(cx.listener(Self::accept_completion))
             .on_action(cx.listener(Self::soft_break))
             .on_action(cx.listener(Self::indent))
             .on_action(cx.listener(Self::outdent))

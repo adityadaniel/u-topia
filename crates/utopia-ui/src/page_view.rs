@@ -1534,11 +1534,14 @@ impl PageView {
         let same = rendered.text.as_ref() == text;
         let source_len = text.len();
         let row2 = row.clone();
+        let links = rendered.links.iter().map(|(r, _)| r.clone()).collect();
         div()
             .flex_1()
             .min_h(px(LINE_HEIGHT))
-            .cursor_text()
-            .child(styled)
+            // An editable row shows the I-beam between its links; a read-only one (a query
+            // or search hit) is itself clickable, so it keeps its container's pointer.
+            .when(row.is_some(), |d| d.cursor_text())
+            .child(rich::LinkText::new(styled, links))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| {

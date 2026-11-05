@@ -5,7 +5,10 @@
 use std::ops::Range;
 
 use gpui::{
-    px, FontStyle, FontWeight, HighlightStyle, SharedString, StrikethroughStyle, UnderlineStyle,
+    point, px, App, Bounds, CursorStyle, Element, ElementId, FontStyle, FontWeight,
+    GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
+    LayoutId, Pixels, SharedString, StrikethroughStyle, StyledText, TextLayout, UnderlineStyle,
+    Window,
 };
 use utopia_core::inline::{extract_refs, parse, Inline, Mark, RefKind};
 
@@ -224,6 +227,127 @@ pub fn render(src: &str, theme: &Theme, chip: &mut dyn FnMut(&str) -> ChipState)
         highlights: b.highlights,
         links: b.links,
     }
+}
+
+/// A rendered block body whose links show the pointing hand on hover.
+///
+/// Links are runs inside one shaped text (§13.4), not child elements, so no `div` can
+/// carry `cursor_pointer` for them. Instead each link's line boxes get a hitbox with the
+/// pointing-hand cursor: gpui then switches the cursor as the mouse crosses them without
+/// re-rendering, and clicks still reach the row's own handler (the hitboxes don't block).
+pub struct LinkText {
+    text: StyledText,
+    links: Vec<Range<usize>>,
+}
+
+impl LinkText {
+    pub fn new(text: StyledText, links: Vec<Range<usize>>) -> Self {
+        Self { text, links }
+    }
+}
+
+impl IntoElement for LinkText {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for LinkText {
+    type RequestLayoutState = ();
+    type PrepaintState = Vec<Hitbox>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        Element::request_layout(&mut self.text, id, inspector_id, window, cx)
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<Hitbox> {
+        Element::prepaint(&mut self.text, id, inspector_id, bounds, state, window, cx);
+        let layout = self.text.layout().clone();
+        self.links
+            .iter()
+            .flat_map(|r| link_boxes(&layout, r, bounds))
+            .map(|b| window.insert_hitbox(b, HitboxBehavior::Normal))
+            .collect()
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut (),
+        hitboxes: &mut Vec<Hitbox>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Element::paint(
+            &mut self.text,
+            id,
+            inspector_id,
+            bounds,
+            state,
+            &mut (),
+            window,
+            cx,
+        );
+        for h in hitboxes.iter() {
+            window.set_cursor_style(CursorStyle::PointingHand, h);
+        }
+    }
+}
+
+/// The boxes a run of text covers: one per visual line it touches.
+fn link_boxes(
+    layout: &TextLayout,
+    r: &Range<usize>,
+    bounds: Bounds<Pixels>,
+) -> Vec<Bounds<Pixels>> {
+    let (Some(a), Some(b)) = (
+        layout.position_for_index(r.start),
+        layout.position_for_index(r.end),
+    ) else {
+        return Vec::new();
+    };
+    let lh = layout.line_height();
+    if (a.y - b.y).abs() < px(1.) {
+        return vec![Bounds::from_corners(a, point(b.x, a.y + lh))];
+    }
+    let mut out = vec![Bounds::from_corners(a, point(bounds.right(), a.y + lh))];
+    if b.y > a.y + lh {
+        out.push(Bounds::from_corners(
+            point(bounds.left(), a.y + lh),
+            point(bounds.right(), b.y),
+        ));
+    }
+    out.push(Bounds::from_corners(
+        point(bounds.left(), b.y),
+        point(b.x, b.y + lh),
+    ));
+    out
 }
 
 /// Syntax colouring for the focused block's source text: references are coloured, the

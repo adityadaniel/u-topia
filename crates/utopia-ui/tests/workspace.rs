@@ -184,12 +184,12 @@ fn autocomplete_inserts_canonical_links(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let text = rows(&app, &page, cx)[0].0.clone();
     assert_eq!(text, "see [[Alpha Prime]] and #[[Modern Religion]]");
-    // Escape dismisses and leaves the typed text intact (FR-2.17).
+    // Escape dismisses and leaves the typed text intact (FR-2.17), auto-closed `]]` too.
     cx.simulate_input(" [[Nov");
     cx.run_until_parked();
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
-    assert!(rows(&app, &page, cx)[0].0.ends_with("[[Nov"));
+    assert!(rows(&app, &page, cx)[0].0.ends_with("[[Nov]]"));
 }
 
 #[gpui::test]
@@ -1202,4 +1202,534 @@ fn relative_date_links(cx: &mut TestAppContext) {
             "no page named Yesterday"
         );
     });
+}
+
+/// The block editor's selected text, for scripts that check what is still selected.
+fn selected_text(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
+    ws.update(cx, |w, cx| {
+        let e = w.editor().read(cx);
+        e.field_text()[e.selection()].to_string()
+    })
+}
+
+/// Typing `[` twice over a selected word makes it a page link, Roam's idiom: the opening
+/// bracket surrounds the selection instead of replacing it, and the word stays selected.
+#[gpui::test]
+fn opening_bracket_wraps_the_selection(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    app.update(cx, |app, _| {
+        // A page the menu could offer for `[[launch`, so a menu opening would be visible.
+        app.store.create_page("Launch checklist").unwrap();
+    });
+    cx.simulate_input("Met Ana about launch");
+    cx.simulate_keystrokes("shift-left shift-left shift-left shift-left shift-left shift-left");
+    assert_eq!(selected_text(&ws, cx), "launch");
+    cx.simulate_input("[");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "Met Ana about [launch]");
+    assert_eq!(selected_text(&ws, cx), "launch", "still selected, inside");
+    cx.simulate_input("[");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "Met Ana about [[launch]]");
+    assert_eq!(selected_text(&ws, cx), "launch");
+    assert!(
+        ws.update(cx, |w, cx| w.editor().read(cx).ac.is_none()),
+        "the user made the link; no menu offers to replace it"
+    );
+    // Leaving the block commits it like any typed link.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    app.update(cx, |app, _| {
+        app.store.sync_index().unwrap();
+        let launch = app.store.find_page("launch").unwrap().expect("linked page");
+        assert_eq!(app.store.backlink_count(&launch).unwrap(), 1);
+    });
+}
+
+/// Each wrap is one edit, so one undo takes back exactly one wrap and never leaves a
+/// half-wrapped `(word` behind. The text is multi-byte and the selection ends on a
+/// grapheme cluster (§13.5).
+#[gpui::test]
+fn bracket_wrap_is_one_undo_step(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("see 日本語👩‍👩‍👧 now");
+    // Let the typing commit (300 ms idle) so it is its own undo step.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("left left left left shift-left shift-left shift-left shift-left");
+    assert_eq!(selected_text(&ws, cx), "日本語👩‍👩‍👧");
+    cx.simulate_input("(");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "see (日本語👩‍👩‍👧) now");
+    // Commit between the two, so they are separate undo steps rather than coalescing.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    cx.simulate_input("{");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "see ({日本語👩‍👩‍👧}) now");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "see (日本語👩‍👩‍👧) now");
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "see 日本語👩‍👩‍👧 now");
+    cx.simulate_keystrokes("cmd-shift-z");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "see (日本語👩‍👩‍👧) now");
+}
+
+/// Only brackets wrap. A quote typed over a selection replaces it as in any text field
+/// (the editor pairs nothing as you type), and IME composition is never wrapped.
+#[gpui::test]
+fn only_plain_brackets_wrap(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("say hi");
+    cx.simulate_keystrokes("shift-left shift-left");
+    cx.simulate_input("\"");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "say \"");
+    cx.simulate_input("hi");
+    cx.simulate_keystrokes("shift-left shift-left");
+    // An IME composes over the selection, then commits a bracket: that is the IME's
+    // text, not a keystroke over a selection, so it is inserted as is.
+    let editor = ws.update(cx, |w, _| w.editor());
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "[", None, window, cx);
+        e.replace_text_in_range(None, "[", window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "say \"[");
+}
+
+/// The title of the suggestion the open menu has highlighted.
+fn highlighted(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
+    use utopia_ui::editor::AcItem;
+    ws.update(cx, |w, cx| {
+        let e = w.editor().read(cx);
+        let ac = e.ac.as_ref().expect("a menu is open");
+        match &ac.items[ac.selected] {
+            AcItem::Page { title, .. } | AcItem::Create(title) => title.clone(),
+            AcItem::Command { label, .. } => label.clone(),
+            AcItem::Block { uid, .. } => uid.clone(),
+        }
+    })
+}
+
+/// Tab takes the highlighted suggestion in every menu, as Enter does (FR-2.17, FR-4.1,
+/// FR-4.2); with no menu open it still indents (FR-2.4).
+#[gpui::test]
+fn tab_accepts_the_highlighted_suggestion(cx: &mut TestAppContext) {
+    use utopia_core::BlockKind;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    app.update(cx, |app, _| {
+        app.store.create_page("Ana Lovelace").unwrap();
+        app.store.create_page("Analytics").unwrap();
+        app.store.create_page("Modern Religion").unwrap();
+    });
+    // `[[`: the first suggestion.
+    cx.simulate_input("Met [[ana");
+    cx.run_until_parked();
+    let first = highlighted(&ws, cx);
+    assert!(first.starts_with("Ana"), "{first}");
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, format!("Met [[{first}]]"));
+    // A moved highlight is what Tab takes.
+    cx.simulate_input(" and [[ana");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down");
+    let second = highlighted(&ws, cx);
+    assert_ne!(second, first);
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&app, &page, cx)[0].0,
+        format!("Met [[{first}]] and [[{second}]]")
+    );
+    // `#`: the canonical multi-word tag.
+    cx.simulate_input(" #mod");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&app, &page, cx)[0].0,
+        format!("Met [[{first}]] and [[{second}]] #[[Modern Religion]]")
+    );
+    // Nothing was indented or split along the way.
+    assert_eq!(rows(&app, &page, cx).len(), 1);
+    assert_eq!(rows(&app, &page, cx)[0].1, 0);
+
+    // `((`: a block reference.
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("see ((Met");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let (target, text) = app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).unwrap();
+        let roots = st.live_roots();
+        (roots[0].clone(), st.block(&roots[1]).unwrap().text.clone())
+    });
+    assert_eq!(text, format!("see (({target}))"));
+
+    // `/`: the slash menu runs the command.
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("Plan /head");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let r = rows(&app, &page, cx);
+    assert_eq!(rows_str(&r)[2], ("Plan ", 0), "accepted, not indented");
+    let kind = app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).unwrap();
+        st.block(&st.live_roots()[2]).unwrap().kind
+    });
+    assert_eq!(kind, BlockKind::Heading(1));
+
+    // No menu: Tab indents as before.
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&app, &page, cx)[2].1,
+        1,
+        "indented under the block above"
+    );
+}
+
+/// Accepting is a rebindable action: moved off Tab, Tab is free to indent again even with
+/// a menu open, and the new keys accept.
+#[gpui::test]
+fn accept_suggestion_can_be_rebound(cx: &mut TestAppContext) {
+    use utopia_ui::actions::{reinstall, Overrides};
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    let mut o = Overrides::default();
+    o.set("AcceptCompletion", "ctrl-y");
+    cx.update(|_, cx| reinstall(cx, &o));
+    app.update(cx, |app, _| {
+        app.store.create_page("Ana Lovelace").unwrap();
+    });
+    cx.simulate_input("first");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("[[ana");
+    cx.run_until_parked();
+    let first = highlighted(&ws, cx);
+    cx.simulate_keystrokes("ctrl-y");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[1].0, format!("[[{first}]]"));
+    cx.simulate_input(" [[ana");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(
+        rows_str(&rows(&app, &page, cx)),
+        vec![("first", 0), (format!("[[{first}]] [[ana]]").as_str(), 1)]
+    );
+}
+
+/// A link in a rendered block carries its own hitbox (for the pointing-hand cursor);
+/// clicking it must still follow the link, and clicking past it must still edit.
+#[gpui::test]
+fn clicking_a_rendered_link_follows_it(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (ana, src) = app.update(cx, |app, _| {
+        let ana = app.store.create_page("Ana Lovelace").unwrap();
+        let src = app.store.create_page("Reading").unwrap();
+        let b = app.store.ensure_first_block(&src).unwrap();
+        app.store
+            .set_block_text(&src, &b, "[[Ana Lovelace]] lent me this", None, None)
+            .unwrap();
+        app.store.sync_index().unwrap();
+        (ana, src)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(src.clone(), None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let content = cx.debug_bounds("content-1").expect("the block is rendered");
+    let line = gpui::px(utopia_ui::theme::LINE_HEIGHT);
+    // Past the link: the row starts editing, the page stays.
+    let past = gpui::point(content.right() - gpui::px(4.), content.top() + line / 2.);
+    cx.simulate_click(past, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(src.clone()));
+    assert!(ws.update(cx, |w, cx| w.editor().read(cx).target.is_some()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let on_link = gpui::point(content.left() + gpui::px(6.), content.top() + line / 2.);
+    cx.simulate_click(on_link, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(ana));
+}
+
+/// The editor's text and caret (before the block commits).
+fn text_and_caret(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> (String, usize) {
+    ws.update(cx, |w, cx| {
+        let e = w.editor().read(cx);
+        (e.field_text().to_string(), e.cursor())
+    })
+}
+
+/// Brackets pair as you type: the closer appears with the caret between, a typed closer
+/// steps over it, and before a word an opener is just an opener (§13.5).
+#[gpui::test]
+fn brackets_pair_as_you_type(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("call (");
+    assert_eq!(text_and_caret(&ws, cx), ("call ()".into(), 6));
+    cx.simulate_input("Ana)");
+    assert_eq!(
+        text_and_caret(&ws, cx),
+        ("call (Ana)".into(), 10),
+        "not `())`"
+    );
+    cx.simulate_input(" {x} [");
+    assert_eq!(text_and_caret(&ws, cx), ("call (Ana) {x} []".into(), 16));
+    cx.simulate_input("]");
+    assert_eq!(text_and_caret(&ws, cx), ("call (Ana) {x} []".into(), 17));
+    // Typing a whole link by hand still gives one pair of each.
+    cx.simulate_input(" [[x]] done");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "call (Ana) {x} [] [[x]] done");
+    // Before a word character: no closer.
+    cx.simulate_keystrokes("home");
+    cx.simulate_input("(");
+    assert_eq!(
+        text_and_caret(&ws, cx),
+        ("(call (Ana) {x} [] [[x]] done".into(), 1)
+    );
+}
+
+/// Backspace in an empty pair removes both brackets; with text inside, it is an ordinary
+/// backspace until the pair is empty again.
+#[gpui::test]
+fn backspace_removes_an_empty_pair(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("a (");
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text_and_caret(&ws, cx), ("a ".into(), 2));
+    cx.simulate_input("[[");
+    assert_eq!(text_and_caret(&ws, cx), ("a [[]]".into(), 4));
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text_and_caret(&ws, cx), ("a []".into(), 3));
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text_and_caret(&ws, cx), ("a ".into(), 2));
+    cx.simulate_input("{x");
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text_and_caret(&ws, cx), ("a {}".into(), 3));
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "a ");
+}
+
+/// A pair is one edit: one undo takes both brackets back.
+#[gpui::test]
+fn bracket_pair_is_one_undo_step(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("note ");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    cx.simulate_input("(");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "note ()");
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "note ");
+    cx.simulate_keystrokes("cmd-shift-z");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "note ()");
+    let _ = ws;
+}
+
+/// `[[`, `#[[` and `((` auto-close, the menus open as before, and accepting replaces the
+/// closers rather than leaving a second set: `[[Page]]` with the caret after `]]`.
+#[gpui::test]
+fn auto_closed_links_complete_cleanly(cx: &mut TestAppContext) {
+    use utopia_ui::editor::AcKind;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    app.update(cx, |app, _| {
+        app.store.create_page("Ana Lovelace").unwrap();
+        app.store.create_page("Modern Religion").unwrap();
+    });
+    cx.simulate_input("Met [[");
+    cx.run_until_parked();
+    assert_eq!(text_and_caret(&ws, cx), ("Met [[]]".into(), 6));
+    cx.simulate_input("An");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.editor().read(cx).ac.as_ref().map(|a| a.kind)),
+        Some(AcKind::Page),
+        "the [[ menu is open inside the auto-closed link"
+    );
+    // A pause mid-title does not commit `[[An]]` and create a page "An".
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    app.update(cx, |app, _| {
+        app.store.sync_index().unwrap();
+        assert!(app.store.find_page("An").unwrap().is_none());
+    });
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let want = "Met [[Ana Lovelace]]";
+    assert_eq!(text_and_caret(&ws, cx), (want.into(), want.len()));
+    // Enter, and the `#[[` form.
+    cx.simulate_input(" on #[[mod");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let want = "Met [[Ana Lovelace]] on #[[Modern Religion]]";
+    assert_eq!(text_and_caret(&ws, cx), (want.into(), want.len()));
+    // Once the caret is out of the link, the idle commit runs and the edge appears.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    app.update(cx, |app, _| {
+        app.store.sync_index().unwrap();
+        let ana = app.store.find_page("Ana Lovelace").unwrap().unwrap();
+        assert_eq!(app.store.backlink_count(&ana).unwrap(), 1);
+        assert!(app.store.find_page("An").unwrap().is_none());
+    });
+    // `((`: a block reference, closers replaced too.
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("see ((Met");
+    cx.run_until_parked();
+    assert_eq!(text_and_caret(&ws, cx).0, "see ((Met))");
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let (target, text) = app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).unwrap();
+        let roots = st.live_roots();
+        (roots[0].clone(), st.block(&roots[1]).unwrap().text.clone())
+    });
+    let want = format!("see (({target}))");
+    assert_eq!(text, want);
+    assert_eq!(text_and_caret(&ws, cx).1, want.len());
+}
+
+/// IME composition is the input method's text: a bracket it commits is not paired.
+#[gpui::test]
+fn ime_brackets_are_not_paired(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("x ");
+    let editor = ws.update(cx, |w, _| w.editor());
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "(", None, window, cx);
+        e.replace_text_in_range(None, "(", window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "x (");
+}
+
+/// No page titled like a relative date, and the day's page linked instead.
+fn assert_tomorrow_linked(app: &Entity<AppState>, cx: &mut VisualTestContext) {
+    app.update(cx, |app, _| {
+        let s = &mut app.store;
+        s.sync_index().unwrap();
+        assert!(
+            s.find_page("tomorrow").unwrap().is_none(),
+            "no page named tomorrow"
+        );
+        let day = s.find_page("2026-11-03").unwrap().expect("tomorrow's page");
+        assert!(s.backlink_count(&day).unwrap() >= 1);
+    });
+}
+
+/// Review fix: a relative date made into a link by wrapping the selection is still
+/// rewritten to the day's title when the block is finished, even though the wrap leaves
+/// the caret inside the link (§10.3.1, relative date links).
+#[gpui::test]
+fn wrapped_relative_date_expands_on_finish(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    cx.simulate_input("Pay rent tomorrow");
+    cx.simulate_keystrokes(
+        "shift-left shift-left shift-left shift-left shift-left shift-left shift-left shift-left",
+    );
+    cx.simulate_input("[[");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        day_texts(&app, today(), cx),
+        ["Pay rent [[November 3rd, 2026]]"]
+    );
+    assert_tomorrow_linked(&app, cx);
+}
+
+/// Review fix: an auto-closed `[[tomorrow]]` whose menu was dismissed is rewritten when
+/// the block is finished by Escape, Enter or moving to another block, with the caret
+/// still before the auto-inserted `]]`.
+#[gpui::test]
+fn auto_closed_relative_date_expands_on_finish(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    // Escape twice: close the menu, then leave the block.
+    cx.simulate_input("a [[tomorrow");
+    cx.simulate_keystrokes("escape escape");
+    cx.run_until_parked();
+    assert_eq!(day_texts(&app, today(), cx), ["a [[November 3rd, 2026]]"]);
+    assert_tomorrow_linked(&app, cx);
+}
+
+#[gpui::test]
+fn auto_closed_relative_date_expands_on_enter(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    cx.simulate_input("b [[tomorrow");
+    cx.simulate_keystrokes("escape enter");
+    cx.run_until_parked();
+    assert_eq!(
+        day_texts(&app, today(), cx),
+        ["b [[November 3rd, 2026]]", ""],
+        "the split lands after the finished link, not inside it"
+    );
+    assert_tomorrow_linked(&app, cx);
+}
+
+#[gpui::test]
+fn auto_closed_relative_date_expands_on_moving_away(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    cx.simulate_input("first");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("c [[tomorrow");
+    cx.simulate_keystrokes("escape up");
+    cx.run_until_parked();
+    assert_eq!(
+        day_texts(&app, today(), cx),
+        ["first", "c [[November 3rd, 2026]]"]
+    );
+    assert_tomorrow_linked(&app, cx);
+}
+
+/// Accepting the suggestion (Tab or Enter) inserts the day's title directly.
+#[gpui::test]
+fn auto_closed_relative_date_accepts_with_tab(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("d [[tomorrow");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let want = "d [[November 3rd, 2026]]";
+    assert_eq!(text_and_caret(&ws, cx), (want.into(), want.len()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(day_texts(&app, today(), cx), [want]);
+    assert_tomorrow_linked(&app, cx);
 }

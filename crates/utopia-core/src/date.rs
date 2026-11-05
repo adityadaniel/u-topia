@@ -267,6 +267,31 @@ pub fn expand_relative_date_links(
     format: &DateFormat,
     exists: impl Fn(&str) -> bool,
 ) -> Option<(String, usize)> {
+    expand_links(text, caret, true, today, format, exists)
+}
+
+/// [`expand_relative_date_links`] for a block that is being finished (blur, Enter,
+/// Escape): the link the caret is in is done too, so it is expanded like the rest and the
+/// caret moves to just after it. Only an idle commit, while the user may still be typing
+/// the phrase, leaves that link alone.
+pub fn finish_relative_date_links(
+    text: &str,
+    caret: usize,
+    today: NaiveDate,
+    format: &DateFormat,
+    exists: impl Fn(&str) -> bool,
+) -> Option<(String, usize)> {
+    expand_links(text, caret, false, today, format, exists)
+}
+
+fn expand_links(
+    text: &str,
+    caret: usize,
+    skip_inside: bool,
+    today: NaiveDate,
+    format: &DateFormat,
+    exists: impl Fn(&str) -> bool,
+) -> Option<(String, usize)> {
     let mut out = String::with_capacity(text.len());
     let mut new_caret = caret;
     let mut last = 0;
@@ -285,7 +310,7 @@ pub fn expand_relative_date_links(
             continue;
         }
         let inside = r.range.start < caret && caret < r.range.end;
-        if inside || r.range.start < last {
+        if (inside && skip_inside) || r.range.start < last {
             continue;
         }
         let Some(d) = relative_date(&r.target, today) else {
@@ -300,6 +325,9 @@ pub fn expand_relative_date_links(
         }
         out.push_str(&text[last..r.range.start]);
         out.push_str(&link);
+        if inside {
+            new_caret = out.len();
+        }
         last = r.range.end;
     }
     if last == 0 {
@@ -599,6 +627,30 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    /// Finishing the block finishes the link the caret is in (a wrapped or auto-closed
+    /// `[[tomorrow|]]`); the caret lands after the new link.
+    #[test]
+    fn finishing_expands_the_link_at_the_caret() {
+        let t = d(2026, 11, 3);
+        let f = DateFormat::default();
+        let none = |_: &str| false;
+        let text = "see [[tomorrow]] then [[yesterday]]";
+        let (out, caret) = finish_relative_date_links(text, 14, t, &f, none).unwrap();
+        assert_eq!(
+            out,
+            "see [[November 4th, 2026]] then [[November 2nd, 2026]]"
+        );
+        assert_eq!(&out[..caret], "see [[November 4th, 2026]]");
+        // Elsewhere it behaves like the idle expansion.
+        let (out, caret) = finish_relative_date_links("[[today]] x", 11, t, &f, none).unwrap();
+        assert_eq!((out.as_str(), caret), ("[[November 3rd, 2026]] x", 24));
+        assert_eq!(
+            finish_relative_date_links("[[Today]]", 4, t, &f, |p| p == "Today"),
+            None,
+            "a real page still wins"
+        );
     }
 
     #[test]
