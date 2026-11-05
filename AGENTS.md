@@ -113,6 +113,66 @@ Sync (§12; secrets never go into the graph file, §15.6):
   — token and passphrase may also come from the macOS keychain (services `utopia-sync`,
   `utopia-sync-passphrase`, account = graph id).
 
+## Verifying a change (do this before opening a PR)
+
+`make check` proves the code compiles and the tests pass. It does **not** prove the feature
+works: every UI bug found in this repo so far — prose that would not wrap, a screenshot drawn
+at the wrong size, a second Settings window opening instead of the first being raised — passed
+every test and was caught by looking at a picture. So verification has four steps, in order.
+
+**1. `make check`.** fmt, build, test, clippy. Never skip it and never open a PR without it.
+
+**2. Seed a graph with mock data.** Drive the `Store` directly rather than typing content
+through keystrokes: it is deterministic, it reads well in a screenshot, and it cannot race the
+UI. `seed_help_graph` in `xtask/src/main.rs` is the worked example — a project page, a person,
+and a few days of notes that link them, which between them exercise links, backlinks,
+attributes, to-dos, nesting and the graph view. Seed into a scratch directory under `target/`,
+never into a real graph.
+
+**3. Drive the real app and capture it.** `UTOPIA_SHOT_SCRIPT` with `UTOPIA_CONFIG_DIR` and
+`--graph` both pointing at scratch paths, so the user's own notes are never touched:
+
+```bash
+UTOPIA_CONFIG_DIR=/tmp/scratch/config \
+UTOPIA_SHOT_SCRIPT="wait 900; keys escape; wait 300; keys cmd-shift-t; wait 700; shot /tmp/scratch/today.png" \
+  cargo run -p utopia-app -- --graph target/help-shots/Demo.utopia
+```
+
+- `keys escape` before a shot: a focused block shows its raw `[[markup]]`, which is not what
+  the feature looks like in use.
+- `wait` generously (500–1200 ms) after anything that opens a panel, loads days or lays out the
+  graph. A shot taken too early captures a half-drawn frame and is worse than no shot.
+- For a second window (Settings), `keys cmd-,; wait 1200; target last; wait 500; shot …`.
+
+**4. Read every PNG you captured.** Not "it ran without error" — actually look. Check the text
+is the mock data you seeded and not stray characters, that nothing overflows its container, and
+that the thing you changed is visible and correct. A capture run against a scratch graph that an
+earlier run already typed into will show that earlier mess; reseed (step 2) rather than
+explaining the mess away. If you cannot see your change in the picture, you have not verified it.
+
+Then save the shots you would want a reviewer to see under
+`docs/verification/<branch-name>/` and reference them from the PR (see below). Keep them
+downscaled (`sips -Z 1200`); a handful of 150–300 KB PNGs is the budget, not full Retina
+captures.
+
+## Opening a PR
+
+CI (`.github/workflows/ci.yml`) runs fmt, build, test and clippy on macOS for every PR; it is
+the floor, not the evidence. A PR is reviewable when its description carries:
+
+- **What changed and why**, citing the PRD ids the change implements.
+- **Proof of work**: the screenshots from step 4 above, inlined from
+  `docs/verification/<branch>/` so they render in the PR, each captioned with what it proves.
+- **The checks**, quoted as output (`make check`, test count), not asserted in prose.
+- **What you did not do**: anything you left out, worked around, or could not verify, and why.
+  A known limit written down is worth more than a clean-looking PR that hides it.
+
+Bugs found and fixed along the way belong in the description too — they are the most useful
+part of a review. `.github/pull_request_template.md` holds this as a checklist.
+
+Performance-sensitive work also needs `cargo run -p xtask --release -- bench --ui` locally. CI
+deliberately does not run it: a shared runner's timings say nothing about the §15.1 budgets.
+
 ## Workspace layout (§13.1)
 
 | Crate | Responsibility | May depend on |

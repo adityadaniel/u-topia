@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a PR makes the previous run irrelevant; macOS minutes are expensive.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # GPUI and Loro rlibs fill the disk fast when features change (see AGENTS.md).
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    # macOS only: the app links AppKit, PDFKit and the macOS keychain, and utopia-store
+    # builds SQLCipher. There is no Linux target to check against.
+    name: build, test, clippy, fmt
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Point at the installed Xcode
+        # The bundle is renamed by every Xcode release, so ask rather than hardcode.
+        run: echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The first build compiles GPUI and takes several minutes; share the cache
+          # across jobs on the same OS.
+          shared-key: macos-15
+
+      # Formatting first: it is seconds, and failing early saves a long build.
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo build
+        run: cargo build --workspace
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `xtask bench` is deliberately not run here: it asserts the §15.1 performance
+      # budgets, and a shared CI runner's timings are not comparable to a real machine.
+      # Run it locally in release before changing anything performance-sensitive.
