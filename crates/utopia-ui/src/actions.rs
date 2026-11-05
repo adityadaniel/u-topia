@@ -915,10 +915,13 @@ impl Overrides {
     }
 }
 
-/// Install default bindings, then the user's overrides on top.
+/// Install default bindings, then the user's overrides on top. A rebound action loses its
+/// default keys: gpui would otherwise keep both, and the old keys would go on firing while
+/// Settings shows only the new ones.
 pub fn install(cx: &mut App, overrides: &Overrides) {
     let mut bindings: Vec<KeyBinding> = CATALOG
         .iter()
+        .filter(|d| !overrides.is_changed(d.action))
         .filter_map(|d| binding(d.action, &platform_keys(d.keys), d.context))
         .collect();
     // Overrides come last: gpui lets a later binding win for the same keys.

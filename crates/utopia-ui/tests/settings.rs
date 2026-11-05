@@ -190,3 +190,27 @@ fn a_broken_keymap_is_reported_not_fatal(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// A rebound action answers to its new keys only: the default it replaced is not left
+/// installed alongside, invisible in Settings but still firing.
+#[gpui::test]
+fn rebinding_replaces_the_default_keys(cx: &mut TestAppContext) {
+    use utopia_ui::actions::{install, GoToday};
+    let mut o = Overrides::default();
+    o.set("GoToday", "alt-cmd-t");
+    cx.update(|cx| install(cx, &o));
+    let keys: Vec<String> = cx.update(|cx| {
+        cx.key_bindings()
+            .borrow()
+            .bindings_for_action(&GoToday)
+            .map(|b| {
+                b.keystrokes()
+                    .iter()
+                    .map(|k| k.unparse())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    });
+    assert_eq!(keys, ["alt-cmd-t"]);
+}
