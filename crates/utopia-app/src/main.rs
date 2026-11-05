@@ -468,7 +468,8 @@ impl Render for Root {
             .bg(th.bg)
             .text_color(th.text)
             .text_size(px(utopia_ui::theme::TEXT_SIZE))
-            .line_height(px(utopia_ui::theme::LINE_HEIGHT));
+            .line_height(px(utopia_ui::theme::LINE_HEIGHT))
+            .font_family(utopia_ui::appearance::font_family(cx));
         match &self.state {
             RootState::Ready(ws) => shell.child(ws.clone()),
             RootState::Onboarding { input, error, .. } => {
@@ -663,6 +664,7 @@ fn run_app(graph: Option<PathBuf>) {
     });
     application.run(move |cx: &mut App| {
         cx.set_global(Theme::light());
+        utopia_ui::appearance::install(cx, &config);
         install_keymap(cx, keymap.as_deref());
         cx.set_menus(menus());
         cx.on_action(|_: &Quit, cx| cx.quit());

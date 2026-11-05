@@ -37,8 +37,12 @@ cargo fmt --all -- --check
 Run the app with `cargo run -p utopia-app` (binary name `utopia`). The graph is chosen in
 this order: `--graph <file>`, `UTOPIA_GRAPH`, the last graph opened (recorded in the config
 dir), the only `*.utopia` in `~/Documents/Utopia`; otherwise onboarding asks for a name (§9.3).
-`UTOPIA_CONFIG_DIR` overrides the config dir (`keymap.json`, `last_graph`); point both env vars
-at a scratch folder when trying the app so you never touch the user's real graph.
+`UTOPIA_CONFIG_DIR` overrides the config dir (`keymap.json`, `settings.json`, `last_graph`); point
+both env vars at a scratch folder when trying the app so you never touch the user's real graph.
+`settings.json` holds local UI preferences (never synced, rule 9), a versioned object:
+`{"version": 1, "font": "system" | "ibm-plex-sans"}` (`utopia_ui::appearance`); a missing file or
+an unknown value means the default, logged; it is written atomically and keeps keys it does
+not know.
 
 Headless commands (`cargo run -p utopia-app -- <cmd>`): `doctor <file> [--rebuild]` checks
 the §10.4 invariants (exit 1 on problems); `export <file> <dir>` writes Markdown (attachments in
@@ -280,9 +284,11 @@ Implemented:
 - **Sync (§11.7, §12):** HTTP relay and client, background sync with status and merge notices,
   snapshot compaction, Loro-cursor caret preservation, end-to-end encryption (Argon2id +
   XChaCha20-Poly1305), realtime WebSocket notices, folder transport, LAN relay with mDNS.
-- **Settings and keybindings (§9.1):** a Settings window (Cmd+,) with three tabs —
+- **Settings and keybindings (§9.1):** a Settings window (Cmd+,) with four tabs —
   **Keybindings**, where every action can be rebound by pressing the keys and the change
-  applies at once; **Shortcuts**, the cheat sheet of everything bound; and **Help**, a tour of
+  applies at once; **Shortcuts**, the cheat sheet of everything bound; **Appearance**, the font
+  (System, or IBM Plex Sans bundled under the OFL in `crates/utopia-ui/assets/fonts`; code stays
+  Menlo), applied to every window at once and kept in `settings.json`; and **Help**, a tour of
   the features with screenshots captured from the app (`cargo run -p xtask -- help-shots`).
   `utopia_ui::actions::CATALOG` is the one source of truth: default keys plus the label,
   category and help text for each action, so the editor, the cheat sheet and the installed
