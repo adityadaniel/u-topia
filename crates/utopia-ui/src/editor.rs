@@ -1241,6 +1241,7 @@ impl BlockEditor {
                 .px_2()
                 .py_1()
                 .rounded_sm()
+                .cursor_pointer()
                 .when(i == ac.selected, |d| d.bg(th.hover))
                 .child(div().text_color(th.text).child(label))
                 .when_some(detail, |d, s| {

@@ -1436,3 +1436,39 @@ fn accept_suggestion_can_be_rebound(cx: &mut TestAppContext) {
         vec![("first", 0), (format!("[[{first}]] [[ana").as_str(), 1)]
     );
 }
+
+/// A link in a rendered block carries its own hitbox (for the pointing-hand cursor);
+/// clicking it must still follow the link, and clicking past it must still edit.
+#[gpui::test]
+fn clicking_a_rendered_link_follows_it(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (ana, src) = app.update(cx, |app, _| {
+        let ana = app.store.create_page("Ana Lovelace").unwrap();
+        let src = app.store.create_page("Reading").unwrap();
+        let b = app.store.ensure_first_block(&src).unwrap();
+        app.store
+            .set_block_text(&src, &b, "[[Ana Lovelace]] lent me this", None, None)
+            .unwrap();
+        app.store.sync_index().unwrap();
+        (ana, src)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(src.clone(), None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let content = cx.debug_bounds("content-1").expect("the block is rendered");
+    let line = gpui::px(utopia_ui::theme::LINE_HEIGHT);
+    // Past the link: the row starts editing, the page stays.
+    let past = gpui::point(content.right() - gpui::px(4.), content.top() + line / 2.);
+    cx.simulate_click(past, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(src.clone()));
+    assert!(ws.update(cx, |w, cx| w.editor().read(cx).target.is_some()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let on_link = gpui::point(content.left() + gpui::px(6.), content.top() + line / 2.);
+    cx.simulate_click(on_link, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(ana));
+}
