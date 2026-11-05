@@ -1309,3 +1309,130 @@ fn only_plain_brackets_wrap(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(rows(&app, &page, cx)[0].0, "say \"[");
 }
+
+/// The title of the suggestion the open menu has highlighted.
+fn highlighted(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
+    use utopia_ui::editor::AcItem;
+    ws.update(cx, |w, cx| {
+        let e = w.editor().read(cx);
+        let ac = e.ac.as_ref().expect("a menu is open");
+        match &ac.items[ac.selected] {
+            AcItem::Page { title, .. } | AcItem::Create(title) => title.clone(),
+            AcItem::Command { label, .. } => label.clone(),
+            AcItem::Block { uid, .. } => uid.clone(),
+        }
+    })
+}
+
+/// Tab takes the highlighted suggestion in every menu, as Enter does (FR-2.17, FR-4.1,
+/// FR-4.2); with no menu open it still indents (FR-2.4).
+#[gpui::test]
+fn tab_accepts_the_highlighted_suggestion(cx: &mut TestAppContext) {
+    use utopia_core::BlockKind;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    app.update(cx, |app, _| {
+        app.store.create_page("Ana Lovelace").unwrap();
+        app.store.create_page("Analytics").unwrap();
+        app.store.create_page("Modern Religion").unwrap();
+    });
+    // `[[`: the first suggestion.
+    cx.simulate_input("Met [[ana");
+    cx.run_until_parked();
+    let first = highlighted(&ws, cx);
+    assert!(first.starts_with("Ana"), "{first}");
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, format!("Met [[{first}]]"));
+    // A moved highlight is what Tab takes.
+    cx.simulate_input(" and [[ana");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down");
+    let second = highlighted(&ws, cx);
+    assert_ne!(second, first);
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&app, &page, cx)[0].0,
+        format!("Met [[{first}]] and [[{second}]]")
+    );
+    // `#`: the canonical multi-word tag.
+    cx.simulate_input(" #mod");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&app, &page, cx)[0].0,
+        format!("Met [[{first}]] and [[{second}]] #[[Modern Religion]]")
+    );
+    // Nothing was indented or split along the way.
+    assert_eq!(rows(&app, &page, cx).len(), 1);
+    assert_eq!(rows(&app, &page, cx)[0].1, 0);
+
+    // `((`: a block reference.
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("see ((Met");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let (target, text) = app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).unwrap();
+        let roots = st.live_roots();
+        (roots[0].clone(), st.block(&roots[1]).unwrap().text.clone())
+    });
+    assert_eq!(text, format!("see (({target}))"));
+
+    // `/`: the slash menu runs the command.
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("Plan /head");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let r = rows(&app, &page, cx);
+    assert_eq!(rows_str(&r)[2], ("Plan ", 0), "accepted, not indented");
+    let kind = app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).unwrap();
+        st.block(&st.live_roots()[2]).unwrap().kind
+    });
+    assert_eq!(kind, BlockKind::Heading(1));
+
+    // No menu: Tab indents as before.
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&app, &page, cx)[2].1,
+        1,
+        "indented under the block above"
+    );
+}
+
+/// Accepting is a rebindable action: moved off Tab, Tab is free to indent again even with
+/// a menu open, and the new keys accept.
+#[gpui::test]
+fn accept_suggestion_can_be_rebound(cx: &mut TestAppContext) {
+    use utopia_ui::actions::{reinstall, Overrides};
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    let mut o = Overrides::default();
+    o.set("AcceptCompletion", "ctrl-y");
+    cx.update(|_, cx| reinstall(cx, &o));
+    app.update(cx, |app, _| {
+        app.store.create_page("Ana Lovelace").unwrap();
+    });
+    cx.simulate_input("first");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("[[ana");
+    cx.run_until_parked();
+    let first = highlighted(&ws, cx);
+    cx.simulate_keystrokes("ctrl-y");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[1].0, format!("[[{first}]]"));
+    cx.simulate_input(" [[ana");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(
+        rows_str(&rows(&app, &page, cx)),
+        vec![("first", 0), (format!("[[{first}]] [[ana").as_str(), 1)]
+    );
+}

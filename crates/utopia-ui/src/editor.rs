@@ -836,6 +836,22 @@ impl BlockEditor {
         self.emit_after_commit(EditorEvent::Split { caret }, cx);
     }
 
+    /// Tab in an open menu (FR-2.17): the highlighted suggestion, which is the first one
+    /// unless the user moved the highlight, exactly as Enter takes it. Bound only while
+    /// the menu has suggestions; otherwise the key falls through to its usual action.
+    fn accept_completion(
+        &mut self,
+        _: &AcceptCompletion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ac.as_ref().is_some_and(|a| !a.items.is_empty()) {
+            self.accept(false, None, window, cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
     fn insert_above(&mut self, _: &InsertAbove, window: &mut Window, cx: &mut Context<Self>) {
         if self.ac.is_some() {
             return self.accept(true, None, window, cx);
@@ -1294,8 +1310,13 @@ impl Render for BlockEditor {
             }
             (StyledText::new(text.clone()).with_highlights(hl), text)
         };
+        let mut key_context = gpui::KeyContext::default();
+        key_context.add(EDITOR_CONTEXT);
+        if self.ac.as_ref().is_some_and(|a| !a.items.is_empty()) {
+            key_context.add(AUTOCOMPLETE_CONTEXT);
+        }
         div()
-            .key_context(EDITOR_CONTEXT)
+            .key_context(key_context)
             .debug_selector(|| "block-editor".into())
             .track_focus(&self.focus)
             .w_full()
@@ -1303,6 +1324,7 @@ impl Render for BlockEditor {
             .cursor_text()
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::insert_above))
+            .on_action(cx.listener(Self::accept_completion))
             .on_action(cx.listener(Self::soft_break))
             .on_action(cx.listener(Self::indent))
             .on_action(cx.listener(Self::outdent))
