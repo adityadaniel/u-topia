@@ -1640,3 +1640,96 @@ fn ime_brackets_are_not_paired(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(rows(&app, &page, cx)[0].0, "x (");
 }
+
+/// No page titled like a relative date, and the day's page linked instead.
+fn assert_tomorrow_linked(app: &Entity<AppState>, cx: &mut VisualTestContext) {
+    app.update(cx, |app, _| {
+        let s = &mut app.store;
+        s.sync_index().unwrap();
+        assert!(
+            s.find_page("tomorrow").unwrap().is_none(),
+            "no page named tomorrow"
+        );
+        let day = s.find_page("2026-11-03").unwrap().expect("tomorrow's page");
+        assert!(s.backlink_count(&day).unwrap() >= 1);
+    });
+}
+
+/// Review fix: a relative date made into a link by wrapping the selection is still
+/// rewritten to the day's title when the block is finished, even though the wrap leaves
+/// the caret inside the link (§10.3.1, relative date links).
+#[gpui::test]
+fn wrapped_relative_date_expands_on_finish(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    cx.simulate_input("Pay rent tomorrow");
+    cx.simulate_keystrokes(
+        "shift-left shift-left shift-left shift-left shift-left shift-left shift-left shift-left",
+    );
+    cx.simulate_input("[[");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        day_texts(&app, today(), cx),
+        ["Pay rent [[November 3rd, 2026]]"]
+    );
+    assert_tomorrow_linked(&app, cx);
+}
+
+/// Review fix: an auto-closed `[[tomorrow]]` whose menu was dismissed is rewritten when
+/// the block is finished by Escape, Enter or moving to another block, with the caret
+/// still before the auto-inserted `]]`.
+#[gpui::test]
+fn auto_closed_relative_date_expands_on_finish(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    // Escape twice: close the menu, then leave the block.
+    cx.simulate_input("a [[tomorrow");
+    cx.simulate_keystrokes("escape escape");
+    cx.run_until_parked();
+    assert_eq!(day_texts(&app, today(), cx), ["a [[November 3rd, 2026]]"]);
+    assert_tomorrow_linked(&app, cx);
+}
+
+#[gpui::test]
+fn auto_closed_relative_date_expands_on_enter(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    cx.simulate_input("b [[tomorrow");
+    cx.simulate_keystrokes("escape enter");
+    cx.run_until_parked();
+    assert_eq!(
+        day_texts(&app, today(), cx),
+        ["b [[November 3rd, 2026]]", ""],
+        "the split lands after the finished link, not inside it"
+    );
+    assert_tomorrow_linked(&app, cx);
+}
+
+#[gpui::test]
+fn auto_closed_relative_date_expands_on_moving_away(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    cx.simulate_input("first");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("c [[tomorrow");
+    cx.simulate_keystrokes("escape up");
+    cx.run_until_parked();
+    assert_eq!(
+        day_texts(&app, today(), cx),
+        ["first", "c [[November 3rd, 2026]]"]
+    );
+    assert_tomorrow_linked(&app, cx);
+}
+
+/// Accepting the suggestion (Tab or Enter) inserts the day's title directly.
+#[gpui::test]
+fn auto_closed_relative_date_accepts_with_tab(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("d [[tomorrow");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let want = "d [[November 3rd, 2026]]";
+    assert_eq!(text_and_caret(&ws, cx), (want.into(), want.len()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(day_texts(&app, today(), cx), [want]);
+    assert_tomorrow_linked(&app, cx);
+}

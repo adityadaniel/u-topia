@@ -550,7 +550,7 @@ impl BlockEditor {
                     if this.typing_link() {
                         return false;
                     }
-                    this.commit(cx);
+                    this.commit_block(false, cx);
                     true
                 });
                 if !matches!(done, Ok(false)) {
@@ -572,10 +572,17 @@ impl BlockEditor {
     }
 
     /// Commit the current block: NFC, hashtag longest-match, page creation for new links.
+    /// This is the block being finished (blur, Enter, Escape, navigation), so relative
+    /// dates are expanded even in the link the caret is in.
     pub fn commit(&mut self, cx: &mut Context<Self>) {
+        self.commit_block(true, cx);
+    }
+
+    /// `finished: false` is the idle commit, which leaves the link being typed alone.
+    fn commit_block(&mut self, finished: bool, cx: &mut Context<Self>) {
         let Some(t) = self.target.clone() else { return };
         self.idle = None;
-        self.expand_relative_dates(&t, cx);
+        self.expand_relative_dates(&t, finished, cx);
         let before = self.field.text.clone();
         let caret = self.field.cursor();
         let after = self.app.update(cx, |app, cx| {
@@ -601,19 +608,32 @@ impl BlockEditor {
     }
 
     /// `[[yesterday]]`, `[[next sunday]]` → a link to that day's page, once the link is
-    /// closed and the caret has left it. The phrase is replaced, not resolved later,
-    /// because its meaning changes every day (§10.3.1).
-    fn expand_relative_dates(&mut self, t: &EditTarget, cx: &mut Context<Self>) {
+    /// closed and the caret has left it, or the block is `finished` (a wrapped or
+    /// auto-closed link leaves the caret inside it). The phrase is replaced, not resolved
+    /// later, because its meaning changes every day (§10.3.1).
+    fn expand_relative_dates(&mut self, t: &EditTarget, finished: bool, cx: &mut Context<Self>) {
         let caret = self.field.cursor();
         let expanded = self.app.update(cx, |app, cx| {
             let store = &app.store;
-            let (text, caret) = utopia_core::date::expand_relative_date_links(
-                &self.field.text,
-                caret,
-                store.today(),
-                store.date_format(),
-                |title| store.find_page(title).ok().flatten().is_some(),
-            )?;
+            let exists = |title: &str| store.find_page(title).ok().flatten().is_some();
+            let (today, format) = (store.today(), store.date_format());
+            let (text, caret) = if finished {
+                utopia_core::date::finish_relative_date_links(
+                    &self.field.text,
+                    caret,
+                    today,
+                    format,
+                    exists,
+                )
+            } else {
+                utopia_core::date::expand_relative_date_links(
+                    &self.field.text,
+                    caret,
+                    today,
+                    format,
+                    exists,
+                )
+            }?;
             let r = app
                 .store
                 .set_block_text(&t.page, &t.block, &text, None, Some(caret));
@@ -870,8 +890,11 @@ impl BlockEditor {
         if self.ac.as_ref().is_some_and(|a| !a.items.is_empty()) {
             return self.accept(false, None, window, cx);
         }
+        // Split where the caret is once the block is finished: committing can rewrite the
+        // text before it (a relative date link the caret was in, §10.3.1).
+        self.commit(cx);
         let caret = self.field.cursor();
-        self.emit_after_commit(EditorEvent::Split { caret }, cx);
+        cx.emit(EditorEvent::Split { caret });
     }
 
     /// Tab in an open menu (FR-2.17): the highlighted suggestion, which is the first one
