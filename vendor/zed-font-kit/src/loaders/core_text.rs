@@ -434,17 +434,28 @@ impl Font {
         glyph_id: u32,
         point_size: f32,
         transform: Transform2F,
-        hinting_options: HintingOptions,
-        rasterization_options: RasterizationOptions,
+        _: HintingOptions,
+        _: RasterizationOptions,
     ) -> Result<RectI, GlyphLoadingError> {
-        <Self as Loader>::raster_bounds(
-            self,
-            glyph_id,
-            point_size,
-            transform,
-            hinting_options,
-            rasterization_options,
-        )
+        // Utopia patch: measure the glyph with a CTFont *at the size it is drawn*. The generic
+        // loader scales the bounds of this font's own instance (created at 16 pt) linearly,
+        // but a font with an optical-size axis (the macOS system font, SF Pro) has different
+        // outlines at every size: from about 20 pt up its glyphs sit further left than the
+        // scaled bounds, and the rasterizer, which draws at the real size, cut off their left
+        // edge (headings and page titles lost their anti-aliased left column). And CoreText's
+        // anti-aliasing spills up to a pixel past the outline, so leave a pixel of room on
+        // every side, or the soft bottom row of a bowl (b, o, d) is cut off flat.
+        let sized = self.core_text_font.clone_with_font_size(point_size as CGFloat);
+        let rect = sized.get_bounding_rects_for_glyphs(kCTFontDefaultOrientation, &[glyph_id as u16]);
+        // Origin top left, y down, like the generic loader.
+        let bounds = RectF::new(
+            Vector2F::new(rect.origin.x as f32, -(rect.origin.y + rect.size.height) as f32),
+            Vector2F::new(rect.size.width as f32, rect.size.height as f32),
+        );
+        Ok((transform * bounds)
+            .dilate(Vector2F::splat(1.0))
+            .round_out()
+            .to_i32())
     }
 
     /// Rasterizes a glyph to a canvas with the given size and origin.
@@ -720,6 +731,24 @@ impl Loader for Font {
         for_rasterization: bool,
     ) -> bool {
         self.supports_hinting_options(hinting_options, for_rasterization)
+    }
+
+    #[inline]
+    fn raster_bounds(
+        &self,
+        glyph_id: u32,
+        point_size: f32,
+        transform: Transform2F,
+        hinting_options: HintingOptions,
+        rasterization_options: RasterizationOptions,
+    ) -> Result<RectI, GlyphLoadingError> {
+        self.raster_bounds(
+            glyph_id,
+            point_size,
+            transform,
+            hinting_options,
+            rasterization_options,
+        )
     }
 
     #[inline]
