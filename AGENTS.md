@@ -60,13 +60,16 @@ Steps (`;` or newline separated): `keys <k…>`, `type <text>` (lines are trimme
 after `type` keeps a leading one), `wait <ms>`, `scroll <dy>` (a real AppKit wheel event in the
 main pane; negative scrolls down), `shot <png>`, `drop <file>` (as from Finder),
 `ws open-pdf` / `ws highlight <page> <x> <y> <w> <h>` (area) / `ws select <page> <x0> <y0> <x1> <y1>`
-(text selection). Then read the PNG. Do this for any visible
+(text selection), `target main|last` (which window the steps after it drive and capture —
+`last` is the most recently opened, which is how the Settings window is reached:
+`keys cmd-,; wait 800; target last; shot …`). Then read the PNG. Do this for any visible
 change: it has caught bugs the geometry tests could not.
 
 UI behaviour is tested without a screen: `crates/utopia-ui/tests/workspace.rs` drives the real
 `Workspace` through GPUI's test platform (`gpui` `test-support` dev-feature) with simulated
 keystrokes and asserts on store state; `crates/utopia-ui/tests/layout.rs` asserts layout
-geometry via `debug_selector` bounds. Add a script there for any new interaction or region.
+geometry via `debug_selector` bounds; `crates/utopia-ui/tests/settings.rs` drives the keybinding
+editor (capture, save, reset, clash). Add a script there for any new interaction or region.
 The list keeps rendering the row being edited when it scrolls out of view (`splice_items`
 passes the editor's focus handle to `ListState::splice_focusable`): a focused element that is
 not rendered gets no keystrokes, so every shortcut would die. Keep that when touching the list.
@@ -110,6 +113,66 @@ Sync (§12; secrets never go into the graph file, §15.6):
   — token and passphrase may also come from the macOS keychain (services `utopia-sync`,
   `utopia-sync-passphrase`, account = graph id).
 
+## Verifying a change (do this before opening a PR)
+
+`make check` proves the code compiles and the tests pass. It does **not** prove the feature
+works: every UI bug found in this repo so far — prose that would not wrap, a screenshot drawn
+at the wrong size, a second Settings window opening instead of the first being raised — passed
+every test and was caught by looking at a picture. So verification has four steps, in order.
+
+**1. `make check`.** fmt, build, test, clippy. Never skip it and never open a PR without it.
+
+**2. Seed a graph with mock data.** Drive the `Store` directly rather than typing content
+through keystrokes: it is deterministic, it reads well in a screenshot, and it cannot race the
+UI. `seed_help_graph` in `xtask/src/main.rs` is the worked example — a project page, a person,
+and a few days of notes that link them, which between them exercise links, backlinks,
+attributes, to-dos, nesting and the graph view. Seed into a scratch directory under `target/`,
+never into a real graph.
+
+**3. Drive the real app and capture it.** `UTOPIA_SHOT_SCRIPT` with `UTOPIA_CONFIG_DIR` and
+`--graph` both pointing at scratch paths, so the user's own notes are never touched:
+
+```bash
+UTOPIA_CONFIG_DIR=/tmp/scratch/config \
+UTOPIA_SHOT_SCRIPT="wait 900; keys escape; wait 300; keys cmd-shift-t; wait 700; shot /tmp/scratch/today.png" \
+  cargo run -p utopia-app -- --graph target/help-shots/Demo.utopia
+```
+
+- `keys escape` before a shot: a focused block shows its raw `[[markup]]`, which is not what
+  the feature looks like in use.
+- `wait` generously (500–1200 ms) after anything that opens a panel, loads days or lays out the
+  graph. A shot taken too early captures a half-drawn frame and is worse than no shot.
+- For a second window (Settings), `keys cmd-,; wait 1200; target last; wait 500; shot …`.
+
+**4. Read every PNG you captured.** Not "it ran without error" — actually look. Check the text
+is the mock data you seeded and not stray characters, that nothing overflows its container, and
+that the thing you changed is visible and correct. A capture run against a scratch graph that an
+earlier run already typed into will show that earlier mess; reseed (step 2) rather than
+explaining the mess away. If you cannot see your change in the picture, you have not verified it.
+
+Then save the shots you would want a reviewer to see under
+`docs/verification/<branch-name>/` and reference them from the PR (see below). Keep them
+downscaled (`sips -Z 1200`); a handful of 150–300 KB PNGs is the budget, not full Retina
+captures.
+
+## Opening a PR
+
+CI (`.github/workflows/ci.yml`) runs fmt, build, test and clippy on macOS for every PR; it is
+the floor, not the evidence. A PR is reviewable when its description carries:
+
+- **What changed and why**, citing the PRD ids the change implements.
+- **Proof of work**: the screenshots from step 4 above, inlined from
+  `docs/verification/<branch>/` so they render in the PR, each captioned with what it proves.
+- **The checks**, quoted as output (`make check`, test count), not asserted in prose.
+- **What you did not do**: anything you left out, worked around, or could not verify, and why.
+  A known limit written down is worth more than a clean-looking PR that hides it.
+
+Bugs found and fixed along the way belong in the description too — they are the most useful
+part of a review. `.github/pull_request_template.md` holds this as a checklist.
+
+Performance-sensitive work also needs `cargo run -p xtask --release -- bench --ui` locally. CI
+deliberately does not run it: a shared runner's timings say nothing about the §15.1 budgets.
+
 ## Workspace layout (§13.1)
 
 | Crate | Responsibility | May depend on |
@@ -122,11 +185,11 @@ Sync (§12; secrets never go into the graph file, §15.6):
 | `crates/utopia-syncd` | Relay server (axum, §12.8): per-page logs, dedupe, auth, quota, snapshots, WebSocket notices; `lan` = in-process relay + mDNS. **No CRDT dependency** | `utopia-proto`, `rusqlite` |
 | `crates/utopia-api` | Local automation API (loopback HTTP, bearer token) and `utopia://` link parsing; `handle(store, Op)` is the one implementation shared with plugins | `utopia-core`, `utopia-store`, `axum` |
 | `crates/utopia-plugin` | WASM plugin sandbox (wasmi: fuel, memory cap, permissioned API calls) | `utopia-api`, `utopia-store`, `wasmi` |
-| `crates/utopia-ui` | GPUI components: block editor (IME via `EntityInputHandler`), outline view, chips, panels, sidebar, background sync runner, graph view, PDF viewer (PDFKit on macOS) | `utopia-core`, `utopia-store`, `utopia-sync`, `utopia-plugin`, `gpui` |
+| `crates/utopia-ui` | GPUI components: block editor (IME via `EntityInputHandler`), outline view, chips, panels, sidebar, background sync runner, graph view, PDF viewer (PDFKit on macOS), Settings window (keybinding editor, shortcut sheet, Help tour) | `utopia-core`, `utopia-store`, `utopia-sync`, `utopia-plugin`, `gpui` |
 | `crates/utopia-app` | Binary: window, keymap, actions, app assembly, CLI subcommands, startup probe, screenshot scripts, API/link inbox, unlock screen | everything above |
 | `crates/utopia-ffi` | Mobile core: UniFFI surface over the store and sync (§14) | `utopia-store`, `utopia-sync`, `uniffi` |
 | `mobile/ios` | SwiftUI shell (`UtopiaMobile`) and the Swift binding check | the generated bindings |
-| `xtask` | Dev tasks: `bench` (budgets), `profile-merge`, `bundle`, `mobile` | anything |
+| `xtask` | Dev tasks: `bench` (budgets), `profile-merge`, `bundle`, `mobile`, `help-shots` | anything |
 
 Dependency direction is one-way: `app → ui → (plugin → api) → store → doc → core`;
 `ffi → sync → store`. If you find yourself importing upward, move the type down instead.
@@ -217,6 +280,19 @@ Implemented:
 - **Sync (§11.7, §12):** HTTP relay and client, background sync with status and merge notices,
   snapshot compaction, Loro-cursor caret preservation, end-to-end encryption (Argon2id +
   XChaCha20-Poly1305), realtime WebSocket notices, folder transport, LAN relay with mDNS.
+- **Settings and keybindings (§9.1):** a Settings window (Cmd+,) with three tabs —
+  **Keybindings**, where every action can be rebound by pressing the keys and the change
+  applies at once; **Shortcuts**, the cheat sheet of everything bound; and **Help**, a tour of
+  the features with screenshots captured from the app (`cargo run -p xtask -- help-shots`).
+  `utopia_ui::actions::CATALOG` is the one source of truth: default keys plus the label,
+  category and help text for each action, so the editor, the cheat sheet and the installed
+  bindings cannot drift apart. Only actions the user changed are written to `keymap.json`,
+  so defaults that move in a later release still reach them. Day navigation is
+  `GoDailyNotes` (Cmd+Shift+D, the feed), `GoToday` (Cmd+Shift+T) and `GoYesterday`
+  (Cmd+Shift+Y). Rebinding captures through a gpui *keystroke interceptor*, which runs before
+  the keymap is consulted, so the keys being recorded cannot also fire their own action —
+  without that, rebinding onto Cmd+Q would quit the app. Keys are compared with
+  `canonical_keys` (gpui's spelling), so `cmd-alt-t` and `alt-cmd-t` are one binding.
 - **v1.2+ / P2 (§4.2, §16):** query blocks (`{{query: …}}`, Roam syntax, SQL-backed, `/Query`)
   with queryable `key:: value` attributes; graph view (Cmd+Shift+G, force-directed, local/global,
   journal toggle); attachments (drop files or `/Attach a file`, image previews, file chips,
@@ -232,6 +308,12 @@ Known limits (pick these up deliberately, don't paper over them):
   compilation, because the Metal toolchain is not installed); later launches draw in ~150 ms.
 - Screenshots come from the app capturing its own window (`UTOPIA_SHOT_SCRIPT`); colours and
   typography are checked by eye, not by tests.
+- Settings → Help embeds its screenshots with `include_bytes!` (~1.3 MB), so they go stale when
+  the UI changes: rerun `cargo run -p xtask -- help-shots` and look at the PNGs. They are shown
+  at a fixed size because gpui only learns an image's aspect ratio a frame after layout.
+- `open_settings` is deferred (`cx.defer`): gpui refuses to update a window from inside its own
+  update, and global action handlers run during one, so Cmd+, pressed while Settings is focused
+  would otherwise open a second Settings window instead of raising the first.
 - Mobile has not run on an iOS device or simulator here. `aarch64-apple-ios-sim` is installed and
   the core builds for it; the iOS Simulator runtime is not (download stopped: the user chose to
   focus on desktop first). The Swift bindings run against the real core on macOS and the SwiftUI shell

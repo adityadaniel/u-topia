@@ -13,6 +13,8 @@
 //! - `ws <command> [args…]` runs a workspace command the app exposes for scripts
 //!   (e.g. `ws open-pdf`, `ws highlight <page> <x> <y> <w> <h>` for an area,
 //!   `ws select <page> <x0> <y0> <x1> <y1>` for a text selection)
+//! - `target main|last` points the steps after it at the main window or at the most
+//!   recently opened one, so a second window (Settings, Cmd+,) can be driven and captured
 //!
 //! The app quits after the last step.
 
@@ -29,6 +31,8 @@ pub enum Step {
     Shot(String),
     Drop(String),
     Ws(Vec<String>),
+    /// Switch which window later steps drive: `main` or `last`.
+    Target(String),
 }
 
 /// How `drop` and `ws` steps reach the workspace.
@@ -64,6 +68,9 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                 "ws" if !rest.trim().is_empty() => Ok(Step::Ws(
                     rest.split_whitespace().map(str::to_string).collect(),
                 )),
+                "target" if matches!(rest.trim(), "main" | "last") => {
+                    Ok(Step::Target(rest.trim().to_string()))
+                }
                 _ => Err(format!("unknown step: {line}")),
             }
         })
@@ -73,10 +80,11 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
 /// Run the steps against `handle`, then quit.
 pub async fn run(
     steps: Vec<Step>,
-    handle: AnyWindowHandle,
+    main: AnyWindowHandle,
     hooks: Box<dyn Hooks>,
     cx: &mut AsyncApp,
 ) {
+    let mut handle = main;
     // Bring the window forward so it is presented, then let the first frames land.
     // GPUI stops presenting while a window is occluded, so float it above other apps.
     let _ = cx.update(|cx| cx.activate(true));
@@ -96,6 +104,29 @@ pub async fn run(
                 hooks.drop_files(&[std::path::PathBuf::from(&path)], window, cx)
             }),
             Step::Ws(args) => handle.update(cx, |_, window, cx| hooks.ws(&args, window, cx)),
+            Step::Target(which) => {
+                // `last` is the most recently opened window, which is the one a step like
+                // `keys cmd-,` just put on screen.
+                let next = if which == "main" {
+                    Some(main)
+                } else {
+                    cx.update(|cx| cx.windows().last().copied()).ok().flatten()
+                };
+                match next {
+                    Some(h) => {
+                        handle = h;
+                        let _ = handle.update(cx, |_, window, _| raise(window));
+                        cx.background_executor()
+                            .timer(Duration::from_millis(250))
+                            .await;
+                        Ok(())
+                    }
+                    None => {
+                        eprintln!("target {which}: no such window");
+                        Ok(())
+                    }
+                }
+            }
             Step::Scroll(dy) => {
                 // A real wheel event through AppKit, sent outside any window update because
                 // GPUI handles it synchronously.

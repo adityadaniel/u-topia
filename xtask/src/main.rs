@@ -780,6 +780,265 @@ fn mobile(ios: bool) -> Result<()> {
     Ok(())
 }
 
+/// `(depth, kind, text)` rows describing a mock page's block tree.
+type MockRows = &'static [(usize, BlockKind, &'static str)];
+
+/// Insert `(depth, kind, text)` rows as a block tree under the page root.
+///
+/// `stack[d]` is the last block inserted at depth `d`, which is both the parent for depth
+/// `d + 1` and the `after` sibling for the next block at depth `d`. Truncating on insert
+/// drops the previous subtree, so coming back up a level starts a fresh child list.
+fn insert_tree(
+    s: &mut Store,
+    page: &PageId,
+    rows: &[(usize, BlockKind, &str)],
+) -> Result<Vec<BlockId>> {
+    let mut cmds = Vec::new();
+    let mut stack: Vec<BlockId> = Vec::new();
+    let mut ids = Vec::new();
+    for &(depth, kind, text) in rows {
+        anyhow::ensure!(
+            depth <= stack.len(),
+            "row at depth {depth} has no parent: {text}"
+        );
+        let id = BlockId::new();
+        let parent = depth.checked_sub(1).map(|d| stack[d].clone());
+        let after = stack.get(depth).cloned();
+        cmds.push(Command::InsertBlock {
+            id: id.clone(),
+            parent,
+            after,
+            text: text.to_string(),
+            kind,
+        });
+        stack.truncate(depth);
+        stack.push(id.clone());
+        ids.push(id);
+    }
+    s.execute(
+        page,
+        cmds,
+        EditOpts {
+            no_undo: true,
+            ..Default::default()
+        },
+    )?;
+    Ok(ids)
+}
+
+/// The mock graph behind the Help screenshots: a small project, a person, and a few days
+/// of notes that link them, so backlinks, attributes and the graph view all have something
+/// real to show.
+fn seed_help_graph(path: &Path) -> Result<()> {
+    use BlockKind::{Bullet, Heading, Quote, Todo};
+    let mut s = Store::open(path)?;
+    let today = chrono::Local::now().date_naive();
+
+    let atlas = s.create_page("Atlas Launch")?;
+    insert_tree(
+        &mut s,
+        &atlas,
+        &[
+            (0, Bullet, "status:: in progress"),
+            (0, Bullet, "owner:: [[Ana Lovelace]]"),
+            (0, Heading(2), "Scope"),
+            (1, Bullet, "A beta for twenty testers, invited by hand"),
+            (1, Bullet, "Import from the old format"),
+            (
+                2,
+                Bullet,
+                "Keep the import path unchanged, so old files still open",
+            ),
+            (2, Todo, "Write the migration notes"),
+            (1, Todo, "Draft the release notes"),
+            (0, Heading(2), "Risks"),
+            (
+                1,
+                Bullet,
+                "The beta date depends on [[Ana Lovelace]]'s review",
+            ),
+            (1, Quote, "Ship the small thing that works."),
+        ],
+    )?;
+
+    let ana = s.create_page("Ana Lovelace")?;
+    insert_tree(
+        &mut s,
+        &ana,
+        &[
+            (0, Bullet, "role:: reviewer on [[Atlas Launch]]"),
+            (0, Bullet, "Prefers a written summary before a call"),
+        ],
+    )?;
+
+    let reading = s.create_page("Reading")?;
+    insert_tree(
+        &mut s,
+        &reading,
+        &[
+            (0, Bullet, "A list of what is worth finishing"),
+            (0, Bullet, "On conflict-free replicated data types"),
+            (
+                1,
+                Bullet,
+                "The merge is the interesting part, not the transport",
+            ),
+        ],
+    )?;
+
+    // A few days of notes, newest last so the feed reads naturally.
+    let days: &[(i64, MockRows)] = &[
+        (
+            4,
+            &[
+                (0, Bullet, "Started sketching the [[Atlas Launch]] scope"),
+                (0, Bullet, "[[Reading]] — two chapters on merge semantics"),
+            ],
+        ),
+        (
+            1,
+            &[
+                (0, Bullet, "Wrote up the import plan for [[Atlas Launch]]"),
+                (1, Bullet, "Old files have to keep opening, no exceptions"),
+                (0, Todo, "Ask [[Ana Lovelace]] to review it"),
+            ],
+        ),
+        (
+            0,
+            &[
+                (
+                    0,
+                    Bullet,
+                    "Met [[Ana Lovelace]] about the [[Atlas Launch]] timeline",
+                ),
+                (1, Bullet, "She wants the beta in testers' hands this month"),
+                (1, Todo, "Send her the migration notes"),
+                (0, Bullet, "[[Reading]] — finished the chapter on CRDTs"),
+                (0, Bullet, "#atlas #beta"),
+            ],
+        ),
+    ];
+    for &(back, rows) in days {
+        let date = today - chrono::Duration::days(back);
+        let page = s.ensure_daily_page(date)?;
+        insert_tree(&mut s, &page, rows)?;
+    }
+
+    s.sync_index()?;
+    Ok(())
+}
+
+/// Regenerate the screenshots embedded in Settings → Help.
+///
+/// Builds the app, seeds a mock graph, then drives the real window with
+/// `UTOPIA_SHOT_SCRIPT` and captures it. The app captures its own window, so this needs no
+/// Screen Recording permission. The Settings window is a separate window and so cannot be
+/// captured by the script, which drives one window only; Help does not show one.
+fn help_shots() -> Result<()> {
+    use std::process::Command as Proc;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .canonicalize()?;
+    let cargo = env!("CARGO");
+    anyhow::ensure!(
+        Proc::new(cargo)
+            .current_dir(&root)
+            .args(["build", "-p", "utopia-app"])
+            .status()?
+            .success(),
+        "cargo build failed"
+    );
+
+    let scratch = root.join("target/help-shots");
+    if scratch.exists() {
+        std::fs::remove_dir_all(&scratch)?;
+    }
+    let config = scratch.join("config");
+    std::fs::create_dir_all(&config)?;
+    let graph = scratch.join("Demo.utopia");
+    seed_help_graph(&graph)?;
+
+    let out = root.join("crates/utopia-ui/assets/help");
+    std::fs::create_dir_all(&out)?;
+    let png = |name: &str| out.join(format!("{name}.png")).display().to_string();
+    // One run, several captures: each `wait` gives the UI time to settle before `shot`.
+    let script = [
+        "wait 900".to_string(),
+        // Leave the block: a focused block shows its raw `[[markup]]`, and Help should
+        // show what reading a note actually looks like.
+        "keys escape".to_string(),
+        "wait 400".to_string(),
+        format!("shot {}", png("daily-notes")),
+        "keys cmd-k".to_string(),
+        "wait 250".to_string(),
+        "type atlas".to_string(),
+        "wait 500".to_string(),
+        format!("shot {}", png("quick-jump")),
+        "keys enter".to_string(),
+        "wait 800".to_string(),
+        format!("shot {}", png("outline")),
+        "keys cmd-shift-f".to_string(),
+        "wait 250".to_string(),
+        "type migration".to_string(),
+        "wait 600".to_string(),
+        format!("shot {}", png("search")),
+        "keys escape".to_string(),
+        "wait 300".to_string(),
+        "keys cmd-k".to_string(),
+        "wait 250".to_string(),
+        "type Ana".to_string(),
+        "wait 500".to_string(),
+        "keys enter".to_string(),
+        "wait 900".to_string(),
+        format!("shot {}", png("links")),
+        "keys cmd-shift-g".to_string(),
+        "wait 1200".to_string(),
+        format!("shot {}", png("graph")),
+    ]
+    .join("; ");
+
+    let status = Proc::new(root.join("target/debug/utopia"))
+        .current_dir(&root)
+        .arg("--graph")
+        .arg(&graph)
+        .env("UTOPIA_CONFIG_DIR", &config)
+        .env("UTOPIA_SHOT_SCRIPT", &script)
+        .status()?;
+    anyhow::ensure!(status.success(), "the app exited with {status}");
+
+    // Downscale so the binary does not carry six full-resolution Retina captures.
+    for name in [
+        "daily-notes",
+        "quick-jump",
+        "outline",
+        "search",
+        "links",
+        "graph",
+    ] {
+        let p = out.join(format!("{name}.png"));
+        anyhow::ensure!(p.exists(), "{} was not captured", p.display());
+        let before = std::fs::metadata(&p)?.len();
+        anyhow::ensure!(
+            Proc::new("sips")
+                .args(["-Z", "1200", "--setProperty", "format", "png"])
+                .arg(&p)
+                .arg("--out")
+                .arg(&p)
+                .status()?
+                .success(),
+            "sips failed on {}",
+            p.display()
+        );
+        println!(
+            "{name}.png  {} KiB -> {} KiB",
+            before / 1024,
+            std::fs::metadata(&p)?.len() / 1024
+        );
+    }
+    println!("\nwrote {}", out.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -807,9 +1066,10 @@ fn main() -> Result<()> {
         Some("rss-probe") => rss_probe(Path::new(args.get(1).context("db path")?)),
         Some("bundle") => bundle(args.iter().any(|a| a == "--debug")),
         Some("mobile") => mobile(args.iter().any(|a| a == "--ios")),
+        Some("help-shots") => help_shots(),
         _ => {
             println!(
-                "usage: cargo run -p xtask --release -- bench [--ui]\n       cargo run -p xtask -- bundle [--debug]   (target/Utopia.app, registers utopia://)\n       cargo run -p xtask -- mobile [--ios]     (Swift bindings, checks, iOS shell)\n       cargo run -p xtask --release -- profile-merge   (loop for sampling with `sample`)"
+                "usage: cargo run -p xtask --release -- bench [--ui]\n       cargo run -p xtask -- bundle [--debug]   (target/Utopia.app, registers utopia://)\n       cargo run -p xtask -- mobile [--ios]     (Swift bindings, checks, iOS shell)\n       cargo run -p xtask -- help-shots         (regenerate Settings -> Help screenshots)\n       cargo run -p xtask --release -- profile-merge   (loop for sampling with `sample`)"
             );
             Ok(())
         }

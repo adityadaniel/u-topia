@@ -413,7 +413,7 @@ impl Workspace {
                 }
             }
         }
-        self.go_today(&GoToday, window, cx);
+        self.open_journal(window, cx);
     }
 
     fn on_page_event(
@@ -782,8 +782,26 @@ impl Workspace {
         self.start_jump(JumpMode::Capture, window, cx);
     }
 
-    fn go_today(&mut self, _: &GoToday, window: &mut Window, cx: &mut Context<Self>) {
+    /// Daily Note (§9.1): the whole feed, which is also the launch view.
+    fn go_daily_notes(&mut self, _: &GoDailyNotes, window: &mut Window, cx: &mut Context<Self>) {
         self.open_journal(window, cx);
+    }
+
+    /// Today (§9.1): today's page on its own, not the feed. A day stays a draft until it is
+    /// written (FR-1.2), so this opens the draft rather than creating the page.
+    fn go_today(&mut self, _: &GoToday, window: &mut Window, cx: &mut Context<Self>) {
+        let today = self.app.read(cx).store.today();
+        self.today = today;
+        self.open_date(today, false, true, window, cx);
+    }
+
+    /// Yesterday (§9.1). `pred_opt` only returns `None` at the start of the proleptic
+    /// calendar, where staying put is the sane answer.
+    fn go_yesterday(&mut self, _: &GoYesterday, window: &mut Window, cx: &mut Context<Self>) {
+        let today = self.app.read(cx).store.today();
+        self.today = today;
+        let d = today.pred_opt().unwrap_or(today);
+        self.open_date(d, false, true, window, cx);
     }
 
     /// The Daily Notes feed in the main pane, caret in today's first block (FR-1.1).
@@ -1506,9 +1524,7 @@ impl Render for Workspace {
                     .text_sm()
                     .cursor_pointer()
                     .child("It's a new day → open today")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.go_today(&GoToday, window, cx)),
-                    ),
+                    .on_click(cx.listener(|this, _, window, cx| this.open_journal(window, cx))),
             );
         }
         let notice = self.sync.as_ref().and_then(|s| s.notice.clone());
@@ -1622,7 +1638,9 @@ impl Render for Workspace {
                 }),
             )
             .on_action(cx.listener(Self::quick_capture))
+            .on_action(cx.listener(Self::go_daily_notes))
             .on_action(cx.listener(Self::go_today))
+            .on_action(cx.listener(Self::go_yesterday))
             .on_action(cx.listener(Self::prev_day))
             .on_action(cx.listener(Self::next_day))
             .on_action(cx.listener(Self::toggle_right))
