@@ -333,6 +333,41 @@ fn sidebar_linked_reference_wraps(cx: &mut TestAppContext) {
     assert_wraps_within(hit, left, left + f32::from(side.size.width));
 }
 
+/// FR-3.9: a long unlinked mention wraps too, keeping its "Link" button in the column.
+#[gpui::test]
+fn unlinked_mention_wraps_and_keeps_link_in_view(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_refs(cx, false);
+    let app = ws.update(cx, |w, _| w.app().clone());
+    app.update(cx, |app, _| {
+        let p = app.store.create_page("Elsewhere").unwrap();
+        let b = app.store.ensure_first_block(&p).unwrap();
+        app.store
+            .set_block_text(&p, &b, &format!("{LONG} target"), None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, None, false, window, cx)
+    });
+    let header = bounds(cx, "unlinked-header");
+    cx.simulate_click(header.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let (link, row) = (0..40)
+        .find_map(|ix| {
+            let link: &'static str = Box::leak(format!("link-{ix}").into_boxed_str());
+            let row: &'static str = Box::leak(format!("mention-{ix}").into_boxed_str());
+            Some((cx.debug_bounds(link)?, cx.debug_bounds(row)?))
+        })
+        .expect("a mention with a Link button was rendered");
+    let (left, right) = column(cx);
+    assert!(
+        f32::from(link.origin.x + link.size.width) <= right + 0.5,
+        "Link stays inside the column ({left}, {right}): {link:?}"
+    );
+    assert_wraps_within(row, left, right);
+}
+
 #[gpui::test]
 fn left_sidebar_collapses_to_a_rail(cx: &mut TestAppContext) {
     let cx = setup(cx);
