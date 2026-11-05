@@ -6991,181 +6991,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "trellis-api"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chrono",
- "getrandom 0.2.17",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "trellis-core",
- "trellis-store",
- "ureq",
-]
-
-[[package]]
-name = "trellis-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "core-graphics 0.24.0",
- "gpui",
- "objc",
- "png 0.17.16",
- "raw-window-handle",
- "tempfile",
- "trellis-api",
- "trellis-core",
- "trellis-store",
- "trellis-sync",
- "trellis-syncd",
- "trellis-ui",
-]
-
-[[package]]
-name = "trellis-core"
-version = "0.1.0"
-dependencies = [
- "caseless",
- "chrono",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "ulid",
- "unicode-normalization",
- "unicode-segmentation",
- "uuid",
-]
-
-[[package]]
-name = "trellis-doc"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "loro",
- "thiserror 2.0.21",
- "trellis-core",
-]
-
-[[package]]
-name = "trellis-ffi"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "trellis-core",
- "trellis-store",
- "trellis-sync",
- "trellis-syncd",
- "uniffi",
-]
-
-[[package]]
-name = "trellis-plugin"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "tempfile",
- "trellis-api",
- "trellis-core",
- "trellis-store",
- "wasmi",
- "wat",
-]
-
-[[package]]
-name = "trellis-proto"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "trellis-store"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.21",
- "trellis-core",
- "trellis-doc",
- "ulid",
-]
-
-[[package]]
-name = "trellis-sync"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "chacha20poly1305",
- "chrono",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "trellis-core",
- "trellis-doc",
- "trellis-proto",
- "trellis-store",
- "tungstenite 0.24.0",
- "ulid",
- "ureq",
- "zstd",
-]
-
-[[package]]
-name = "trellis-syncd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "mdns-sd",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "trellis-core",
- "trellis-proto",
- "trellis-store",
- "trellis-sync",
- "zstd",
-]
-
-[[package]]
-name = "trellis-ui"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "core-graphics 0.24.0",
- "foreign-types",
- "gpui",
- "image",
- "objc",
- "png 0.17.16",
- "serde",
- "serde_json",
- "tempfile",
- "trellis-core",
- "trellis-plugin",
- "trellis-store",
- "trellis-sync",
-]
-
-[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7574,6 +7399,181 @@ name = "utf_types"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
+
+[[package]]
+name = "utopia-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "getrandom 0.2.17",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "ureq",
+ "utopia-core",
+ "utopia-store",
+]
+
+[[package]]
+name = "utopia-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core-graphics 0.24.0",
+ "gpui",
+ "objc",
+ "png 0.17.16",
+ "raw-window-handle",
+ "tempfile",
+ "utopia-api",
+ "utopia-core",
+ "utopia-store",
+ "utopia-sync",
+ "utopia-syncd",
+ "utopia-ui",
+]
+
+[[package]]
+name = "utopia-core"
+version = "0.1.0"
+dependencies = [
+ "caseless",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "ulid",
+ "unicode-normalization",
+ "unicode-segmentation",
+ "uuid",
+]
+
+[[package]]
+name = "utopia-doc"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "loro",
+ "thiserror 2.0.21",
+ "utopia-core",
+]
+
+[[package]]
+name = "utopia-ffi"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "uniffi",
+ "utopia-core",
+ "utopia-store",
+ "utopia-sync",
+ "utopia-syncd",
+]
+
+[[package]]
+name = "utopia-plugin"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "utopia-api",
+ "utopia-core",
+ "utopia-store",
+ "wasmi",
+ "wat",
+]
+
+[[package]]
+name = "utopia-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "utopia-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "ulid",
+ "utopia-core",
+ "utopia-doc",
+]
+
+[[package]]
+name = "utopia-sync"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "chacha20poly1305",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tungstenite 0.24.0",
+ "ulid",
+ "ureq",
+ "utopia-core",
+ "utopia-doc",
+ "utopia-proto",
+ "utopia-store",
+ "zstd",
+]
+
+[[package]]
+name = "utopia-syncd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "mdns-sd",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "utopia-core",
+ "utopia-proto",
+ "utopia-store",
+ "utopia-sync",
+ "zstd",
+]
+
+[[package]]
+name = "utopia-ui"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "core-graphics 0.24.0",
+ "foreign-types",
+ "gpui",
+ "image",
+ "objc",
+ "png 0.17.16",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "utopia-core",
+ "utopia-plugin",
+ "utopia-store",
+ "utopia-sync",
+]
 
 [[package]]
 name = "uuid"
@@ -8711,10 +8711,10 @@ dependencies = [
  "chrono",
  "tempfile",
  "tokio",
- "trellis-core",
- "trellis-store",
- "trellis-sync",
- "trellis-syncd",
+ "utopia-core",
+ "utopia-store",
+ "utopia-sync",
+ "utopia-syncd",
 ]
 
 [[package]]

@@ -1,10 +1,10 @@
-# PRD — Trellis
+# PRD — Utopia
 
 **A local-first, Roam-style networked-notes desktop app in Rust + GPUI**
 
 | Field | Value |
 |---|---|
-| Working name | **Trellis** (placeholder; crates `trellis-*`) |
+| Working name | **Utopia** (placeholder; crates `utopia-*`) |
 | Document version | 1.0 (draft for review) |
 | Date | 2026-11-02 |
 | Owner | Aditya Daniel |
@@ -409,7 +409,7 @@ pub enum RefResolution {
 | FR-4.7 | Unresolved block refs render as a red-tinted chip: "Missing block ((uid))" with copy-id and dismiss actions. They are never silently dropped. |
 | FR-4.8 | Hovering any reference shows a peek card (target title, first 3 blocks, backlink count) without navigation; `Cmd+Click` opens in the other pane. |
 | FR-4.9 | Reference edges record an anchor span so highlights survive edits elsewhere in the block; the anchor is recomputed on block edit. |
-| FR-4.10 | All node types are addressable by copy-paste of a `trellis://` URL: `trellis://page/<id>`, `trellis://block/<id>` — enabling cross-app linking from other tools. |
+| FR-4.10 | All node types are addressable by copy-paste of a `utopia://` URL: `utopia://page/<id>`, `utopia://block/<id>` — enabling cross-app linking from other tools. |
 | FR-4.11 | **Reference kinds are uniform.** A `[[page]]`, a `#tag`, a `((block))`, and a `[[date]]` produce the same edge shape with different resolution rules. The inspector, backlink panel, and export all treat them uniformly — there is no separate "tags" subsystem. |
 | FR-4.12 | **Rename is safe.** Renaming a page keeps its id, rewrites its rendered title, and registers every previous title as an alias so existing `[[old title]]` references keep resolving (with a tooltip showing the alias). |
 | FR-4.13 | **Rename onto an existing title merges.** If the new title collides with another live page, the app merges the two (see §8.6) rather than erroring or creating a duplicate. |
@@ -495,7 +495,7 @@ Bindings load from `keymap.json` in the app config dir; unknown actions log a wa
 
 ```
 ┌───────────────┬──────────────────────────────────────┬────────────────────────┐
-│ Trellis   ⌘K  │ ◂ Nov 2 ›              Today    ⋯    │ ⧉ Alpha Prime      ✕   │
+│ Utopia   ⌘K  │ ◂ Nov 2 ›              Today    ⋯    │ ⧉ Alpha Prime      ✕   │
 │               ├──────────────────────────────────────┤   • A thesis I keep…   │
 │ ▾ Journal     │  • Morning pages                     ├────────────────────────┤
 │   Today    ●  │    • Woke up thinking about          │ ⧉ Dana             ✕   │
@@ -517,7 +517,7 @@ Bindings load from `keymap.json` in the app config dir; unknown actions log a wa
 
 | State | Behavior |
 |---|---|
-| No graph yet | One-field onboarding: "Name your graph" → creates `~/Documents/Trellis/<name>.trellis`. |
+| No graph yet | One-field onboarding: "Name your graph" → creates `~/Documents/Utopia/<name>.utopia`. |
 | No daily note today | Created on first visit; a single empty bullet with the caret, and a ghost hint that fades on the first keystroke. |
 | Unresolved ref | Chip with `Create "Foo"` / `Change to…` / `Show as text`. |
 | Sync offline | Status dot turns amber, "Offline — N changes queued"; everything remains editable. |
@@ -531,7 +531,7 @@ Bindings load from `keymap.json` in the app config dir; unknown actions log a wa
 ### 10.1 Entity relationships
 
 ```
-graph (one per .trellis file)
+graph (one per .utopia file)
  └── page (kind: page | daily)
       └── block (forest; parent_id null = root level)
            └── ref edges (src_block → dst_page | dst_block)
@@ -687,7 +687,7 @@ Design notes:
 - Unresolved intents keep the normalized key, so creating the page later resolves every intent at once (FR-3.12).
 - The resolver is called at **index time**, never at paint time; renderers consume stored resolutions.
 
-### 10.4 Invariants (enforced by tests, checked by a `trellis doctor` command)
+### 10.4 Invariants (enforced by tests, checked by a `utopia doctor` command)
 
 1. `block.page_id` equals the page of its parent (single-page subtrees).
 2. `block.depth` = parent depth + 1, roots = 0.
@@ -733,7 +733,7 @@ Design notes:
 > **Merge model: Loro CRDT, one document shard per page, persisted as snapshot + update log in the same SQLite file.**
 > **Projections: `block`, `page`, `ref`, FTS5 tables are derived indexes over the CRDT state, written in the same transaction as the shard.**
 > **Sync: a small self-hostable Rust relay that stores opaque CRDT updates per page; no conflict logic on the server.**
-> **Mobile: the same `trellis-core` crate compiled for iOS/Android behind a UniFFI surface, with a native UI shell.**
+> **Mobile: the same `utopia-core` crate compiled for iOS/Android behind a UniFFI surface, with a native UI shell.**
 
 One sentence: **SQLite is the durable, portable, queryable substrate; the CRDT is the merge algorithm; the relay is a dumb, replaceable pipe.**
 
@@ -768,7 +768,7 @@ A CRDT also gives us:
 | Mobile bindings | ✅ `loro-ffi` (UniFFI), `loro-react-native` | ✅ Swift/Kotlin (mature) | ✅ via community |
 | Doc size / speed | strong published benchmarks | improved in v3, historically larger | strong |
 
-**Choice: Loro.** The deciding factor is the **movable list + tree + shallow snapshot** combination, which maps directly onto "blocks in an ordered tree that get reordered" and "a graph that lives for ten years". Automerge is the documented fallback if Loro's mobile FFI proves insufficient; the swap is contained in `trellis-doc` behind a narrow trait (§13.1) so it is a 1-module change, not a rewrite.
+**Choice: Loro.** The deciding factor is the **movable list + tree + shallow snapshot** combination, which maps directly onto "blocks in an ordered tree that get reordered" and "a graph that lives for ten years". Automerge is the documented fallback if Loro's mobile FFI proves insufficient; the swap is contained in `utopia-doc` behind a narrow trait (§13.1) so it is a 1-module change, not a rewrite.
 
 > Note: this is a **contained** abstraction, not a generic CRDT framework. We do not attempt to support two CRDTs simultaneously.
 
@@ -788,7 +788,7 @@ A CRDT also gives us:
 ### 11.6 What lives where
 
 ```
-~/Library/Application Support/Trellis/graphs/<graph-id>/
+~/Library/Application Support/Utopia/graphs/<graph-id>/
 ├── graph.db          # SQLite: pages, blocks, refs, page_doc blobs, FTS, outbox
 ├── graph.db-wal      # transient
 ├── blobs/<sha256>    # attachments (P2), content-addressed
@@ -868,7 +868,7 @@ GET  /v1/graphs/{gid}/pages/{pid}/updates?since={frontier}
 | Both edit the same daily note offline | One page, merged content | scripted |
 | Clock skew ±24 h | No impact on ordering (fractional index + HLC) | fuzz with skewed clocks |
 
-**Invariant to test:** for any two peers that exchange all updates, `to_json(page)` is identical. This is the convergence property test run in CI on every PR touching `trellis-doc`.
+**Invariant to test:** for any two peers that exchange all updates, `to_json(page)` is identical. This is the convergence property test run in CI on every PR touching `utopia-doc`.
 
 ### 12.5 What never syncs
 
@@ -889,7 +889,7 @@ GET  /v1/graphs/{gid}/pages/{pid}/updates?since={frontier}
 
 ### 12.7 Transport variants (all reuse the same update format)
 
-1. **Hosted relay** (default): `trellis-sync` binary deployed by us or by the user.
+1. **Hosted relay** (default): `utopia-sync` binary deployed by us or by the user.
 2. **Self-hosted**: single binary + SQLite/Postgres + optional S3; `docker run`.
 3. **Folder transport** (P2, zero-infra): a sync folder (iCloud Drive, Dropbox, Syncthing, WebDAV) containing `pages/<page_id>/<peer_id>/<seq>.upd`. Append-only, never overwrite, so file-sync tools are safe. The app watches the folder and merges. This is the "no account, no server" path and directly addresses "sync with my phone" for users who already pay for iCloud/Dropbox.
 4. **LAN direct** (P3): mDNS + QUIC between desktop and phone at home.
@@ -922,16 +922,16 @@ Server responsibilities: auth, quota, dedupe by `change_id`, monotonic `seq`, sn
 ### 13.1 Crate layout
 
 ```
-trellis/
+utopia/
 ├── crates/
-│   ├── trellis-core/    # domain: ids, commands, block tree, markdown parser, undo stack
-│   ├── trellis-doc/     # CRDT boundary: Loro schema, apply/project, cursors, frontiers
-│   ├── trellis-store/   # SQLite: migrations, projections, refs index, FTS, queries
-│   ├── trellis-sync/    # client: outbox, pull loop, backoff, Transport trait
-│   ├── trellis-ui/      # GPUI components: bullet row, virtual list, chips, panels
-│   ├── trellis-app/     # bin: window, keymap, actions, app assembly
-│   ├── trellis-ffi/     # UniFFI surface for mobile/CLI (P2)
-│   └── trellis-syncd/   # server bin (axum) — separate deployment
+│   ├── utopia-core/    # domain: ids, commands, block tree, markdown parser, undo stack
+│   ├── utopia-doc/     # CRDT boundary: Loro schema, apply/project, cursors, frontiers
+│   ├── utopia-store/   # SQLite: migrations, projections, refs index, FTS, queries
+│   ├── utopia-sync/    # client: outbox, pull loop, backoff, Transport trait
+│   ├── utopia-ui/      # GPUI components: bullet row, virtual list, chips, panels
+│   ├── utopia-app/     # bin: window, keymap, actions, app assembly
+│   ├── utopia-ffi/     # UniFFI surface for mobile/CLI (P2)
+│   └── utopia-syncd/   # server bin (axum) — separate deployment
 └── xtask/               # packaging, notarization, fixtures, benches
 ```
 
@@ -1013,7 +1013,7 @@ GPUI is pre-1.0 (`gpui 0.2.2`, Apache-2.0, published Oct 2025) and has no rich i
 - `RootView` holds `Entity<AppState>`: open pages, sidebar, panels, sync status.
 - Each page has `PageState { blocks: im::OrdMap<BlockId, BlockNode>, roots: Vec<BlockId>, version: u64 }` — persistent data structures so snapshots are cheap and diffing is O(changed).
 - Commands produce `DocDelta { changed: Vec<BlockId>, inserted, removed }`; the view re-renders only affected rows.
-- Undo stack is a `Vec<UndoEntry>` in `trellis-core`, persisted per page in `meta` on close for crash recovery.
+- Undo stack is a `Vec<UndoEntry>` in `utopia-core`, persisted per page in `meta` on close for crash recovery.
 
 ### 13.7 Platform integration
 
@@ -1021,7 +1021,7 @@ GPUI is pre-1.0 (`gpui 0.2.2`, Apache-2.0, published Oct 2025) and has no rich i
 |---|---|
 | Menu bar / shortcuts | GPUI actions + native menu on macOS |
 | File dialogs | `rfd` |
-| Deep links | `trellis://` handler registration (macOS `CFBundleURLTypes`) |
+| Deep links | `utopia://` handler registration (macOS `CFBundleURLTypes`) |
 | Autosave | Continuous; no save button |
 | Crash safety | WAL + outbox; rolling snapshots every 5 min |
 | Updates (P2) | Signed appcast / self-hosted feed |
@@ -1039,12 +1039,12 @@ GPUI is pre-1.0 (`gpui 0.2.2`, Apache-2.0, published Oct 2025) and has no rich i
 
 | Option | Description | Effort | Risk | Recommendation |
 |---|---|---|---|---|
-| **A. Rust core + UniFFI + native UI** | `trellis-core`/`doc`/`store` compiled to a static lib; SwiftUI (iOS) and Compose (Android) shells | High | Medium — FFI surface must stay small | **Recommended for v1.2 if mobile is a real product surface** |
-| **B. Tauri 2 mobile + web UI** | Reuse `trellis-core` via the same FFI; web front end (Svelte/React) | Medium | Medium — second UI, but one codebase for iOS+Android | **Recommended if speed matters more than GPUI parity** |
+| **A. Rust core + UniFFI + native UI** | `utopia-core`/`doc`/`store` compiled to a static lib; SwiftUI (iOS) and Compose (Android) shells | High | Medium — FFI surface must stay small | **Recommended for v1.2 if mobile is a real product surface** |
+| **B. Tauri 2 mobile + web UI** | Reuse `utopia-core` via the same FFI; web front end (Svelte/React) | Medium | Medium — second UI, but one codebase for iOS+Android | **Recommended if speed matters more than GPUI parity** |
 | **C. React Native + `loro-react-native` + expo-sqlite** | Reuses only the sync/data format | Low | High — third tech stack, diverging logic | Only for a throwaway read-only client |
 | **D. Responsive web client served by the relay** | Same Rust core compiled to WASM (Loro has WASM) | Medium | Medium — requires server to be online | Good companion for "quick capture from phone browser" |
 
-**Recommendation:** Build the desktop first with a **UniFFI-clean core** (no GPUI types below `trellis-ui`). Then ship **Option A (iOS first)** for v1.2. If the team is 1–2 people, take **Option B** instead and accept UI divergence. Either way the `.trellis` file and the sync protocol are the contract, so a third-party client is always possible.
+**Recommendation:** Build the desktop first with a **UniFFI-clean core** (no GPUI types below `utopia-ui`). Then ship **Option A (iOS first)** for v1.2. If the team is 1–2 people, take **Option B** instead and accept UI divergence. Either way the `.utopia` file and the sync protocol are the contract, so a third-party client is always possible.
 
 ### 14.3 Minimal mobile v1 scope (when it happens)
 
@@ -1081,7 +1081,7 @@ Daily note (today only) · bullet capture · page/block refs (insert) · backlin
 ### 15.2 Reliability
 
 - Zero-data-loss target for local edits: WAL + debounced commits + rolling snapshots (every 5 min, keep 6).
-- `trellis doctor` CLI: invariant checks, index rebuild, orphan detection, export-on-corruption.
+- `utopia doctor` CLI: invariant checks, index rebuild, orphan detection, export-on-corruption.
 - Fuzz targets: markdown parser, ref parser, sync import, block move.
 - Property tests: convergence (2 peers), undo/redo round-trip, projection == full rebuild.
 
@@ -1159,7 +1159,7 @@ Indicative for a 1–2 engineer team; the point is ordering and exit criteria, n
 
 | # | Risk | L | I | Mitigation | Trigger to act |
 |---|---|---|---|---|---|
-| R1 | **GPUI is pre-1.0**; API churn breaks the app | High | Medium | Pin exact version; wrap all GPUI touches in `trellis-ui`; budget 1 upgrade day per quarter; track upstream breaking changes | A needed feature requires a fork |
+| R1 | **GPUI is pre-1.0**; API churn breaks the app | High | Medium | Pin exact version; wrap all GPUI touches in `utopia-ui`; budget 1 upgrade day per quarter; track upstream breaking changes | A needed feature requires a fork |
 | R2 | **Text editing quality** (IME, RTL, emoji, selection) below bar | High | High | M0 spike; grapheme-aware core; corpus tests; single-block editing scope | M0 spike fails → fall back to simpler editor + native text field composition |
 | R3 | **Accessibility** insufficient (screen readers) | High | Medium | Don't promise it in v1; keyboard completeness; AccessKit when upstream lands | Enterprise/user demand |
 | R4 | **CRDT + index divergence** → wrong backlinks | Medium | High | Rebuildable projections + invariant tests + `doctor` | Any divergence in CI |
@@ -1182,7 +1182,7 @@ Indicative for a 1–2 engineer team; the point is ordering and exit criteria, n
 5. **Roam import** — is migration from an existing Roam graph a launch requirement? It changes M2 scope by ~1 week (JSON + EDN export shapes).
 6. **Graph scale target** — 100k blocks is the design point. Do you expect 1M+? That changes the sharding and search design.
 7. **Encryption at rest** — required in v1 for a specific threat model, or acceptable in v1.1?
-8. **Naming/branding** — "Trellis" is a placeholder.
+8. **Naming/branding** — "Utopia" is a placeholder.
 9. **Unlinked References: P0 or P1?** Eliason calls the unlinked→linked promotion loop "the best feature I've found for discovering new relationships between information", which argues for P0. Cost is roughly one week (FTS query, in-place rewrite command, panel section). **Recommendation: pull into M2 if M1 lands on schedule.**
 10. **Multi-word hashtags.** Our normative rule stores multi-word tags as `#[[Modern Religion]]` and uses a commit-time longest-match heuristic for the un-delimited form (§6.5). Roam users type `#Modern Religion` naturally, so this is a visible papercut. Confirm the rule is acceptable, or budget a two-day disambiguation UX (typed-while-`#` phrase mode) before M1.
 
@@ -1215,7 +1215,7 @@ Indicative for a 1–2 engineer team; the point is ordering and exit criteria, n
 | Graph view | Force-directed graph | P2 |
 | PDF highlights | Embedded PDF + annotations | P2 |
 | `roam/js`, Depot | WASM plugin sandbox | P2 (maybe never) |
-| In-app automation API | Local HTTP API + `trellis://` | P2 |
+| In-app automation API | Local HTTP API + `utopia://` | P2 |
 | Mobile app | Native shell | P2 |
 
 ### B. Markdown subset (normative)
@@ -1245,7 +1245,7 @@ Rules:
 7. A `title` that parses as an unambiguous date resolves to that day's page (§10.3.1); the literal text the user typed is preserved in the source.
 8. `[[` and `((` inside `code` are never references.
 
-### C. Command surface (`trellis-core`)
+### C. Command surface (`utopia-core`)
 
 ```rust
 pub enum Command {

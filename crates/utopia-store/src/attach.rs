@@ -1,0 +1,366 @@
+//! Attachments (P2): content-addressed files beside the graph (§10.3, §11.6).
+//!
+//! `notes.utopia` keeps its attachments in `notes.blobs/<sha256>`. A blob is written
+//! once (to a temporary name, then renamed), never modified, and verified against its
+//! hash whenever it arrives from sync, so a corrupt or malicious copy cannot replace a
+//! good one. Blocks reference blobs with the markup in [`utopia_core::attach`].
+
+use std::collections::BTreeSet;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use rusqlite::{params, OptionalExtension};
+use sha2::{Digest, Sha256};
+use utopia_core::attach::{blob_refs, highlight_markup, highlights, is_hash, sniff_mime};
+use utopia_core::{outline, BlockId, BlockKind, PageId};
+
+use crate::{Result, Store, StoreError};
+
+/// Largest attachment accepted (sync payloads and memory use stay bounded).
+pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Attachment {
+    pub hash: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+impl Store {
+    /// Where this graph's blobs live, `None` for in-memory graphs.
+    pub fn blob_dir(&self) -> Option<PathBuf> {
+        let p = self.path.as_ref()?;
+        let stem = p.file_stem()?.to_string_lossy().to_string();
+        Some(p.with_file_name(format!("{stem}.blobs")))
+    }
+
+    /// The file holding a blob, if this device has it.
+    pub fn blob_path(&self, hash: &str) -> Option<PathBuf> {
+        if !is_hash(hash) {
+            return None;
+        }
+        let p = self.blob_dir()?.join(hash);
+        p.exists().then_some(p)
+    }
+
+    pub fn has_blob(&self, hash: &str) -> bool {
+        is_hash(hash) && (self.mem_blobs.contains_key(hash) || self.blob_path(hash).is_some())
+    }
+
+    pub fn blob(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        if !is_hash(hash) {
+            return Ok(None);
+        }
+        if let Some(b) = self.mem_blobs.get(hash) {
+            return Ok(Some(b.clone()));
+        }
+        match self.blob_path(hash) {
+            Some(p) => Ok(Some(std::fs::read(p)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn attachment(&self, hash: &str) -> Result<Option<Attachment>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT hash, name, mime, size FROM attachment WHERE hash=?1",
+                [hash],
+                |r| {
+                    Ok(Attachment {
+                        hash: r.get(0)?,
+                        name: r.get(1)?,
+                        mime: r.get(2)?,
+                        size: r.get::<_, i64>(3)? as u64,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    fn write_blob(&mut self, hash: &str, bytes: &[u8]) -> Result<()> {
+        match self.blob_dir() {
+            None => {
+                self.mem_blobs.insert(hash.to_string(), bytes.to_vec());
+            }
+            Some(dir) => {
+                let dst = dir.join(hash);
+                if dst.exists() {
+                    return Ok(());
+                }
+                std::fs::create_dir_all(&dir)?;
+                let tmp = dir.join(format!(".{hash}.{}.tmp", std::process::id()));
+                let mut f = std::fs::File::create(&tmp)?;
+                f.write_all(bytes)?;
+                f.sync_all()?;
+                drop(f);
+                std::fs::rename(&tmp, &dst)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record(&self, a: &Attachment, uploaded: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO attachment(hash, name, mime, size, created_at, uploaded)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(hash) DO UPDATE SET uploaded = max(uploaded, excluded.uploaded)",
+            params![a.hash, a.name, a.mime, a.size as i64, self.now(), uploaded],
+        )?;
+        Ok(())
+    }
+
+    /// Store bytes as an attachment and return its identity. Adding the same content
+    /// twice is a no-op that returns the same hash.
+    pub fn add_blob(&mut self, name: &str, bytes: &[u8]) -> Result<Attachment> {
+        if bytes.len() > MAX_BLOB_BYTES {
+            return Err(StoreError::Invalid(format!(
+                "{name} is larger than {} MB",
+                MAX_BLOB_BYTES / (1024 * 1024)
+            )));
+        }
+        let hash = sha256_hex(bytes);
+        if let Some(a) = self.attachment(&hash)? {
+            if self.has_blob(&hash) {
+                return Ok(a);
+            }
+        }
+        self.write_blob(&hash, bytes)?;
+        let a = Attachment {
+            hash,
+            name: name.to_string(),
+            mime: sniff_mime(name, bytes).to_string(),
+            size: bytes.len() as u64,
+        };
+        self.record(&a, false)?;
+        Ok(a)
+    }
+
+    pub fn attach_file(&mut self, path: &Path) -> Result<Attachment> {
+        let meta = std::fs::metadata(path)?;
+        if meta.len() as usize > MAX_BLOB_BYTES {
+            return Err(StoreError::Invalid(format!(
+                "{} is larger than {} MB",
+                path.display(),
+                MAX_BLOB_BYTES / (1024 * 1024)
+            )));
+        }
+        let bytes = std::fs::read(path)?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".into());
+        self.add_blob(&name, &bytes)
+    }
+
+    /// A blob that arrived from sync. Rejected unless its content hashes to `hash`.
+    pub fn put_synced_blob(&mut self, hash: &str, bytes: &[u8]) -> Result<()> {
+        if !is_hash(hash) || sha256_hex(bytes) != hash {
+            return Err(StoreError::Invalid(format!(
+                "blob {hash} failed verification"
+            )));
+        }
+        self.write_blob(hash, bytes)?;
+        let name = self
+            .referenced_blob_names()?
+            .into_iter()
+            .find(|(h, _)| h == hash)
+            .map_or_else(|| hash.to_string(), |(_, n)| n);
+        self.record(
+            &Attachment {
+                hash: hash.to_string(),
+                mime: sniff_mime(&name, bytes).to_string(),
+                name,
+                size: bytes.len() as u64,
+            },
+            true,
+        )
+    }
+
+    /// `(hash, name)` for every attachment live blocks point at.
+    fn referenced_blob_names(&self) -> Result<Vec<(String, String)>> {
+        self.read_barrier()?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT text FROM block WHERE deleted_at IS NULL AND instr(text, 'blob:') > 0",
+        )?;
+        let mut out = Vec::new();
+        for text in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            for r in blob_refs(&text?) {
+                out.push((r.hash, r.name));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn referenced_blobs(&self) -> Result<BTreeSet<String>> {
+        Ok(self
+            .referenced_blob_names()?
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect())
+    }
+
+    /// Referenced blobs this device does not have (sync fetches these).
+    pub fn missing_blobs(&self) -> Result<Vec<String>> {
+        Ok(self
+            .referenced_blobs()?
+            .into_iter()
+            .filter(|h| !self.has_blob(h))
+            .collect())
+    }
+
+    /// Local blobs not yet uploaded, oldest first.
+    pub fn blobs_to_upload(&self, limit: usize) -> Result<Vec<(String, Vec<u8>)>> {
+        let hashes: Vec<String> = {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT hash FROM attachment WHERE uploaded = 0 ORDER BY created_at, hash LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map([limit as i64], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            rows
+        };
+        let mut out = Vec::new();
+        for h in hashes {
+            if let Some(b) = self.blob(&h)? {
+                out.push((h, b));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn mark_blobs_uploaded(&self, hashes: &[String]) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("UPDATE attachment SET uploaded = 1 WHERE hash = ?1")?;
+        for h in hashes {
+            stmt.execute([h])?;
+        }
+        Ok(())
+    }
+}
+
+/// A highlight block in the graph.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PdfHighlight {
+    pub block: BlockId,
+    pub page_id: PageId,
+    /// 0-based PDF page.
+    pub pdf_page: usize,
+    pub rects: Vec<[f32; 4]>,
+    /// The block text without the highlight markup (the quote and any note).
+    pub text: String,
+}
+
+impl Store {
+    /// Highlights on a PDF, in PDF page order.
+    pub fn pdf_highlights(&self, hash: &str) -> Result<Vec<PdfHighlight>> {
+        self.read_barrier()?;
+        let needle = format!("{{{{highlight: blob:{hash}");
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, page_id, text FROM block WHERE deleted_at IS NULL AND instr(text, ?1) > 0",
+        )?;
+        let mut out = Vec::new();
+        for row in stmt.query_map([&needle], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })? {
+            let (id, page, text) = row?;
+            for h in highlights(&text).into_iter().filter(|h| h.hash == hash) {
+                let mut plain = text.clone();
+                plain.replace_range(h.range.clone(), "");
+                out.push(PdfHighlight {
+                    block: BlockId(id.clone()),
+                    page_id: PageId(page.clone()),
+                    pdf_page: h.page,
+                    rects: h.rects.clone(),
+                    text: plain.trim().to_string(),
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            (a.pdf_page, a.rects[0][1])
+                .partial_cmp(&(b.pdf_page, b.rects[0][1]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(out)
+    }
+
+    /// Record a highlight as a quote block under the block that shows the PDF (or on
+    /// today's page when no block does), so it gets references, search and sync like
+    /// any other block.
+    pub fn add_pdf_highlight(
+        &mut self,
+        hash: &str,
+        host: Option<&BlockId>,
+        pdf_page: usize,
+        rects: &[[f32; 4]],
+        quote: &str,
+    ) -> Result<(PageId, BlockId)> {
+        self.sync_index()?;
+        // The block that attaches this PDF (not a highlight that merely mentions it).
+        let attaches = |text: &str| blob_refs(text).iter().any(|r| r.hash == hash);
+        let given = match host {
+            Some(h) => self
+                .block_row(h)?
+                .filter(|r| r.deleted_at.is_none() && attaches(&r.text))
+                .map(|r| (r.page_id, r.id)),
+            None => None,
+        };
+        // Without a known host (opened from a link), the oldest block that attaches it.
+        let fallback = || -> Result<Option<(PageId, BlockId)>> {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT id, page_id, text FROM block WHERE deleted_at IS NULL AND instr(text, ?1) > 0
+                 ORDER BY created_at",
+            )?;
+            let rows = stmt.query_map([format!("blob:{hash}")], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (b, p, text) = row?;
+                if attaches(&text) {
+                    return Ok(Some((PageId(p), BlockId(b))));
+                }
+            }
+            Ok(None)
+        };
+        let (page, parent) = match given.map(Ok).or_else(|| fallback().transpose()) {
+            Some(r) => {
+                let (p, b) = r?;
+                (p, Some(b))
+            }
+            None => (self.ensure_daily_page(self.today())?, None),
+        };
+        let quote = quote.split_whitespace().collect::<Vec<_>>().join(" ");
+        let text = if quote.is_empty() {
+            highlight_markup(hash, pdf_page, rects)
+        } else {
+            format!("{quote} {}", highlight_markup(hash, pdf_page, rects))
+        };
+        self.seal_undo();
+        let plan = outline::append_block(self.page_state(&page)?, parent.as_ref());
+        let block = self
+            .execute_plan(&page, plan, None)?
+            .ok_or_else(|| StoreError::Invalid("could not add the highlight".into()))?
+            .block;
+        self.set_block_text(&page, &block, &text, None, None)?;
+        self.set_block_kind(&page, &block, BlockKind::Quote, false)?;
+        self.commit_block(&page, &block)?;
+        Ok((page, block))
+    }
+}

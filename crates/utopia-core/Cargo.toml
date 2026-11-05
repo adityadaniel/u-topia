@@ -1,0 +1,20 @@
+[package]
+name = "utopia-core"
+description = "Utopia domain model: ids, titles, dates, inline markdown, block tree, commands, undo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+caseless.workspace = true
+chrono.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+unicode-normalization.workspace = true
+unicode-segmentation.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

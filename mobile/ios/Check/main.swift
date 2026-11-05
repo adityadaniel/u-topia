@@ -11,9 +11,9 @@ func check(_ cond: Bool, _ what: String) {
     print("ok: \(what)")
 }
 
-let dir = FileManager.default.temporaryDirectory.appendingPathComponent("trellis-check-\(getpid())")
+let dir = FileManager.default.temporaryDirectory.appendingPathComponent("utopia-check-\(getpid())")
 try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-let path = dir.appendingPathComponent("m.trellis").path
+let path = dir.appendingPathComponent("m.utopia").path
 let g = try Graph.open(path: path, passphrase: nil)
 try g.setToday(date: "2026-11-02")
 let day = try g.today()

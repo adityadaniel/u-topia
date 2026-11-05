@@ -1,0 +1,13 @@
+[package]
+name = "utopia-doc"
+description = "Utopia CRDT boundary: one Loro document shard per page"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+loro.workspace = true
+thiserror.workspace = true
+utopia-core.workspace = true

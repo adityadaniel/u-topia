@@ -1,4 +1,4 @@
-;; Word count: a minimal Trellis plugin, written by hand in WebAssembly text.
+;; Word count: a minimal Utopia plugin, written by hand in WebAssembly text.
 ;; It needs no permissions: it only reads its input and returns a message.
 ;;
 ;; Input (from the host): {"block":…,"command":"count","page":…,"text":"…"}
@@ -10,7 +10,7 @@
   (data (i32.const 16) "{\"message\":\"")   ;; 12 bytes
   (data (i32.const 32) " words\"}")          ;; 8 bytes
 
-  (func (export "trellis_alloc") (param $n i32) (result i32)
+  (func (export "utopia_alloc") (param $n i32) (result i32)
     (local $p i32)
     (local.set $p (global.get $heap))
     (global.set $heap (i32.add (global.get $heap) (local.get $n)))
@@ -36,7 +36,7 @@
         (br $outer)))
     (i32.const -1))
 
-  (func (export "trellis_run") (param $p i32) (param $n i32) (result i64)
+  (func (export "utopia_run") (param $p i32) (param $n i32) (result i64)
     (local $i i32) (local $c i32) (local $words i32) (local $inword i32) (local $ws i32)
     (local $len i32) (local $tmp i32) (local $k i32)
     (local.set $i (call $find (local.get $p) (local.get $n)))

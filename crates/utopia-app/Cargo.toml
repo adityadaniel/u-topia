@@ -1,0 +1,30 @@
+[package]
+name = "utopia-app"
+description = "Utopia desktop app: window, keymap, menus, CLI (doctor, export)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "utopia"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+utopia-api.workspace = true
+utopia-core.workspace = true
+utopia-store.workspace = true
+utopia-sync.workspace = true
+utopia-syncd = { path = "../utopia-syncd" }
+utopia-ui.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+objc = "0.2"
+png = "0.17"
+raw-window-handle = "0.6"
+
+[dev-dependencies]
+tempfile.workspace = true

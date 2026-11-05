@@ -1,0 +1,28 @@
+[package]
+name = "utopia-ffi"
+description = "Utopia mobile core (PRD §14): the store behind a UniFFI surface for Swift/Kotlin shells"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+name = "utopia_ffi"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+chrono.workspace = true
+thiserror.workspace = true
+utopia-core.workspace = true
+utopia-store.workspace = true
+utopia-sync.workspace = true
+uniffi = { version = "0.32.2", features = ["cli"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+utopia-syncd = { path = "../utopia-syncd" }
+tokio.workspace = true

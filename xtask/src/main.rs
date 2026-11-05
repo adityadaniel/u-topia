@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
-use trellis_core::outline;
-use trellis_core::{BlockId, BlockKind, Command, PageId};
-use trellis_store::{EditOpts, RefQuery, Store};
+use utopia_core::outline;
+use utopia_core::{BlockId, BlockKind, Command, PageId};
+use utopia_store::{EditOpts, RefQuery, Store};
 
 struct Row {
     name: &'static str,
@@ -191,15 +191,15 @@ fn rss_probe(db: &Path) -> Result<()> {
 
 fn sync_round_trip(r: &mut Report) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    let db = Arc::new(trellis_syncd::Db::open_in_memory().map_err(|e| anyhow::anyhow!("{e:?}"))?);
-    let app = trellis_syncd::router(db, trellis_syncd::Config::default());
+    let db = Arc::new(utopia_syncd::Db::open_in_memory().map_err(|e| anyhow::anyhow!("{e:?}"))?);
+    let app = utopia_syncd::router(db, utopia_syncd::Config::default());
     let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
     let base = format!("http://{}", listener.local_addr()?);
     rt.spawn(async move { axum_serve(listener, app).await });
     let transport =
-        |s: &Store| -> Result<trellis_sync::SyncClient<trellis_sync::http::HttpTransport>> {
-            Ok(trellis_sync::SyncClient::new(
-                trellis_sync::http::HttpTransport::new(&base, "bench", None)?,
+        |s: &Store| -> Result<utopia_sync::SyncClient<utopia_sync::http::HttpTransport>> {
+            Ok(utopia_sync::SyncClient::new(
+                utopia_sync::http::HttpTransport::new(&base, "bench", None)?,
                 s,
             )?)
         };
@@ -227,20 +227,20 @@ fn sync_round_trip(r: &mut Report) -> Result<()> {
     Ok(())
 }
 
-async fn axum_serve(listener: tokio::net::TcpListener, app: trellis_syncd::Router) {
-    let _ = trellis_syncd::serve(listener, app).await;
+async fn axum_serve(listener: tokio::net::TcpListener, app: utopia_syncd::Router) {
+    let _ = utopia_syncd::serve(listener, app).await;
 }
 
-/// Launch the release app with `TRELLIS_PROBE` and parse its measurements.
+/// Launch the release app with `UTOPIA_PROBE` and parse its measurements.
 fn probe(graph: &Path, config: &Path) -> Result<(f64, f64, f64)> {
-    let exe = std::env::current_exe()?.with_file_name("trellis");
+    let exe = std::env::current_exe()?.with_file_name("utopia");
     if !exe.exists() {
-        bail!("build the app first: cargo build --release -p trellis-app");
+        bail!("build the app first: cargo build --release -p utopia-app");
     }
     let out = std::process::Command::new(&exe)
-        .env("TRELLIS_PROBE", "1")
-        .env("TRELLIS_GRAPH", graph)
-        .env("TRELLIS_CONFIG_DIR", config)
+        .env("UTOPIA_PROBE", "1")
+        .env("UTOPIA_GRAPH", graph)
+        .env("UTOPIA_CONFIG_DIR", config)
         .output()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let line = text
@@ -271,7 +271,7 @@ fn bench(ui: bool) -> Result<()> {
         eprintln!("warning: run with --release; debug builds are 10–50× slower");
     }
     let dir = tempfile::tempdir()?;
-    let path = dir.path().join("bench.trellis");
+    let path = dir.path().join("bench.utopia");
     let mut r = Report::default();
     let fx;
     {
@@ -543,7 +543,7 @@ fn bench(ui: bool) -> Result<()> {
     Ok(())
 }
 
-/// `Info.plist` for the app bundle. `CFBundleURLTypes` claims the `trellis://` scheme so
+/// `Info.plist` for the app bundle. `CFBundleURLTypes` claims the `utopia://` scheme so
 /// links from other apps reach `on_open_urls` (P2 automation).
 fn info_plist(version: &str) -> String {
     format!(
@@ -551,10 +551,10 @@ fn info_plist(version: &str) -> String {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Trellis</string>
-  <key>CFBundleDisplayName</key><string>Trellis</string>
-  <key>CFBundleIdentifier</key><string>app.trellis.Trellis</string>
-  <key>CFBundleExecutable</key><string>trellis</string>
+  <key>CFBundleName</key><string>Utopia</string>
+  <key>CFBundleDisplayName</key><string>Utopia</string>
+  <key>CFBundleIdentifier</key><string>app.utopia.Utopia</string>
+  <key>CFBundleExecutable</key><string>utopia</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>{version}</string>
   <key>CFBundleShortVersionString</key><string>{version}</string>
@@ -563,8 +563,8 @@ fn info_plist(version: &str) -> String {
   <key>CFBundleURLTypes</key>
   <array>
     <dict>
-      <key>CFBundleURLName</key><string>app.trellis.link</string>
-      <key>CFBundleURLSchemes</key><array><string>trellis</string></array>
+      <key>CFBundleURLName</key><string>app.utopia.link</string>
+      <key>CFBundleURLSchemes</key><array><string>utopia</string></array>
     </dict>
   </array>
 </dict>
@@ -573,19 +573,17 @@ fn info_plist(version: &str) -> String {
     )
 }
 
-/// Build the app and lay out `target/Trellis.app`.
+/// Build the app and lay out `target/Utopia.app`.
 fn bundle(debug: bool) -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut build = std::process::Command::new(env!("CARGO"));
-    build
-        .current_dir(&root)
-        .args(["build", "-p", "trellis-app"]);
+    build.current_dir(&root).args(["build", "-p", "utopia-app"]);
     if !debug {
         build.arg("--release");
     }
     anyhow::ensure!(build.status()?.success(), "cargo build failed");
     let profile = if debug { "debug" } else { "release" };
-    let app = root.join("target/Trellis.app");
+    let app = root.join("target/Utopia.app");
     let contents = app.join("Contents");
     if app.exists() {
         std::fs::remove_dir_all(&app)?;
@@ -593,8 +591,8 @@ fn bundle(debug: bool) -> Result<()> {
     std::fs::create_dir_all(contents.join("MacOS"))?;
     std::fs::create_dir_all(contents.join("Resources"))?;
     std::fs::copy(
-        root.join("target").join(profile).join("trellis"),
-        contents.join("MacOS/trellis"),
+        root.join("target").join(profile).join("utopia"),
+        contents.join("MacOS/utopia"),
     )?;
     std::fs::write(
         contents.join("Info.plist"),
@@ -626,19 +624,19 @@ fn mobile(ios: bool) -> Result<()> {
     std::fs::create_dir_all(&gen)?;
     run(Command::new(cargo)
         .current_dir(&root)
-        .args(["build", "-p", "trellis-ffi"]))?;
-    let lib = root.join("target/debug/libtrellis_ffi.a");
+        .args(["build", "-p", "utopia-ffi"]))?;
+    let lib = root.join("target/debug/libutopia_ffi.a");
     run(Command::new(cargo).current_dir(&root).args([
         "run",
         "-q",
         "-p",
-        "trellis-ffi",
+        "utopia-ffi",
         "--bin",
         "uniffi-bindgen",
         "--",
         "generate",
         "--library",
-        root.join("target/debug/libtrellis_ffi.dylib")
+        root.join("target/debug/libutopia_ffi.dylib")
             .to_str()
             .unwrap(),
         "--language",
@@ -651,14 +649,14 @@ fn mobile(ios: bool) -> Result<()> {
         "run",
         "-q",
         "-p",
-        "trellis-ffi",
+        "utopia-ffi",
         "--bin",
         "uniffi-bindgen",
         "--",
         "generate",
         "--no-format",
         "--library",
-        root.join("target/debug/libtrellis_ffi.dylib")
+        root.join("target/debug/libutopia_ffi.dylib")
             .to_str()
             .unwrap(),
         "--language",
@@ -666,12 +664,12 @@ fn mobile(ios: bool) -> Result<()> {
         "--out-dir",
         out.join("kotlin").to_str().unwrap(),
     ]))?;
-    let bindings = gen.join("trellis_ffi.swift");
+    let bindings = gen.join("utopia_ffi.swift");
     let modulemap = format!(
         "-fmodule-map-file={}",
-        gen.join("trellis_ffiFFI.modulemap").display()
+        gen.join("utopia_ffiFFI.modulemap").display()
     );
-    let app_sources: Vec<PathBuf> = std::fs::read_dir(root.join("mobile/ios/TrellisMobile"))?
+    let app_sources: Vec<PathBuf> = std::fs::read_dir(root.join("mobile/ios/UtopiaMobile"))?
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "swift"))
@@ -704,7 +702,7 @@ fn mobile(ios: bool) -> Result<()> {
     run(&mut c)?;
     run(&mut Command::new(&check))?;
     // 2. The shell on macOS (a preview of the same SwiftUI code).
-    let mac = out.join("TrellisMobile-macos");
+    let mac = out.join("UtopiaMobile-macos");
     let mut c = swiftc("macosx");
     c.arg("-parse-as-library")
         .args(&app_sources)
@@ -744,11 +742,11 @@ fn mobile(ios: bool) -> Result<()> {
     run(Command::new(cargo).current_dir(&root).args([
         "build",
         "-p",
-        "trellis-ffi",
+        "utopia-ffi",
         "--target",
         target,
     ]))?;
-    let app = out.join("TrellisMobile.app");
+    let app = out.join("UtopiaMobile.app");
     if app.exists() {
         std::fs::remove_dir_all(&app)?;
     }
@@ -761,14 +759,14 @@ fn mobile(ios: bool) -> Result<()> {
     ])
     .args(&app_sources)
     .arg("-o")
-    .arg(app.join("TrellisMobile"));
+    .arg(app.join("UtopiaMobile"));
     link(
         &mut c,
-        &root.join(format!("target/{target}/debug/libtrellis_ffi.a")),
+        &root.join(format!("target/{target}/debug/libutopia_ffi.a")),
     );
     run(&mut c)?;
     std::fs::copy(
-        root.join("mobile/ios/TrellisMobile/Info.plist"),
+        root.join("mobile/ios/UtopiaMobile/Info.plist"),
         app.join("Info.plist"),
     )?;
     run(Command::new("codesign")
@@ -788,7 +786,7 @@ fn main() -> Result<()> {
         Some("bench") => bench(args.iter().any(|a| a == "--ui")),
         Some("profile-merge") => {
             let dir = tempfile::tempdir()?;
-            let mut s = Store::open(dir.path().join("p.trellis"))?;
+            let mut s = Store::open(dir.path().join("p.utopia"))?;
             let filler = s.create_page("Filler")?;
             insert_flat(&mut s, &filler, (0..5_000).map(|i| format!("filler {i}")))?;
             for round in 0..150 {
@@ -811,7 +809,7 @@ fn main() -> Result<()> {
         Some("mobile") => mobile(args.iter().any(|a| a == "--ios")),
         _ => {
             println!(
-                "usage: cargo run -p xtask --release -- bench [--ui]\n       cargo run -p xtask -- bundle [--debug]   (target/Trellis.app, registers trellis://)\n       cargo run -p xtask -- mobile [--ios]     (Swift bindings, checks, iOS shell)\n       cargo run -p xtask --release -- profile-merge   (loop for sampling with `sample`)"
+                "usage: cargo run -p xtask --release -- bench [--ui]\n       cargo run -p xtask -- bundle [--debug]   (target/Utopia.app, registers utopia://)\n       cargo run -p xtask -- mobile [--ios]     (Swift bindings, checks, iOS shell)\n       cargo run -p xtask --release -- profile-merge   (loop for sampling with `sample`)"
             );
             Ok(())
         }
