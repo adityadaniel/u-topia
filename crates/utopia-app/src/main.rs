@@ -11,13 +11,15 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, size, App, Application, Bounds, Context, Entity, EntityInputHandler, Menu,
-    MenuItem, Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, size, App, Application, Bounds, Context, Entity, EntityInputHandler,
+    Global, Menu, MenuItem, Subscription, TitlebarOptions, Window, WindowBounds, WindowHandle,
+    WindowOptions,
 };
 use utopia_store::Store;
 use utopia_ui::actions::*;
 use utopia_ui::app_state::AppState;
 use utopia_ui::line_input::{LineInput, LineInputEvent};
+use utopia_ui::settings::{SettingsView, Tab as SettingsTab};
 use utopia_ui::theme::{theme, Theme};
 use utopia_ui::workspace::Workspace;
 
@@ -555,12 +557,63 @@ impl Render for Root {
     }
 }
 
+/// The open Settings window, so Cmd+, raises the existing one instead of stacking copies.
+#[derive(Default)]
+struct SettingsWindow(Option<WindowHandle<SettingsView>>);
+
+impl Global for SettingsWindow {}
+
+/// Open Settings on `tab`, or bring the open one to the front and switch it to `tab`.
+///
+/// Deferred because gpui refuses to update a window from inside its own update, and global
+/// action handlers run during one: pressing Cmd+, while Settings is focused would otherwise
+/// fail to reach the existing window and open a second copy of it.
+fn open_settings(tab: SettingsTab, cx: &mut App) {
+    cx.defer(move |cx| open_settings_now(tab, cx));
+}
+
+fn open_settings_now(tab: SettingsTab, cx: &mut App) {
+    if let Some(handle) = cx.global::<SettingsWindow>().0 {
+        // `update` fails if the user closed the window; fall through and make a new one.
+        let raised = handle
+            .update(cx, |view, window, cx| {
+                view.show(tab, cx);
+                window.activate_window();
+            })
+            .is_ok();
+        if raised {
+            return;
+        }
+        cx.global_mut::<SettingsWindow>().0 = None;
+    }
+    let config = paths::config_dir();
+    // Wide enough that the Help column and its screenshots fit without clipping.
+    let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Settings".into()),
+            ..Default::default()
+        }),
+        window_min_size: Some(size(px(900.), px(520.))),
+        ..Default::default()
+    };
+    match cx.open_window(options, move |window, cx| {
+        cx.new(|cx| SettingsView::new(config, tab, window, cx))
+    }) {
+        Ok(handle) => cx.global_mut::<SettingsWindow>().0 = Some(handle),
+        Err(e) => eprintln!("utopia: could not open Settings: {e}"),
+    }
+}
+
 fn menus() -> Vec<Menu> {
     vec![
         Menu {
             name: "Utopia".into(),
             items: vec![
                 MenuItem::action("Quick Jump", QuickJump),
+                MenuItem::separator(),
+                MenuItem::action("Settings…", OpenSettings),
                 MenuItem::separator(),
                 MenuItem::action("Quit Utopia", Quit),
             ],
@@ -580,13 +633,22 @@ fn menus() -> Vec<Menu> {
         Menu {
             name: "Go".into(),
             items: vec![
+                MenuItem::action("Daily Note", GoDailyNotes),
                 MenuItem::action("Today", GoToday),
+                MenuItem::action("Yesterday", GoYesterday),
                 MenuItem::action("Previous Day", PrevDay),
                 MenuItem::action("Next Day", NextDay),
                 MenuItem::separator(),
                 MenuItem::action("Toggle Left Sidebar", ToggleLeftSidebar),
                 MenuItem::action("Toggle Right Sidebar", ToggleRightSidebar),
                 MenuItem::action("Toggle References", ToggleReferences),
+            ],
+        },
+        Menu {
+            name: "Help".into(),
+            items: vec![
+                MenuItem::action("Keyboard Shortcuts", ShowShortcuts),
+                MenuItem::action("Utopia Help", UtopiaHelp),
             ],
         },
     ]
@@ -604,6 +666,10 @@ fn run_app(graph: Option<PathBuf>) {
         install_keymap(cx, keymap.as_deref());
         cx.set_menus(menus());
         cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(|_: &OpenSettings, cx| open_settings(SettingsTab::Keybindings, cx));
+        cx.on_action(|_: &ShowShortcuts, cx| open_settings(SettingsTab::Shortcuts, cx));
+        cx.on_action(|_: &UtopiaHelp, cx| open_settings(SettingsTab::Help, cx));
+        cx.set_global(SettingsWindow::default());
         let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),

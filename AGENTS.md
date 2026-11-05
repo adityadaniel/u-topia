@@ -60,13 +60,16 @@ Steps (`;` or newline separated): `keys <k…>`, `type <text>` (lines are trimme
 after `type` keeps a leading one), `wait <ms>`, `scroll <dy>` (a real AppKit wheel event in the
 main pane; negative scrolls down), `shot <png>`, `drop <file>` (as from Finder),
 `ws open-pdf` / `ws highlight <page> <x> <y> <w> <h>` (area) / `ws select <page> <x0> <y0> <x1> <y1>`
-(text selection). Then read the PNG. Do this for any visible
+(text selection), `target main|last` (which window the steps after it drive and capture —
+`last` is the most recently opened, which is how the Settings window is reached:
+`keys cmd-,; wait 800; target last; shot …`). Then read the PNG. Do this for any visible
 change: it has caught bugs the geometry tests could not.
 
 UI behaviour is tested without a screen: `crates/utopia-ui/tests/workspace.rs` drives the real
 `Workspace` through GPUI's test platform (`gpui` `test-support` dev-feature) with simulated
 keystrokes and asserts on store state; `crates/utopia-ui/tests/layout.rs` asserts layout
-geometry via `debug_selector` bounds. Add a script there for any new interaction or region.
+geometry via `debug_selector` bounds; `crates/utopia-ui/tests/settings.rs` drives the keybinding
+editor (capture, save, reset, clash). Add a script there for any new interaction or region.
 The list keeps rendering the row being edited when it scrolls out of view (`splice_items`
 passes the editor's focus handle to `ListState::splice_focusable`): a focused element that is
 not rendered gets no keystrokes, so every shortcut would die. Keep that when touching the list.
@@ -122,11 +125,11 @@ Sync (§12; secrets never go into the graph file, §15.6):
 | `crates/utopia-syncd` | Relay server (axum, §12.8): per-page logs, dedupe, auth, quota, snapshots, WebSocket notices; `lan` = in-process relay + mDNS. **No CRDT dependency** | `utopia-proto`, `rusqlite` |
 | `crates/utopia-api` | Local automation API (loopback HTTP, bearer token) and `utopia://` link parsing; `handle(store, Op)` is the one implementation shared with plugins | `utopia-core`, `utopia-store`, `axum` |
 | `crates/utopia-plugin` | WASM plugin sandbox (wasmi: fuel, memory cap, permissioned API calls) | `utopia-api`, `utopia-store`, `wasmi` |
-| `crates/utopia-ui` | GPUI components: block editor (IME via `EntityInputHandler`), outline view, chips, panels, sidebar, background sync runner, graph view, PDF viewer (PDFKit on macOS) | `utopia-core`, `utopia-store`, `utopia-sync`, `utopia-plugin`, `gpui` |
+| `crates/utopia-ui` | GPUI components: block editor (IME via `EntityInputHandler`), outline view, chips, panels, sidebar, background sync runner, graph view, PDF viewer (PDFKit on macOS), Settings window (keybinding editor, shortcut sheet, Help tour) | `utopia-core`, `utopia-store`, `utopia-sync`, `utopia-plugin`, `gpui` |
 | `crates/utopia-app` | Binary: window, keymap, actions, app assembly, CLI subcommands, startup probe, screenshot scripts, API/link inbox, unlock screen | everything above |
 | `crates/utopia-ffi` | Mobile core: UniFFI surface over the store and sync (§14) | `utopia-store`, `utopia-sync`, `uniffi` |
 | `mobile/ios` | SwiftUI shell (`UtopiaMobile`) and the Swift binding check | the generated bindings |
-| `xtask` | Dev tasks: `bench` (budgets), `profile-merge`, `bundle`, `mobile` | anything |
+| `xtask` | Dev tasks: `bench` (budgets), `profile-merge`, `bundle`, `mobile`, `help-shots` | anything |
 
 Dependency direction is one-way: `app → ui → (plugin → api) → store → doc → core`;
 `ffi → sync → store`. If you find yourself importing upward, move the type down instead.
@@ -217,6 +220,19 @@ Implemented:
 - **Sync (§11.7, §12):** HTTP relay and client, background sync with status and merge notices,
   snapshot compaction, Loro-cursor caret preservation, end-to-end encryption (Argon2id +
   XChaCha20-Poly1305), realtime WebSocket notices, folder transport, LAN relay with mDNS.
+- **Settings and keybindings (§9.1):** a Settings window (Cmd+,) with three tabs —
+  **Keybindings**, where every action can be rebound by pressing the keys and the change
+  applies at once; **Shortcuts**, the cheat sheet of everything bound; and **Help**, a tour of
+  the features with screenshots captured from the app (`cargo run -p xtask -- help-shots`).
+  `utopia_ui::actions::CATALOG` is the one source of truth: default keys plus the label,
+  category and help text for each action, so the editor, the cheat sheet and the installed
+  bindings cannot drift apart. Only actions the user changed are written to `keymap.json`,
+  so defaults that move in a later release still reach them. Day navigation is
+  `GoDailyNotes` (Cmd+Shift+D, the feed), `GoToday` (Cmd+Shift+T) and `GoYesterday`
+  (Cmd+Shift+Y). Rebinding captures through a gpui *keystroke interceptor*, which runs before
+  the keymap is consulted, so the keys being recorded cannot also fire their own action —
+  without that, rebinding onto Cmd+Q would quit the app. Keys are compared with
+  `canonical_keys` (gpui's spelling), so `cmd-alt-t` and `alt-cmd-t` are one binding.
 - **v1.2+ / P2 (§4.2, §16):** query blocks (`{{query: …}}`, Roam syntax, SQL-backed, `/Query`)
   with queryable `key:: value` attributes; graph view (Cmd+Shift+G, force-directed, local/global,
   journal toggle); attachments (drop files or `/Attach a file`, image previews, file chips,
@@ -232,6 +248,12 @@ Known limits (pick these up deliberately, don't paper over them):
   compilation, because the Metal toolchain is not installed); later launches draw in ~150 ms.
 - Screenshots come from the app capturing its own window (`UTOPIA_SHOT_SCRIPT`); colours and
   typography are checked by eye, not by tests.
+- Settings → Help embeds its screenshots with `include_bytes!` (~1.3 MB), so they go stale when
+  the UI changes: rerun `cargo run -p xtask -- help-shots` and look at the PNGs. They are shown
+  at a fixed size because gpui only learns an image's aspect ratio a frame after layout.
+- `open_settings` is deferred (`cx.defer`): gpui refuses to update a window from inside its own
+  update, and global action handlers run during one, so Cmd+, pressed while Settings is focused
+  would otherwise open a second Settings window instead of raising the first.
 - Mobile has not run on an iOS device or simulator here. `aarch64-apple-ios-sim` is installed and
   the core builds for it; the iOS Simulator runtime is not (download stopped: the user chose to
   focus on desktop first). The Swift bindings run against the real core on macOS and the SwiftUI shell

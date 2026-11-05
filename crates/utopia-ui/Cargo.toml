@@ -27,3 +27,10 @@ png = "0.17"
 [dev-dependencies]
 tempfile.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
+
+# The `objc` crate's `msg_send!` expands to `cfg(feature = "cargo-clippy")`, a pattern
+# current rustc flags. The warning is attributed to our call sites (pdf.rs, shot.rs) but
+# comes from the macro, and objc is unmaintained, so declare the value as expected rather
+# than let `-D warnings` fail the build on a dependency's spelling.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

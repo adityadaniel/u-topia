@@ -283,6 +283,54 @@ fn day_navigation(cx: &mut TestAppContext) {
     assert_eq!(shown, today_page(&app, cx));
 }
 
+/// The three date shortcuts (§9.1): Daily Note is the whole feed, while Today and
+/// Yesterday open that one day on its own.
+#[gpui::test]
+fn date_shortcuts(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let in_feed = |ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
+        !ws.update(cx, |w, cx| w.journal_days(cx)).is_empty()
+    };
+    let shown_date =
+        |app: &Entity<AppState>, ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            let p = ws.update(cx, |w, cx| w.main_page(cx)).unwrap();
+            app.update(cx, |app, _| {
+                app.store.page_state(&p).unwrap().meta.daily_date
+            })
+        };
+    assert!(in_feed(&ws, cx), "the launch view is the feed (FR-1.1)");
+
+    // Today leaves the feed for the single day.
+    cx.simulate_keystrokes("cmd-shift-t");
+    cx.run_until_parked();
+    assert!(!in_feed(&ws, cx), "Today opens one day, not the feed");
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)).unwrap(),
+        today_page(&app, cx)
+    );
+
+    cx.simulate_keystrokes("cmd-shift-y");
+    cx.run_until_parked();
+    assert!(!in_feed(&ws, cx), "Yesterday opens one day");
+    assert_eq!(
+        shown_date(&app, &ws, cx),
+        NaiveDate::from_ymd_opt(2026, 11, 1),
+        "yesterday"
+    );
+
+    // Daily Note brings the feed back.
+    cx.simulate_keystrokes("cmd-shift-d");
+    cx.run_until_parked();
+    assert!(in_feed(&ws, cx), "Daily Note returns to the feed");
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)).unwrap(),
+        today_page(&app, cx)
+    );
+
+    // Neither shortcut wrote a page: a day is a draft until it is typed in (FR-1.2).
+    assert_eq!(daily_count(&app, cx), 0, "visiting a day creates nothing");
+}
+
 #[gpui::test]
 fn marks_and_soft_breaks(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);
