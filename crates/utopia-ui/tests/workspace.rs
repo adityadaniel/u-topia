@@ -1203,3 +1203,109 @@ fn relative_date_links(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// The block editor's selected text, for scripts that check what is still selected.
+fn selected_text(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
+    ws.update(cx, |w, cx| {
+        let e = w.editor().read(cx);
+        e.field_text()[e.selection()].to_string()
+    })
+}
+
+/// Typing `[` twice over a selected word makes it a page link, Roam's idiom: the opening
+/// bracket surrounds the selection instead of replacing it, and the word stays selected.
+#[gpui::test]
+fn opening_bracket_wraps_the_selection(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    app.update(cx, |app, _| {
+        // A page the menu could offer for `[[launch`, so a menu opening would be visible.
+        app.store.create_page("Launch checklist").unwrap();
+    });
+    cx.simulate_input("Met Ana about launch");
+    cx.simulate_keystrokes("shift-left shift-left shift-left shift-left shift-left shift-left");
+    assert_eq!(selected_text(&ws, cx), "launch");
+    cx.simulate_input("[");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "Met Ana about [launch]");
+    assert_eq!(selected_text(&ws, cx), "launch", "still selected, inside");
+    cx.simulate_input("[");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "Met Ana about [[launch]]");
+    assert_eq!(selected_text(&ws, cx), "launch");
+    assert!(
+        ws.update(cx, |w, cx| w.editor().read(cx).ac.is_none()),
+        "the user made the link; no menu offers to replace it"
+    );
+    // Leaving the block commits it like any typed link.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    app.update(cx, |app, _| {
+        app.store.sync_index().unwrap();
+        let launch = app.store.find_page("launch").unwrap().expect("linked page");
+        assert_eq!(app.store.backlink_count(&launch).unwrap(), 1);
+    });
+}
+
+/// Each wrap is one edit, so one undo takes back exactly one wrap and never leaves a
+/// half-wrapped `(word` behind. The text is multi-byte and the selection ends on a
+/// grapheme cluster (§13.5).
+#[gpui::test]
+fn bracket_wrap_is_one_undo_step(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("see 日本語👩‍👩‍👧 now");
+    // Let the typing commit (300 ms idle) so it is its own undo step.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("left left left left shift-left shift-left shift-left shift-left");
+    assert_eq!(selected_text(&ws, cx), "日本語👩‍👩‍👧");
+    cx.simulate_input("(");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "see (日本語👩‍👩‍👧) now");
+    // Commit between the two, so they are separate undo steps rather than coalescing.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    cx.simulate_input("{");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "see ({日本語👩‍👩‍👧}) now");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "see (日本語👩‍👩‍👧) now");
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "see 日本語👩‍👩‍👧 now");
+    cx.simulate_keystrokes("cmd-shift-z");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "see (日本語👩‍👩‍👧) now");
+}
+
+/// Only brackets wrap. A quote typed over a selection replaces it as in any text field
+/// (the editor pairs nothing as you type), and IME composition is never wrapped.
+#[gpui::test]
+fn only_plain_brackets_wrap(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("say hi");
+    cx.simulate_keystrokes("shift-left shift-left");
+    cx.simulate_input("\"");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "say \"");
+    cx.simulate_input("hi");
+    cx.simulate_keystrokes("shift-left shift-left");
+    // An IME composes over the selection, then commits a bracket: that is the IME's
+    // text, not a keystroke over a selection, so it is inserted as is.
+    let editor = ws.update(cx, |w, _| w.editor());
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "[", None, window, cx);
+        e.replace_text_in_range(None, "[", window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "say \"[");
+}

@@ -242,7 +242,11 @@ impl FieldHost for BlockEditor {
     }
 }
 
-crate::impl_field_input_handler!(BlockEditor, BlockEditor::after_edit);
+crate::impl_field_input_handler!(
+    BlockEditor,
+    BlockEditor::after_edit,
+    BlockEditor::wrap_typed_bracket
+);
 
 impl BlockEditor {
     pub fn new(app: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -273,6 +277,11 @@ impl BlockEditor {
 
     pub fn selection(&self) -> std::ops::Range<usize> {
         self.field.sel.clone()
+    }
+
+    /// The text being edited, as typed (before the block commits).
+    pub fn field_text(&self) -> &str {
+        &self.field.text
     }
 
     /// Start editing `target`, committing the previous block first.
@@ -452,6 +461,37 @@ impl BlockEditor {
                 .collect()
         });
         !markup.is_empty() && self.insert_text(&markup.join(" "), window, cx)
+    }
+
+    /// Typing `(`, `[` or `{` over a selection surrounds it and keeps it selected, so `[`
+    /// twice turns `word` into `[[word]]` (Roam's link idiom). One text edit, so one undo
+    /// step like any keystroke. Only for plain typing that replaces the selection: never
+    /// while IME text is being composed.
+    fn wrap_typed_bracket(
+        &mut self,
+        range: std::ops::Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.target.is_none() || self.field.marked.is_some() || range != self.field.sel {
+            return false;
+        }
+        let Some((wrapped, sel)) = utopia_core::text::wrap_selection(&self.field.text, range, text)
+        else {
+            return false;
+        };
+        let reversed = self.field.reversed;
+        self.field.text = wrapped;
+        self.field.sel = sel;
+        self.field.reversed = reversed;
+        self.after_edit(window, cx);
+        // `[[word` now looks like a link being typed, but the user just made the link;
+        // a menu here would let Enter swap their word for some other page.
+        if let Some(ac) = self.ac.take() {
+            self.ac_dismissed = Some(ac.start);
+        }
+        true
     }
 
     fn after_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {

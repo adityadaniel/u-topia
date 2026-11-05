@@ -156,6 +156,39 @@ pub fn toggle_mark(text: &str, sel: Range<usize>, delim: &str) -> (String, Range
     (out, sel.start + dl..sel.end + dl)
 }
 
+/// The closing bracket for a typed opening one. Only brackets wrap a selection: the
+/// editor pairs nothing else as you type, and `**`/`_`/`` ` `` have Cmd+B/I/E (FR-2.16),
+/// so a typed quote or `*` still replaces the selection the way it does in any text field.
+pub fn closing_bracket(open: &str) -> Option<&'static str> {
+    match open {
+        "(" => Some(")"),
+        "[" => Some("]"),
+        "{" => Some("}"),
+        _ => None,
+    }
+}
+
+/// Typing an opening bracket over a non-empty selection surrounds it instead of replacing
+/// it, and keeps the original text selected inside the new brackets, so typing `[` twice
+/// over `word` gives `[[word]]`. `None` when `open` is not a bracket or nothing is selected.
+pub fn wrap_selection(text: &str, sel: Range<usize>, open: &str) -> Option<(String, Range<usize>)> {
+    let close = closing_bracket(open)?;
+    if sel.start >= sel.end
+        || sel.end > text.len()
+        || !text.is_char_boundary(sel.start)
+        || !text.is_char_boundary(sel.end)
+    {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len() + open.len() + close.len());
+    out.push_str(&text[..sel.start]);
+    out.push_str(open);
+    out.push_str(&text[sel.clone()]);
+    out.push_str(close);
+    out.push_str(&text[sel.end..]);
+    Some((out, sel.start + open.len()..sel.end + open.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +253,31 @@ mod tests {
         assert_eq!(&t2[sel2], "word");
         let (t3, _) = toggle_mark("x", 1..1, "`");
         assert_eq!(t3, "x``");
+    }
+
+    #[test]
+    fn brackets_wrap_the_selection() {
+        let (t, sel) = wrap_selection("see 日本語 now", 4..13, "[").unwrap();
+        assert_eq!(t, "see [日本語] now");
+        assert_eq!(&t[sel.clone()], "日本語");
+        // Again on the still-selected text: the Roam page-link idiom.
+        let (t, sel) = wrap_selection(&t, sel, "[").unwrap();
+        assert_eq!(t, "see [[日本語]] now");
+        assert_eq!(&t[sel], "日本語");
+        let fam = "a👩‍👩‍👧b";
+        let (t, sel) = wrap_selection(fam, 1..fam.len() - 1, "(").unwrap();
+        assert_eq!(t, "a(👩‍👩‍👧)b");
+        assert_eq!(&t[sel], "👩‍👩‍👧");
+        assert_eq!(wrap_selection("x", 0..1, "{").unwrap().0, "{x}");
+        // Nothing selected, or not a bracket: an ordinary keystroke.
+        assert!(wrap_selection("x", 1..1, "[").is_none());
+        for ch in ["\"", "'", "`", "*", "_", ")", "]", "x"] {
+            assert!(wrap_selection("word", 0..4, ch).is_none(), "{ch}");
+        }
+        assert!(
+            wrap_selection("日", 0..1, "[").is_none(),
+            "not a char boundary"
+        );
     }
 
     #[test]
