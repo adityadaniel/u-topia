@@ -172,3 +172,20 @@ fn system_font_glyphs_fit_their_bitmaps() {
         all[..all.len().min(20)].join("\n")
     );
 }
+
+/// The bundled IBM Plex Sans (Settings → Appearance), registered with gpui from memory,
+/// which font-kit loads with `Font::from_bytes`.
+#[test]
+fn ibm_plex_sans_glyphs_fit_their_bitmaps() {
+    let mut all = Vec::new();
+    for (face, bytes) in utopia_ui::fonts::IBM_PLEX_SANS_FACES {
+        let font = Font::from_bytes(std::sync::Arc::new(bytes.to_vec()), 0).unwrap();
+        all.extend(misses(&format!("IBM Plex Sans {face}"), &font));
+    }
+    assert!(
+        all.is_empty(),
+        "{} glyphs drawn outside their bitmap, e.g.:\n{}",
+        all.len(),
+        all[..all.len().min(20)].join("\n")
+    );
+}

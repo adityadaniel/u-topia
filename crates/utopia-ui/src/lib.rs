@@ -5,6 +5,7 @@ pub mod app_state;
 pub mod calendar;
 pub mod editor;
 pub mod field;
+pub mod fonts;
 pub mod graph_view;
 pub mod help;
 pub mod line_input;
