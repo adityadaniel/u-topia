@@ -214,3 +214,34 @@ fn rebinding_replaces_the_default_keys(cx: &mut TestAppContext) {
     });
     assert_eq!(keys, ["alt-cmd-t"]);
 }
+
+/// Review fix: an override whose keys cannot be used (empty, or not a keystroke) is
+/// ignored with a warning, and the action keeps its default rather than ending up with
+/// no binding at all (rule 11: degrade, don't break).
+#[gpui::test]
+fn an_unusable_override_keeps_the_default(cx: &mut TestAppContext) {
+    use utopia_ui::actions::{install, GoToday};
+    for bad in ["", "   ", "nonsense-key"] {
+        let (o, warnings) =
+            Overrides::from_json(&format!(r#"[{{"key":"{bad}","action":"GoToday"}}]"#));
+        assert!(warnings.is_empty(), "a known action is read as before");
+        cx.update(|cx| {
+            cx.clear_key_bindings();
+            install(cx, &o);
+        });
+        let keys: Vec<String> = cx.update(|cx| {
+            cx.key_bindings()
+                .borrow()
+                .bindings_for_action(&GoToday)
+                .map(|b| {
+                    b.keystrokes()
+                        .iter()
+                        .map(|k| k.unparse())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect()
+        });
+        assert_eq!(keys, [platform_keys("cmd-shift-t")], "override {bad:?}");
+    }
+}

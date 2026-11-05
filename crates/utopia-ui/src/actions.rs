@@ -934,21 +934,28 @@ impl Overrides {
 
 /// Install default bindings, then the user's overrides on top. A rebound action loses its
 /// default keys: gpui would otherwise keep both, and the old keys would go on firing while
-/// Settings shows only the new ones.
+/// Settings shows only the new ones. An override that cannot be bound (empty or invalid
+/// keys) is reported and ignored, and its action keeps the default (rule 11).
 pub fn install(cx: &mut App, overrides: &Overrides) {
-    let mut bindings: Vec<KeyBinding> = CATALOG
-        .iter()
-        .filter(|d| !overrides.is_changed(d.action))
-        .filter_map(|d| binding(d.action, &platform_keys(d.keys), d.context))
-        .collect();
-    // Overrides come last: gpui lets a later binding win for the same keys.
+    let mut replaced = std::collections::BTreeSet::new();
+    let mut user = Vec::new();
     for (action, keys) in &overrides.0 {
         let ctx = doc(action).and_then(|d| d.context);
         match binding(action, keys, ctx) {
-            Some(b) => bindings.push(b),
+            Some(b) => {
+                replaced.insert(action.as_str());
+                user.push(b);
+            }
             None => eprintln!("utopia: ignoring keybinding {keys} -> {action}"),
         }
     }
+    let mut bindings: Vec<KeyBinding> = CATALOG
+        .iter()
+        .filter(|d| !replaced.contains(d.action))
+        .filter_map(|d| binding(d.action, &platform_keys(d.keys), d.context))
+        .collect();
+    // Overrides come last: gpui lets a later binding win for the same keys.
+    bindings.extend(user);
     cx.bind_keys(bindings);
 }
 
