@@ -184,12 +184,12 @@ fn autocomplete_inserts_canonical_links(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let text = rows(&app, &page, cx)[0].0.clone();
     assert_eq!(text, "see [[Alpha Prime]] and #[[Modern Religion]]");
-    // Escape dismisses and leaves the typed text intact (FR-2.17).
+    // Escape dismisses and leaves the typed text intact (FR-2.17), auto-closed `]]` too.
     cx.simulate_input(" [[Nov");
     cx.run_until_parked();
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
-    assert!(rows(&app, &page, cx)[0].0.ends_with("[[Nov"));
+    assert!(rows(&app, &page, cx)[0].0.ends_with("[[Nov]]"));
 }
 
 #[gpui::test]
@@ -1433,7 +1433,7 @@ fn accept_suggestion_can_be_rebound(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(
         rows_str(&rows(&app, &page, cx)),
-        vec![("first", 0), (format!("[[{first}]] [[ana").as_str(), 1)]
+        vec![("first", 0), (format!("[[{first}]] [[ana]]").as_str(), 1)]
     );
 }
 
@@ -1471,4 +1471,172 @@ fn clicking_a_rendered_link_follows_it(cx: &mut TestAppContext) {
     cx.simulate_click(on_link, gpui::Modifiers::default());
     cx.run_until_parked();
     assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(ana));
+}
+
+/// The editor's text and caret (before the block commits).
+fn text_and_caret(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> (String, usize) {
+    ws.update(cx, |w, cx| {
+        let e = w.editor().read(cx);
+        (e.field_text().to_string(), e.cursor())
+    })
+}
+
+/// Brackets pair as you type: the closer appears with the caret between, a typed closer
+/// steps over it, and before a word an opener is just an opener (§13.5).
+#[gpui::test]
+fn brackets_pair_as_you_type(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("call (");
+    assert_eq!(text_and_caret(&ws, cx), ("call ()".into(), 6));
+    cx.simulate_input("Ana)");
+    assert_eq!(
+        text_and_caret(&ws, cx),
+        ("call (Ana)".into(), 10),
+        "not `())`"
+    );
+    cx.simulate_input(" {x} [");
+    assert_eq!(text_and_caret(&ws, cx), ("call (Ana) {x} []".into(), 16));
+    cx.simulate_input("]");
+    assert_eq!(text_and_caret(&ws, cx), ("call (Ana) {x} []".into(), 17));
+    // Typing a whole link by hand still gives one pair of each.
+    cx.simulate_input(" [[x]] done");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "call (Ana) {x} [] [[x]] done");
+    // Before a word character: no closer.
+    cx.simulate_keystrokes("home");
+    cx.simulate_input("(");
+    assert_eq!(
+        text_and_caret(&ws, cx),
+        ("(call (Ana) {x} [] [[x]] done".into(), 1)
+    );
+}
+
+/// Backspace in an empty pair removes both brackets; with text inside, it is an ordinary
+/// backspace until the pair is empty again.
+#[gpui::test]
+fn backspace_removes_an_empty_pair(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("a (");
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text_and_caret(&ws, cx), ("a ".into(), 2));
+    cx.simulate_input("[[");
+    assert_eq!(text_and_caret(&ws, cx), ("a [[]]".into(), 4));
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text_and_caret(&ws, cx), ("a []".into(), 3));
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text_and_caret(&ws, cx), ("a ".into(), 2));
+    cx.simulate_input("{x");
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text_and_caret(&ws, cx), ("a {}".into(), 3));
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "a ");
+}
+
+/// A pair is one edit: one undo takes both brackets back.
+#[gpui::test]
+fn bracket_pair_is_one_undo_step(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("note ");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    cx.simulate_input("(");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "note ()");
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "note ");
+    cx.simulate_keystrokes("cmd-shift-z");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "note ()");
+    let _ = ws;
+}
+
+/// `[[`, `#[[` and `((` auto-close, the menus open as before, and accepting replaces the
+/// closers rather than leaving a second set: `[[Page]]` with the caret after `]]`.
+#[gpui::test]
+fn auto_closed_links_complete_cleanly(cx: &mut TestAppContext) {
+    use utopia_ui::editor::AcKind;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    app.update(cx, |app, _| {
+        app.store.create_page("Ana Lovelace").unwrap();
+        app.store.create_page("Modern Religion").unwrap();
+    });
+    cx.simulate_input("Met [[");
+    cx.run_until_parked();
+    assert_eq!(text_and_caret(&ws, cx), ("Met [[]]".into(), 6));
+    cx.simulate_input("An");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.editor().read(cx).ac.as_ref().map(|a| a.kind)),
+        Some(AcKind::Page),
+        "the [[ menu is open inside the auto-closed link"
+    );
+    // A pause mid-title does not commit `[[An]]` and create a page "An".
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    app.update(cx, |app, _| {
+        app.store.sync_index().unwrap();
+        assert!(app.store.find_page("An").unwrap().is_none());
+    });
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let want = "Met [[Ana Lovelace]]";
+    assert_eq!(text_and_caret(&ws, cx), (want.into(), want.len()));
+    // Enter, and the `#[[` form.
+    cx.simulate_input(" on #[[mod");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let want = "Met [[Ana Lovelace]] on #[[Modern Religion]]";
+    assert_eq!(text_and_caret(&ws, cx), (want.into(), want.len()));
+    // Once the caret is out of the link, the idle commit runs and the edge appears.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    app.update(cx, |app, _| {
+        app.store.sync_index().unwrap();
+        let ana = app.store.find_page("Ana Lovelace").unwrap().unwrap();
+        assert_eq!(app.store.backlink_count(&ana).unwrap(), 1);
+        assert!(app.store.find_page("An").unwrap().is_none());
+    });
+    // `((`: a block reference, closers replaced too.
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("see ((Met");
+    cx.run_until_parked();
+    assert_eq!(text_and_caret(&ws, cx).0, "see ((Met))");
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let (target, text) = app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).unwrap();
+        let roots = st.live_roots();
+        (roots[0].clone(), st.block(&roots[1]).unwrap().text.clone())
+    });
+    let want = format!("see (({target}))");
+    assert_eq!(text, want);
+    assert_eq!(text_and_caret(&ws, cx).1, want.len());
+}
+
+/// IME composition is the input method's text: a bracket it commits is not paired.
+#[gpui::test]
+fn ime_brackets_are_not_paired(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("x ");
+    let editor = ws.update(cx, |w, _| w.editor());
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "(", None, window, cx);
+        e.replace_text_in_range(None, "(", window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "x (");
 }

@@ -245,7 +245,7 @@ impl FieldHost for BlockEditor {
 crate::impl_field_input_handler!(
     BlockEditor,
     BlockEditor::after_edit,
-    BlockEditor::wrap_typed_bracket
+    BlockEditor::typed_bracket
 );
 
 impl BlockEditor {
@@ -463,11 +463,13 @@ impl BlockEditor {
         !markup.is_empty() && self.insert_text(&markup.join(" "), window, cx)
     }
 
-    /// Typing `(`, `[` or `{` over a selection surrounds it and keeps it selected, so `[`
-    /// twice turns `word` into `[[word]]` (Roam's link idiom). One text edit, so one undo
-    /// step like any keystroke. Only for plain typing that replaces the selection: never
-    /// while IME text is being composed.
-    fn wrap_typed_bracket(
+    /// Brackets typed at the caret (§13.5). Over a selection, `(`, `[` or `{` surrounds it
+    /// and keeps it selected, so `[` twice turns `word` into `[[word]]` (Roam's link
+    /// idiom). With no selection they pair (`(|)`) and a typed closer steps over the one
+    /// already there; see [`utopia_core::text::auto_pair`]. Each is one text edit, so one
+    /// undo step like any keystroke. Only for plain typing at the selection: never while
+    /// IME text is being composed.
+    fn typed_bracket(
         &mut self,
         range: std::ops::Range<usize>,
         text: &str,
@@ -476,6 +478,22 @@ impl BlockEditor {
     ) -> bool {
         if self.target.is_none() || self.field.marked.is_some() || range != self.field.sel {
             return false;
+        }
+        if range.is_empty() {
+            let Some((paired, caret)) =
+                utopia_core::text::auto_pair(&self.field.text, range.start, text)
+            else {
+                return false;
+            };
+            if paired == self.field.text {
+                self.field.move_to(caret);
+                self.moved(cx);
+            } else {
+                self.field.text = paired;
+                self.field.move_to(caret);
+                self.after_edit(window, cx);
+            }
+            return true;
         }
         let Some((wrapped, sel)) = utopia_core::text::wrap_selection(&self.field.text, range, text)
         else {
@@ -520,17 +538,37 @@ impl BlockEditor {
         if changed {
             self.edits += 1;
             let seen = self.edits;
-            self.idle = Some(cx.spawn(async move |this, cx| {
+            self.idle = Some(cx.spawn(async move |this, cx| loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(300))
                     .await;
-                let _ = this.update(cx, |this, cx| {
-                    if this.edits == seen {
-                        this.commit(cx);
+                // `Ok(false)`: still inside a link being typed, so look again later.
+                let done = this.update(cx, |this, cx| {
+                    if this.edits != seen {
+                        return true;
                     }
+                    if this.typing_link() {
+                        return false;
+                    }
+                    this.commit(cx);
+                    true
                 });
+                if !matches!(done, Ok(false)) {
+                    break;
+                }
             }));
         }
+    }
+
+    /// The caret is inside a `[[…]]`/`#[[…]]` still being typed. Auto-pairing closes the
+    /// link before its title is finished, so committing on idle here would create a page
+    /// for every pause (`[[An` → "An"). The idle commit waits until the caret has left
+    /// the link; blur, Enter and Escape commit at once, as before.
+    fn typing_link(&self) -> bool {
+        matches!(
+            detect_trigger(&self.field.text, self.field.cursor()),
+            Some((AcKind::Page | AcKind::BracketTag, ..))
+        )
     }
 
     /// Commit the current block: NFC, hashtag longest-match, page creation for new links.
@@ -882,8 +920,23 @@ impl BlockEditor {
                 self.ac = None;
                 return self.emit_after_commit(EditorEvent::MergeBackward, cx);
             }
-            let to = self.field.prev_boundary();
-            self.field.select_to(to);
+            // `(|)` → `|`: the closer was put there by the opener, so it goes with it.
+            let pair = self
+                .field
+                .marked
+                .is_none()
+                .then(|| utopia_core::text::empty_pair_at(&self.field.text, self.field.cursor()))
+                .flatten();
+            match pair {
+                Some(r) => {
+                    self.field.move_to(r.start);
+                    self.field.select_to(r.end);
+                }
+                None => {
+                    let to = self.field.prev_boundary();
+                    self.field.select_to(to);
+                }
+            }
         }
         let sel = self.field.sel.clone();
         self.field.replace(sel, "");
