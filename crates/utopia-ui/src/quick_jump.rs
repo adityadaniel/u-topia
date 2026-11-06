@@ -6,7 +6,7 @@
 
 use gpui::{
     anchored, deferred, div, point, prelude::*, px, Context, Corner, Entity, EventEmitter,
-    HighlightStyle, MouseButton, MouseDownEvent, StyledText, Subscription, Window,
+    HighlightStyle, MouseButton, MouseDownEvent, ScrollHandle, StyledText, Subscription, Window,
 };
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, PageId};
@@ -69,6 +69,8 @@ pub struct JumpPalette {
     age_menu: bool,
     /// The selected result in full (SR-4), read when the selection moves, not at paint.
     preview: Option<BlockPreview>,
+    /// Keeps the selected row visible when page titles fill the list (SR-5).
+    scroll: ScrollHandle,
     _sub: Subscription,
 }
 
@@ -195,6 +197,7 @@ impl JumpPalette {
             age: SearchAge::default(),
             age_menu: false,
             preview: None,
+            scroll: ScrollHandle::new(),
             _sub: sub,
         };
         me.search("", cx);
@@ -224,6 +227,7 @@ impl JumpPalette {
             first_page
         }
         .unwrap_or_default();
+        self.scroll.scroll_to_item(self.selected);
         self.load_preview(cx);
         cx.notify();
     }
@@ -373,6 +377,7 @@ impl JumpPalette {
             i = (i as isize + d).rem_euclid(n as isize) as usize;
             if self.rows[i].selectable() {
                 self.selected = i;
+                self.scroll.scroll_to_item(self.selected);
                 self.load_preview(cx);
                 cx.notify();
                 return;
@@ -822,8 +827,11 @@ impl Render for JumpPalette {
                             .flex_1()
                             .min_w_0()
                             .max_h(px(pane_h))
+                            .flex()
+                            .flex_col()
+                            .track_scroll(&self.scroll)
                             .overflow_y_scroll()
-                            .child(div().flex().flex_col().children(rows)),
+                            .children(rows),
                     )
                     .children(preview),
             )

@@ -1075,6 +1075,45 @@ fn search_scope_filters_page_titles(cx: &mut TestAppContext) {
     );
 }
 
+/// SR-5: when page titles fill the results viewport, the block Cmd+Shift+F selects is
+/// scrolled into view; otherwise Enter opens a row the user cannot see.
+#[gpui::test]
+fn search_scrolls_the_selected_block_into_view(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        for i in 1..=12 {
+            app.store.create_page(&format!("Zebra Page {i:02}")).unwrap();
+        }
+        let atlas = app.store.create_page("Atlas").unwrap();
+        let b = app.store.ensure_first_block(&atlas).unwrap();
+        app.store
+            .set_block_text(&atlas, &b, "zebra block", None, None)
+            .unwrap();
+        app.store.commit_block(&atlas, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("search is open");
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.page_titles()).len(),
+        12,
+        "twelve page rows fill the viewport before the group"
+    );
+    let results = cx.debug_bounds("jump-results").expect("the results list");
+    let hit = cx
+        .debug_bounds("search-hit-0-0")
+        .expect("the selected block row");
+    assert!(
+        hit.origin.y >= results.origin.y - gpui::px(0.5)
+            && hit.origin.y + hit.size.height <= results.bottom() + gpui::px(0.5),
+        "the selected block is visible in the list: {hit:?} {results:?}"
+    );
+}
+
 #[gpui::test]
 fn full_search_and_quick_capture(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);
