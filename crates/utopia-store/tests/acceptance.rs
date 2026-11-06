@@ -995,3 +995,47 @@ fn sr_3_search_scopes_and_age() {
         4
     );
 }
+
+/// SR-4: the preview of a search hit carries its path from the root, its state and its
+/// first children (with the total count), read from the index rather than at paint time.
+#[test]
+fn sr_4_preview_has_path_children_and_state() {
+    use utopia_core::BlockKind;
+
+    let mut s = store();
+    let p = s.create_page("Atlas").unwrap();
+    let parent = write(&mut s, &p, "Risks");
+    let plan = outline::append_block(s.page_state(&p).unwrap(), Some(&parent));
+    let hit = run(&mut s, &p, plan).unwrap();
+    s.set_block_text(&p, &hit, "zebra migration is late", None, None)
+        .unwrap();
+    s.set_block_kind(&p, &hit, BlockKind::Todo, true).unwrap();
+    // A couple of children under the hit, one more than the preview lists.
+    for i in 0..(utopia_store::PREVIEW_CHILDREN + 1) {
+        let plan = outline::append_block(s.page_state(&p).unwrap(), Some(&hit));
+        let c = run(&mut s, &p, plan).unwrap();
+        s.set_block_text(&p, &c, &format!("child {i}"), None, None)
+            .unwrap();
+    }
+    s.sync_index().unwrap();
+    let preview = s.preview_block(&hit).unwrap().expect("a live block");
+    assert_eq!(preview.page, p);
+    assert_eq!(preview.page_title, "Atlas");
+    assert!(!preview.daily);
+    assert_eq!(preview.path.len(), 1, "the parent above the hit");
+    assert_eq!(preview.path[0].1, "Risks");
+    assert_eq!((preview.kind, preview.checked), (BlockKind::Todo, true));
+    assert_eq!(
+        preview.child_count,
+        utopia_store::PREVIEW_CHILDREN + 1,
+        "the count is the whole list"
+    );
+    assert_eq!(
+        preview.children.len(),
+        utopia_store::PREVIEW_CHILDREN,
+        "the pane lists the first few"
+    );
+    assert_eq!(preview.children[0].text, "child 0");
+    // No panic on user data: a missing block is `None`, never an error.
+    assert!(s.preview_block(&BlockId("nope".into())).unwrap().is_none());
+}

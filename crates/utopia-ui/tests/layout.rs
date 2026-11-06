@@ -191,6 +191,39 @@ fn quick_jump_is_centered(cx: &mut TestAppContext) {
     );
 }
 
+/// SR-4: search widens to 860 px and the preview fills the right half, beside the list
+/// rather than over it.
+#[gpui::test]
+fn search_preview_sits_in_the_right_half(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_input("zebra crossing");
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("zebra");
+    let palette = bounds(cx, "jump-palette");
+    assert!(
+        approx(palette.size.width, 860.),
+        "the search dialog is about 860 px wide: {palette:?}"
+    );
+    let results = bounds(cx, "jump-results");
+    let preview = bounds(cx, "search-preview");
+    assert!(
+        f32::from(preview.origin.x) >= f32::from(palette.origin.x) + 430.,
+        "the preview starts in the right half: {preview:?} {palette:?}"
+    );
+    assert!(
+        preview.origin.x >= results.origin.x + results.size.width - px(0.5),
+        "the list ends before the preview: {results:?} {preview:?}"
+    );
+    assert!(
+        preview.right() <= palette.right() + px(0.5),
+        "the preview stays inside the dialog: {preview:?} {palette:?}"
+    );
+    assert!(
+        results.size.width >= px(300.),
+        "the list keeps usable width: {results:?}"
+    );
+}
+
 /// SR-3: the scope chips sit under the field inside the palette, and the "Any time" menu
 /// floats over the results without moving them (deferred + anchored, like the page menu).
 #[gpui::test]

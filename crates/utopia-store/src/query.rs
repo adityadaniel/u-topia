@@ -214,6 +214,33 @@ pub struct BlockGroup {
     pub hits: Vec<BlockHit>,
 }
 
+/// One child of a previewed block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewChild {
+    pub block: BlockId,
+    pub text: String,
+    pub kind: BlockKind,
+    pub checked: bool,
+}
+
+/// The selected search result, in full (SR-4): its source text, path from the root, state
+/// and first few children. Read in the palette's handler, never in `render` (rule 10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockPreview {
+    pub block: BlockId,
+    pub page: PageId,
+    pub page_title: String,
+    pub daily: bool,
+    pub text: String,
+    pub kind: BlockKind,
+    pub checked: bool,
+    pub updated_at: i64,
+    /// Ancestors, root first. The page title is `page_title`, not part of this list.
+    pub path: Vec<(BlockId, String)>,
+    pub children: Vec<PreviewChild>,
+    pub child_count: usize,
+}
+
 /// Where a search may look (SR-3). The chips under the field: All · Journal · Pages · To-dos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub enum SearchScope {
@@ -391,6 +418,9 @@ pub fn fuzzy_score(needle: &str, hay: &str) -> Option<i64> {
     }
     Some(score - hay.len() as i64)
 }
+
+/// How many children the search preview lists before "+N more" (SR-4).
+pub const PREVIEW_CHILDREN: usize = 6;
 
 /// A raw search row before grouping or truncation: the hit plus the day an age window
 /// is measured against.
@@ -730,6 +760,65 @@ impl Store {
             });
         }
         Ok(groups)
+    }
+
+    /// The block behind a search result, with its path, state and first children (SR-4).
+    /// Returns `None` for a tombstone or a block that is not in the index.
+    pub fn preview_block(&self, block: &BlockId) -> Result<Option<BlockPreview>> {
+        let Some(row) = self.block_row(block)? else {
+            return Ok(None);
+        };
+        let Some(page) = self.page_row(&row.page_id)? else {
+            return Ok(None);
+        };
+        if row.deleted_at.is_some() || page.deleted_at.is_some() {
+            return Ok(None);
+        }
+        let path = match &row.parent_id {
+            Some(parent) => self
+                .ancestry(&mut HashMap::new(), parent.as_str())?
+                .into_iter()
+                .map(|(id, text, _)| (BlockId(id), plain_text(&text)))
+                .collect(),
+            None => Vec::new(),
+        };
+        let map_child = |r: &Row<'_>| {
+            Ok(PreviewChild {
+                block: BlockId(r.get(0)?),
+                text: r.get(1)?,
+                kind: BlockKind::from_parts(
+                    &r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?.map(|l| l as u8),
+                ),
+                checked: r.get(4)?,
+            })
+        };
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, text, block_type, heading_level, checked FROM block
+             WHERE parent_id=?1 AND deleted_at IS NULL ORDER BY position LIMIT ?2",
+        )?;
+        let children = stmt
+            .query_map(params![block.as_str(), PREVIEW_CHILDREN as i64], map_child)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let child_count: i64 = self.conn.query_row(
+            "SELECT count(*) FROM block WHERE parent_id=?1 AND deleted_at IS NULL",
+            [block.as_str()],
+            |r| r.get(0),
+        )?;
+        let daily = page.is_daily();
+        Ok(Some(BlockPreview {
+            block: block.clone(),
+            page: page.id.clone(),
+            page_title: page.title,
+            daily,
+            text: row.text,
+            kind: row.kind,
+            checked: row.checked,
+            updated_at: row.updated_at,
+            path,
+            children,
+            child_count: child_count as usize,
+        }))
     }
 
     /// Status of a `((uid))` target, including tombstones (§10.3.1).

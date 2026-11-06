@@ -12,7 +12,7 @@ use gpui::{
 };
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, PageId};
-use utopia_store::{BlockGroup, SearchAge, SearchScope, TitleHit};
+use utopia_store::{BlockGroup, BlockHit, BlockPreview, SearchAge, SearchScope, TitleHit};
 
 use crate::app_state::AppState;
 use crate::line_input::{LineInput, LineInputEvent};
@@ -69,6 +69,8 @@ pub struct JumpPalette {
     scope: SearchScope,
     age: SearchAge,
     age_menu: bool,
+    /// The selected result in full (SR-4), read when the selection moves, not at paint.
+    preview: Option<BlockPreview>,
     _sub: Subscription,
 }
 
@@ -183,6 +185,7 @@ impl JumpPalette {
             scope: SearchScope::default(),
             age: SearchAge::default(),
             age_menu: false,
+            preview: None,
             _sub: sub,
         };
         me.search("", cx);
@@ -206,6 +209,7 @@ impl JumpPalette {
             .iter()
             .position(Row::selectable)
             .unwrap_or_default();
+        self.load_preview(cx);
         cx.notify();
     }
 
@@ -270,6 +274,34 @@ impl JumpPalette {
         &self.groups
     }
 
+    /// The selected block's preview (SR-4), `None` when a page row is selected.
+    pub fn preview(&self) -> Option<&BlockPreview> {
+        self.preview.as_ref()
+    }
+
+    fn selected_hit(&self) -> Option<&BlockHit> {
+        match self.rows.get(self.selected) {
+            Some(Row::Block { group, hit }) => self.groups.get(*group)?.hits.get(*hit),
+            _ => None,
+        }
+    }
+
+    /// Read the preview for the current selection. Store work stays out of `render` (rule 10).
+    fn load_preview(&mut self, cx: &mut Context<Self>) {
+        let block = self.selected_hit().map(|h| h.block.clone());
+        self.preview = block.and_then(|b| {
+            let app = self.app.read(cx);
+            match app.store.preview_block(&b) {
+                Ok(p) => p,
+                Err(e) => {
+                    // Rule 11: a preview that cannot be read logs and leaves the pane empty.
+                    eprintln!("utopia: {e}");
+                    None
+                }
+            }
+        });
+    }
+
     pub fn scope(&self) -> SearchScope {
         self.scope
     }
@@ -294,6 +326,7 @@ impl JumpPalette {
             i = (i as isize + d).rem_euclid(n as isize) as usize;
             if self.rows[i].selectable() {
                 self.selected = i;
+                self.load_preview(cx);
                 cx.notify();
                 return;
             }
@@ -362,6 +395,137 @@ impl JumpPalette {
 }
 
 impl JumpPalette {
+    /// The state of a previewed block as a short label, when it is worth naming (SR-4).
+    fn state_label(kind: utopia_core::BlockKind, checked: bool) -> Option<&'static str> {
+        use utopia_core::BlockKind::*;
+        Some(match kind {
+            Todo if checked => "Done",
+            Todo => "To-do",
+            Heading(1) => "Heading 1",
+            Heading(2) => "Heading 2",
+            Heading(_) => "Heading 3",
+            Quote => "Quote",
+            Code => "Code",
+            Numbered => "Numbered",
+            Bullet => return None,
+        })
+    }
+
+    /// The right half: the selected block's path, text, state and first children (SR-4).
+    fn preview_pane(&self, p: &BlockPreview, th: &Theme) -> gpui::Stateful<gpui::Div> {
+        let mut crumbs: Vec<String> = vec![p.page_title.clone()];
+        crumbs.extend(p.path.iter().map(|(_, t)| {
+            let mut s: String = t.chars().take(40).collect();
+            if t.chars().count() > 40 {
+                s.push('…');
+            }
+            s
+        }));
+        let body = utopia_core::inline::plain_text(&p.text);
+        let anchors = self
+            .selected_hit()
+            .map(|h| h.anchors.as_slice())
+            .unwrap_or(&[]);
+        let mut pane = div()
+            .id("search-preview")
+            .debug_selector(|| "search-preview".into())
+            .w(px(340.))
+            .flex_none()
+            .max_h(px(340.))
+            .overflow_y_scroll()
+            .pl_3()
+            .border_l_1()
+            .border_color(th.line)
+            .flex()
+            .flex_col()
+            .gap_2();
+        pane = pane.child(
+            div()
+                .debug_selector(|| "search-preview-path".into())
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted)
+                .line_clamp(2)
+                .child(crumbs.join(" › ")),
+        );
+        let mut state = div().flex().items_center().gap_2();
+        if let Some(label) = Self::state_label(p.kind, p.checked) {
+            let (bg, fg) = if p.kind == utopia_core::BlockKind::Todo && p.checked {
+                (th.chip_bg, th.muted)
+            } else {
+                (th.chip_bg, th.accent)
+            };
+            state = state.child(
+                div()
+                    .debug_selector(|| "search-preview-state".into())
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(bg)
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(fg)
+                    .child(label),
+            );
+        }
+        if let Some(when) = chrono::DateTime::from_timestamp_millis(p.updated_at) {
+            state = state.child(
+                div()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(format!("Edited {}", when.format("%b %-d, %Y"))),
+            );
+        }
+        pane = pane
+            .child(state)
+            .child(
+                div()
+                    .text_color(th.text)
+                    .line_clamp(6)
+                    .child(marked(&body, anchors, th)),
+            )
+            .child(
+                div()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(match p.child_count {
+                        0 => "No children".to_string(),
+                        1 => "1 child".to_string(),
+                        n => format!("{n} children"),
+                    }),
+            );
+        for (i, c) in p.children.iter().enumerate() {
+            let lead = match (c.kind, c.checked) {
+                (utopia_core::BlockKind::Todo, true) => "☑",
+                (utopia_core::BlockKind::Todo, false) => "☐",
+                _ => "•",
+            };
+            pane = pane.child(
+                div()
+                    .debug_selector(move || format!("search-preview-child-{i}"))
+                    .flex()
+                    .gap_2()
+                    .items_start()
+                    .child(div().flex_none().text_color(th.muted).child(lead))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(if c.checked { th.muted } else { th.text })
+                            .line_clamp(2)
+                            .child(utopia_core::inline::plain_text(&c.text)),
+                    ),
+            );
+        }
+        if p.child_count > p.children.len() {
+            pane = pane.child(
+                div()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(format!("+{} more", p.child_count - p.children.len())),
+            );
+        }
+        pane
+    }
+
     /// The scope and age chips under the field (SR-3). Only search has scopes; quick jump
     /// still searches titles.
     fn scope_bar(&self, th: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
@@ -465,6 +629,7 @@ impl Render for JumpPalette {
         // Build the chips before borrowing the rows, because their click listeners need a
         // mutable context.
         let scopes = (self.mode == PaletteMode::Search).then(|| self.scope_bar(&th, cx));
+        let preview = self.preview.as_ref().map(|p| self.preview_pane(p, &th));
         let rows = self.rows.iter().enumerate().map(|(i, r)| match r {
             Row::Group { group } => group_header(*group, &self.groups[*group], &th),
             Row::Page(h) => {
@@ -547,7 +712,12 @@ impl Render for JumpPalette {
         });
         div()
             .debug_selector(|| "jump-palette".into())
-            .w(px(520.))
+            // Search shows a preview beside the results; the small prompts stay narrow.
+            .w(px(if self.mode == PaletteMode::Search {
+                860.
+            } else {
+                520.
+            }))
             .max_h(px(440.))
             .flex()
             .flex_col()
@@ -577,10 +747,21 @@ impl Render for JumpPalette {
             .children(scopes)
             .child(
                 div()
-                    .id("jump-results")
+                    .id("jump-results-row")
+                    .flex()
+                    .gap_2()
                     .max_h(px(340.))
-                    .overflow_y_scroll()
-                    .child(div().flex().flex_col().children(rows)),
+                    .child(
+                        div()
+                            .id("jump-results")
+                            .debug_selector(|| "jump-results".into())
+                            .flex_1()
+                            .min_w_0()
+                            .max_h(px(340.))
+                            .overflow_y_scroll()
+                            .child(div().flex().flex_col().children(rows)),
+                    )
+                    .children(preview),
             )
     }
 }

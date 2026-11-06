@@ -792,6 +792,89 @@ fn search_scope_and_age_filter_the_results(cx: &mut TestAppContext) {
     assert_eq!(titles, vec!["Atlas".to_string()], "October is out of Today");
 }
 
+/// SR-4: the selected block's preview carries its path, state and children, and moving
+/// the selection (arrow keys) reads the next block's preview.
+#[gpui::test]
+fn search_preview_follows_the_selection(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        let atlas = app.store.create_page("Atlas").unwrap();
+        let risks = app.store.ensure_first_block(&atlas).unwrap();
+        app.store
+            .set_block_text(&atlas, &risks, "Risks", None, None)
+            .unwrap();
+        app.store.commit_block(&atlas, &risks).unwrap();
+        for text in ["zebra migration", "zebra budget"] {
+            let plan = utopia_core::outline::append_block(
+                app.store.page_state(&atlas).unwrap(),
+                Some(&risks),
+            );
+            let b = app
+                .store
+                .execute_plan(&atlas, plan, None)
+                .unwrap()
+                .unwrap()
+                .block;
+            app.store
+                .set_block_text(&atlas, &b, text, None, None)
+                .unwrap();
+            app.store.commit_block(&atlas, &b).unwrap();
+        }
+        app.store.sync_index().unwrap();
+    });
+    // A page row selected in quick jump has no block to preview.
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("quick jump is open");
+    assert!(jump.read_with(cx, |j, _| j.preview().is_none()));
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("search is open");
+    let first = jump
+        .read_with(cx, |j, _| j.preview().cloned())
+        .expect("the first hit is a block, so it has a preview");
+    assert_eq!(first.page_title, "Atlas");
+    assert_eq!(
+        first
+            .path
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Risks"],
+        "the block's path from the root"
+    );
+    assert_eq!(first.child_count, 0);
+    assert_eq!(
+        utopia_core::inline::plain_text(&first.text),
+        "zebra budget",
+        "the newest block is selected first"
+    );
+    let preview = cx.debug_bounds("search-preview").expect("the pane");
+    let results = cx.debug_bounds("jump-results").expect("the list");
+    assert!(
+        preview.origin.x >= results.origin.x + results.size.width,
+        "the preview is beside the list: {preview:?} {results:?}"
+    );
+
+    // Down moves to the other hit and the preview follows it.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    let second = jump
+        .read_with(cx, |j, _| j.preview().cloned())
+        .expect("the second hit is a block too");
+    assert_eq!(
+        utopia_core::inline::plain_text(&second.text),
+        "zebra migration"
+    );
+    assert_eq!(second.path.len(), 1, "still under Risks");
+    assert_ne!(first.block, second.block);
+}
+
 #[gpui::test]
 fn full_search_and_quick_capture(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);
