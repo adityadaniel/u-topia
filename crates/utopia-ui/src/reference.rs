@@ -5,9 +5,7 @@
 
 use std::ops::Range;
 
-use gpui::{
-    div, prelude::*, px, AnyElement, Context, ElementId, Entity, MouseButton, StyledText, Window,
-};
+use gpui::{div, prelude::*, px, AnyElement, Context, Entity, MouseButton, StyledText, Window};
 use utopia_core::{BlockId, PageId};
 use utopia_store::{BlockRefStatus, RefHit, Store};
 
@@ -54,7 +52,6 @@ pub trait RefRowHost: Sized {
 /// `pad_x` is the row's inset from the panel edge, so the two call sites can keep their own
 /// measure without a second renderer.
 pub fn reference_row<H: RefRowHost + 'static>(
-    id: impl Into<ElementId>,
     prefix: &'static str,
     ix: usize,
     hit: &RefHit,
@@ -81,7 +78,7 @@ pub fn reference_row<H: RefRowHost + 'static>(
     let (page, block) = (hit.page.clone(), hit.block.clone());
     let (a, b) = (host.clone(), host);
     div()
-        .id(id)
+        .id(("reference", ix))
         .debug_selector(move || format!("{prefix}-{ix}"))
         .px(px(pad_x))
         .py_0p5()

@@ -98,6 +98,10 @@ pub struct Workspace {
     panes: Vec<Entity<PageView>>,
     splits: Vec<Entity<PageView>>,
     right_open: bool,
+    /// The right sidebar's width in points (RS-4), kept in `settings.json` (rule 9).
+    right_width: f32,
+    /// A drag of the sidebar's left edge: where it started and the width then.
+    resize_from: Option<(f32, f32)>,
     /// Left sidebar and its month grid; local UI state (rule 9), kept in `local_state`.
     left_open: bool,
     calendar_open: bool,
@@ -200,6 +204,8 @@ impl Workspace {
             panes: Vec::new(),
             splits: Vec::new(),
             right_open: false,
+            right_width: crate::appearance::right_sidebar_width(cx),
+            resize_from: None,
             left_open,
             calendar_open,
             inspector_open: true,
@@ -955,6 +961,38 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Dragging the sidebar's left edge (RS-4). The window-level move listener runs wherever
+    /// the pointer is, so dragging past the edge keeps the width following the pointer.
+    fn resize_move(&mut self, e: &gpui::MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((start_x, start_width)) = self.resize_from else {
+            return;
+        };
+        if e.pressed_button.is_none() {
+            self.resize_from = None;
+            return;
+        }
+        let width = crate::appearance::clamp_sidebar_width(
+            start_width + (start_x - f32::from(e.position.x)),
+        );
+        if (width - self.right_width).abs() >= 1. {
+            self.right_width = width;
+            crate::appearance::set_right_sidebar_width(cx, width);
+        }
+    }
+
+    /// The drag ended: remember the width in `settings.json` (rule 9). One write per drag,
+    /// not one per pixel.
+    fn resize_done(&mut self, _: &gpui::MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.resize_from.take().is_none() {
+            return;
+        }
+        self.right_width = crate::appearance::right_sidebar_width(cx);
+        if let Err(e) = crate::appearance::remember(cx) {
+            eprintln!("utopia: settings.json: {e}");
+        }
+        cx.notify();
+    }
+
     fn toggle_left(&mut self, _: &ToggleLeftSidebar, _: &mut Window, cx: &mut Context<Self>) {
         self.left_open = !self.left_open;
         let _ = (self.app.read(cx).store).local_set("left_sidebar", flag(self.left_open));
@@ -1039,6 +1077,11 @@ impl Workspace {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let v = self.app.read(cx).refs_version;
+        // RS-4: the width lives in the preferences, so a reset from Settings (or another
+        // window's drag) reaches this sidebar too. Never while this one is dragging.
+        if self.resize_from.is_none() {
+            self.right_width = crate::appearance::right_sidebar_width(cx);
+        }
         // Pinned pages are a local preference (rule 9); re-read when it changes.
         if crate::appearance::pinned_pages(cx) != self.pinned_ids {
             self.load_pinned(cx);
@@ -1590,7 +1633,6 @@ impl Workspace {
                     body = body.child(header);
                     for hit in &group.hits {
                         body = body.child(crate::reference::reference_row(
-                            ("ref-block", ix),
                             "ref-block",
                             ix,
                             hit,
@@ -1990,16 +2032,57 @@ impl Render for Workspace {
         let right = self.right_open.then(|| {
             let mut col = div()
                 .debug_selector(|| "right-sidebar".into())
-                .w(px(380.))
+                .w(px(self.right_width))
                 .h_full()
                 .flex_none()
                 .flex()
-                .flex_col()
+                .flex_row()
                 .bg(th.surface)
                 .border_l_1()
-                .border_color(th.line);
+                .border_color(th.line)
+                // RS-4: a 4 px handle on the left edge. The drag is tracked from here and
+                // read by the window-level move handler below, so it survives the pointer
+                // leaving the sidebar.
+                .child(
+                    div()
+                        .id("right-resize")
+                        .debug_selector(|| "right-resize".into())
+                        .w(px(4.))
+                        .h_full()
+                        .flex_none()
+                        .cursor(gpui::CursorStyle::ResizeLeftRight)
+                        .when(self.resize_from.is_some(), |d| d.bg(th.accent))
+                        .hover(|d| d.bg(th.accent))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                                this.resize_from =
+                                    Some((f32::from(e.position.x), this.right_width));
+                                cx.notify();
+                            }),
+                        ),
+                );
+            let mut panel = div().flex().flex_col().flex_1().min_w_0().h_full().child(
+                // The sidebar's own header: it collapses here (RS-4).
+                div().flex().items_center().justify_end().px_1().child(
+                    div()
+                        .id("right-close")
+                        .debug_selector(|| "right-close".into())
+                        .px_1()
+                        .rounded_sm()
+                        .text_size(px(crate::theme::CONTROL_SIZE))
+                        .text_color(th.muted)
+                        .cursor_pointer()
+                        .hover(|d| d.bg(th.hover).text_color(th.text))
+                        .child("×")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.right_open = false;
+                            cx.notify();
+                        })),
+                ),
+            );
             if self.panes.is_empty() && !self.inspector_open {
-                col = col.child(
+                panel = panel.child(
                     div()
                         .p_4()
                         .text_size(px(crate::theme::BODY_SIZE))
@@ -2008,7 +2091,7 @@ impl Render for Workspace {
                 );
             }
             for p in &self.panes {
-                col = col.child(
+                panel = panel.child(
                     div()
                         .flex_1()
                         .min_h(px(140.))
@@ -2018,8 +2101,9 @@ impl Render for Workspace {
                 );
             }
             if self.inspector_open {
-                col = col.child(self.render_inspector(cx));
+                panel = panel.child(self.render_inspector(cx));
             }
+            col = col.child(panel);
             col
         });
         let overlay = self.jump.as_ref().map(|(j, _)| {
@@ -2067,6 +2151,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::prev_day))
             .on_action(cx.listener(Self::next_day))
             .on_action(cx.listener(Self::toggle_right))
+            .on_mouse_move(cx.listener(Self::resize_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::resize_done))
             .on_action(cx.listener(Self::toggle_left))
             .on_action(cx.listener(Self::toggle_refs))
             .on_action(cx.listener(Self::undo))

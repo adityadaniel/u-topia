@@ -2578,7 +2578,6 @@ impl PageView {
                 // reads the same in the page and in the inspector.
                 let th = th.clone();
                 crate::reference::reference_row(
-                    ("hit", ix),
                     "hit",
                     ix,
                     &hit,

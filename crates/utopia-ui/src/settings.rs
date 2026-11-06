@@ -283,6 +283,18 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Settings → Appearance: put the right sidebar back to its default width (RS-4).
+    pub fn reset_sidebar_width(&mut self, cx: &mut Context<Self>) {
+        let width = appearance::RIGHT_SIDEBAR_DEFAULT_WIDTH as i32;
+        self.status = Some(
+            match appearance::reset_right_sidebar_width(cx, &self.config_dir) {
+                Ok(()) => format!("The right sidebar is back to {width} px.").into(),
+                Err(e) => format!("Could not save settings.json: {e}").into(),
+            },
+        );
+        cx.notify();
+    }
+
     /// Settings → Appearance: switch density in every window and remember it (ALL-5).
     pub fn choose_density(&mut self, density: Density, cx: &mut Context<Self>) {
         let before = appearance::density(cx);
@@ -677,6 +689,7 @@ impl SettingsView {
                 .on_click(cx.listener(move |this, _, _, cx| this.choose_font(f, cx)))
         });
         let options: Vec<_> = options.collect();
+        let sidebar_width = appearance::right_sidebar_width(cx);
         let current_density = appearance::density(cx);
         let densities: Vec<_> = Density::ALL
             .iter()
@@ -781,7 +794,45 @@ impl SettingsView {
                                  kept in settings.json, never synced.",
                             ),
                     )
-                    .children(densities),
+                    .children(densities)
+                    // RS-4: the width the sidebar's drag handle set. The handle is the
+                    // control; this row reports it and offers a way back to the default.
+                    .child(
+                        div()
+                            .pt_4()
+                            .pb_1()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.faint)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Right sidebar"),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || {
+                                format!("settings-sidebar-width-{}", sidebar_width.round() as i32)
+                            })
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(format!(
+                                "Width: {} px. Drag the sidebar's left edge to resize it; the \
+                                 width is kept in settings.json and never synced.",
+                                sidebar_width.round() as i32
+                            )),
+                    )
+                    .child(
+                        div().pt_1().child(
+                            quiet_control(
+                                "sidebar-reset",
+                                format!(
+                                    "Reset to {} px",
+                                    appearance::RIGHT_SIDEBAR_DEFAULT_WIDTH as i32
+                                ),
+                                &th,
+                            )
+                            .debug_selector(|| "settings-sidebar-reset".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.reset_sidebar_width(cx))),
+                        ),
+                    ),
             )
     }
 

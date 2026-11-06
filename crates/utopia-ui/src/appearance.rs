@@ -1,5 +1,5 @@
 //! Appearance preferences (Settings → Appearance): which font the notes and the interface
-//! are set in.
+//! are set in, how tightly blocks are set, and the shape of the right sidebar.
 //!
 //! They live in `<config dir>/settings.json`, next to `keymap.json` and resolved the same way
 //! (`UTOPIA_CONFIG_DIR`). Window and UI preferences are local to the machine and never sync
@@ -7,12 +7,19 @@
 //! versioned object meant to grow more general preferences:
 //!
 //! ```json
-//! { "version": 1, "font": "system", "density": "comfortable", "pinned_pages": [] }
+//! {
+//!   "version": 1,
+//!   "font": "system",
+//!   "density": "comfortable",
+//!   "right_sidebar_width": 380.0,
+//!   "pinned_pages": []
+//! }
 //! ```
 //!
 //! `font` is `"system"` (the default) or `"ibm-plex-sans"`; `density` is
-//! `"comfortable"` (the default) or `"compact"` (ALL-5); `pinned_pages` lists the page ids
-//! kept in the right sidebar's Pinned tab, most recent first (RS-3). A missing file means
+//! `"comfortable"` (the default) or `"compact"` (ALL-5); `right_sidebar_width` is the width
+//! the right sidebar was dragged to (RS-4); `pinned_pages` lists the page ids kept in the
+//! right sidebar's Pinned tab, most recent first (RS-3). A missing file means
 //! defaults; an unreadable file, an unknown value or a newer version is logged and read as
 //! far as it can be, never a panic (rule 11). Keys this version does not know are kept when
 //! the file is rewritten, so a newer release's preferences survive a round trip through an
@@ -123,16 +130,46 @@ impl Density {
     }
 }
 
+/// The right sidebar's width as it was before the setting existed.
+pub const RIGHT_SIDEBAR_DEFAULT_WIDTH: f32 = 380.;
+/// Narrow enough to leave a readable page beside it, wide enough for a reference.
+pub const RIGHT_SIDEBAR_MIN_WIDTH: f32 = 240.;
+pub const RIGHT_SIDEBAR_MAX_WIDTH: f32 = 640.;
+
+/// Keep a width — dragged, typed or read from a file — inside what the layout can show.
+pub fn clamp_sidebar_width(width: f32) -> f32 {
+    if width.is_finite() {
+        width.clamp(RIGHT_SIDEBAR_MIN_WIDTH, RIGHT_SIDEBAR_MAX_WIDTH)
+    } else {
+        RIGHT_SIDEBAR_DEFAULT_WIDTH
+    }
+}
+
 /// What `settings.json` holds.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
     pub font: UiFont,
     pub density: Density,
+    /// How wide the right sidebar is, in points (RS-4). Clamped to
+    /// [`RIGHT_SIDEBAR_MIN_WIDTH`]..=[`RIGHT_SIDEBAR_MAX_WIDTH`] when read and written.
+    pub right_sidebar_width: f32,
     /// Pages pinned in the right sidebar's Pinned tab (RS-3), most recent first. Ids are
     /// stable across renames; one from another graph simply does not resolve.
     pub pinned_pages: Vec<String>,
     /// Keys this version does not understand, written back untouched.
     rest: Map<String, Value>,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            font: UiFont::default(),
+            density: Density::default(),
+            right_sidebar_width: RIGHT_SIDEBAR_DEFAULT_WIDTH,
+            pinned_pages: Vec::new(),
+            rest: Map::new(),
+        }
+    }
 }
 
 impl Prefs {
@@ -182,6 +219,26 @@ impl Prefs {
                 Density::default()
             }
         };
+        let right_sidebar_width = match rest.remove("right_sidebar_width") {
+            None => RIGHT_SIDEBAR_DEFAULT_WIDTH,
+            Some(Value::Number(n)) => match n.as_f64() {
+                Some(w) if w.is_finite() => clamp_sidebar_width(w as f32),
+                _ => {
+                    warnings.push(format!(
+                        "{FILE}: right_sidebar_width {n} is not a width; using \
+                         {RIGHT_SIDEBAR_DEFAULT_WIDTH}"
+                    ));
+                    RIGHT_SIDEBAR_DEFAULT_WIDTH
+                }
+            },
+            Some(v) => {
+                warnings.push(format!(
+                    "{FILE}: right_sidebar_width should be a number, not {v}; using \
+                     {RIGHT_SIDEBAR_DEFAULT_WIDTH}"
+                ));
+                RIGHT_SIDEBAR_DEFAULT_WIDTH
+            }
+        };
         let pinned_pages = match rest.remove("pinned_pages") {
             None => Vec::new(),
             Some(Value::Array(items)) => items
@@ -208,6 +265,7 @@ impl Prefs {
             Self {
                 font,
                 density,
+                right_sidebar_width,
                 pinned_pages,
                 rest,
             },
@@ -220,6 +278,11 @@ impl Prefs {
         m.insert("version".into(), VERSION.into());
         m.insert("font".into(), self.font.key().into());
         m.insert("density".into(), self.density.key().into());
+        m.insert(
+            "right_sidebar_width".into(),
+            serde_json::Number::from_f64(clamp_sidebar_width(self.right_sidebar_width) as f64)
+                .map_or(Value::Null, Value::Number),
+        );
         m.insert(
             "pinned_pages".into(),
             Value::Array(
@@ -308,6 +371,28 @@ pub fn remember(cx: &mut App) -> std::io::Result<()> {
     }
 }
 
+/// The right sidebar's width in force (RS-4). 380 when nothing was installed.
+pub fn right_sidebar_width(cx: &App) -> f32 {
+    cx.try_global::<Appearance>()
+        .map_or(RIGHT_SIDEBAR_DEFAULT_WIDTH, |a| {
+            clamp_sidebar_width(a.prefs.right_sidebar_width)
+        })
+}
+
+/// Set the sidebar's width in memory while it is being dragged; the file follows on release
+/// through [`remember`] (RS-4: one write per drag, not one per pixel).
+pub fn set_right_sidebar_width(cx: &mut App, width: f32) {
+    cx.default_global::<Appearance>().prefs.right_sidebar_width = clamp_sidebar_width(width);
+    cx.refresh_windows();
+}
+
+/// Put the sidebar back to its default width and write that down (Settings → Appearance).
+pub fn reset_right_sidebar_width(cx: &mut App, config_dir: &Path) -> std::io::Result<()> {
+    cx.default_global::<Appearance>().prefs.right_sidebar_width = RIGHT_SIDEBAR_DEFAULT_WIDTH;
+    cx.refresh_windows();
+    cx.global::<Appearance>().prefs.save(config_dir)
+}
+
 /// The pages pinned in the right sidebar's Pinned tab, most recent first (RS-3).
 pub fn pinned_pages(cx: &App) -> Vec<String> {
     cx.try_global::<Appearance>()
@@ -378,6 +463,7 @@ mod tests {
         let p = Prefs {
             font: UiFont::IbmPlexSans,
             density: Density::Compact,
+            right_sidebar_width: 420.0,
             pinned_pages: vec!["page-1".into(), "page-2".into()],
             ..Default::default()
         };
@@ -389,6 +475,7 @@ mod tests {
                 "version": 1,
                 "font": "ibm-plex-sans",
                 "density": "compact",
+                "right_sidebar_width": 420.0,
                 "pinned_pages": ["page-1", "page-2"],
             })
         );
@@ -415,6 +502,33 @@ mod tests {
     fn missing_keys_are_defaults_without_complaint() {
         assert_eq!(Prefs::from_json("{}"), (Prefs::default(), vec![]));
         assert_eq!(Prefs::default().density, Density::Comfortable);
+    }
+
+    /// RS-4: the sidebar width is clamped to what the layout can show, and junk is the
+    /// default with a warning rather than a panic (rule 11).
+    #[test]
+    fn the_sidebar_width_is_clamped_and_never_fatal() {
+        assert_eq!(clamp_sidebar_width(10.), RIGHT_SIDEBAR_MIN_WIDTH);
+        assert_eq!(clamp_sidebar_width(10_000.), RIGHT_SIDEBAR_MAX_WIDTH);
+        assert_eq!(clamp_sidebar_width(f32::NAN), RIGHT_SIDEBAR_DEFAULT_WIDTH);
+        let (p, w) = Prefs::from_json(r#"{"version": 1, "right_sidebar_width": 480}"#);
+        assert_eq!(p.right_sidebar_width, 480.);
+        assert!(w.is_empty(), "{w:?}");
+        for bad in [
+            r#"{"version": 1, "right_sidebar_width": "wide"}"#,
+            r#"{"version": 1, "right_sidebar_width": null}"#,
+        ] {
+            let (p, w) = Prefs::from_json(bad);
+            assert_eq!(p.right_sidebar_width, RIGHT_SIDEBAR_DEFAULT_WIDTH, "{bad}");
+            assert_eq!(w.len(), 1, "{bad}: {w:?}");
+        }
+        // A width outside the range is brought back into it on the way in and out.
+        let (p, _) = Prefs::from_json(r#"{"version": 1, "right_sidebar_width": 4000}"#);
+        assert_eq!(p.right_sidebar_width, RIGHT_SIDEBAR_MAX_WIDTH);
+        assert_eq!(
+            serde_json::from_str::<Value>(&p.to_json()).unwrap()["right_sidebar_width"],
+            serde_json::json!(RIGHT_SIDEBAR_MAX_WIDTH as f64)
+        );
     }
 
     /// RS-3: the pinned list is a list of page ids; anything else is skipped, not fatal.
