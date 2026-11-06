@@ -168,6 +168,11 @@ impl GraphView {
         self.reload(cx);
     }
 
+    /// Re-read the graph after the index changed while the view stayed open.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.reload(cx);
+    }
+
     /// Keep the panel around the page that is open beside it (GR-5).
     pub fn set_origin(&mut self, origin: Option<PageId>, cx: &mut Context<Self>) {
         if self.origin == origin {

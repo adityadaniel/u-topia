@@ -995,6 +995,59 @@ fn graph_panel_sits_beside_the_page(cx: &mut TestAppContext) {
     assert!(ws.update(cx, |w, _| w.graph_view()).is_some());
 }
 
+/// GR-5: the panel is a projection of the index, so a new link while it is open must show
+/// up even though the page id did not change.
+#[gpui::test]
+fn graph_panel_refreshes_after_new_links(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let local = cx
+        .debug_bounds("graph-local")
+        .expect("Around this page filter")
+        .center();
+    cx.simulate_click(local, Modifiers::default());
+    cx.run_until_parked();
+    let panel = ws.update(cx, |w, _| w.graph_panel()).expect("panel open");
+    assert_eq!(panel.update(cx, |g, _| g.node_count()), 3);
+    assert_eq!(panel.update(cx, |g, _| g.edge_count()), 2);
+
+    // Add a third link to the page open beside the panel. The page id is unchanged, so an
+    // origin-only refresh would miss it.
+    let today = today_page(&app, cx);
+    let block = app.update(cx, |app, _| {
+        app.store
+            .page_state(&today)
+            .unwrap()
+            .live_roots()
+            .first()
+            .cloned()
+            .unwrap()
+    });
+    app.update(cx, |app, cx| {
+        let r =
+            app.store
+                .set_block_text(&today, &block, "[[Alpha]] [[Beta]] [[Gamma]]", None, None);
+        app.report(r);
+        let r = app.store.commit_block(&today, &block);
+        app.report(r);
+        app.changed(vec![today.clone()], true, cx);
+    });
+    cx.run_until_parked();
+
+    let panel = ws.update(cx, |w, _| w.graph_panel()).expect("panel stays");
+    assert_eq!(
+        panel.update(cx, |g, _| g.node_count()),
+        4,
+        "the panel shows the new page"
+    );
+    assert_eq!(panel.update(cx, |g, _| g.edge_count()), 3);
+}
+
 #[gpui::test]
 fn dropped_files_become_attachments(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);

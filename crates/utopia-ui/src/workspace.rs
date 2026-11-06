@@ -17,7 +17,7 @@ use utopia_core::{BlockId, PageId};
 use utopia_store::{JournalEntry, OutgoingRef, PageRow, RefTarget};
 
 use crate::actions::*;
-use crate::app_state::AppState;
+use crate::app_state::{AppState, IndexUpdated};
 use crate::editor::{BlockEditor, EditorEvent};
 use crate::graph_view::{GraphEvent, GraphView};
 use crate::page_view::{PageView, PageViewEvent};
@@ -168,6 +168,15 @@ impl Workspace {
                 panel.update(cx, |graph, cx| graph.set_origin(page, cx));
             }
         }));
+        // GR-5: the panel is an index projection. In debounced mode links arrive after the
+        // keystroke, so reload when the writer has caught up, not only when the page changes.
+        let app = me.app.clone();
+        me.subs
+            .push(cx.subscribe(&app, |this, _, _: &IndexUpdated, cx| {
+                if let Some(panel) = this.graph_panel.clone() {
+                    panel.update(cx, |graph, cx| graph.refresh(cx));
+                }
+            }));
         me.spawn_timers(cx);
         me
     }
