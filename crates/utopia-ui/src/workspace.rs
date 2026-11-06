@@ -1278,10 +1278,17 @@ impl Workspace {
         .into_any_element()
     }
 
-    /// The muted line a panel shows when it has nothing to list (RS-2, RS-3).
-    fn panel_empty(&self, text: &'static str, cx: &mut Context<Self>) -> AnyElement {
+    /// The muted line a panel shows when it has nothing to list (RS-2, RS-3). `id` names
+    /// it for `debug_selector`, so a test can tell the empty state from a missing panel.
+    fn panel_empty(
+        &self,
+        id: &'static str,
+        text: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let th = theme(cx).clone();
         div()
+            .debug_selector(move || id.to_string())
             .px_2()
             .py_1()
             .text_size(px(crate::theme::CAPTION_SIZE))
@@ -1338,6 +1345,7 @@ impl Workspace {
                    cx: &mut Context<Self>| {
             div()
                 .id(id)
+                .debug_selector(move || id.to_string())
                 .px_2()
                 .text_size(px(crate::theme::CAPTION_SIZE))
                 .rounded_sm()
@@ -1389,7 +1397,8 @@ impl Workspace {
                 let groups: Vec<utopia_store::RefGroup> = self.inspector.incoming.clone();
                 let me = cx.entity();
                 if groups.is_empty() {
-                    body = body.child(self.panel_empty("No references yet.", cx));
+                    body =
+                        body.child(self.panel_empty("references-empty", "No references yet.", cx));
                 }
                 let mut ix = 0usize;
                 for (gi, group) in groups.iter().enumerate() {
@@ -1475,54 +1484,54 @@ impl Workspace {
                 }
             }
             InspectorTab::Unresolved => {
+                // RS-2: every dangling reference is a row you can act on — the title becomes
+                // a page, or the intent is pointed elsewhere or turned back into text
+                // (FR-4.14). A missing `((block))` has no page to create, only these choices.
                 let rows = self.inspector.unresolved.clone();
                 if rows.is_empty() {
-                    body = body.child(
-                        div()
-                            .px_2()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.faint)
-                            .child("Every reference resolves."),
-                    );
+                    body = body.child(self.panel_empty(
+                        "unresolved-empty",
+                        "No unresolved references",
+                        cx,
+                    ));
                 }
                 for (i, (o, label)) in rows.into_iter().enumerate() {
                     let block = o.from_block.clone();
-                    let mut row = div().flex().flex_col().px_2().py_1().child(
+                    let mut row = div().flex().flex_col().gap_1().px_2().py_1().child(
                         div()
                             .text_size(px(crate::theme::BODY_SIZE))
                             .text_color(th.danger)
                             .child(label.clone()),
                     );
                     if let RefTarget::UnresolvedPage { key } = &o.target {
-                        let (k1, k2, k3) = (key.clone(), key.clone(), key.clone());
+                        let (k2, k3) = (key.clone(), key.clone());
                         let (b2, b3) = (block.clone(), block.clone());
                         let title = label.clone();
-                        let action = |id: (&'static str, usize), text: &'static str| {
-                            div()
-                                .id(id)
-                                .px_1()
-                                .text_size(px(crate::theme::CAPTION_SIZE))
-                                .rounded_sm()
-                                .text_color(th.accent)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(th.hover))
-                                .child(text)
-                        };
+                        let action =
+                            |id: &'static str, text: &'static str, th: &crate::theme::Theme| {
+                                quiet_control((id, i), text, th)
+                                    .debug_selector(move || format!("unresolved-{id}-{i}"))
+                            };
                         row = row.child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .gap_1()
-                                .child(action(("create", i), "Create").on_click(cx.listener(
+                                .child(action("create", "Create page", &th).on_click(cx.listener(
                                     move |this, _, _, cx| {
-                                        let _ = &k1;
-                                        this.app.update(cx, |app, cx| {
+                                        // The row's title is the page title, exactly as
+                                        // following the intent from the outline would
+                                        // create it (FR-4.14).
+                                        let page = this.app.update(cx, |app, cx| {
                                             let r = app.store.create_page(&title);
-                                            app.report(r);
+                                            let page = app.report(r);
                                             app.changed(Vec::new(), true, cx);
+                                            page
                                         });
+                                        let _ = page;
                                     },
                                 )))
-                                .child(action(("redirect", i), "Redirect…").on_click(cx.listener(
+                                .child(action("redirect", "Redirect…", &th).on_click(cx.listener(
                                     move |this, _, window, cx| {
                                         this.start_jump(
                                             JumpMode::Redirect {
@@ -1534,7 +1543,7 @@ impl Workspace {
                                         )
                                     },
                                 )))
-                                .child(action(("plain", i), "Show as text").on_click(cx.listener(
+                                .child(action("plain", "Show as text", &th).on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         this.app.update(cx, |app, cx| {
                                             let r = app.store.unlink_intent(&b3, &k3);

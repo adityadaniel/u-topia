@@ -488,6 +488,61 @@ fn a_reference_row_in_the_sidebar_opens_its_block(cx: &mut TestAppContext) {
     );
 }
 
+/// RS-2: an unresolved reference in the sidebar offers "Create page", which makes the page
+/// on the spot, and an empty Unresolved tab says so.
+#[gpui::test]
+fn unresolved_references_can_be_created_from_the_sidebar(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = app.update(cx, |app, _| {
+        let p = app.store.create_page("Drafting").unwrap();
+        let b = app.store.ensure_first_block(&p).unwrap();
+        app.store
+            .set_block_text(&p, &b, "ask [[Ana Lovelace]] about it", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        // A link creates its page on commit, so the only way to a dangling intent is to
+        // delete the page that the link now points at (AC-2.10).
+        let ana = app.store.find_page("Ana Lovelace").unwrap().unwrap();
+        app.store.delete_page(&ana).unwrap();
+        app.store.sync_index().unwrap();
+        p
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let unresolved = cx.debug_bounds("tab-un").expect("the Unresolved tab");
+    cx.simulate_click(unresolved.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("unresolved-empty").is_none(),
+        "there is one unresolved reference, so the tab lists it"
+    );
+    let create = cx
+        .debug_bounds("unresolved-create-0")
+        .expect("the row offers Create page");
+    cx.simulate_click(create.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    app.update(cx, |app, _| {
+        assert!(
+            app.store.unresolved_refs(&page).unwrap().is_empty(),
+            "the intent resolves now that its page exists (FR-4.14)"
+        );
+    });
+
+    // A page with nothing dangling says so instead of showing an empty panel.
+    let other = app.update(cx, |app, _| app.store.create_page("Clean").unwrap());
+    ws.update_in(cx, |w, window, cx| {
+        w.open(other, None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("unresolved-empty").is_some(),
+        "the empty state is drawn for a page with no unresolved references"
+    );
+}
+
 #[gpui::test]
 fn keystrokes_are_debounced_then_committed(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);
