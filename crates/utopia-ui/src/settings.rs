@@ -78,7 +78,7 @@ impl Tab {
         match self {
             Tab::Appearance => "Aa",
             Tab::Keybindings => "⌘",
-            Tab::Shortcuts => "⌨",
+            Tab::Shortcuts => "☰",
             Tab::Sync => "↻",
             Tab::Help => "?",
         }
@@ -170,7 +170,7 @@ impl SettingsView {
         }
         // Already logged at startup; repeated here so the user sees it.
         warnings.extend(appearance::Prefs::load(&config_dir).1);
-        let search = cx.new(|cx| LineInput::new("Filter by name, description or key", cx));
+        let search = cx.new(|cx| LineInput::new("name, description or key", cx));
         let subs = vec![
             // Escape clears the field and hands the keyboard back to the window, so the
             // key list's own shortcuts keep working.
@@ -404,6 +404,11 @@ impl SettingsView {
         })
         .detach();
         cx.notify();
+    }
+
+    /// How far the key list is scrolled (px), so a test can see a clash link's jump (ST-3).
+    pub fn key_list_offset(&self) -> f32 {
+        f32::from(self.keys_scroll.offset().y)
     }
 
     /// ST-4: the actions the filter lets through, in catalog order.
@@ -750,8 +755,8 @@ fn radio(on: bool, th: &Theme) -> Div {
 impl SettingsView {
     /// The filter field (ST-4). Click it, type, and the key list below narrows to the
     /// actions whose name, description or keys match.
-    fn render_search(&mut self, _cx: &mut Context<Self>) -> Div {
-        let th = theme(_cx).clone();
+    fn render_search(&mut self, cx: &mut Context<Self>) -> Div {
+        let th = theme(cx).clone();
         column()
             .debug_selector(|| "settings-search".into())
             .flex()
@@ -977,6 +982,7 @@ impl SettingsView {
                     div()
                         .id(SharedString::from(format!("clash-{}", other.action)))
                         .debug_selector(move || format!("settings-clash-link-{}", other.action))
+                        .underline()
                         .cursor_pointer()
                         .hover(|x| x.text_color(th.text))
                         .child(other.label)
@@ -995,23 +1001,21 @@ impl SettingsView {
         let density = appearance::density(cx);
         let groups = self.visible_groups();
         let shown: usize = groups.iter().map(|(_, rows)| rows.len()).sum();
-        let hint = if self.query.trim().is_empty() {
-            "Every shortcut in the app, as it is bound now.".to_string()
-        } else {
-            format!(
-                "{shown} of {} shortcuts match “{}”.",
-                CATALOG.len(),
-                self.query.trim()
-            )
-        };
-        let mut list = pane("settings-shortcuts", "settings-shortcuts")
-            .child(
+        let mut list = pane("settings-shortcuts", "settings-shortcuts");
+        if !self.query.trim().is_empty() {
+            list = list.child(
                 column()
+                    .debug_selector(|| "settings-search-count".into())
                     .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.muted)
-                    .child(hint),
-            )
-            .child(self.render_search(cx));
+                    .child(format!(
+                        "{shown} of {} shortcuts match “{}”.",
+                        CATALOG.len(),
+                        self.query.trim()
+                    )),
+            );
+        }
+        list = list.child(self.render_search(cx));
 
         if groups.is_empty() {
             list = list.child(
@@ -1298,7 +1302,9 @@ impl SettingsView {
             .target
             .clone()
             .unwrap_or_else(|| "Local only (no relay, no shared folder)".to_string());
-        let encryption = if facts.encrypted {
+        let encryption = if !facts.is_on() {
+            "Nothing to encrypt: sync is off"
+        } else if facts.encrypted {
             "End-to-end encrypted: the relay only sees ciphertext"
         } else {
             "Not encrypted: a relay can read page payloads"

@@ -552,6 +552,37 @@ fn a_clash_is_shown_inline_and_links_to_the_other_row(cx: &mut TestAppContext) {
     );
 }
 
+/// ST-3: a clash across categories jumps the list to the other card, so "Also used by
+/// Quit" actually takes you to Quit rather than naming it out of reach.
+#[gpui::test]
+fn a_clash_link_scrolls_to_the_other_card(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = Overrides::default();
+    o.set("GoToday", "cmd-q");
+    std::fs::write(dir.path().join("keymap.json"), o.to_json()).unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.key_list_offset()), 0.);
+
+    let link = cx
+        .debug_bounds("settings-clash-link-Quit")
+        .expect("Quit is linked under Today");
+    cx.simulate_click(link.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.flashed()), Some("Quit"));
+    assert!(
+        view.read_with(cx, |v, _| v.key_list_offset()) < -100.,
+        "the list scrolled down to the Application card"
+    );
+}
+
 /// A `keymap.json` that cannot be read must not take the window down with it (rule 11).
 #[gpui::test]
 fn a_broken_keymap_is_reported_not_fatal(cx: &mut TestAppContext) {

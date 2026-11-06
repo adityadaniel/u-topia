@@ -311,6 +311,13 @@ impl Root {
             }
             Ok(store) => {
                 paths::remember_graph(&self.config, &path);
+                // Settings → Sync can name the graph even when sync is off; the transport
+                // is filled in below when one is configured.
+                cx.set_global(utopia_ui::sync_runner::SyncFacts {
+                    target: None,
+                    graph: Some(paths::graph_id(&path)),
+                    encrypted: false,
+                });
                 let plugins = self.config.join("plugins");
                 let app = cx.new(|_| {
                     let mut a = AppState::new(store);
