@@ -928,6 +928,149 @@ fn seed_help_graph(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A scratch graph for the Daily Notes feed screenshots (DN-1 to DN-3): a long today so
+/// the pinned date can be caught mid-scroll, a written yesterday, empty days to fold and an
+/// older day with notes. Never seed into a real graph.
+fn seed_daily_feed(path: &Path) -> Result<()> {
+    use BlockKind::{Bullet, Heading, Quote, Todo};
+    let mut s = Store::open(path)?;
+    let today = chrono::Local::now().date_naive();
+
+    let atlas = s.create_page("Atlas Launch")?;
+    insert_tree(
+        &mut s,
+        &atlas,
+        &[
+            (0, Bullet, "status:: in progress"),
+            (0, Bullet, "owner:: [[Ana Lovelace]]"),
+            (0, Heading(2), "Scope"),
+            (1, Bullet, "A beta for twenty testers, invited by hand"),
+            (1, Bullet, "Import from the old format"),
+            (1, Todo, "Draft the release notes"),
+        ],
+    )?;
+    let ana = s.create_page("Ana Lovelace")?;
+    insert_tree(
+        &mut s,
+        &ana,
+        &[
+            (0, Bullet, "role:: reviewer on [[Atlas Launch]]"),
+            (0, Bullet, "Prefers a written summary before a call"),
+        ],
+    )?;
+    let reading = s.create_page("Reading")?;
+    insert_tree(
+        &mut s,
+        &reading,
+        &[(0, Bullet, "A list of what is worth finishing")],
+    )?;
+
+    // Today, long enough to scroll: the heading has to leave the top of the column.
+    let page = s.ensure_daily_page(today)?;
+    insert_tree(
+        &mut s,
+        &page,
+        &[
+            (0, Todo, "Review the [[Atlas Launch]] migration notes"),
+            (
+                1,
+                Bullet,
+                "The import path stays unchanged, so old files still open",
+            ),
+            (1, Todo, "Write the paragraph on merge conflicts"),
+            (0, Todo, "Send [[Ana Lovelace]] the beta list"),
+            (1, Bullet, "Twenty testers, invited by hand"),
+            (0, Bullet, "Draft the release note for the beta"),
+            (1, Quote, "Ship the small thing that works."),
+            (0, Heading(2), "Afternoon"),
+            (
+                0,
+                Bullet,
+                "Met [[Ana Lovelace]] about the [[Atlas Launch]] timeline",
+            ),
+            (1, Bullet, "She wants the beta in testers' hands this month"),
+            (1, Todo, "Send her the migration notes"),
+            (0, Bullet, "[[Reading]] — finished the chapter on CRDTs"),
+            (
+                1,
+                Bullet,
+                "The merge is the interesting part, not the transport",
+            ),
+            (1, Bullet, "Worth rereading before the beta"),
+            (0, Bullet, "#atlas #beta"),
+            (0, Heading(2), "Evening"),
+            (0, Bullet, "Sketched the outline of the beta announcement"),
+            (
+                1,
+                Bullet,
+                "Open with the import path, it is the thing people ask about",
+            ),
+            (1, Bullet, "Then the twenty testers"),
+            (
+                1,
+                Bullet,
+                "Then the date, once [[Ana Lovelace]] has reviewed it",
+            ),
+            (0, Todo, "Book the room for the kickoff"),
+            (0, Bullet, "Picked a title: “The small thing that works”"),
+            (0, Bullet, "Notes for tomorrow"),
+            (
+                1,
+                Todo,
+                "Ask [[Ana Lovelace]] to review the migration notes",
+            ),
+            (1, Todo, "Check the import on the 2019 export"),
+            (1, Bullet, "Keep the old export around for testing"),
+            (
+                0,
+                Bullet,
+                "[[Reading]] — the chapter on local-first software",
+            ),
+            (
+                1,
+                Bullet,
+                "Offline editing is the feature, not the fallback",
+            ),
+            (0, Bullet, "Ideas for the graph view"),
+            (1, Bullet, "Size the nodes by the number of links"),
+            (
+                1,
+                Bullet,
+                "Fade everything that is not a neighbour on hover",
+            ),
+            (0, Todo, "Reply to the testers' thread"),
+            (0, Bullet, "Good day."),
+        ],
+    )?;
+
+    // Yesterday: written, so it stays open (DN-1).
+    let page = s.ensure_daily_page(today - chrono::Duration::days(1))?;
+    insert_tree(
+        &mut s,
+        &page,
+        &[
+            (0, Bullet, "Wrote up the import plan for [[Atlas Launch]]"),
+            (1, Bullet, "Old files have to keep opening, no exceptions"),
+            (0, Todo, "Ask [[Ana Lovelace]] to review it"),
+            (0, Todo, "Book the room for the beta kickoff"),
+        ],
+    )?;
+
+    // An older day with notes, below the two empty days the feed folds (DN-1).
+    let page = s.ensure_daily_page(today - chrono::Duration::days(4))?;
+    insert_tree(
+        &mut s,
+        &page,
+        &[
+            (0, Bullet, "Started sketching the [[Atlas Launch]] scope"),
+            (0, Bullet, "[[Reading]] — two chapters on merge semantics"),
+        ],
+    )?;
+
+    s.sync_index()?;
+    Ok(())
+}
+
 /// Regenerate the screenshots embedded in Settings → Help.
 ///
 /// Builds the app, seeds a mock graph, then drives the real window with
@@ -1067,9 +1210,10 @@ fn main() -> Result<()> {
         Some("bundle") => bundle(args.iter().any(|a| a == "--debug")),
         Some("mobile") => mobile(args.iter().any(|a| a == "--ios")),
         Some("help-shots") => help_shots(),
+        Some("seed-daily") => seed_daily_feed(Path::new(args.get(1).context("graph path")?)),
         _ => {
             println!(
-                "usage: cargo run -p xtask --release -- bench [--ui]\n       cargo run -p xtask -- bundle [--debug]   (target/Utopia.app, registers utopia://)\n       cargo run -p xtask -- mobile [--ios]     (Swift bindings, checks, iOS shell)\n       cargo run -p xtask -- help-shots         (regenerate Settings -> Help screenshots)\n       cargo run -p xtask --release -- profile-merge   (loop for sampling with `sample`)"
+                "usage: cargo run -p xtask --release -- bench [--ui]\n       cargo run -p xtask -- bundle [--debug]   (target/Utopia.app, registers utopia://)\n       cargo run -p xtask -- mobile [--ios]     (Swift bindings, checks, iOS shell)\n       cargo run -p xtask -- help-shots         (regenerate Settings -> Help screenshots)\n       cargo run -p xtask -- seed-daily <graph>  (a scratch graph for the Daily Notes shots)\n       cargo run -p xtask --release -- profile-merge   (loop for sampling with `sample`)"
             );
             Ok(())
         }
