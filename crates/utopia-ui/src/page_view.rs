@@ -960,46 +960,28 @@ impl PageView {
         }
     }
 
-    /// Pages co-referenced by the current results, with how many hits mention them, for the
-    /// co-reference chips (FR-3.10, LR-1).
+    /// Pages co-referenced by the current results, for the co-reference chips (FR-3.10,
+    /// LR-1). The store resolves them from the index and counts the hits each would keep
+    /// with the same predicate the filter applies, so the chip's number is what it selects.
     fn compute_suggestions(
         &self,
         page: &PageId,
         cx: &mut Context<Self>,
     ) -> Vec<(PageId, String, usize)> {
-        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for g in &self.refs.groups {
-            for h in &g.hits {
-                for r in extract_refs(&h.text) {
-                    if r.is_page_like() {
-                        *counts.entry(r.target.clone()).or_default() += 1;
-                    }
-                }
-            }
-        }
-        let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        let store = &self.app.read(cx).store;
-        let mut out: Vec<(PageId, String, usize)> = Vec::new();
-        for (target, count) in ranked {
-            if let Ok(Some(id)) = store.find_page(&target) {
-                if id != *page
-                    && !self.query.also.contains(&id)
-                    && !out.iter().any(|(p, _, _)| *p == id)
-                {
-                    let title = store
-                        .page_row(&id)
-                        .ok()
-                        .flatten()
-                        .map_or(target.clone(), |r| r.title);
-                    out.push((id, title, count));
-                }
-            }
-            if out.len() >= 6 {
-                break;
-            }
-        }
-        out
+        let hits: Vec<RefHit> = self
+            .refs
+            .groups
+            .iter()
+            .flat_map(|g| g.hits.iter().cloned())
+            .collect();
+        self.app
+            .read(cx)
+            .store
+            .co_references(&hits, page, &self.query.also)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| (c.page, c.title, c.hits))
+            .collect()
     }
 
     // ---------------------------------------------------------------- editor events
@@ -2322,6 +2304,7 @@ impl PageView {
                     .child(title.clone())
                     .child(
                         div()
+                            .debug_selector(move || format!("suggest-count-{i}-{count}"))
                             .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.faint)
                             .child(count.to_string()),

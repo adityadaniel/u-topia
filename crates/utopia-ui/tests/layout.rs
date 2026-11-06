@@ -1017,3 +1017,66 @@ fn reference_controls_fit_a_narrow_split_pane(cx: &mut TestAppContext) {
         "{sort:?} {split:?}"
     );
 }
+
+/// A graph where one hit mentions "Ana Lovelace" twice and another once: the co-reference
+/// chip must count the two hits it selects, not the three occurrences of the link (LR-1).
+fn setup_ref_token_counts(
+    cx: &mut TestAppContext,
+) -> (&mut VisualTestContext, Entity<Workspace>, PageId) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let target = store.create_page("Target").unwrap();
+    store.create_page("Ana Lovelace").unwrap();
+    let src = store.create_page("Source").unwrap();
+    let b = store.ensure_first_block(&src).unwrap();
+    store
+        .set_block_text(
+            &src,
+            &b,
+            "[[Target]] with [[Ana Lovelace]] and [[Ana Lovelace]] again",
+            None,
+            None,
+        )
+        .unwrap();
+    store.commit_block(&src, &b).unwrap();
+    let plan = utopia_core::outline::append_block(store.page_state(&src).unwrap(), None);
+    let b2 = store.execute_plan(&src, plan, None).unwrap().unwrap().block;
+    store
+        .set_block_text(
+            &src,
+            &b2,
+            "another [[Target]] with [[Ana Lovelace]]",
+            None,
+            None,
+        )
+        .unwrap();
+    store.commit_block(&src, &b2).unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    (cx, ws, target)
+}
+
+/// LR-1 review fix: a co-reference chip counts the distinct hits it would leave, exactly
+/// like the filter it applies, instead of every occurrence of the link in the text.
+#[gpui::test]
+fn co_reference_counts_match_the_hits_they_select(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_token_counts(cx);
+    // Two hits mention Ana; one of them mentions her twice. The chip says 2, not 3.
+    bounds(cx, "suggest-count-0-2");
+    let chip = bounds(cx, "suggest-chip-0");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    bounds(cx, "refs-count-2");
+}

@@ -481,3 +481,67 @@ fn unlinked_count_reads_the_index_without_flushing() {
     assert_eq!(s.unlinked_references(&m).unwrap().len(), 1);
     assert_eq!(s.unlinked_references_now(&m).unwrap().len(), 1);
 }
+
+/// LR-1 review fix: the co-reference chips and their counts use the filter's own predicate.
+/// An alias resolves to the page, an ancestor reference counts for its descendants, and two
+/// mentions of the same page in one block are still one hit.
+#[test]
+fn co_reference_counts_use_the_filter_predicate() {
+    use utopia_core::outline;
+    let (mut s, _d) = store();
+    let target = s.create_page("Target").unwrap();
+    let ana = s.create_page("Ana Lovelace").unwrap();
+    s.add_alias(&ana, "AL").unwrap();
+    let bob = s.create_page("Bob").unwrap();
+    let src = s.create_page("Source").unwrap();
+    let parent = write(&mut s, &src, "Review of [[AL]]");
+    // A child that references Target, under a parent that references Ana through her alias.
+    let plan = outline::append_block(s.page_state(&src).unwrap(), Some(&parent));
+    let child = s.execute_plan(&src, plan, None).unwrap().unwrap().block;
+    s.set_block_text(
+        &src,
+        &child,
+        "the [[Target]] plan with [[Bob]] and [[Bob]]",
+        None,
+        None,
+    )
+    .unwrap();
+    s.commit_block(&src, &child).unwrap();
+    write(&mut s, &src, "another [[Target]] note with [[Bob]]");
+    s.sync_index().unwrap();
+
+    let refs = s.linked_references(&target, &Default::default()).unwrap();
+    let hits: Vec<_> = refs.groups.iter().flat_map(|g| g.hits.clone()).collect();
+    assert_eq!(hits.len(), 2);
+
+    let co = s.co_references(&hits, &target, &[]).unwrap();
+    let by_page = |p: &PageId| co.iter().find(|c| c.page == *p).map(|c| c.hits);
+    assert_eq!(
+        by_page(&ana),
+        Some(1),
+        "the alias reference on the ancestor counts for the child hit"
+    );
+    assert_eq!(
+        by_page(&bob),
+        Some(2),
+        "two hits, although one block mentions Bob twice"
+    );
+    assert!(
+        co.iter().all(|c| c.page != target),
+        "the page itself is never a co-reference"
+    );
+    // The count is exactly what the filter leaves.
+    let q = utopia_store::RefQuery {
+        also: vec![bob.clone()],
+        ..Default::default()
+    };
+    assert_eq!(
+        s.linked_references(&target, &q).unwrap().shown(),
+        by_page(&bob).unwrap()
+    );
+    // And applied filters are not offered again.
+    let co = s
+        .co_references(&hits, &target, std::slice::from_ref(&bob))
+        .unwrap();
+    assert!(co.iter().all(|c| c.page != bob));
+}

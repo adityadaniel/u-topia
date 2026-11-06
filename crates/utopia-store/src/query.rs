@@ -151,6 +151,18 @@ pub struct LinkedRefs {
     pub groups: Vec<RefGroup>,
 }
 
+/// A page the current hits co-reference: the chip a reference panel offers, with the number
+/// of hits selecting it would keep (FR-3.10, LR-1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoReference {
+    pub page: PageId,
+    pub title: String,
+    pub hits: usize,
+}
+
+/// How many co-reference chips a panel offers.
+pub const CO_REFERENCE_LIMIT: usize = 6;
+
 /// A referencing block's children for an inline preview (LR-4): the ones shown and how many
 /// the block has in total, so the view can fold the rest behind its chip.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -726,6 +738,78 @@ impl Store {
             );
         }
         Ok(out)
+    }
+
+    /// The pages the current hits co-reference, each with the number of hits that selecting
+    /// it would keep (FR-3.10, LR-1). Candidates come from the index — the referencing
+    /// block, its ancestors and their aliases all resolve to pages there — and the count
+    /// uses the very predicate a co-reference filter applies, so a chip's number is exactly
+    /// the number of results it produces.
+    pub fn co_references(
+        &self,
+        hits: &[RefHit],
+        page: &PageId,
+        applied: &[PageId],
+    ) -> Result<Vec<CoReference>> {
+        self.read_barrier()?;
+        let mut candidates: HashSet<String> = HashSet::new();
+        {
+            let mut refs = self.conn.prepare_cached(
+                "SELECT DISTINCT dst_page_id FROM ref
+                 WHERE src_block_id=?1 AND dst_kind='page' AND dst_page_id IS NOT NULL",
+            )?;
+            for h in hits {
+                let blocks = std::iter::once(&h.block).chain(h.breadcrumb.iter().map(|(b, _)| b));
+                for block in blocks {
+                    let rows = refs.query_map([block.as_str()], |r| r.get::<_, String>(0))?;
+                    for id in rows {
+                        candidates.insert(id?);
+                    }
+                }
+            }
+        }
+        let mut filter = self.conn.prepare_cached(
+            "SELECT src_block_id FROM ref WHERE dst_page_id=?1 AND dst_kind='page'",
+        )?;
+        let mut out: Vec<(String, CoReference)> = Vec::new();
+        for id in candidates {
+            let candidate = PageId(id);
+            if candidate == *page || applied.contains(&candidate) {
+                continue;
+            }
+            let set: HashSet<String> = filter
+                .query_map([candidate.as_str()], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            // The `RefQuery::also` predicate: the hit's block, an ancestor, or its page.
+            let kept = hits
+                .iter()
+                .filter(|h| {
+                    h.page == candidate
+                        || set.contains(h.block.as_str())
+                        || h.breadcrumb.iter().any(|(a, _)| set.contains(a.as_str()))
+                })
+                .count();
+            if kept == 0 {
+                continue;
+            }
+            let Some(row) = self.page_row(&candidate)? else {
+                continue;
+            };
+            if row.deleted_at.is_some() {
+                continue;
+            }
+            out.push((
+                row.title_key,
+                CoReference {
+                    page: candidate,
+                    title: row.title,
+                    hits: kept,
+                },
+            ));
+        }
+        out.sort_by(|a, b| b.1.hits.cmp(&a.1.hits).then(a.0.cmp(&b.0)));
+        out.truncate(CO_REFERENCE_LIMIT);
+        Ok(out.into_iter().map(|(_, c)| c).collect())
     }
 
     /// Number of live blocks referencing a page.
