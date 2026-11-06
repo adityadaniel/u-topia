@@ -403,10 +403,11 @@ impl JumpPalette {
 }
 
 impl JumpPalette {
-    /// The state of a previewed block as a short label, when it is worth naming (SR-4).
-    fn state_label(kind: utopia_core::BlockKind, checked: bool) -> Option<&'static str> {
+    /// The state of a previewed block as a short label (SR-4): its type, or Done for a
+    /// checked to-do.
+    fn state_label(kind: utopia_core::BlockKind, checked: bool) -> &'static str {
         use utopia_core::BlockKind::*;
-        Some(match kind {
+        match kind {
             Todo if checked => "Done",
             Todo => "To-do",
             Heading(1) => "Heading 1",
@@ -415,8 +416,8 @@ impl JumpPalette {
             Quote => "Quote",
             Code => "Code",
             Numbered => "Numbered",
-            Bullet => return None,
-        })
+            Bullet => "Bullet",
+        }
     }
 
     /// The right half: the selected block's path, text, state and first children (SR-4).
@@ -455,25 +456,21 @@ impl JumpPalette {
                 .line_clamp(2)
                 .child(crumbs.join(" › ")),
         );
-        let mut state = div().flex().items_center().gap_2();
-        if let Some(label) = Self::state_label(p.kind, p.checked) {
-            let (bg, fg) = if p.kind == utopia_core::BlockKind::Todo && p.checked {
-                (th.chip_bg, th.muted)
-            } else {
-                (th.chip_bg, th.accent)
-            };
-            state = state.child(
-                div()
-                    .debug_selector(|| "search-preview-state".into())
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .bg(bg)
-                    .text_size(px(crate::theme::CAPTION_SIZE))
-                    .text_color(fg)
-                    .child(label),
-            );
-        }
+        let label = Self::state_label(p.kind, p.checked);
+        let muted_state = p.kind == utopia_core::BlockKind::Bullet
+            || (p.kind == utopia_core::BlockKind::Todo && p.checked);
+        let fg = if muted_state { th.muted } else { th.accent };
+        let mut state = div().flex().items_center().gap_2().child(
+            div()
+                .debug_selector(|| "search-preview-state".into())
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .bg(th.chip_bg)
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(fg)
+                .child(label),
+        );
         if let Some(when) = chrono::DateTime::from_timestamp_millis(p.updated_at) {
             state = state.child(
                 div()

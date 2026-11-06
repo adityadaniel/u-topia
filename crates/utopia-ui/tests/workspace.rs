@@ -838,6 +838,10 @@ fn search_preview_follows_the_selection(cx: &mut TestAppContext) {
     let first = jump
         .read_with(cx, |j, _| j.preview().cloned())
         .expect("the first hit is a block, so it has a preview");
+    assert!(
+        cx.debug_bounds("search-preview-state").is_some(),
+        "the preview names the block's state"
+    );
     assert_eq!(first.page_title, "Atlas");
     assert_eq!(
         first
