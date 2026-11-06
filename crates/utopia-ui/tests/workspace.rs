@@ -1733,3 +1733,36 @@ fn auto_closed_relative_date_accepts_with_tab(cx: &mut TestAppContext) {
     assert_eq!(day_texts(&app, today(), cx), [want]);
     assert_tomorrow_linked(&app, cx);
 }
+
+/// SB-2, rule 10: the tag mark comes from a classification cached off the render path; a
+/// store change the app was never told about must not be discovered while drawing a frame.
+#[gpui::test]
+fn tag_marks_come_from_the_index_feed_not_from_render(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        let (p, b) = app.store.open_daily(today()).unwrap();
+        app.store
+            .set_block_text(&p, &b, "#atlas", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    // Make the sidebar re-query its list, without running the index feed: rendering must
+    // still use the cached classification.
+    app.update(cx, |app, cx| {
+        app.refs_version += 1;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("tag-glyph-atlas").is_none(),
+        "render must not call hashtag_only_pages (rule 10)"
+    );
+    // Once the app is told the index moved, the cache refreshes and the mark appears.
+    app.update(cx, |app, cx| app.flush_now(cx));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("tag-glyph-atlas").is_some(),
+        "the index feed refreshed the tag cache"
+    );
+}

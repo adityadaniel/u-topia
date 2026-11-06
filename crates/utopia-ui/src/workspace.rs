@@ -1030,10 +1030,13 @@ impl Workspace {
             self.sidebar_seen = Some(v);
             let store = &self.app.read(cx).store;
             let all = store.list_pages(true).unwrap_or_default();
+            // The tag classification is cached by `AppState` on the index feed, never
+            // computed from a frame (SB-2, rule 10).
+            let tags = self.app.read(cx).tag_pages.clone();
             self.sidebar = SidebarData {
                 journal: store.journal(14).unwrap_or_default(),
                 days: all.iter().filter_map(|p| p.daily_date).collect(),
-                tags: store.hashtag_only_pages().unwrap_or_default(),
+                tags,
                 pages: all.iter().filter(|p| !p.is_daily()).cloned().collect(),
                 all,
             };
