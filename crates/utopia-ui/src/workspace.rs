@@ -121,6 +121,9 @@ pub struct Workspace {
     sync_target: Option<String>,
     /// The footer's sync view is open (SB-4); it floats above the footer.
     sync_open: bool,
+    /// The dot state the last painted frame showed. Checked by tests to prove that a state
+    /// change actually repainted (debug bounds linger after an element stops being drawn).
+    rendered_sync_dot: Option<SyncDot>,
     sync: Option<SyncRunner>,
     focus: FocusHandle,
     subs: Vec<Subscription>,
@@ -199,6 +202,7 @@ impl Workspace {
             encrypted,
             sync_target: None,
             sync_open: false,
+            rendered_sync_dot: None,
             sync: None,
             focus: cx.focus_handle(),
             subs,
@@ -324,6 +328,9 @@ impl Workspace {
                 let Workspace { app, sync, .. } = this;
                 let runner = sync.as_mut()?;
                 let transport = runner.transport.take()?;
+                // The footer's dot says "syncing" from now until the exchange returns; ask
+                // for the frame now, or an idle window keeps last round's green (SB-4).
+                cx.notify();
                 let out = app.update(cx, |app, _| runner.engine.prepare(&mut app.store));
                 match out {
                     Ok(out) => Some((out, transport)),
@@ -962,6 +969,17 @@ impl Workspace {
         self.sync_open
     }
 
+    /// The dot state from the runner right now (SB-4): off, synced, in flight or failed.
+    pub fn sync_dot(&self) -> SyncDot {
+        sync_dot(self.sync.as_ref())
+    }
+
+    /// The dot state the last painted frame showed (SB-4), for tests that must tell a
+    /// repaint from a stale one.
+    pub fn rendered_sync_dot(&self) -> Option<SyncDot> {
+        self.rendered_sync_dot
+    }
+
     fn toggle_refs(&mut self, _: &ToggleReferences, _: &mut Window, cx: &mut Context<Self>) {
         if self.right_open && self.inspector_open {
             self.inspector_open = false;
@@ -1438,6 +1456,7 @@ impl Workspace {
             .unwrap_or_else(|| "in-memory graph".into());
         let (err, notice) = (app.last_error.clone(), app.notice.clone());
         let dot = sync_dot(self.sync.as_ref());
+        self.rendered_sync_dot = Some(dot);
         let dot_color = match dot {
             SyncDot::Off => th.faint,
             SyncDot::Synced => th.success,

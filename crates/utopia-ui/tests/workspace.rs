@@ -1766,3 +1766,58 @@ fn tag_marks_come_from_the_index_feed_not_from_render(cx: &mut TestAppContext) {
         "the index feed refreshed the tag cache"
     );
 }
+
+/// SB-4: when a new exchange starts, the footer's dot must repaint as "syncing" at once.
+/// Without a notification the window keeps showing the green dot from the previous round
+/// for the whole network exchange.
+#[gpui::test]
+fn sync_dot_turns_amber_when_an_exchange_starts(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use utopia_ui::sync_runner::{BoxTransport, SyncDot};
+
+    let (_app, ws, cx) = setup(cx);
+    let nudge = Arc::new(AtomicBool::new(false));
+    let transport: BoxTransport = Box::new(utopia_sync::relay::RelayTransport::new(
+        utopia_sync::relay::Relay::new(),
+        "graph",
+    ));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(transport, Some(nudge.clone()), cx)
+    });
+    // The first round finishes quickly: the dot is green and painted.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(10));
+    cx.run_until_parked();
+    cx.update(|_, _| {});
+    assert_eq!(ws.update(cx, |w, _| w.sync_dot()), SyncDot::Synced);
+    assert_eq!(
+        ws.update(cx, |w, _| w.rendered_sync_dot()),
+        Some(SyncDot::Synced)
+    );
+
+    // Ask for the next round now and stop at the moment the exchange is in flight.
+    nudge.store(true, Ordering::SeqCst);
+    let mut started = false;
+    for _ in 0..500 {
+        if ws.update(cx, |w, _| w.sync_dot()) == SyncDot::Syncing {
+            started = true;
+            break;
+        }
+        // Move the test clock to the loop's next 250 ms poll (if it registered one), then
+        // run exactly one queued task. The exchange is only queued after the loop takes
+        // the transport, so it cannot run before the state is observed.
+        cx.dispatcher.advance_clock_to_next_delayed();
+        if !cx.background_executor.tick() {
+            break;
+        }
+    }
+    assert!(started, "the second exchange never started");
+    // Flushing effects paints the window only if the state change requested a frame.
+    cx.update(|_, _| {});
+    assert_eq!(
+        ws.update(cx, |w, _| w.rendered_sync_dot()),
+        Some(SyncDot::Syncing),
+        "the in-flight dot was never painted"
+    );
+}
