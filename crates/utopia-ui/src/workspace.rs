@@ -487,6 +487,7 @@ impl Workspace {
                     cx,
                 );
             }
+            PageViewEvent::TogglePin { page } => self.toggle_pin(page.clone(), cx),
         }
     }
 
@@ -1088,12 +1089,14 @@ impl Workspace {
     }
 
     /// A page in the sidebar: one list for ordinary pages and tag pages (SB-2), the only
-    /// difference being the `#` glyph in the tag colour.
+    /// difference being the `#` glyph in the tag colour. `unpin` builds the row for the
+    /// Pinned group, which carries a control to take the page out of it again (SB-3).
     fn sidebar_page_row(
         &self,
         index: usize,
         page: &PageRow,
         tagged: bool,
+        unpin: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let th = theme(cx).clone();
@@ -1101,9 +1104,10 @@ impl Workspace {
         let active = !main.is_journal() && main.page.as_ref() == Some(&page.id);
         let id = page.id.clone();
         let key = page.title_key.clone();
+        let group = if unpin { "pinned" } else { "page" };
         div()
-            .id(("page", index))
-            .debug_selector(move || format!("page-row-{index}"))
+            .id((group, index))
+            .debug_selector(move || format!("{group}-row-{index}"))
             .flex()
             .items_center()
             .gap_1()
@@ -1132,12 +1136,49 @@ impl Workspace {
                     .truncate()
                     .child(page.title.clone()),
             )
+            .when(unpin, |d| {
+                let unpin_page = id.clone();
+                d.child(
+                    div()
+                        .id(("unpin", index))
+                        .debug_selector(move || format!("unpin-{index}"))
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.faint)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(th.line).text_color(th.text))
+                        .child("✕")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_pin(unpin_page.clone(), cx);
+                            }),
+                        ),
+                )
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| {
                     this.open(id.clone(), None, None, e.modifiers.shift, window, cx)
                 }),
             )
+    }
+
+    /// SB-3: pin or unpin a page; the preference is local (`settings.json`, rule 9).
+    fn toggle_pin(&mut self, page: PageId, cx: &mut Context<Self>) {
+        match crate::appearance::toggle_pinned(cx, &page) {
+            Ok(_) => cx.notify(),
+            Err(e) => {
+                self.app.update(cx, |app, cx| {
+                    app.last_error =
+                        Some(format!("could not save {}: {e}", crate::appearance::FILE));
+                    cx.notify();
+                });
+            }
+        }
     }
 
     /// One line per day (SB-1): the date, then a muted count of its blocks. Two preview
@@ -1323,9 +1364,21 @@ impl Workspace {
         for (i, entry) in self.sidebar.journal.iter().enumerate() {
             scroll = scroll.child(self.recent_day_row(i, entry, cx));
         }
-        scroll = scroll.child(section("PAGES"));
         let pages = self.sidebar.pages.clone();
         let tags = self.sidebar.tags.clone();
+        // SB-3: pinned pages first, in pin order, above the ordinary list.
+        let pinned: Vec<PageRow> = crate::appearance::pinned(cx)
+            .iter()
+            .filter_map(|id| pages.iter().find(|p| &p.id == id).cloned())
+            .collect();
+        if !pinned.is_empty() {
+            scroll = scroll.child(section("PINNED").debug_selector(|| "pinned-header".into()));
+            for (i, page) in pinned.into_iter().enumerate() {
+                let tagged = tags.contains(&page.id);
+                scroll = scroll.child(self.sidebar_page_row(i, &page, tagged, true, cx));
+            }
+        }
+        scroll = scroll.child(section("PAGES").debug_selector(|| "pages-header".into()));
         if pages.is_empty() {
             scroll = scroll.child(
                 div()
@@ -1337,7 +1390,7 @@ impl Workspace {
         }
         for (i, page) in pages.into_iter().enumerate() {
             let tagged = tags.contains(&page.id);
-            scroll = scroll.child(self.sidebar_page_row(i, &page, tagged, cx));
+            scroll = scroll.child(self.sidebar_page_row(i, &page, tagged, false, cx));
         }
         col = col.child(scroll);
         let (file, err, notice) = {

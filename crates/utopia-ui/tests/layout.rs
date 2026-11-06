@@ -678,3 +678,83 @@ fn tag_pages_get_a_hash_glyph(cx: &mut TestAppContext) {
         "a [[link]] page is not marked as a tag page"
     );
 }
+
+/// SB-3: a page pinned from its "···" menu sits in a Pinned group above Pages, the pin is
+/// written to settings.json as local state (rule 9), and the row's ✕ unpins it without
+/// opening the page behind the click.
+#[gpui::test]
+fn pinned_pages_sit_above_pages_and_are_local(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| {
+        s.create_page("Alpha").unwrap();
+        s.create_page("Beta").unwrap();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|_, cx| utopia_ui::appearance::install(cx, dir.path()));
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let alpha = PageId::for_title_key("alpha");
+    let beta = PageId::for_title_key("beta");
+    cx.update(|window, cx| {
+        ws.update(cx, |w, cx| {
+            w.open(alpha.clone(), None, None, false, window, cx)
+        })
+    });
+    cx.run_until_parked();
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    let pin = bounds(cx, "page-menu-pin");
+    cx.simulate_click(pin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let pinned_header = bounds(cx, "pinned-header");
+    let pages_header = bounds(cx, "pages-header");
+    let row = bounds_of(cx, "pinned-row-0".into());
+    assert!(
+        pinned_header.origin.y < pages_header.origin.y,
+        "the Pinned group is above Pages: {pinned_header:?} {pages_header:?}"
+    );
+    assert!(
+        row.origin.y >= pinned_header.origin.y
+            && row.origin.y + row.size.height <= pages_header.origin.y + px(0.5),
+        "the pinned row sits between the two headers: {row:?}"
+    );
+    let saved = || -> serde_json::Value {
+        let s = std::fs::read_to_string(dir.path().join("settings.json")).expect("settings.json");
+        serde_json::from_str(&s).expect("settings.json is JSON")
+    };
+    assert_eq!(saved()["pinned"], serde_json::json!([alpha.as_str()]));
+    assert!(
+        !dir.path().join("keymap.json").exists(),
+        "a pin is not a keybinding"
+    );
+    // A new launch reads the pin back from the file.
+    cx.update(|_, cx| {
+        utopia_ui::appearance::install(cx, dir.path());
+        assert_eq!(utopia_ui::appearance::pinned(cx), [alpha.clone()]);
+    });
+
+    // Show another page, then unpin Alpha with the row's ✕. The click must not open Alpha.
+    cx.update(|window, cx| {
+        ws.update(cx, |w, cx| {
+            w.open(beta.clone(), None, None, false, window, cx)
+        })
+    });
+    cx.run_until_parked();
+    let before = pages_header.origin.y;
+    let unpin = bounds_of(cx, "unpin-0".into());
+    cx.simulate_click(unpin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(beta),
+        "unpinning does not follow the row's link"
+    );
+    assert_eq!(saved()["pinned"], serde_json::json!([]));
+    let pages_header = bounds(cx, "pages-header");
+    assert!(
+        pages_header.origin.y < before,
+        "Pages moves up once the Pinned group is gone: {pages_header:?}"
+    );
+}
