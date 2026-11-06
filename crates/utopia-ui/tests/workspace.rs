@@ -1048,6 +1048,70 @@ fn graph_panel_refreshes_after_new_links(cx: &mut TestAppContext) {
     assert_eq!(panel.update(cx, |g, _| g.edge_count()), 3);
 }
 
+/// AGENTS.md focus invariant: removing the focused graph must hand focus back, or every
+/// workspace shortcut dies with it.
+#[gpui::test]
+fn closing_the_graph_panel_restores_focus(cx: &mut TestAppContext) {
+    let (_app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let local = cx
+        .debug_bounds("graph-local")
+        .expect("Around this page filter")
+        .center();
+    cx.simulate_click(local, Modifiers::default());
+    cx.run_until_parked();
+    let canvas = cx.debug_bounds("graph-canvas").expect("panel canvas");
+    cx.simulate_click(canvas.origin + point(px(6.), px(6.)), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(ws.update(cx, |w, _| w.graph_panel()).is_none());
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("jump-palette").is_some(),
+        "workspace shortcuts work after closing the panel"
+    );
+}
+
+/// AGENTS.md focus invariant: ⌘-click opens a split, then the full-screen graph that had
+/// focus disappears; focus must not go with it.
+#[gpui::test]
+fn graph_cmd_click_split_restores_focus(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let graph = ws.update(cx, |w, _| w.graph_view()).expect("graph shown");
+    let alpha = app.update(cx, |a, _| a.store.find_page("Alpha").unwrap().unwrap());
+    let nodes = graph.update(cx, |g, _| g.node_count());
+    let i = (0..nodes)
+        .find(|&i| graph.update(cx, |g, _| g.node_page(i)) == Some(alpha.clone()))
+        .unwrap();
+    let at = graph.update(cx, |g, _| g.node_screen_pos(i)).unwrap();
+    let cmd = Modifiers {
+        platform: true,
+        ..Default::default()
+    };
+    cx.simulate_click(at, cmd);
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.split_pages(cx)), vec![alpha]);
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("jump-palette").is_some(),
+        "workspace shortcuts work after the split opens"
+    );
+}
+
 #[gpui::test]
 fn dropped_files_become_attachments(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);

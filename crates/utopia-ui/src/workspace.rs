@@ -663,6 +663,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let from_panel = self.graph_panel.as_ref() == Some(view);
+        // AGENTS.md focus invariant: a removed element gets no keystrokes. If this graph
+        // owned focus, hand it back; otherwise leave an editor's focus untouched.
+        let had_focus = view.read(cx).focus_handle(cx).is_focused(window);
         match e {
             GraphEvent::Open {
                 page,
@@ -674,6 +677,9 @@ impl Workspace {
                 }
                 if *split {
                     self.open_split(page.clone(), window, cx);
+                    if had_focus {
+                        window.focus(&self.focus);
+                    }
                 } else {
                     self.open(page.clone(), None, None, *sidebar, window, cx);
                 }
@@ -689,7 +695,7 @@ impl Workspace {
             GraphEvent::Close => {
                 self.graph = None;
                 self.graph_panel = None;
-                if !from_panel {
+                if had_focus {
                     window.focus(&self.focus);
                 }
             }
