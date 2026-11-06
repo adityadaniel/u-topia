@@ -207,6 +207,9 @@ pub struct BlockHit {
 pub struct JournalEntry {
     pub page: PageRow,
     pub preview: Vec<String>,
+    /// Live blocks with text: what the sidebar's muted count says (SB-1). A day that only
+    /// exists because a link pointed at it has 0 here.
+    pub blocks: usize,
 }
 
 /// Subsequence fuzzy score of `needle` in `hay` (both normalized); higher is better.
@@ -326,7 +329,8 @@ impl Store {
         Ok(rows.iter().map(|t| plain_text(t)).collect())
     }
 
-    /// The last `limit` journal pages up to `today`, with a 2-line preview (FR-1.3).
+    /// The last `limit` journal pages up to `today`, with a 2-line preview (FR-1.3) and
+    /// the number of blocks on the day (SB-1).
     pub fn journal(&self, limit: usize) -> Result<Vec<JournalEntry>> {
         self.journal_pages(limit)?
             .into_iter()
@@ -336,9 +340,26 @@ impl Store {
                     .into_iter()
                     .filter(|s| !s.trim().is_empty())
                     .collect();
-                Ok(JournalEntry { page, preview })
+                let blocks = self.page_block_count(&page.id)?;
+                Ok(JournalEntry {
+                    page,
+                    preview,
+                    blocks,
+                })
             })
             .collect()
+    }
+
+    /// Live blocks with text on a page. An empty block does not count: the sidebar's
+    /// count says how much was written, not how many blank rows the outliner holds.
+    pub fn page_block_count(&self, page: &PageId) -> Result<usize> {
+        self.read_barrier()?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT count(*) FROM block
+             WHERE page_id=?1 AND deleted_at IS NULL AND trim(text) <> ''",
+        )?;
+        let n: i64 = stmt.query_row(params![page.as_str()], |r| r.get(0))?;
+        Ok(n.max(0) as usize)
     }
 
     /// Daily pages up to today with something on them, newest first: the Daily Notes

@@ -3,6 +3,7 @@
 
 use chrono::NaiveDate;
 use gpui::{px, size, AppContext as _, Bounds, Entity, Pixels, TestAppContext, VisualTestContext};
+use utopia_core::outline;
 use utopia_core::PageId;
 use utopia_store::Store;
 use utopia_ui::actions::install_keymap;
@@ -13,19 +14,50 @@ use utopia_ui::workspace::Workspace;
 const W: f32 = 1280.;
 const H: f32 = 820.;
 
+fn today() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()
+}
+
 fn setup(cx: &mut TestAppContext) -> &mut VisualTestContext {
+    setup_seeded(cx, |_| {})
+}
+
+/// The workspace over a store seeded directly (never through keystrokes): deterministic
+/// content for the sidebar, and no race with the UI's debounce.
+fn setup_seeded(cx: &mut TestAppContext, seed: impl FnOnce(&mut Store)) -> &mut VisualTestContext {
     cx.update(|cx| {
         cx.set_global(Theme::light());
         install_keymap(cx, None);
     });
     let mut store = Store::open_in_memory().unwrap();
-    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    store.set_today(Some(today()));
+    seed(&mut store);
+    store.sync_index().unwrap();
     let app = cx.new(|_| AppState::new(store));
     let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
     cx.simulate_resize(size(px(W), px(H)));
     ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
     cx.run_until_parked();
     cx
+}
+
+/// `n` days of history, two blocks each, so the old two-line preview would have shown
+/// both (SB-1).
+fn seed_days(store: &mut Store, n: usize) {
+    for i in 0..n {
+        let d = today() - chrono::Duration::days(i as i64);
+        let (p, b) = store.open_daily(d).unwrap();
+        store
+            .set_block_text(&p, &b, &format!("Day {i} first block"), None, None)
+            .unwrap();
+        store.commit_block(&p, &b).unwrap();
+        let plan = outline::append_block(store.page_state(&p).unwrap(), None);
+        let second = store.execute_plan(&p, plan, None).unwrap().unwrap().block;
+        store
+            .set_block_text(&p, &second, &format!("Day {i} second block"), None, None)
+            .unwrap();
+        store.commit_block(&p, &second).unwrap();
+    }
 }
 
 /// Today's page on its own (the calendar's "Today"), not the Daily Notes feed.
@@ -50,6 +82,13 @@ fn setup_page(cx: &mut TestAppContext) -> &mut VisualTestContext {
 }
 
 fn bounds(cx: &mut VisualTestContext, sel: &'static str) -> Bounds<Pixels> {
+    bounds_of(cx, sel.to_string())
+}
+
+/// `debug_bounds` only takes a `&'static str`; a test-built selector is leaked for the
+/// duration of the process (a handful of short strings).
+fn bounds_of(cx: &mut VisualTestContext, sel: String) -> Bounds<Pixels> {
+    let sel: &'static str = Box::leak(sel.into_boxed_str());
     cx.run_until_parked();
     cx.debug_bounds(sel)
         .unwrap_or_else(|| panic!("{sel} was not rendered"))
@@ -560,5 +599,58 @@ fn opening_the_page_menu_does_not_move_the_title(cx: &mut TestAppContext) {
     assert_eq!(
         closed, open,
         "the title keeps its bounds when the menu opens"
+    );
+}
+
+/// SB-1: ten days are ten one-line rows, each with a muted block count. At the old
+/// two-preview height three days took half the sidebar; these ten fit without scrolling.
+#[gpui::test]
+fn recent_days_are_one_line_each(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| seed_days(s, 10));
+    cx.simulate_keystrokes("escape");
+    let sidebar = bounds(cx, "left-sidebar");
+    let mut previous: Option<Bounds<Pixels>> = None;
+    for i in 0..10 {
+        let row = bounds_of(cx, format!("recent-day-{i}"));
+        assert!(
+            row.size.height <= px(22.),
+            "row {i} is one line, not a preview block: {row:?}"
+        );
+        let count = bounds_of(cx, format!("recent-day-count-{i}"));
+        assert!(
+            count.origin.x > row.origin.x + row.size.width / 2.
+                && count.origin.x + count.size.width <= row.origin.x + row.size.width + px(0.5),
+            "the count sits at the right edge of row {i}: {count:?} {row:?}"
+        );
+        if let Some(p) = previous {
+            assert!(
+                row.origin.y >= p.origin.y + p.size.height - px(1.),
+                "rows stack: {p:?} {row:?}"
+            );
+        }
+        previous = Some(row);
+    }
+    let last = previous.expect("ten rows");
+    assert!(
+        last.origin.y + last.size.height <= sidebar.origin.y + sidebar.size.height,
+        "ten compact days fit in the sidebar without scrolling: {last:?} {sidebar:?}"
+    );
+}
+
+/// SB-1: a compact row keeps the day's first block one hover away.
+#[gpui::test]
+fn recent_day_hover_shows_its_first_block(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| seed_days(s, 3));
+    cx.simulate_keystrokes("escape");
+    let row = bounds_of(cx, "recent-day-0".into());
+    cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    // gpui waits 500 ms before showing a tooltip.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(700));
+    cx.run_until_parked();
+    let tip = bounds_of(cx, "recent-day-preview".into());
+    assert!(
+        tip.size.width > px(40.) && tip.size.height >= px(12.),
+        "the first block is drawn as a tooltip: {tip:?}"
     );
 }

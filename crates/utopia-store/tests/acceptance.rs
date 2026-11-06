@@ -869,3 +869,27 @@ fn reopening_mid_session_sees_writer_commits() {
         vec![("from the writer thread".to_string(), 0)]
     );
 }
+
+/// SB-1: the sidebar's muted count says how much was written on a day, so an empty day
+/// (kept only for a link into it) counts zero and a blank row never counts.
+#[test]
+fn sb_1_journal_counts_written_blocks() {
+    let mut s = store();
+    let (p, first) = s.open_daily(date(2026, 11, 2)).unwrap();
+    s.set_block_text(&p, &first, "one", None, None).unwrap();
+    write(&mut s, &p, "two");
+    let blank = write(&mut s, &p, "");
+    assert!(
+        s.page_state(&p).unwrap().block(&blank).unwrap().live,
+        "the blank block exists but is not written on"
+    );
+    assert_eq!(s.page_block_count(&p).unwrap(), 2);
+    let entry = s.journal(14).unwrap().remove(0);
+    assert_eq!(entry.page.id, p);
+    assert_eq!(entry.blocks, 2);
+    assert_eq!(
+        entry.preview.len(),
+        2,
+        "the preview still has one line per block"
+    );
+}

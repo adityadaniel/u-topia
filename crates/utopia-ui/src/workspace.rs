@@ -57,6 +57,31 @@ struct InspectorData {
     unresolved: Vec<(OutgoingRef, String)>,
 }
 
+/// A recent day's first block, shown as a tooltip on its one-line row (SB-1). A real view
+/// rather than a styled div because gpui tooltips are views.
+struct SidebarTooltip {
+    text: SharedString,
+}
+
+impl Render for SidebarTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let th = theme(cx).clone();
+        div()
+            .debug_selector(|| "recent-day-preview".into())
+            .max_w(px(240.))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(th.surface)
+            .border_1()
+            .border_color(th.line)
+            .shadow_md()
+            .text_size(px(crate::theme::CAPTION_SIZE))
+            .text_color(th.text)
+            .child(self.text.clone())
+    }
+}
+
 pub struct Workspace {
     app: Entity<AppState>,
     editor: Entity<BlockEditor>,
@@ -1058,6 +1083,65 @@ impl Workspace {
             })
     }
 
+    /// One line per day (SB-1): the date, then a muted count of its blocks. Two preview
+    /// lines used to make three days take the space ten now do; the first block is still
+    /// reachable, as a tooltip, so a compact row does not lose what the day is about.
+    fn recent_day_row(
+        &self,
+        index: usize,
+        entry: &JournalEntry,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let th = theme(cx).clone();
+        let main = self.main.read(cx);
+        let active = !main.is_journal() && main.page.as_ref() == Some(&entry.page.id);
+        let page = entry.page.id.clone();
+        let title = entry.page.title.clone();
+        let blocks = entry.blocks;
+        let first: SharedString = entry
+            .preview
+            .first()
+            .map(|p| p.chars().take(160).collect::<String>())
+            .unwrap_or_default()
+            .into();
+        div()
+            .id(("recent-day", index))
+            .debug_selector(move || format!("recent-day-{index}"))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .rounded_sm()
+            .line_height(px(18.))
+            .text_size(px(13.5))
+            .cursor_pointer()
+            .text_color(if active { th.accent } else { th.text })
+            .when(active, |d| d.bg(th.hover))
+            .hover(|s| s.bg(th.hover))
+            .child(div().flex_1().min_w_0().truncate().child(title))
+            .child(
+                div()
+                    .debug_selector(move || format!("recent-day-count-{index}"))
+                    .flex_none()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(blocks.to_string()),
+            )
+            .tooltip(move |_, cx| {
+                cx.new(|_| SidebarTooltip {
+                    text: first.clone(),
+                })
+                .into()
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    this.new_day = false;
+                    this.open(page.clone(), None, None, e.modifiers.shift, window, cx)
+                }),
+            )
+    }
+
     fn render_left(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let th = theme(cx).clone();
         let today = self.today;
@@ -1179,35 +1263,11 @@ impl Workspace {
             .min_h_0()
             .overflow_y_scroll();
         scroll = scroll.child(section("RECENT DAYS"));
-        let journal: Vec<(PageId, String, Vec<String>)> = self
-            .sidebar
-            .journal
-            .iter()
-            .map(|j| (j.page.id.clone(), j.page.title.clone(), j.preview.clone()))
-            .collect();
-        for (i, (id, title, preview)) in journal.into_iter().enumerate() {
-            let item = self.nav_item(("journal", i), title, Some(id), cx).child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .text_size(px(crate::theme::CAPTION_SIZE))
-                    .text_color(th.muted)
-                    .children(
-                        preview
-                            .into_iter()
-                            .take(2)
-                            .map(|p| p.chars().take(48).collect::<String>()),
-                    ),
-            );
-            scroll = scroll.child(item);
+        for (i, entry) in self.sidebar.journal.iter().enumerate() {
+            scroll = scroll.child(self.recent_day_row(i, entry, cx));
         }
         scroll = scroll.child(section("PAGES"));
-        let pages: Vec<(PageId, String)> = self
-            .sidebar
-            .pages
-            .iter()
-            .map(|p| (p.id.clone(), p.title.clone()))
-            .collect();
+        let pages = self.sidebar.pages.clone();
         if pages.is_empty() {
             scroll = scroll.child(
                 div()
@@ -1217,8 +1277,8 @@ impl Workspace {
                     .child("Type [[ or # to make a page."),
             );
         }
-        for (i, (id, title)) in pages.into_iter().enumerate() {
-            scroll = scroll.child(self.nav_item(("page", i), title, Some(id), cx));
+        for (i, page) in pages.into_iter().enumerate() {
+            scroll = scroll.child(self.nav_item(("page", i), page.title, Some(page.id), cx));
         }
         col = col.child(scroll);
         let (file, err, notice) = {
