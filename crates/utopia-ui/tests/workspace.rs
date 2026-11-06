@@ -227,6 +227,64 @@ fn quick_jump_creates_and_opens(cx: &mut TestAppContext) {
     assert_eq!(rows_str(&rows(&app, &page, cx)), vec![("first thought", 0)]);
 }
 
+/// QJ-1: with nothing typed the palette offers today, yesterday and the pages opened
+/// last, and picking one opens it. The list is local UI state (rule 9), not the index.
+#[gpui::test]
+fn quick_jump_empty_state_lists_days_and_recent_pages(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-row-0").is_some(),
+        "today is the first row"
+    );
+    assert!(
+        cx.debug_bounds("qj-row-1").is_some(),
+        "yesterday is the second"
+    );
+    assert!(
+        cx.debug_bounds("qj-row-2").is_none(),
+        "nothing has been opened yet"
+    );
+    // Create a page through the palette, then leave it: it becomes the first recent page.
+    cx.simulate_input("Reading log");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    let reading = app
+        .update(cx, |app, _| app.store.find_page("Reading log").unwrap())
+        .unwrap();
+    app.update(cx, |app, _| {
+        let stored = app
+            .store
+            .local_get("recent_pages")
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(
+            stored.lines().next(),
+            Some(reading.as_str()),
+            "newest first: {stored:?}"
+        );
+    });
+    // Go elsewhere, then reopen the palette: the page is offered by name, not by query.
+    cx.simulate_keystrokes("cmd-shift-t");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-row-2").is_some(),
+        "the recent page follows today and yesterday"
+    );
+    cx.simulate_keystrokes("down down enter");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(reading),
+        "Enter opens the highlighted recent page"
+    );
+}
+
 #[gpui::test]
 fn query_blocks_list_results(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);

@@ -49,6 +49,13 @@ struct SidebarData {
     days: HashSet<NaiveDate>,
 }
 
+/// `local_state` key holding the pages opened last, newest first (QJ-1). Device-local UI
+/// state like collapse, so it never syncs and never enters a shard (rule 9).
+const RECENT_KEY: &str = "recent_pages";
+/// How many ids are kept: Quick jump shows eight after today and yesterday, and pages
+/// deleted since the list was written are skipped, so a few spares are kept.
+const RECENT_KEEP: usize = 24;
+
 #[derive(Default)]
 struct InspectorData {
     incoming: Vec<(PageRow, usize)>,
@@ -78,6 +85,9 @@ pub struct Workspace {
     sidebar_seen: Option<u64>,
     inspector: InspectorData,
     inspector_seen: Option<(PageId, u64)>,
+    /// Pages opened last, newest first, for the Quick jump empty state (QJ-1). Read from
+    /// and written back to `local_state`, never to a shard (rule 9).
+    recent: Vec<PageId>,
     month: NaiveDate,
     today: NaiveDate,
     new_day: bool,
@@ -129,6 +139,21 @@ impl Workspace {
                 .map_or(default, |v| v == "1")
         };
         let (left_open, calendar_open) = (flag("left_sidebar", true), flag("calendar", false));
+        let recent = app
+            .read(cx)
+            .store
+            .local_get(RECENT_KEY)
+            .ok()
+            .flatten()
+            .map(|v| {
+                v.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .take(RECENT_KEEP)
+                    .map(|l| PageId(l.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut me = Self {
             app,
             editor,
@@ -147,6 +172,7 @@ impl Workspace {
             sidebar_seen: None,
             inspector: InspectorData::default(),
             inspector_seen: None,
+            recent,
             month: today,
             today,
             new_day: false,
@@ -416,6 +442,27 @@ impl Workspace {
         self.open_journal(window, cx);
     }
 
+    /// Remember that `page` was opened, for the Quick jump empty state (QJ-1). Local UI
+    /// state in `local_state` (rule 9): a page opened on another device is not reordered
+    /// here, and a write failure costs the ordering, never the page.
+    fn note_opened(&mut self, page: &PageId, cx: &mut Context<Self>) {
+        if self.recent.first() == Some(page) {
+            return;
+        }
+        self.recent.retain(|p| p != page);
+        self.recent.insert(0, page.clone());
+        self.recent.truncate(RECENT_KEEP);
+        let joined = self
+            .recent
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Err(e) = self.app.read(cx).store.local_set(RECENT_KEY, &joined) {
+            eprintln!("utopia: {e}");
+        }
+    }
+
     fn on_page_event(
         &mut self,
         view: &Entity<PageView>,
@@ -472,6 +519,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.editor.update(cx, |e, cx| e.end(cx));
+        self.note_opened(&page, cx);
         if sidebar {
             // Shift-click stacks the page beside the current one (§0, W6).
             let existing = self
@@ -534,8 +582,15 @@ impl Workspace {
             JumpMode::Capture => ("Quick capture → today", PaletteMode::Capture),
             JumpMode::Extract { .. } => ("Extract block to page", PaletteMode::Text),
         };
+        // QJ-1: only "go to page" has an empty state worth having — today, yesterday and
+        // the pages opened last. Redirecting a link or naming an extracted page has
+        // nothing to do with where you have been.
+        let recent = match mode {
+            JumpMode::Open => Some(self.recent.clone()),
+            _ => None,
+        };
         let app = self.app.clone();
-        let jump = cx.new(|cx| JumpPalette::with_mode(app, title, palette, window, cx));
+        let jump = cx.new(|cx| JumpPalette::with_mode(app, title, palette, recent, window, cx));
         self.subs.push(cx.subscribe_in(
             &jump,
             window,
@@ -559,6 +614,9 @@ impl Workspace {
                             app.report(r);
                             app.changed(Vec::new(), true, cx);
                         });
+                    }
+                    (QuickJumpEvent::ChosenDay { date, sidebar }, Some(JumpMode::Open)) => {
+                        this.open_date(*date, *sidebar, !*sidebar, window, cx)
                     }
                     (QuickJumpEvent::Text(text), Some(JumpMode::Capture)) => {
                         this.app.update(cx, |app, cx| {

@@ -191,6 +191,113 @@ fn quick_jump_is_centered(cx: &mut TestAppContext) {
     );
 }
 
+/// QJ-1: with nothing typed the palette offers today and yesterday, in that order, and
+/// nothing else — there is no query to search or create from.
+#[gpui::test]
+fn quick_jump_empty_state_lists_today_and_yesterday(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape cmd-k");
+    let palette = bounds(cx, "jump-palette");
+    let today = bounds(cx, "qj-row-0");
+    let yesterday = bounds(cx, "qj-row-1");
+    assert!(yesterday.origin.y > today.origin.y, "today comes first");
+    assert!(
+        today.origin.y >= palette.origin.y
+            && yesterday.origin.y + yesterday.size.height
+                <= palette.origin.y + palette.size.height + px(0.5),
+        "both rows sit inside the palette: {today:?} {yesterday:?} {palette:?}"
+    );
+    assert!(
+        cx.debug_bounds("qj-row-2").is_none(),
+        "nothing has been opened yet"
+    );
+}
+
+/// Opening the palette is an overlay: the page underneath does not move.
+#[gpui::test]
+fn quick_jump_does_not_move_the_page(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    let before = bounds(cx, "main-pane");
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input("Brand new page");
+    let after = bounds(cx, "main-pane");
+    assert_eq!(before, after, "the palette floats over the page");
+}
+
+/// QJ-1: ten rows (today, yesterday and eight recent pages) keep the palette under its
+/// height cap, so the list scrolls rather than growing without limit.
+#[gpui::test]
+fn quick_jump_caps_its_height(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let mut ids = Vec::new();
+    for title in [
+        "Atlas Launch",
+        "Ana Lovelace",
+        "Library",
+        "Operations",
+        "Reading log",
+        "Trips",
+        "Recipes",
+        "Garden",
+        "Budget",
+        "Inbox",
+    ] {
+        ids.push(store.create_page(title).unwrap());
+    }
+    // Most recently opened first, as the workspace writes it (rule 9).
+    let keyed = ids
+        .iter()
+        .rev()
+        .map(|p| p.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    store.local_set("recent_pages", &keyed).unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape cmd-k");
+    let palette = bounds(cx, "jump-palette");
+    assert!(
+        palette.size.height <= px(440.) + px(0.5),
+        "the palette caps its height: {palette:?}"
+    );
+    assert!(
+        cx.debug_bounds("qj-row-9").is_some(),
+        "all ten rows are offered, and the list scrolls"
+    );
+}
+
+/// ALL-5: Compact density does not break the palette — the rows still fit, in order.
+#[gpui::test]
+fn quick_jump_works_at_compact_density(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|_window, cx| {
+        utopia_ui::appearance::set_density(cx, utopia_ui::appearance::Density::Compact, dir.path())
+            .unwrap();
+    });
+    cx.simulate_keystrokes("escape cmd-k");
+    let palette = bounds(cx, "jump-palette");
+    let today = bounds(cx, "qj-row-0");
+    let yesterday = bounds(cx, "qj-row-1");
+    assert!(
+        yesterday.origin.y > today.origin.y,
+        "{today:?} {yesterday:?}"
+    );
+    assert!(
+        yesterday.origin.y + yesterday.size.height
+            <= palette.origin.y + palette.size.height + px(0.5),
+        "Compact keeps the rows inside: {yesterday:?} {palette:?}"
+    );
+}
+
 #[gpui::test]
 fn minimum_window_size_still_lays_out(cx: &mut TestAppContext) {
     let cx = setup(cx);
