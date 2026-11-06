@@ -15,6 +15,7 @@ mod blockquery;
 mod crypt;
 mod doctor;
 mod export;
+pub use export::{write_export, ExportSnapshot};
 mod extras;
 mod pagegraph;
 mod pages;

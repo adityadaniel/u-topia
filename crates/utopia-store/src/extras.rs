@@ -663,19 +663,7 @@ impl Store {
 
     /// OPML export of every live page (v1.1).
     pub fn export_opml(&mut self, path: &Path) -> Result<()> {
-        self.sync_index()?;
-        let mut pages = Vec::new();
-        for row in self.list_pages(true)? {
-            let st = self.page_state(&row.id)?.clone();
-            pages.push((row.title, st));
-        }
-        let refs: Vec<(String, &PageState)> = pages.iter().map(|(t, s)| (t.clone(), s)).collect();
-        if let Some(dir) = path.parent() {
-            if !dir.as_os_str().is_empty() {
-                std::fs::create_dir_all(dir)?;
-            }
-        }
-        std::fs::write(path, utopia_core::markdown::pages_to_opml(&refs))?;
-        Ok(())
+        let snapshot = self.export_snapshot()?;
+        crate::export::write_opml(&snapshot, path)
     }
 }

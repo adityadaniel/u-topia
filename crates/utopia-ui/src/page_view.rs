@@ -1852,6 +1852,10 @@ impl PageView {
 
     /// "Export" in the page menu (PG-2): write Markdown, `graph.json` and `graph.opml` to a
     /// folder the user picks, exactly what `utopia export <graph> <dir>` writes (G4).
+    ///
+    /// Only the snapshot is taken here, on the UI thread; serializing three formats and
+    /// copying the files (attachments included) runs on a worker, so a large graph does not
+    /// freeze every window while it is written (rule 10).
     fn export_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: false,
@@ -1866,16 +1870,35 @@ impl PageView {
             let Some(dir) = paths.into_iter().next() else {
                 return;
             };
+            let snapshot = match this
+                .update_in(cx, |this, _, cx| {
+                    this.app.update(cx, |app, _| app.store.export_snapshot())
+                })
+                .ok()
+            {
+                Some(Ok(snapshot)) => snapshot,
+                Some(Err(e)) => {
+                    let _ = this.update_in(cx, |this, _, cx| {
+                        this.app.update(cx, |app, cx| {
+                            app.last_error = Some(e.to_string());
+                            cx.notify();
+                        });
+                    });
+                    return;
+                }
+                None => return,
+            };
+            let exported = cx
+                .background_executor()
+                .spawn(async move { utopia_store::write_export(&snapshot, &dir).map(|n| (n, dir)) })
+                .await;
             let _ = this.update_in(cx, |this, _, cx| {
                 this.app.update(cx, |app, cx| {
-                    let r = (|| {
-                        let n = app.store.export_markdown(&dir)?;
-                        app.store.export_json(&dir.join("graph.json"))?;
-                        app.store.export_opml(&dir.join("graph.opml"))?;
-                        Ok::<_, utopia_store::StoreError>(n)
-                    })();
-                    if let Some(n) = app.report(r) {
-                        app.notice = Some(format!("Exported {n} pages to {}", dir.display()));
+                    let dir = exported.as_ref().ok().map(|(_, d)| d.clone());
+                    if let Some(n) = app.report(exported.map(|(n, _)| n)) {
+                        if let Some(dir) = dir {
+                            app.notice = Some(format!("Exported {n} pages to {}", dir.display()));
+                        }
                     }
                     app.changed(Vec::new(), false, cx);
                 });

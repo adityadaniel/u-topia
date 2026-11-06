@@ -600,3 +600,54 @@ fn tag_classification_is_updated_incrementally() {
     assert!(s.tag_pages().unwrap().is_empty());
     assert_eq!(s.tag_page_full_scans(), full);
 }
+
+/// PG-2 review fix: an export copies what it needs off the store, then the serialization and
+/// the file writes take no store at all — that is what lets them run on a background worker
+/// instead of freezing every window. Both routes must write the same files.
+#[test]
+fn export_snapshot_is_written_off_the_store() {
+    let (mut s, _d) = store();
+    let src = s.create_page("Notes").unwrap();
+    write(&mut s, &src, "see #alpha and [[Beta]]");
+    let daily = s.create_page("Reading").unwrap();
+    write(&mut s, &daily, "a second page");
+    s.sync_index().unwrap();
+
+    // The snapshot is a value: the free writer runs it without borrowing the store.
+    let snapshot = s.export_snapshot().unwrap();
+    let from_snapshot = tempfile::tempdir().unwrap();
+    let pages = utopia_store::write_export(&snapshot, from_snapshot.path()).unwrap();
+    assert_eq!(pages, snapshot.pages.len());
+    for name in ["graph.json", "graph.opml"] {
+        assert!(
+            from_snapshot.path().join(name).is_file(),
+            "{name} is written"
+        );
+    }
+
+    // The store's own methods write the same files.
+    let from_store = tempfile::tempdir().unwrap();
+    assert_eq!(s.export_markdown(from_store.path()).unwrap(), pages);
+    s.export_json(&from_store.path().join("graph.json"))
+        .unwrap();
+    s.export_opml(&from_store.path().join("graph.opml"))
+        .unwrap();
+    let mut names: Vec<String> = std::fs::read_dir(from_store.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    let mut snapshot_names: Vec<String> = std::fs::read_dir(from_snapshot.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    snapshot_names.sort();
+    assert_eq!(names, snapshot_names, "the same files either way");
+    for name in names {
+        assert_eq!(
+            std::fs::read(from_snapshot.path().join(&name)).unwrap(),
+            std::fs::read(from_store.path().join(&name)).unwrap(),
+            "{name} has the same bytes"
+        );
+    }
+}
