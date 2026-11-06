@@ -20,6 +20,23 @@ The source changes are covered by `crates/utopia-ui/tests/layout.rs`,
 - `quote_is_indented_and_code_names_its_language` (PG-5)
 - `a_code_blocks_language_is_its_first_line_when_it_names_one` (PG-5)
 
+The compact rendering PG-1 adds also has to keep the page usable, so these pin the cases a
+review found:
+
+- `switching_to_compact_keeps_the_edited_descendant_rendered` — switching Settings →
+  Appearance to Compact rows while a child of an attribute is being edited keeps that
+  ancestor path expanded, so the editor's row (and focus handle) is still drawn.
+- `backspace_merges_into_the_previous_visible_row` — Backspace at the start of the block
+  after a folded attribute merges into the attribute, never into a hidden child (FR-2.5).
+- `opening_a_compact_attribute_target_focuses_it` /
+  `opening_a_hidden_descendant_reveals_and_focuses_it` — the public focus path (search,
+  query, backlink, undo caret) opens a folded attribute's path rather than silently doing
+  nothing.
+- `starting_a_note_on_an_attribute_only_page_appends_a_block` and
+  `starting_a_note_on_an_attribute_only_day_appends_a_block` — "Click to start writing" on
+  a page or day whose only blocks are attributes adds a new block; typing never rewrites an
+  attribute's key.
+
 ## Captures
 
 Both sides use the same seeded scratch graph:
