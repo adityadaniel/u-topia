@@ -654,3 +654,27 @@ fn recent_day_hover_shows_its_first_block(cx: &mut TestAppContext) {
         "the first block is drawn as a tooltip: {tip:?}"
     );
 }
+
+/// SB-2: a page that only exists because of a `#tag` gets a `#` in the tag colour;
+/// a page reached through a `[[link]]` does not. One list, display only (FR-2.15).
+#[gpui::test]
+fn tag_pages_get_a_hash_glyph(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| {
+        let (p, b) = s.open_daily(today()).unwrap();
+        s.set_block_text(&p, &b, "#atlas and [[Atlas Launch]]", None, None)
+            .unwrap();
+        s.commit_block(&p, &b).unwrap();
+    });
+    cx.simulate_keystrokes("escape");
+    let glyph = bounds_of(cx, "tag-glyph-atlas".into());
+    let row = bounds_of(cx, "page-row-0".into());
+    assert!(
+        glyph.origin.x >= row.origin.x
+            && glyph.origin.x + glyph.size.width <= row.origin.x + row.size.width + px(0.5),
+        "the glyph sits inside the page row: {glyph:?} {row:?}"
+    );
+    assert!(
+        cx.debug_bounds("tag-glyph-atlas launch").is_none(),
+        "a [[link]] page is not marked as a tag page"
+    );
+}

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::NaiveDate;
 use rusqlite::{params, OptionalExtension, Row};
 use serde::Serialize;
-use utopia_core::inline::plain_text;
+use utopia_core::inline::{extract_refs, plain_text, RefKind};
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, BlockKind, PageId, PageKind};
 
@@ -327,6 +327,60 @@ impl Store {
             .query_map(params![page.as_str(), n as i64], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows.iter().map(|t| plain_text(t)).collect())
+    }
+
+    /// Pages that exist only because of a `#tag` (SB-2, FR-2.15): no blocks of their own,
+    /// and every incoming reference to them is a hashtag (`#tag` / `#[[tag]]`), never a
+    /// `[[link]]`. Display-only: the sidebar draws a `#` beside these, there is no tags
+    /// subsystem. Ref spans are re-read from the source blocks because `ref` stores the
+    /// resolved edge only; this is an index-time query, never paint-time work (rule 3).
+    pub fn hashtag_only_pages(&self) -> Result<HashSet<PageId>> {
+        self.read_barrier()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.title_key FROM page p
+             WHERE p.deleted_at IS NULL AND p.kind = 'page'
+               AND NOT EXISTS (SELECT 1 FROM block b WHERE b.page_id = p.id
+                                 AND b.deleted_at IS NULL AND trim(b.text) <> '')
+               AND EXISTS (SELECT 1 FROM ref r JOIN block b ON b.id = r.src_block_id
+                            WHERE r.dst_page_id = p.id AND b.deleted_at IS NULL)",
+        )?;
+        let candidates = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut out = HashSet::new();
+        for (id, title_key) in candidates {
+            // A reference through an alias reaches the page under the alias's key.
+            let mut keys = HashSet::from([title_key]);
+            let mut aliases = self
+                .conn
+                .prepare_cached("SELECT alias_key FROM alias WHERE page_id=?1")?;
+            keys.extend(
+                aliases
+                    .query_map(params![id], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+            let mut sources = self.conn.prepare_cached(
+                "SELECT b.text FROM ref r JOIN block b ON b.id = r.src_block_id
+                 WHERE r.dst_page_id = ?1 AND b.deleted_at IS NULL",
+            )?;
+            let texts = sources
+                .query_map(params![id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut any = false;
+            let mut all_tags = true;
+            for text in texts {
+                for r in extract_refs(&text) {
+                    if r.is_page_like() && keys.contains(&normalize_title(&r.target)) {
+                        any = true;
+                        all_tags &= r.kind == RefKind::Tag;
+                    }
+                }
+            }
+            if any && all_tags {
+                out.insert(PageId(id));
+            }
+        }
+        Ok(out)
     }
 
     /// The last `limit` journal pages up to `today`, with a 2-line preview (FR-1.3) and

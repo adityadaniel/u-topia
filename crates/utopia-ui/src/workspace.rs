@@ -47,6 +47,9 @@ struct SidebarData {
     journal: Vec<JournalEntry>,
     pages: Vec<PageRow>,
     days: HashSet<NaiveDate>,
+    /// Pages that exist only because of a `#tag` (SB-2). Display only: the list gets a
+    /// `#` glyph, the store and the resolver are untouched (FR-2.15).
+    tags: HashSet<PageId>,
 }
 
 #[derive(Default)]
@@ -999,6 +1002,7 @@ impl Workspace {
             self.sidebar = SidebarData {
                 journal: store.journal(14).unwrap_or_default(),
                 days: all.iter().filter_map(|p| p.daily_date).collect(),
+                tags: store.hashtag_only_pages().unwrap_or_default(),
                 pages: all.into_iter().filter(|p| !p.is_daily()).collect(),
             };
         }
@@ -1081,6 +1085,59 @@ impl Workspace {
                     }),
                 )
             })
+    }
+
+    /// A page in the sidebar: one list for ordinary pages and tag pages (SB-2), the only
+    /// difference being the `#` glyph in the tag colour.
+    fn sidebar_page_row(
+        &self,
+        index: usize,
+        page: &PageRow,
+        tagged: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let th = theme(cx).clone();
+        let main = self.main.read(cx);
+        let active = !main.is_journal() && main.page.as_ref() == Some(&page.id);
+        let id = page.id.clone();
+        let key = page.title_key.clone();
+        div()
+            .id(("page", index))
+            .debug_selector(move || format!("page-row-{index}"))
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_0p5()
+            .rounded_sm()
+            .cursor_pointer()
+            .text_size(px(crate::theme::BODY_SIZE))
+            .text_color(if active { th.accent } else { th.text })
+            .when(active, |d| d.bg(th.hover))
+            .hover(|s| s.bg(th.hover))
+            .when(tagged, |d| {
+                d.child(
+                    div()
+                        .debug_selector(move || format!("tag-glyph-{key}"))
+                        .flex_none()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.tag)
+                        .child("#"),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(page.title.clone()),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    this.open(id.clone(), None, None, e.modifiers.shift, window, cx)
+                }),
+            )
     }
 
     /// One line per day (SB-1): the date, then a muted count of its blocks. Two preview
@@ -1268,6 +1325,7 @@ impl Workspace {
         }
         scroll = scroll.child(section("PAGES"));
         let pages = self.sidebar.pages.clone();
+        let tags = self.sidebar.tags.clone();
         if pages.is_empty() {
             scroll = scroll.child(
                 div()
@@ -1278,7 +1336,8 @@ impl Workspace {
             );
         }
         for (i, page) in pages.into_iter().enumerate() {
-            scroll = scroll.child(self.nav_item(("page", i), page.title, Some(page.id), cx));
+            let tagged = tags.contains(&page.id);
+            scroll = scroll.child(self.sidebar_page_row(i, &page, tagged, cx));
         }
         col = col.child(scroll);
         let (file, err, notice) = {
