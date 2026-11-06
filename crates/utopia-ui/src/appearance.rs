@@ -7,14 +7,16 @@
 //! versioned object meant to grow more general preferences:
 //!
 //! ```json
-//! { "version": 1, "font": "system", "density": "comfortable" }
+//! { "version": 1, "font": "system", "density": "comfortable", "pinned_pages": [] }
 //! ```
 //!
 //! `font` is `"system"` (the default) or `"ibm-plex-sans"`; `density` is
-//! `"comfortable"` (the default) or `"compact"` (ALL-5). A missing file means defaults; an
-//! unreadable file, an unknown value or a newer version is logged and read as far as it can
-//! be, never a panic (rule 11). Keys this version does not know are kept when the file is
-//! rewritten, so a newer release's preferences survive a round trip through an older one.
+//! `"comfortable"` (the default) or `"compact"` (ALL-5); `pinned_pages` lists the page ids
+//! kept in the right sidebar's Pinned tab, most recent first (RS-3). A missing file means
+//! defaults; an unreadable file, an unknown value or a newer version is logged and read as
+//! far as it can be, never a panic (rule 11). Keys this version does not know are kept when
+//! the file is rewritten, so a newer release's preferences survive a round trip through an
+//! older one.
 
 use gpui::{App, Global, SharedString};
 use serde_json::{Map, Value};
@@ -126,6 +128,9 @@ impl Density {
 pub struct Prefs {
     pub font: UiFont,
     pub density: Density,
+    /// Pages pinned in the right sidebar's Pinned tab (RS-3), most recent first. Ids are
+    /// stable across renames; one from another graph simply does not resolve.
+    pub pinned_pages: Vec<String>,
     /// Keys this version does not understand, written back untouched.
     rest: Map<String, Value>,
 }
@@ -177,10 +182,33 @@ impl Prefs {
                 Density::default()
             }
         };
+        let pinned_pages = match rest.remove("pinned_pages") {
+            None => Vec::new(),
+            Some(Value::Array(items)) => items
+                .into_iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s),
+                    other => {
+                        warnings.push(format!(
+                            "{FILE}: pinned_pages holds {other}, which is not a page id; \
+                             skipping it"
+                        ));
+                        None
+                    }
+                })
+                .collect(),
+            Some(v) => {
+                warnings.push(format!(
+                    "{FILE}: pinned_pages should be a list, not {v}; starting empty"
+                ));
+                Vec::new()
+            }
+        };
         (
             Self {
                 font,
                 density,
+                pinned_pages,
                 rest,
             },
             warnings,
@@ -192,6 +220,16 @@ impl Prefs {
         m.insert("version".into(), VERSION.into());
         m.insert("font".into(), self.font.key().into());
         m.insert("density".into(), self.density.key().into());
+        m.insert(
+            "pinned_pages".into(),
+            Value::Array(
+                self.pinned_pages
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
         for (k, v) in &self.rest {
             m.insert(k.clone(), v.clone());
         }
@@ -224,6 +262,9 @@ impl Prefs {
 pub struct Appearance {
     pub prefs: Prefs,
     plex_registered: bool,
+    /// Where `settings.json` lives, so a view that owns a preference (the right sidebar's
+    /// pinned pages, RS-3) can write it without being handed the path.
+    config_dir: Option<std::path::PathBuf>,
 }
 
 impl Global for Appearance {}
@@ -238,6 +279,7 @@ pub fn install(cx: &mut App, config_dir: &Path) -> Vec<String> {
     cx.set_global(Appearance {
         prefs,
         plex_registered: false,
+        config_dir: Some(config_dir.to_path_buf()),
     });
     apply(cx, font);
     warnings
@@ -252,6 +294,42 @@ pub fn ui_font(cx: &App) -> UiFont {
 /// The family every window's root sets, so all text below it follows the setting.
 pub fn font_family(cx: &App) -> SharedString {
     ui_font(cx).family().into()
+}
+
+/// Write the preferences in force to the installed `settings.json`. A view that changed one
+/// calls this; a failed write is returned, not fatal (the choice still holds this session).
+pub fn remember(cx: &mut App) -> std::io::Result<()> {
+    cx.refresh_windows();
+    let appearance = cx.default_global::<Appearance>();
+    match appearance.config_dir.clone() {
+        Some(dir) => appearance.prefs.save(&dir),
+        // No settings file (tests, early startup): the preference still applies here.
+        None => Ok(()),
+    }
+}
+
+/// The pages pinned in the right sidebar's Pinned tab, most recent first (RS-3).
+pub fn pinned_pages(cx: &App) -> Vec<String> {
+    cx.try_global::<Appearance>()
+        .map(|a| a.prefs.pinned_pages.clone())
+        .unwrap_or_default()
+}
+
+/// Pin `page`, or unpin it when it is already pinned (RS-3). Local UI state, kept in
+/// `settings.json` (rule 9): it never enters a CRDT shard and never syncs.
+pub fn toggle_pinned_page(cx: &mut App, page: &str) {
+    {
+        let appearance = cx.default_global::<Appearance>();
+        match appearance.prefs.pinned_pages.iter().position(|p| p == page) {
+            Some(i) => {
+                appearance.prefs.pinned_pages.remove(i);
+            }
+            None => appearance.prefs.pinned_pages.insert(0, page.to_string()),
+        }
+    }
+    if let Err(e) = remember(cx) {
+        eprintln!("utopia: {FILE}: {e}");
+    }
 }
 
 /// The density in force. Comfortable when nothing was installed (tests, early startup).
@@ -300,6 +378,7 @@ mod tests {
         let p = Prefs {
             font: UiFont::IbmPlexSans,
             density: Density::Compact,
+            pinned_pages: vec!["page-1".into(), "page-2".into()],
             ..Default::default()
         };
         let json = p.to_json();
@@ -310,6 +389,7 @@ mod tests {
                 "version": 1,
                 "font": "ibm-plex-sans",
                 "density": "compact",
+                "pinned_pages": ["page-1", "page-2"],
             })
         );
         assert_eq!(Prefs::from_json(&json), (p, vec![]));
@@ -335,6 +415,20 @@ mod tests {
     fn missing_keys_are_defaults_without_complaint() {
         assert_eq!(Prefs::from_json("{}"), (Prefs::default(), vec![]));
         assert_eq!(Prefs::default().density, Density::Comfortable);
+    }
+
+    /// RS-3: the pinned list is a list of page ids; anything else is skipped, not fatal.
+    #[test]
+    fn pinned_pages_survive_a_round_trip_and_reject_junk() {
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned_pages": ["a", 3, "b"]}"#);
+        assert_eq!(p.pinned_pages, ["a", "b"]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned_pages": "a"}"#);
+        assert!(p.pinned_pages.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned_pages": ["x"]}"#);
+        assert_eq!(p.pinned_pages, ["x"]);
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     /// An unknown density is the comfortable one, said out loud, never a panic (rule 11).

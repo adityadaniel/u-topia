@@ -350,6 +350,7 @@ mod appearance {
                 "version": 1,
                 "font": "ibm-plex-sans",
                 "density": "comfortable",
+                "pinned_pages": [],
             }))
         );
         assert!(
@@ -416,6 +417,57 @@ mod appearance {
             Density::Comfortable
         );
         assert_eq!(settings_json(dir.path()).unwrap()["density"], "comfortable");
+    }
+
+    /// RS-3: pinning a page is local UI state, written to `settings.json` (rule 9) and
+    /// read back by the next launch.
+    #[gpui::test]
+    fn pinning_a_page_is_written_to_settings_json(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        cx.update(|cx| {
+            cx.set_global(Theme::light());
+            install_keymap(cx, None);
+            appearance::install(cx, &path);
+        });
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+        let page = store.create_page("Keep me").unwrap();
+        let app = cx.new(|_| AppState::new(store));
+        let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+        ws.update_in(cx, |w, window, cx| {
+            w.open(page.clone(), None, None, false, window, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape cmd-shift-\\");
+        cx.run_until_parked();
+        let pinned_tab = cx.debug_bounds("panel-pinned").expect("the Pinned tab");
+        cx.simulate_click(pinned_tab.center(), Modifiers::default());
+        cx.run_until_parked();
+        let pin = cx.debug_bounds("pin-current").expect("the pin control");
+        cx.simulate_click(pin.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            settings_json(dir.path()).expect("settings.json written")["pinned_pages"],
+            serde_json::json!([page.as_str()])
+        );
+        let (prefs, warnings) = appearance::Prefs::load(dir.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(prefs.pinned_pages, vec![page.as_str().to_string()]);
+        assert_eq!(
+            prefs.density,
+            Density::Comfortable,
+            "pinning does not disturb the other preferences"
+        );
+
+        let unpin = cx.debug_bounds("unpin-0").expect("the unpin control");
+        cx.simulate_click(unpin.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            settings_json(dir.path()).unwrap()["pinned_pages"],
+            serde_json::json!([])
+        );
     }
 
     /// The saved choice is what a new launch comes up with.

@@ -543,6 +543,115 @@ fn unresolved_references_can_be_created_from_the_sidebar(cx: &mut TestAppContext
     );
 }
 
+/// RS-3: the sidebar's Outline tab lists the page's headings and a click jumps to one.
+#[gpui::test]
+fn the_outline_lists_headings_and_jumps_to_them(cx: &mut TestAppContext) {
+    use utopia_core::{BlockKind, Command};
+    let (app, ws, cx) = setup(cx);
+    let (page, heading) = app.update(cx, |app, _| {
+        let p = app.store.create_page("Plan").unwrap();
+        let b = app.store.ensure_first_block(&p).unwrap();
+        app.store
+            .set_block_text(&p, &b, "Risks", None, None)
+            .unwrap();
+        app.store
+            .execute(
+                &p,
+                vec![Command::SetBlockKind {
+                    id: b.clone(),
+                    kind: BlockKind::Heading(2),
+                    checked: false,
+                }],
+                Default::default(),
+            )
+            .unwrap();
+        let plan = utopia_core::outline::append_block(app.store.page_state(&p).unwrap(), None);
+        let plan = app.store.execute_plan(&p, plan, None).unwrap().unwrap();
+        app.store
+            .set_block_text(&p, &plan.block, "not a heading", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+        (p, b)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page, None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let outline = cx.debug_bounds("panel-outline").expect("the Outline tab");
+    cx.simulate_click(outline.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let heading_row = cx.debug_bounds("outline-0").expect("the heading is listed");
+    assert!(
+        cx.debug_bounds("outline-1").is_none(),
+        "only headings are listed, not the body block below it"
+    );
+    assert!(
+        heading_row.size.height >= gpui::px(utopia_ui::theme::H2_SIZE),
+        "a heading draws at the heading size: {heading_row:?}"
+    );
+    cx.simulate_click(heading_row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.block.clone())),
+        Some(heading),
+        "clicking the outline row jumped to the heading"
+    );
+}
+
+/// RS-3: the Pinned tab keeps a page one click away; pinning is local (settings.json,
+/// rule 9) and the row can be unpinned again.
+#[gpui::test]
+fn pinned_pages_can_be_added_and_removed(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = app.update(cx, |app, _| {
+        let p = app.store.create_page("Pinboard").unwrap();
+        let b = app.store.ensure_first_block(&p).unwrap();
+        app.store
+            .set_block_text(&p, &b, "a page worth keeping", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+        p
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page, None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let pinned_tab = cx.debug_bounds("panel-pinned").expect("the Pinned tab");
+    cx.simulate_click(pinned_tab.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("pinned-empty").is_some(),
+        "nothing is pinned at first"
+    );
+    let pin = cx.debug_bounds("pin-current").expect("the pin control");
+    cx.simulate_click(pin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("pinned-0").is_some(),
+        "the page now sits in the Pinned tab"
+    );
+    assert!(
+        ws.update(cx, |w, cx| w.pinned_pages(cx)).len() == 1,
+        "the workspace remembers the pin"
+    );
+    let unpin = cx.debug_bounds("unpin-0").expect("the unpin control");
+    cx.simulate_click(unpin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        ws.update(cx, |w, cx| w.pinned_pages(cx)).is_empty(),
+        "unpinning removed it"
+    );
+}
+
 #[gpui::test]
 fn keystrokes_are_debounced_then_committed(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);

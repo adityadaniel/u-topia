@@ -26,11 +26,42 @@ use crate::quick_jump::{JumpPalette, PaletteMode, QuickJumpEvent};
 use crate::sync_runner::{exchange_owned, status_line, BoxTransport, SyncRunner};
 use crate::theme::{quiet_control, theme};
 
+/// The reference panel's sub-tabs: which way the edges are looked at (FR-4.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InspectorTab {
     Incoming,
     Outgoing,
     Unresolved,
+}
+
+/// What the right sidebar's own tabs show (RS-3): the page's references, its headings, or
+/// the pages pinned to stay reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelTab {
+    References,
+    Outline,
+    Pinned,
+}
+
+impl PanelTab {
+    /// Spelled in a `debug_selector`, so tests can name the panel they are looking at.
+    fn id(self) -> &'static str {
+        match self {
+            PanelTab::References => "references",
+            PanelTab::Outline => "outline",
+            PanelTab::Pinned => "pinned",
+        }
+    }
+}
+
+/// One heading of the page in the main pane, for the Outline tab (RS-3).
+#[derive(Debug, Clone)]
+struct OutlineEntry {
+    block: BlockId,
+    /// `BlockKind::Heading(level)`: 1–3.
+    level: u8,
+    depth: usize,
+    text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +87,8 @@ struct InspectorData {
     outgoing: Vec<OutgoingRef>,
     /// Unresolved targets with a display title recovered from the source text.
     unresolved: Vec<(OutgoingRef, String)>,
+    /// The page's headings in document order (RS-3).
+    outline: Vec<OutlineEntry>,
 }
 
 pub struct Workspace {
@@ -70,6 +103,11 @@ pub struct Workspace {
     calendar_open: bool,
     inspector_open: bool,
     tab: InspectorTab,
+    /// Which of the sidebar's own tabs is showing (RS-3).
+    panel_tab: PanelTab,
+    /// Pages pinned in the Pinned tab, resolved to titles, and the ids they came from.
+    pinned: Vec<(PageId, String)>,
+    pinned_ids: Vec<String>,
     jump: Option<(Entity<JumpPalette>, JumpMode)>,
     /// The graph view, shown in place of the main page while open (P2).
     graph: Option<Entity<GraphView>>,
@@ -166,6 +204,9 @@ impl Workspace {
             calendar_open,
             inspector_open: true,
             tab: InspectorTab::Incoming,
+            panel_tab: PanelTab::References,
+            pinned: Vec::new(),
+            pinned_ids: Vec::new(),
             jump: None,
             graph: None,
             pdf: None,
@@ -401,6 +442,11 @@ impl Workspace {
             .iter()
             .filter_map(|p| p.read(cx).page.clone())
             .collect()
+    }
+
+    /// Pages pinned in the sidebar's Pinned tab, in the order they show (RS-3).
+    pub fn pinned_pages(&self, _cx: &gpui::App) -> Vec<PageId> {
+        self.pinned.iter().map(|(p, _)| p.clone()).collect()
     }
 
     /// Pages stacked in the right sidebar, top first.
@@ -993,6 +1039,10 @@ impl Workspace {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let v = self.app.read(cx).refs_version;
+        // Pinned pages are a local preference (rule 9); re-read when it changes.
+        if crate::appearance::pinned_pages(cx) != self.pinned_ids {
+            self.load_pinned(cx);
+        }
         if self.sidebar_seen != Some(v) {
             self.sidebar_seen = Some(v);
             let store = &self.app.read(cx).store;
@@ -1008,6 +1058,30 @@ impl Workspace {
         };
         if self.inspector_seen.as_ref() != Some(&(page.clone(), v)) {
             self.inspector_seen = Some((page.clone(), v));
+            // RS-3's Outline: the page's headings in document order, so a long page is
+            // navigable from the panel. Read from the shard, never resolved at paint time.
+            let outline = self.app.update(cx, |app, _| {
+                app.store
+                    .page_state(&page)
+                    .map(|st| {
+                        st.live_preorder()
+                            .into_iter()
+                            .filter_map(|(id, depth)| {
+                                let b = st.block(&id)?;
+                                match b.kind {
+                                    utopia_core::BlockKind::Heading(level) => Some(OutlineEntry {
+                                        block: id,
+                                        level: level.clamp(1, 3),
+                                        depth,
+                                        text: plain_text(&b.text),
+                                    }),
+                                    _ => None,
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            });
             let store = &self.app.read(cx).store;
             let incoming = store
                 .linked_references(&page, &Default::default())
@@ -1043,6 +1117,7 @@ impl Workspace {
                 incoming,
                 outgoing,
                 unresolved,
+                outline,
             };
         }
     }
@@ -1336,7 +1411,82 @@ impl Workspace {
         }
     }
 
+    /// The right sidebar's reference panel: three tabs (RS-3) over the page's references,
+    /// its headings, or the pages pinned to stay reachable.
     fn render_inspector(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let th = theme(cx).clone();
+        let panel_tab = |this: &Self,
+                         id: &'static str,
+                         t: PanelTab,
+                         label: &'static str,
+                         cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .text_size(px(crate::theme::CONTROL_SIZE))
+                .cursor_pointer()
+                .text_color(if this.panel_tab == t {
+                    th.accent
+                } else {
+                    th.muted
+                })
+                .when(this.panel_tab == t, |d| d.bg(th.hover))
+                .hover(|d| d.bg(th.hover))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.panel_tab = t;
+                    cx.notify();
+                }))
+        };
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(panel_tab(
+                self,
+                "panel-references",
+                PanelTab::References,
+                "References",
+                cx,
+            ))
+            .child(panel_tab(
+                self,
+                "panel-outline",
+                PanelTab::Outline,
+                "Outline",
+                cx,
+            ))
+            .child(panel_tab(
+                self,
+                "panel-pinned",
+                PanelTab::Pinned,
+                "Pinned",
+                cx,
+            ));
+        let body = match self.panel_tab {
+            PanelTab::References => self.render_references(cx),
+            PanelTab::Outline => self.render_outline(cx),
+            PanelTab::Pinned => self.render_pinned(cx),
+        };
+        div()
+            .debug_selector(|| format!("panel-{}", self.panel_tab.id()))
+            .h(px(260.))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .border_t_1()
+            .border_color(th.line)
+            .child(header)
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_references(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let th = theme(cx).clone();
         let tab = |this: &Self,
                    id: &'static str,
@@ -1559,24 +1709,183 @@ impl Workspace {
             }
         }
         div()
-            .h(px(260.))
-            .flex_none()
             .flex()
             .flex_col()
             .gap_1()
-            .p_2()
-            .border_t_1()
-            .border_color(th.line)
-            .child(
-                div()
-                    .text_size(px(crate::theme::CAPTION_SIZE))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(th.muted)
-                    .child("REFERENCES"),
-            )
+            .flex_1()
+            .min_h_0()
             .child(tabs)
             .child(body)
             .into_any_element()
+    }
+
+    /// RS-3: the headings of the page in the main pane, indented as they are in the outline
+    /// and drawn at the type scale's heading sizes. Clicking one jumps to it (caret at its
+    /// start, scrolled into view).
+    fn render_outline(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let th = theme(cx).clone();
+        let entries = self.inspector.outline.clone();
+        let mut body = div()
+            .id("outline-body")
+            .debug_selector(|| "outline-body".into())
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .overflow_y_scroll()
+            .flex_1()
+            .min_h_0();
+        if entries.is_empty() {
+            body = body.child(self.panel_empty("outline-empty", "No headings in this page.", cx));
+        }
+        for (i, e) in entries.iter().enumerate() {
+            let block = e.block.clone();
+            body = body.child(
+                div()
+                    .id(("outline", i))
+                    .debug_selector(move || format!("outline-{i}"))
+                    .flex()
+                    .items_center()
+                    .pr_2()
+                    .pl(px(8. + e.depth.min(6) as f32 * 10.))
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_size(px(match e.level {
+                        1 => crate::theme::H1_SIZE,
+                        2 => crate::theme::H2_SIZE,
+                        _ => crate::theme::H3_SIZE,
+                    }))
+                    .text_color(th.text)
+                    .hover(|d| d.bg(th.hover))
+                    .child(div().flex_1().min_w_0().child(e.text.clone()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.main
+                            .update(cx, |m, cx| m.focus_block(&block, None, window, cx));
+                    })),
+            );
+        }
+        body.into_any_element()
+    }
+
+    /// RS-3: pages pinned to the sidebar, and the control that pins the page being read.
+    /// Pinning is local UI state, kept in `settings.json` (rule 9) and never synced.
+    fn render_pinned(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let th = theme(cx).clone();
+        let current = self.main.read(cx).page.clone();
+        let pinned_here = current
+            .as_ref()
+            .is_some_and(|p| self.pinned.iter().any(|(q, _)| q == p));
+        let mut body = div()
+            .id("pinned-body")
+            .debug_selector(|| "pinned-body".into())
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .overflow_y_scroll()
+            .flex_1()
+            .min_h_0();
+        if let Some(page) = current {
+            let id = page.as_str().to_string();
+            body = body.child(
+                quiet_control(
+                    "pin-current",
+                    if pinned_here {
+                        "Unpin this page"
+                    } else {
+                        "Pin this page"
+                    },
+                    &th,
+                )
+                .debug_selector(|| "pin-current".into())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    crate::appearance::toggle_pinned_page(cx, &id);
+                    this.reload_pinned(cx);
+                    cx.notify();
+                })),
+            );
+        }
+        if self.pinned.is_empty() {
+            body = body.child(self.panel_empty(
+                "pinned-empty",
+                "No pinned pages yet. Pin the page you are reading to keep it one click away.",
+                cx,
+            ));
+        }
+        for (i, (page, title)) in self.pinned.clone().into_iter().enumerate() {
+            let open_page = page.clone();
+            let unpin = page.as_str().to_string();
+            body = body.child(
+                div()
+                    .id(("pinned", i))
+                    .debug_selector(move || format!("pinned-{i}"))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(th.hover))
+                    .child(div().flex_1().min_w_0().child(title))
+                    .child(
+                        div()
+                            .id(("unpin", i))
+                            .debug_selector(move || format!("unpin-{i}"))
+                            .px_1()
+                            .rounded_sm()
+                            .text_color(th.muted)
+                            .cursor_pointer()
+                            .hover(|d| d.bg(th.hover).text_color(th.text))
+                            .child("×")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                crate::appearance::toggle_pinned_page(cx, &unpin);
+                                this.reload_pinned(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                        this.open(
+                            open_page.clone(),
+                            None,
+                            None,
+                            e.modifiers().shift,
+                            window,
+                            cx,
+                        )
+                    })),
+            );
+        }
+        body.into_any_element()
+    }
+
+    /// Read the pinned ids from the preferences and resolve each to its current title, so a
+    /// rename shows up without a restart and an id from another graph is skipped.
+    fn load_pinned(&mut self, cx: &mut Context<Self>) {
+        let ids = crate::appearance::pinned_pages(cx);
+        let resolved = self.app.update(cx, |app, _| {
+            let fmt = app.store.date_format().clone();
+            ids.iter()
+                .filter_map(|id| {
+                    let page = PageId(id.clone());
+                    let title = app
+                        .store
+                        .page_state(&page)
+                        .map(|st| utopia_store::display_title(st, &fmt))
+                        .ok()
+                        .filter(|t| !t.is_empty())?;
+                    Some((page, title))
+                })
+                .collect::<Vec<_>>()
+        });
+        self.pinned = resolved;
+        self.pinned_ids = ids;
+    }
+
+    /// Re-read the pinned list after the user changed it from the panel.
+    fn reload_pinned(&mut self, cx: &mut Context<Self>) {
+        self.load_pinned(cx);
+        self.refresh(cx);
     }
 }
 
