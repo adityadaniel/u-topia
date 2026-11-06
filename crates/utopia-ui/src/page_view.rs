@@ -53,6 +53,10 @@ pub enum PageViewEvent {
         page: PageId,
         block: BlockId,
     },
+    /// "Open in graph" in the page menu (PG-2): show the graph with this page focused.
+    OpenGraph {
+        page: PageId,
+    },
     /// A `{{pdf: blob:…}}` attachment was clicked (P2 PDF viewer).
     OpenPdf {
         hash: String,
@@ -1509,6 +1513,43 @@ impl PageView {
         cx.notify();
     }
 
+    /// "Export" in the page menu (PG-2): write Markdown, `graph.json` and `graph.opml` to a
+    /// folder the user picks, exactly what `utopia export <graph> <dir>` writes (G4).
+    fn export_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Export".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            let Some(dir) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.app.update(cx, |app, cx| {
+                    let r = (|| {
+                        let n = app.store.export_markdown(&dir)?;
+                        app.store.export_json(&dir.join("graph.json"))?;
+                        app.store.export_opml(&dir.join("graph.opml"))?;
+                        Ok::<_, utopia_store::StoreError>(n)
+                    })();
+                    match app.report(r) {
+                        Some(n) => {
+                            app.notice = Some(format!("Exported {n} pages to {}", dir.display()))
+                        }
+                        None => {}
+                    }
+                    app.changed(Vec::new(), false, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
     // ---------------------------------------------------------------- rendering
 
     fn chip_state(store: &utopia_store::Store, uid: &str, row_block: &BlockId) -> ChipState {
@@ -1858,9 +1899,25 @@ impl PageView {
     }
 
     /// The page actions menu. It is drawn deferred and anchored, so opening it floats over
-    /// the page instead of taking a row in the column (ALL-3).
+    /// the page instead of taking a row in the column (ALL-3). Order per PG-2: the two
+    /// navigation/export actions, then the two that change the page, then the danger item.
     fn page_menu_popup(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let th = theme(cx).clone();
+        let graph = quiet_control("page-menu-graph", "Open in graph", &th)
+            .debug_selector(|| "page-menu-graph".into())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.page_menu = false;
+                if let Some(page) = this.page.clone() {
+                    this.editor.update(cx, |e, cx| e.end(cx));
+                    cx.emit(PageViewEvent::OpenGraph { page });
+                }
+            }));
+        let export = quiet_control("page-menu-export", "Export", &th)
+            .debug_selector(|| "page-menu-export".into())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.page_menu = false;
+                this.export_graph(window, cx);
+            }));
         // Daily titles are display-only (rule 6): `start_rename` would open the calendar
         // for them, so Rename is only offered on ordinary pages.
         let rename = (self.header.kind != PageKind::Daily).then(|| {
@@ -1871,6 +1928,17 @@ impl PageView {
                     this.start_rename(window, cx);
                 }))
         });
+        // FR-3.6: after a rename the old title stays an alias, and this rewrites every
+        // reference to it. It only applies when there is an alias to rewrite.
+        let rewrite =
+            (!self.header.aliases.is_empty() && self.header.kind == PageKind::Page).then(|| {
+                quiet_control("page-menu-rewrite", "Rewrite references", &th)
+                    .debug_selector(|| "page-menu-rewrite".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.page_menu = false;
+                        this.page_action("rewrite", cx);
+                    }))
+            });
         let delete = quiet_danger("page-menu-delete", "Delete page", &th)
             .debug_selector(|| "page-menu-delete".into())
             .on_click(cx.listener(|this, _, _, cx| {
@@ -1890,7 +1958,12 @@ impl PageView {
             .border_color(th.line)
             .rounded_md()
             .shadow_md()
+            .child(graph.w_full().justify_start())
+            .child(export.w_full().justify_start())
             .children(rename.map(|r| r.w_full().justify_start()))
+            .children(rewrite.map(|r| r.w_full().justify_start()))
+            // A hairline sets the destructive item apart, always last.
+            .child(div().h(px(1.)).my_1().bg(th.line))
             .child(delete.w_full().justify_start())
     }
 
@@ -1948,29 +2021,6 @@ impl PageView {
                 d.child(
                     self.button("restore", "Restore from trash", cx)
                         .on_click(cx.listener(|this, _, _, cx| this.page_action("restore", cx))),
-                )
-            })
-            .when(!h.deleted && !h.draft && self.zoom.is_none(), |d| {
-                d.child(
-                    div()
-                        .relative()
-                        .child(
-                            self.button("page-menu", "···", cx)
-                                .debug_selector(|| "page-menu".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.page_menu = !this.page_menu;
-                                    cx.notify();
-                                })),
-                        )
-                        .children(self.page_menu.then(|| {
-                            deferred(
-                                anchored()
-                                    .anchor(Corner::TopRight)
-                                    .offset(point(px(0.), px(6.)))
-                                    .child(self.page_menu_popup(cx)),
-                            )
-                            .with_priority(1)
-                        })),
                 )
             });
         col = col.child(top);
@@ -2052,6 +2102,81 @@ impl PageView {
                 .into_any_element(),
         };
         col = col.child(title_el);
+        // PG-2: the page's own controls in one row under the title: alias chips, "+ alias",
+        // and the "···" menu kept at the far right of the column.
+        if self.zoom.is_none() && !h.deleted {
+            let mut left = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted);
+            for (i, a) in h.aliases.iter().enumerate() {
+                let alias = a.clone();
+                left = left.child(
+                    div()
+                        .id(("alias", i))
+                        .debug_selector(move || format!("alias-{i}"))
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .bg(th.chip_bg)
+                        .text_color(th.muted)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(th.hover).text_color(th.text))
+                        .child(format!("{a} ×"))
+                        .on_click(cx.listener(move |this, _, _, cx| this.remove_alias(&alias, cx))),
+                );
+            }
+            left = match &self.alias_input {
+                Some(input) => left.child(
+                    div()
+                        .w(px(160.))
+                        .px_1()
+                        .border_1()
+                        .border_color(th.accent)
+                        .rounded_md()
+                        .child(input.clone()),
+                ),
+                None => left.child(
+                    self.button("add-alias", "+ alias", cx)
+                        .debug_selector(|| "add-alias".into())
+                        .on_click(cx.listener(|this, _, window, cx| this.start_alias(window, cx))),
+                ),
+            };
+            let menu = (!h.draft).then(|| {
+                div()
+                    .relative()
+                    .child(
+                        self.button("page-menu", "···", cx)
+                            .debug_selector(|| "page-menu".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.page_menu = !this.page_menu;
+                                cx.notify();
+                            })),
+                    )
+                    .children(self.page_menu.then(|| {
+                        deferred(
+                            anchored()
+                                .anchor(Corner::TopRight)
+                                .offset(point(px(0.), px(6.)))
+                                .child(self.page_menu_popup(cx)),
+                        )
+                        .with_priority(1)
+                    }))
+            });
+            col = col.child(
+                div()
+                    .debug_selector(|| "page-toolbar".into())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(left)
+                    .children(menu),
+            );
+        }
         if self.show_calendar {
             let today = self.app.read(cx).store.today();
             let existing: HashSet<NaiveDate> = HashSet::new();
@@ -2090,57 +2215,6 @@ impl PageView {
                 );
             }
             col = col.child(grid);
-        }
-        if self.zoom.is_none() && !h.deleted {
-            let mut row = div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap_1()
-                .text_size(px(crate::theme::CAPTION_SIZE))
-                .text_color(th.muted);
-            if !h.aliases.is_empty() {
-                row = row.child("Also known as:");
-            }
-            for (i, a) in h.aliases.iter().enumerate() {
-                let alias = a.clone();
-                row = row.child(
-                    div()
-                        .id(("alias", i))
-                        .px_1()
-                        .rounded_sm()
-                        .bg(th.chip_bg)
-                        .cursor_pointer()
-                        .child(format!("{a} ×"))
-                        .on_click(cx.listener(move |this, _, _, cx| this.remove_alias(&alias, cx))),
-                );
-            }
-            match &self.alias_input {
-                Some(input) => {
-                    row = row.child(
-                        div()
-                            .w(px(160.))
-                            .px_1()
-                            .border_1()
-                            .border_color(th.accent)
-                            .rounded_sm()
-                            .child(input.clone()),
-                    );
-                }
-                None => {
-                    row =
-                        row.child(self.button("add-alias", "+ alias", cx).on_click(
-                            cx.listener(|this, _, window, cx| this.start_alias(window, cx)),
-                        ));
-                }
-            }
-            if !h.aliases.is_empty() && h.kind == PageKind::Page {
-                row = row.child(
-                    self.button("rewrite", "Rewrite references to this title", cx)
-                        .on_click(cx.listener(|this, _, _, cx| this.page_action("rewrite", cx))),
-                );
-            }
-            col = col.child(row);
         }
         col.into_any_element()
     }

@@ -442,6 +442,10 @@ impl Workspace {
                 self.splits.retain(|p| p != view);
                 cx.notify();
             }
+            PageViewEvent::OpenGraph { page } => {
+                self.graph = None;
+                self.open_graph(Some(page.clone()), window, cx);
+            }
             PageViewEvent::OpenSplit { page } => self.open_split(page.clone(), window, cx),
             PageViewEvent::OpenPdf {
                 hash,
@@ -603,8 +607,15 @@ impl Workspace {
             cx.notify();
             return;
         }
-        self.editor.update(cx, |e, cx| e.end(cx));
         let origin = self.main.read(cx).page.clone();
+        self.open_graph(origin, window, cx);
+    }
+
+    /// Show the graph view with `origin` (the page the user came from) highlighted (GR-1).
+    /// Cmd+Shift+G passes the main pane's page; the page menu's "Open in graph" (PG-2)
+    /// passes the page whose menu it was.
+    fn open_graph(&mut self, origin: Option<PageId>, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |e, cx| e.end(cx));
         let view = cx.new(|cx| GraphView::new(self.app.clone(), origin, cx));
         self.subs.push(
             cx.subscribe_in(&view, window, |this, _, e: &GraphEvent, window, cx| {

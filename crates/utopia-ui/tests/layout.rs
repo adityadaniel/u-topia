@@ -757,3 +757,97 @@ fn todo_box_is_a_drawn_control(cx: &mut TestAppContext) {
         assert!(b.checked, "clicking the box checked it");
     });
 }
+
+/// A page with one alias, opened on its own, for the header toolbar (PG-2).
+fn setup_alias_page(cx: &mut TestAppContext) -> &mut VisualTestContext {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = store.create_page("Trellis").unwrap();
+    store.add_alias(&page, "the board").unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    cx
+}
+
+/// PG-2: under the title sits one toolbar — alias chips, "+ alias", then the "···" menu —
+/// and the menu's items run Open in graph, Export, Rename, Delete page last.
+#[gpui::test]
+fn page_toolbar_sits_under_the_title(cx: &mut TestAppContext) {
+    let cx = setup_alias_page(cx);
+    let title = bounds(cx, "page-title");
+    let toolbar = bounds(cx, "page-toolbar");
+    let alias = bounds(cx, "alias-0");
+    let add = bounds(cx, "add-alias");
+    let menu = bounds(cx, "page-menu");
+    assert!(
+        toolbar.origin.y >= title.origin.y + title.size.height - px(1.),
+        "the toolbar follows the title: {title:?} {toolbar:?}"
+    );
+    assert!(
+        alias.origin.x < add.origin.x && add.origin.x < menu.origin.x,
+        "chips, then + alias, then the menu: {alias:?} {add:?} {menu:?}"
+    );
+    for (what, b) in [("alias", alias), ("+ alias", add), ("menu", menu)] {
+        assert!(
+            b.origin.y >= toolbar.origin.y - px(1.)
+                && b.origin.y + b.size.height <= toolbar.bottom() + px(1.),
+            "{what} sits in the toolbar row: {b:?} {toolbar:?}"
+        );
+    }
+
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let opened = bounds(cx, "page-toolbar");
+    assert_eq!(
+        toolbar, opened,
+        "opening the menu floats over the page; the toolbar stays put"
+    );
+    let graph = bounds(cx, "page-menu-graph");
+    let export = bounds(cx, "page-menu-export");
+    let rename = bounds(cx, "page-menu-rename");
+    let delete = bounds(cx, "page-menu-delete");
+    assert!(
+        graph.origin.y < export.origin.y
+            && export.origin.y < rename.origin.y
+            && rename.origin.y < delete.origin.y,
+        "menu order: {graph:?} {export:?} {rename:?} {delete:?}"
+    );
+    assert!(
+        delete.origin.y > rename.origin.y + rename.size.height,
+        "a hairline sets the danger item apart, last: {rename:?} {delete:?}"
+    );
+}
+
+/// PG-2: "Open in graph" in the page menu shows the graph view with the page highlighted,
+/// the same view Cmd+Shift+G opens.
+#[gpui::test]
+fn page_menu_opens_the_graph(cx: &mut TestAppContext) {
+    let cx = setup_alias_page(cx);
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let item = bounds(cx, "page-menu-graph");
+    cx.simulate_click(item.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    assert!(
+        ws.update(cx, |w, _| w.graph_view()).is_some(),
+        "the graph view is showing"
+    );
+    assert!(
+        cx.debug_bounds("graph-view").is_some(),
+        "and it is drawn over the page"
+    );
+}
