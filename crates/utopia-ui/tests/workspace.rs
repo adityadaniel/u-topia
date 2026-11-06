@@ -318,6 +318,49 @@ fn quick_jump_marks_tag_pages(cx: &mut TestAppContext) {
     );
 }
 
+/// QJ-5: `>` lists the actions in the catalog, and picking one runs it as its key would.
+#[gpui::test]
+fn quick_jump_runs_commands(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // Somewhere to come back from: today's own page, then the feed behind the palette.
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input("Reading log");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    let reading = app
+        .update(cx, |app, _| app.store.find_page("Reading log").unwrap())
+        .unwrap();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(reading));
+    // " > " lists commands instead of pages; "Today" runs GoToday.
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input(">Today");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-icon-0-command").is_some(),
+        "the first match is a command row"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let shown = ws.update(cx, |w, cx| w.main_page(cx)).unwrap();
+    let date = app.update(cx, |app, _| {
+        app.store.page_state(&shown).unwrap().meta.daily_date
+    });
+    assert_eq!(date, Some(today()), "GoToday ran from the palette");
+    // The palette is gone and focus is back on the page: typing lands in today's block.
+    cx.simulate_input("ran from the palette");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let page = today_page(&app, cx);
+    assert_eq!(
+        rows_str(&rows(&app, &page, cx)),
+        vec![("ran from the palette", 0)]
+    );
+}
+
 #[gpui::test]
 fn query_blocks_list_results(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);

@@ -624,6 +624,74 @@ pub fn doc(action: &str) -> Option<&'static ActionDoc> {
     CATALOG.iter().find(|d| d.action == action)
 }
 
+/// The action a catalog name names, so Quick jump can run a command through the same
+/// dispatch path as its keystroke (QJ-5). `None` for a name the catalog does not know;
+/// [`CATALOG`] and this match are kept in step by a test.
+pub fn action_for(name: &str) -> Option<Box<dyn gpui::Action>> {
+    let action: Box<dyn gpui::Action> = match name {
+        "GoDailyNotes" => Box::new(GoDailyNotes),
+        "GoToday" => Box::new(GoToday),
+        "GoYesterday" => Box::new(GoYesterday),
+        "PrevDay" => Box::new(PrevDay),
+        "NextDay" => Box::new(NextDay),
+        "QuickJump" => Box::new(QuickJump),
+        "FullSearch" => Box::new(FullSearch),
+        "ZoomIn" => Box::new(ZoomIn),
+        "ZoomOut" => Box::new(ZoomOut),
+        "Newline" => Box::new(Newline),
+        "InsertAbove" => Box::new(InsertAbove),
+        "SoftBreak" => Box::new(SoftBreak),
+        "Indent" => Box::new(Indent),
+        "Outdent" => Box::new(Outdent),
+        "MoveBlockUp" => Box::new(MoveBlockUp),
+        "MoveBlockDown" => Box::new(MoveBlockDown),
+        "ToggleCollapse" => Box::new(ToggleCollapse),
+        "ToggleCollapseAll" => Box::new(ToggleCollapseAll),
+        "ToggleTodo" => Box::new(ToggleTodo),
+        "DeleteBlock" => Box::new(DeleteBlock),
+        "CopyBlockRef" => Box::new(CopyBlockRef),
+        "Bold" => Box::new(Bold),
+        "Italic" => Box::new(Italic),
+        "Code" => Box::new(Code),
+        "Undo" => Box::new(Undo),
+        "Redo" => Box::new(Redo),
+        "Copy" => Box::new(Copy),
+        "Cut" => Box::new(Cut),
+        "Paste" => Box::new(Paste),
+        "SelectAll" => Box::new(SelectAll),
+        "Backspace" => Box::new(Backspace),
+        "Delete" => Box::new(Delete),
+        "Left" => Box::new(Left),
+        "Right" => Box::new(Right),
+        "Up" => Box::new(Up),
+        "Down" => Box::new(Down),
+        "SelectLeft" => Box::new(SelectLeft),
+        "SelectRight" => Box::new(SelectRight),
+        "SelectUp" => Box::new(SelectUp),
+        "SelectDown" => Box::new(SelectDown),
+        "WordLeft" => Box::new(WordLeft),
+        "WordRight" => Box::new(WordRight),
+        "LineStart" => Box::new(LineStart),
+        "LineEnd" => Box::new(LineEnd),
+        "Home" => Box::new(Home),
+        "End" => Box::new(End),
+        "Escape" => Box::new(Escape),
+        "AcceptCompletion" => Box::new(AcceptCompletion),
+        "ShowCharacterPalette" => Box::new(ShowCharacterPalette),
+        "ToggleLeftSidebar" => Box::new(ToggleLeftSidebar),
+        "ToggleRightSidebar" => Box::new(ToggleRightSidebar),
+        "ToggleReferences" => Box::new(ToggleReferences),
+        "ShowGraph" => Box::new(ShowGraph),
+        "QuickCapture" => Box::new(QuickCapture),
+        "OpenSettings" => Box::new(OpenSettings),
+        "ShowShortcuts" => Box::new(ShowShortcuts),
+        "UtopiaHelp" => Box::new(UtopiaHelp),
+        "Quit" => Box::new(Quit),
+        _ => return None,
+    };
+    Some(action)
+}
+
 /// The actions of one category, in catalog order.
 pub fn by_category(c: Category) -> impl Iterator<Item = &'static ActionDoc> {
     CATALOG.iter().filter(move |d| d.category == c)
@@ -1003,6 +1071,17 @@ mod tests {
     fn defaults_do_not_conflict() {
         let c = Overrides::default().conflicts();
         assert!(c.is_empty(), "conflicting defaults: {c:?}");
+    }
+
+    /// QJ-5: every command the palette can list has an action to run, spelled the way the
+    /// catalog spells it. A name added to the catalog without a match here would show up in
+    /// the palette and do nothing when picked.
+    #[test]
+    fn every_catalog_action_can_be_run() {
+        for d in CATALOG {
+            assert!(action_for(d.action).is_some(), "{} has no action", d.action);
+        }
+        assert!(action_for("Nope").is_none());
     }
 
     #[test]

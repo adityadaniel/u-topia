@@ -49,13 +49,6 @@ struct SidebarData {
     days: HashSet<NaiveDate>,
 }
 
-/// `local_state` key holding the pages opened last, newest first (QJ-1). Device-local UI
-/// state like collapse, so it never syncs and never enters a shard (rule 9).
-const RECENT_KEY: &str = "recent_pages";
-/// How many ids are kept: Quick jump shows eight after today and yesterday, and pages
-/// deleted since the list was written are skipped, so a few spares are kept.
-const RECENT_KEEP: usize = 24;
-
 #[derive(Default)]
 struct InspectorData {
     incoming: Vec<(PageRow, usize)>,
@@ -63,6 +56,13 @@ struct InspectorData {
     /// Unresolved targets with a display title recovered from the source text.
     unresolved: Vec<(OutgoingRef, String)>,
 }
+
+/// `local_state` key holding the pages opened last, newest first (QJ-1). Device-local UI
+/// state like collapse, so it never syncs and never enters a shard (rule 9).
+const RECENT_KEY: &str = "recent_pages";
+/// How many ids are kept: Quick jump shows eight after today and yesterday, and pages
+/// deleted since the list was written are skipped, so a few spares are kept.
+const RECENT_KEEP: usize = 24;
 
 pub struct Workspace {
     app: Entity<AppState>,
@@ -617,6 +617,15 @@ impl Workspace {
                     }
                     (QuickJumpEvent::ChosenDay { date, sidebar }, Some(JumpMode::Open)) => {
                         this.open_date(*date, *sidebar, !*sidebar, window, cx)
+                    }
+                    // QJ-5: run the command exactly as its keystroke would, once the
+                    // palette is gone and focus is back on the workspace.
+                    (QuickJumpEvent::RunCommand(name), _) => {
+                        window.focus(&this.focus);
+                        match action_for(name) {
+                            Some(action) => window.dispatch_action(action, cx),
+                            None => eprintln!("utopia: no action named {name}"),
+                        }
                     }
                     (QuickJumpEvent::Text(text), Some(JumpMode::Capture)) => {
                         this.app.update(cx, |app, cx| {

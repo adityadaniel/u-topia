@@ -4,7 +4,8 @@
 //! One shell is shared by every palette mode (quick jump, full-text search, quick capture,
 //! free text). In page mode it has a useful empty state — today, yesterday and the pages
 //! opened last (QJ-1) — labelled rows with an icon per type (QJ-2), the typed letters in
-//! semibold (QJ-4) and a footer of key hints (QJ-3).
+//! semibold (QJ-4), a footer of key hints (QJ-3), and, after a leading `>`, the actions
+//! from [`crate::actions::CATALOG`] with their keys (QJ-5).
 //!
 //! All of this is view state. Rows come from the index (`Store::search_titles`,
 //! `Store::tag_pages`) when the query changes, never while painting (rule 3), and nothing
@@ -22,6 +23,7 @@ use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, PageId};
 use utopia_store::{BlockHit, TitleHit};
 
+use crate::actions::{platform_keys, pretty_keys, ActionDoc, CATALOG};
 use crate::app_state::AppState;
 use crate::line_input::{LineInput, LineInputEvent};
 use crate::theme::{theme, Theme, CAPTION_SIZE, CONTROL_SIZE};
@@ -42,6 +44,8 @@ pub enum QjItem {
     },
     Create(String),
     Block(BlockHit),
+    /// An action from [`CATALOG`], listed after a leading `>` (QJ-5).
+    Command(&'static ActionDoc),
 }
 
 /// What a result row is. The palette draws one glyph and one type label per kind (QJ-2).
@@ -51,6 +55,7 @@ enum RowKind {
     Day,
     Tag,
     Block,
+    Command,
     Create,
 }
 
@@ -62,6 +67,7 @@ impl RowKind {
             RowKind::Day => "day",
             RowKind::Tag => "tag",
             RowKind::Block => "block",
+            RowKind::Command => "command",
             RowKind::Create => "create",
         }
     }
@@ -73,6 +79,7 @@ impl RowKind {
             RowKind::Day => "Day",
             RowKind::Tag => "Tag",
             RowKind::Block => "",
+            RowKind::Command => "",
             RowKind::Create => "",
         }
     }
@@ -103,6 +110,8 @@ pub enum QuickJumpEvent {
         date: NaiveDate,
         sidebar: bool,
     },
+    /// A command from the catalog (QJ-5), by its `keymap.json` name.
+    RunCommand(&'static str),
     Text(String),
     Dismissed,
 }
@@ -144,7 +153,7 @@ impl JumpPalette {
         cx: &mut Context<Self>,
     ) -> Self {
         let placeholder = match mode {
-            PaletteMode::Pages => "Go to page or date…",
+            PaletteMode::Pages => "Go to page or date, or > for a command…",
             PaletteMode::Search => "Search all blocks…",
             PaletteMode::Capture => "Capture to today's note…",
             PaletteMode::Text => "Title…",
@@ -202,6 +211,14 @@ impl JumpPalette {
                 return;
             }
             PaletteMode::Pages => {}
+        }
+        // QJ-5: a leading `>` lists the command catalog instead of pages.
+        if let Some(rest) = q.strip_prefix('>') {
+            self.results = commands(rest).into_iter().map(QjItem::Command).collect();
+            self.tags.clear();
+            self.selected = 0;
+            cx.notify();
+            return;
         }
         // QJ-1: with nothing typed, offer today, yesterday and the pages opened last.
         if q.trim().is_empty() {
@@ -342,7 +359,7 @@ impl JumpPalette {
             }
             // Nothing matched yet: treat the query as a title (dates resolve first).
             let q = self.input.read(cx).text().to_string();
-            if q.trim().is_empty() {
+            if q.trim().is_empty() || q.starts_with('>') {
                 return;
             }
             return self.create(&q, sidebar, cx);
@@ -359,6 +376,7 @@ impl JumpPalette {
                 sidebar,
                 focus: Some(b.block),
             }),
+            QjItem::Command(d) => cx.emit(QuickJumpEvent::RunCommand(d.action)),
             QjItem::Create(t) => self.create(&t, sidebar, cx),
         }
     }
@@ -411,6 +429,11 @@ impl JumpPalette {
                     .take(80)
                     .collect(),
                 b.page_title.clone(),
+            ),
+            QjItem::Command(d) => (
+                RowKind::Command,
+                d.label.to_string(),
+                pretty_keys(&platform_keys(d.keys)),
             ),
         }
     }
@@ -519,6 +542,11 @@ fn row_icon(i: usize, kind: RowKind, th: &Theme) -> AnyElement {
         RowKind::Block => slot
             .child(div().w(px(7.)).h(px(1.)).bg(th.faint))
             .into_any_element(),
+        RowKind::Command => slot
+            .text_size(px(CAPTION_SIZE))
+            .text_color(th.muted)
+            .child("⌘")
+            .into_any_element(),
         RowKind::Create => slot
             .text_size(px(CONTROL_SIZE))
             .text_color(th.accent)
@@ -613,6 +641,25 @@ impl Render for JumpPalette {
     }
 }
 
+/// The commands a `>` query lists (QJ-5), in catalog order so an empty query reads as a
+/// menu grouped by category. Matches the label, the category, and the keys either as
+/// `keymap.json` spells them or as the row shows them.
+fn commands(query: &str) -> Vec<&'static ActionDoc> {
+    let q = query.trim().to_lowercase();
+    CATALOG
+        .iter()
+        .filter(|d| {
+            q.is_empty()
+                || d.label.to_lowercase().contains(&q)
+                || d.category.label().to_lowercase().contains(&q)
+                || d.keys.to_lowercase().contains(&q)
+                || pretty_keys(&platform_keys(d.keys))
+                    .to_lowercase()
+                    .contains(&q)
+        })
+        .collect()
+}
+
 /// Byte ranges of the typed letters inside `label`, for the semibold match (QJ-4). A
 /// contiguous, case-insensitive match wins, so `ana` bolds just the `ana` of `Dana`;
 /// otherwise the letters of the fuzzy subsequence are marked one at a time, which is why
@@ -677,5 +724,25 @@ mod tests {
         // Ranges are byte ranges into the label, so a non-ASCII title stays intact.
         assert_eq!(highlight_ranges("Café notes", "é"), vec![3..5]);
         assert_eq!(highlight_ranges("Café notes", "notes"), vec![6..11]);
+    }
+
+    /// QJ-5: `>` lists the catalog, filtered by label, category or key.
+    #[test]
+    fn commands_come_from_the_catalog() {
+        assert_eq!(commands("").len(), CATALOG.len());
+        let today = commands("today");
+        assert!(
+            today.iter().any(|d| d.action == "GoToday"),
+            "{:?}",
+            today.iter().map(|d| d.action).collect::<Vec<_>>()
+        );
+        assert!(commands("navigation")
+            .iter()
+            .all(|d| d.category.label() == "Navigation"));
+        assert!(commands("cmd-shift-g")
+            .iter()
+            .any(|d| d.action == "ShowGraph"));
+        assert!(commands("⇧⌘G").iter().any(|d| d.action == "ShowGraph"));
+        assert!(commands("nonsense-nothing").is_empty());
     }
 }
