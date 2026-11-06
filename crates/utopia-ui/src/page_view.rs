@@ -209,6 +209,9 @@ pub struct PageView {
     pub page: Option<PageId>,
     pub zoom: Option<BlockId>,
     pub compact: bool,
+    /// Whether this pane draws its own ✕ in the page header (split panes do, sidebar cards
+    /// carry the close in their card header, RS-5).
+    close: bool,
     items: Vec<Item>,
     list: ListState,
     header: Header,
@@ -266,10 +269,13 @@ impl crate::reference::RefRowHost for PageView {
 }
 
 impl PageView {
+    /// `compact` is a pane rather than the main page; `close` draws the pane's own ✕ — the
+    /// right sidebar's cards carry theirs (RS-5), split panes do not.
     pub fn new(
         app: Entity<AppState>,
         editor: Entity<BlockEditor>,
         compact: bool,
+        close: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -307,6 +313,7 @@ impl PageView {
             page: None,
             zoom: None,
             compact,
+            close,
             items: Vec::new(),
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             header: Header::default(),
@@ -1853,7 +1860,7 @@ impl PageView {
             .flex()
             .items_center()
             .gap_1()
-            .when(self.compact, |d| {
+            .when(self.compact && self.close, |d| {
                 d.child(
                     self.button("close", "✕", cx)
                         .on_click(cx.listener(|_, _, _, cx| cx.emit(PageViewEvent::Close))),

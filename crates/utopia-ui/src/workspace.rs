@@ -173,7 +173,8 @@ impl Focusable for Workspace {
 impl Workspace {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| BlockEditor::new(app.clone(), cx));
-        let main = cx.new(|cx| PageView::new(app.clone(), editor.clone(), false, window, cx));
+        let main =
+            cx.new(|cx| PageView::new(app.clone(), editor.clone(), false, false, window, cx));
         let today = app.read(cx).store.today();
         let backup_dir = app
             .read(cx)
@@ -419,7 +420,16 @@ impl Workspace {
     /// Split panes (P1): an editable page beside the main one (Cmd+Shift+Click). At most
     /// two splits; the oldest closes first.
     pub fn open_split(&mut self, page: PageId, window: &mut Window, cx: &mut Context<Self>) {
-        let v = cx.new(|cx| PageView::new(self.app.clone(), self.editor.clone(), true, window, cx));
+        let v = cx.new(|cx| {
+            PageView::new(
+                self.app.clone(),
+                self.editor.clone(),
+                true,
+                true,
+                window,
+                cx,
+            )
+        });
         self.subs
             .push(cx.subscribe_in(&v, window, Self::on_page_event));
         v.update(cx, |v, cx| v.open(page, None, cx));
@@ -582,7 +592,14 @@ impl Workspace {
                 Some(i) => self.panes.remove(i),
                 None => {
                     let v = cx.new(|cx| {
-                        PageView::new(self.app.clone(), self.editor.clone(), true, window, cx)
+                        PageView::new(
+                            self.app.clone(),
+                            self.editor.clone(),
+                            true,
+                            false,
+                            window,
+                            cx,
+                        )
                     });
                     self.subs
                         .push(cx.subscribe_in(&v, window, Self::on_page_event));
