@@ -1626,7 +1626,10 @@ impl Render for Workspace {
                 )
         });
         let _ = window;
+        let font = crate::appearance::ui_font(cx);
         div()
+            // Names the font in force, for tests (Settings → Appearance).
+            .debug_selector(move || format!("ui-font-{}", font.key()))
             .key_context("Workspace")
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::quick_jump))
@@ -1657,7 +1660,7 @@ impl Render for Workspace {
             .text_color(th.text)
             .text_size(px(crate::theme::TEXT_SIZE))
             .line_height(px(crate::theme::LINE_HEIGHT))
-            .font_family(".SystemUIFont")
+            .font_family(font.family())
             .child(left)
             .child(main_col)
             .children(right)

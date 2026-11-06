@@ -28,6 +28,13 @@ png = "0.17"
 tempfile.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 
+# tests/glyph_bounds.rs measures glyphs through the same font-kit (patched to the fork,
+# see the workspace Cargo.toml) and CoreText calls gpui uses.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+core-text = "21"
+pathfinder_geometry = "0.5"
+zed-font-kit = "0.14.1-zed"
+
 # The `objc` crate's `msg_send!` expands to `cfg(feature = "cargo-clippy")`, a pattern
 # current rustc flags. The warning is attributed to our call sites (pdf.rs, shot.rs) but
 # comes from the macro, and objc is unmaintained, so declare the value as expected rather

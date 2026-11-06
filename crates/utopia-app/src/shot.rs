@@ -8,6 +8,9 @@
 //! - `wait <ms>` lets the app run (sync, debounce, animations)
 //! - `scroll <dy>` scrolls the wheel by `dy` pixels at the centre of the window (negative
 //!   moves the content up, i.e. scrolls down, as a trackpad does)
+//! - `click <x> <y>` clicks the left button at a point in the window's content, in points
+//!   from its top left (a Retina capture is twice that and includes the 28 pt title bar),
+//!   for controls with no shortcut
 //! - `shot <path.png>` captures the window
 //! - `drop <file>` drops a file on the window, as from Finder
 //! - `ws <command> [args…]` runs a workspace command the app exposes for scripts
@@ -28,6 +31,7 @@ pub enum Step {
     Type(String),
     Wait(u64),
     Scroll(f32),
+    Click(f32, f32),
     Shot(String),
     Drop(String),
     Ws(Vec<String>),
@@ -63,6 +67,14 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                     .parse()
                     .map(Step::Scroll)
                     .map_err(|_| format!("bad scroll: {line}")),
+                "click" => match rest
+                    .split_whitespace()
+                    .map(str::parse::<f32>)
+                    .collect::<Vec<_>>()[..]
+                {
+                    [Ok(x), Ok(y)] => Ok(Step::Click(x, y)),
+                    _ => Err(format!("bad click: {line}")),
+                },
                 "shot" if !rest.trim().is_empty() => Ok(Step::Shot(rest.trim().to_string())),
                 "drop" if !rest.trim().is_empty() => Ok(Step::Drop(rest.trim().to_string())),
                 "ws" if !rest.trim().is_empty() => Ok(Step::Ws(
@@ -133,6 +145,15 @@ pub async fn run(
                 let target = handle.update(cx, |_, window, _| scroll_target(window));
                 if let Ok(Some((w, at))) = target {
                     scroll_wheel(w, at, dy);
+                }
+                Ok(())
+            }
+            Step::Click(x, y) => {
+                // Real AppKit mouse events, sent outside any window update (as for scroll).
+                let target = handle.update(cx, |_, window, _| click_target(window));
+                if let Ok(Some((w, height))) = target {
+                    // AppKit window coordinates have their origin at the bottom left.
+                    click(w, (f64::from(x), height - f64::from(y)));
                 }
                 Ok(())
             }
@@ -320,6 +341,50 @@ fn scroll_wheel(window: usize, at: (f64, f64), dy: f32) {
 #[cfg(not(target_os = "macos"))]
 fn scroll_wheel(_: usize, _: (f64, f64), _: f32) {}
 
+/// The NSWindow and its content height, which flips GPUI's top-left points to AppKit's.
+#[cfg(target_os = "macos")]
+fn click_target(window: &Window) -> Option<(usize, f64)> {
+    let h = f64::from(f32::from(window.viewport_size().height));
+    ns_window(window).map(|w| (w as usize, h))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn click_target(_: &Window) -> Option<(usize, f64)> {
+    None
+}
+
+/// Move to, press and release the left button at `at`, in the window's own coordinates.
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+fn click(window: usize, at: (f64, f64)) {
+    use core_graphics::geometry::CGPoint;
+    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    // NSEventType: MouseMoved = 5, LeftMouseDown = 1, LeftMouseUp = 2.
+    for kind in [5u64, 1, 2] {
+        // SAFETY: `window` is this app's live NSWindow; the event is autoreleased by AppKit
+        // and no GPUI window is borrowed while it is handled.
+        unsafe {
+            let number: isize = msg_send![window as *mut Object, windowNumber];
+            let ns: *mut Object = msg_send![class!(NSEvent),
+                mouseEventWithType: kind
+                location: CGPoint::new(at.0, at.1)
+                modifierFlags: 0u64
+                timestamp: 0f64
+                windowNumber: number
+                context: std::ptr::null::<Object>()
+                eventNumber: 0isize
+                clickCount: if kind == 5 { 0isize } else { 1isize }
+                pressure: if kind == 1 { 1f32 } else { 0f32 }];
+            if !ns.is_null() {
+                let _: () = msg_send![window as *mut Object, sendEvent: ns];
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn click(_: usize, _: (f64, f64)) {}
+
 #[cfg(target_os = "macos")]
 // objc 0.2's `msg_send!` checks a cfg this crate does not declare.
 #[allow(unexpected_cfgs)]
@@ -396,6 +461,12 @@ mod tests {
         assert!(parse("jump").is_err());
         assert!(parse("wait soon").is_err());
         assert!(parse("shot").is_err());
+        assert_eq!(
+            parse("click 12 40.5").unwrap(),
+            vec![Step::Click(12., 40.5)]
+        );
+        assert!(parse("click 12").is_err());
+        assert!(parse("click a b").is_err());
         assert_eq!(
             parse("ws open-pdf").unwrap(),
             vec![Step::Ws(vec!["open-pdf".into()])]

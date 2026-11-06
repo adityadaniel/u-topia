@@ -245,3 +245,146 @@ fn an_unusable_override_keeps_the_default(cx: &mut TestAppContext) {
         assert_eq!(keys, [platform_keys("cmd-shift-t")], "override {bad:?}");
     }
 }
+
+mod appearance {
+    use chrono::NaiveDate;
+    use gpui::{AppContext as _, Modifiers, TestAppContext, VisualTestContext};
+    use utopia_store::Store;
+    use utopia_ui::actions::install_keymap;
+    use utopia_ui::app_state::AppState;
+    use utopia_ui::appearance::{self, UiFont};
+    use utopia_ui::settings::{SettingsView, Tab};
+    use utopia_ui::theme::Theme;
+    use utopia_ui::workspace::Workspace;
+
+    fn settings_json(dir: &std::path::Path) -> Option<serde_json::Value> {
+        let s = std::fs::read_to_string(dir.join("settings.json")).ok()?;
+        Some(serde_json::from_str(&s).expect("settings.json is JSON"))
+    }
+
+    /// A main window and the Settings window, both open, as in the app.
+    fn open_both(
+        cx: &mut TestAppContext,
+        dir: &std::path::Path,
+    ) -> (gpui::AnyWindowHandle, gpui::AnyWindowHandle) {
+        let path = dir.to_path_buf();
+        cx.update(|cx| {
+            cx.set_global(Theme::light());
+            install_keymap(cx, None);
+            appearance::install(cx, &path);
+        });
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+        let app = cx.new(|_| AppState::new(store));
+        let main = cx.add_window(|window, cx| Workspace::new(app, window, cx));
+        let settings =
+            cx.add_window(move |window, cx| SettingsView::new(path, Tab::Appearance, window, cx));
+        cx.run_until_parked();
+        (main.into(), settings.into())
+    }
+
+    /// Settings → Appearance: picking IBM Plex Sans applies it to every open window at once
+    /// and writes it to `settings.json` (not `keymap.json`), versioned.
+    #[gpui::test]
+    fn choosing_a_font_applies_everywhere_and_is_saved(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, settings) = open_both(cx, dir.path());
+        assert_eq!(cx.update(|cx| appearance::ui_font(cx)), UiFont::System);
+        assert!(settings_json(dir.path()).is_none(), "nothing saved yet");
+        {
+            let mut w = VisualTestContext::from_window(main, cx);
+            assert!(w.debug_bounds("ui-font-system").is_some());
+        }
+
+        let mut s = VisualTestContext::from_window(settings, cx);
+        s.run_until_parked();
+        assert!(s.debug_bounds("settings-ui-font-system").is_some());
+        let option = s
+            .debug_bounds("settings-font-ibm-plex-sans")
+            .expect("the IBM Plex Sans choice is shown");
+        s.simulate_click(option.center(), Modifiers::default());
+        s.run_until_parked();
+
+        assert_eq!(
+            s.update(|_, cx| appearance::ui_font(cx)),
+            UiFont::IbmPlexSans
+        );
+        assert_eq!(
+            s.update(|_, cx| appearance::font_family(cx)),
+            "IBM Plex Sans",
+            "the family the bundled faces register under"
+        );
+        // Both windows were drawn again with the new family at their root, unprompted.
+        assert!(s.debug_bounds("settings-ui-font-ibm-plex-sans").is_some());
+        let mut w = VisualTestContext::from_window(main, cx);
+        w.run_until_parked();
+        assert!(w.debug_bounds("ui-font-ibm-plex-sans").is_some());
+
+        assert_eq!(
+            settings_json(dir.path()),
+            Some(serde_json::json!({"version": 1, "font": "ibm-plex-sans"}))
+        );
+        assert!(
+            !dir.path().join("keymap.json").exists(),
+            "the font is not a keybinding"
+        );
+
+        // And back: System is written down too, so the choice is explicit.
+        let mut s = VisualTestContext::from_window(settings, cx);
+        let option = s.debug_bounds("settings-font-system").unwrap();
+        s.simulate_click(option.center(), Modifiers::default());
+        s.run_until_parked();
+        assert_eq!(s.update(|_, cx| appearance::ui_font(cx)), UiFont::System);
+        assert_eq!(
+            settings_json(dir.path()).unwrap()["font"],
+            "system",
+            "switching back is saved"
+        );
+    }
+
+    /// The saved choice is what a new launch comes up with.
+    #[gpui::test]
+    fn a_saved_font_is_used_at_startup(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"version": 1, "font": "ibm-plex-sans"}"#,
+        )
+        .unwrap();
+        let (main, _) = open_both(cx, dir.path());
+        assert_eq!(cx.update(|cx| appearance::ui_font(cx)), UiFont::IbmPlexSans);
+        let mut w = VisualTestContext::from_window(main, cx);
+        assert!(w.debug_bounds("ui-font-ibm-plex-sans").is_some());
+    }
+
+    /// Rule 11: an unknown font in the file comes up as System, says so, and the window opens.
+    #[gpui::test]
+    fn an_unknown_font_falls_back_to_system(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"version": 1, "font": "comic-sans"}"#,
+        )
+        .unwrap();
+        let warnings = cx.update(|cx| appearance::install(cx, dir.path()));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(cx.update(|cx| appearance::ui_font(cx)), UiFont::System);
+
+        let (main, settings) = open_both(cx, dir.path());
+        let mut w = VisualTestContext::from_window(main, cx);
+        assert!(w.debug_bounds("ui-font-system").is_some());
+        let view = settings.downcast::<SettingsView>().unwrap();
+        let status = cx
+            .read(|cx| view.read(cx).map(|v| v.status().map(str::to_string)))
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            status.contains("comic-sans"),
+            "the user is told: {status:?}"
+        );
+        // The file is left as it was until the user picks something.
+        assert!(std::fs::read_to_string(dir.path().join("settings.json"))
+            .unwrap()
+            .contains("comic-sans"));
+    }
+}

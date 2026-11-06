@@ -44,3 +44,12 @@ uuid = { version = "1.10", features = ["v5"] }
 
 [profile.dev.package."*"]
 opt-level = 1
+
+# gpui 0.2.2 measures each glyph's bitmap from a 16 pt instance of the font, scaled; the
+# system font changes shape with size (optical sizing), so headings and titles drew with
+# their left edge cut off. The fork (branch utopia/glyph-bounds: zed-font-kit 0.14.1-zed
+# plus one commit) measures at the drawn size. CI fails if this patch stops applying, so a
+# GPUI upgrade that moves off 0.14.1-zed is noticed: then drop it, or re-apply it to the new
+# version if the bug is still there. Upstream: zed-industries/zed#45957, #63469.
+[patch.crates-io]
+zed-font-kit = { git = "https://github.com/adityadaniel/font-kit", rev = "753458b2a14f2b72d0f740a1c70681d5e9529f0c" }

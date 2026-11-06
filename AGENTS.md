@@ -37,8 +37,12 @@ cargo fmt --all -- --check
 Run the app with `cargo run -p utopia-app` (binary name `utopia`). The graph is chosen in
 this order: `--graph <file>`, `UTOPIA_GRAPH`, the last graph opened (recorded in the config
 dir), the only `*.utopia` in `~/Documents/Utopia`; otherwise onboarding asks for a name (§9.3).
-`UTOPIA_CONFIG_DIR` overrides the config dir (`keymap.json`, `last_graph`); point both env vars
-at a scratch folder when trying the app so you never touch the user's real graph.
+`UTOPIA_CONFIG_DIR` overrides the config dir (`keymap.json`, `settings.json`, `last_graph`); point
+both env vars at a scratch folder when trying the app so you never touch the user's real graph.
+`settings.json` holds local UI preferences (never synced, rule 9), a versioned object:
+`{"version": 1, "font": "system" | "ibm-plex-sans"}` (`utopia_ui::appearance`); a missing file or
+an unknown value means the default, logged; it is written atomically and keeps keys it does
+not know.
 
 Headless commands (`cargo run -p utopia-app -- <cmd>`): `doctor <file> [--rebuild]` checks
 the §10.4 invariants (exit 1 on problems); `export <file> <dir>` writes Markdown (attachments in
@@ -58,7 +62,10 @@ UTOPIA_CONFIG_DIR=/tmp/t UTOPIA_SHOT_SCRIPT="type Met [[Ana]]; keys escape; wait
 
 Steps (`;` or newline separated): `keys <k…>`, `type <text>` (lines are trimmed; a second space
 after `type` keeps a leading one), `wait <ms>`, `scroll <dy>` (a real AppKit wheel event in the
-main pane; negative scrolls down), `shot <png>`, `drop <file>` (as from Finder),
+main pane; negative scrolls down), `click <x> <y>` (a real AppKit left click in points
+from the top left of the content, so halve a Retina PNG's pixels and take off the 28 pt title
+bar), `shot <png>`, `drop <file>` (as
+from Finder),
 `ws open-pdf` / `ws highlight <page> <x> <y> <w> <h>` (area) / `ws select <page> <x0> <y0> <x1> <y1>`
 (text selection), `target main|last` (which window the steps after it drive and capture —
 `last` is the most recently opened, which is how the Settings window is reached:
@@ -243,6 +250,14 @@ Dependency direction is one-way: `app → ui → (plugin → api) → store → 
 
 - Rust 2021 edition, workspace-level dependency versions in the root `Cargo.toml`
   (`[workspace.dependencies]`). Pin GPUI exactly (`=0.2.2`, risk R1).
+- `zed-font-kit` is patched (`[patch.crates-io]` in the root `Cargo.toml`) to the fork
+  github.com/adityadaniel/font-kit, branch `utopia/glyph-bounds`, pinned by `rev`: crates.io
+  `zed-font-kit 0.14.1-zed` plus one commit in `src/loaders/core_text.rs` `raster_bounds`, so
+  glyph bitmaps are measured at the size drawn plus a pixel of room and headings in the system
+  font are not clipped (`crates/utopia-ui/tests/glyph_bounds.rs`). CI fails when the patch
+  stops applying (a GPUI upgrade moved off 0.14.1-zed): then drop it, or rebase the fork's
+  commit onto the new version if the bug is still there. Upstream: zed-industries/zed#45957
+  and #63469.
 - Errors: `thiserror` enums in library crates (`DomainError`, `StoreError`), `anyhow` only in
   `utopia-app`.
 - Timestamps: Unix ms UTC (`i64`). Ordering uses fractional positions, never timestamps (§10.7).
@@ -280,9 +295,11 @@ Implemented:
 - **Sync (§11.7, §12):** HTTP relay and client, background sync with status and merge notices,
   snapshot compaction, Loro-cursor caret preservation, end-to-end encryption (Argon2id +
   XChaCha20-Poly1305), realtime WebSocket notices, folder transport, LAN relay with mDNS.
-- **Settings and keybindings (§9.1):** a Settings window (Cmd+,) with three tabs —
+- **Settings and keybindings (§9.1):** a Settings window (Cmd+,) with four tabs —
   **Keybindings**, where every action can be rebound by pressing the keys and the change
-  applies at once; **Shortcuts**, the cheat sheet of everything bound; and **Help**, a tour of
+  applies at once; **Shortcuts**, the cheat sheet of everything bound; **Appearance**, the font
+  (System, or IBM Plex Sans bundled under the OFL in `crates/utopia-ui/assets/fonts`; code stays
+  Menlo), applied to every window at once and kept in `settings.json`; and **Help**, a tour of
   the features with screenshots captured from the app (`cargo run -p xtask -- help-shots`).
   `utopia_ui::actions::CATALOG` is the one source of truth: default keys plus the label,
   category and help text for each action, so the editor, the cheat sheet and the installed

@@ -1,10 +1,13 @@
-//! The Settings window (§9.1, `OpenSettings` / Cmd+,). Three tabs:
+//! The Settings window (§9.1, `OpenSettings` / Cmd+,). Four tabs:
 //!
 //! - **Keybindings** — every action in [`crate::actions::CATALOG`] with the keys in force,
 //!   rebindable by pressing the combination you want. Changes apply at once and are written
 //!   to `keymap.json`; only the actions you changed are stored.
 //! - **Shortcuts** — the cheat sheet of everything currently bound, which is also what the
 //!   Help menu's "Keyboard Shortcuts" opens.
+//! - **Appearance** — the font notes and the interface are set in (System or the bundled
+//!   IBM Plex Sans). Applies to every window at once; kept in `settings.json`
+//!   ([`crate::appearance`]), not in `keymap.json`.
 //! - **Help** — a tour of the app's features, with screenshots taken from the app itself.
 //!
 //! Capture uses a gpui *keystroke interceptor* rather than a key-down handler on purpose:
@@ -21,6 +24,7 @@ use std::path::PathBuf;
 use crate::actions::{
     by_category, canonical_keys, doc, pretty_keys, reinstall, ActionDoc, Category, Overrides,
 };
+use crate::appearance::{self, UiFont};
 use crate::help::{shot_image, TOPICS};
 use crate::theme::theme;
 
@@ -37,6 +41,7 @@ const HELP_SHOT_HEIGHT: f32 = HELP_SHOT_WIDTH * 798. / 1200.;
 pub enum Tab {
     Keybindings,
     Shortcuts,
+    Appearance,
     Help,
 }
 
@@ -45,12 +50,13 @@ impl Tab {
         match self {
             Tab::Keybindings => "Keybindings",
             Tab::Shortcuts => "Shortcuts",
+            Tab::Appearance => "Appearance",
             Tab::Help => "Help",
         }
     }
 
     fn all() -> &'static [Tab] {
-        &[Tab::Keybindings, Tab::Shortcuts, Tab::Help]
+        &[Tab::Keybindings, Tab::Shortcuts, Tab::Appearance, Tab::Help]
     }
 }
 
@@ -82,10 +88,16 @@ impl SettingsView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (overrides, warnings) = Overrides::load(&config_dir);
+        // The Appearance tab shows a sample of every font it offers.
+        for &f in UiFont::ALL {
+            appearance::load_font(cx, f);
+        }
+        let (overrides, mut warnings) = Overrides::load(&config_dir);
         for w in &warnings {
             eprintln!("utopia: {w}");
         }
+        // Already logged at startup; repeated here so the user sees it.
+        warnings.extend(appearance::Prefs::load(&config_dir).1);
         Self {
             config_dir,
             overrides,
@@ -93,8 +105,8 @@ impl SettingsView {
             capturing: None,
             capture: None,
             window: None,
-            // A malformed keymap.json is worth saying out loud: the user's bindings are not
-            // the ones they wrote (rule 11: degrade, never panic).
+            // A malformed keymap.json or settings.json is worth saying out loud: what is in
+            // force is not what the user wrote (rule 11: degrade, never panic).
             status: warnings.first().map(|w| SharedString::from(w.clone())),
             topic: 0,
             focus: cx.focus_handle(),
@@ -253,6 +265,22 @@ impl SettingsView {
     pub fn tab(&self) -> Tab {
         self.tab
     }
+
+    /// Settings → Appearance: put `font` in force in every window and remember it.
+    pub fn choose_font(&mut self, font: UiFont, cx: &mut Context<Self>) {
+        let before = appearance::ui_font(cx);
+        self.status = Some(match appearance::set_font(cx, font, &self.config_dir) {
+            Err(e) => format!(
+                "{} applies now, but could not save {}: {e}",
+                font.label(),
+                appearance::FILE
+            )
+            .into(),
+            Ok(()) if before == font => format!("The font is already {}.", font.label()).into(),
+            Ok(()) => format!("The font is now {}.", font.label()).into(),
+        });
+        cx.notify();
+    }
 }
 
 /// gpui sends modifier presses through as keystrokes with no real key on some layouts.
@@ -287,10 +315,12 @@ impl Render for SettingsView {
                 .on_click(cx.listener(move |this, _, _, cx| this.set_tab(t, cx)))
         });
         let tabs: Vec<_> = tabs.collect();
+        let font = appearance::ui_font(cx);
 
         let body = match self.tab {
             Tab::Keybindings => self.render_keybindings(cx).into_any_element(),
             Tab::Shortcuts => self.render_shortcuts(cx).into_any_element(),
+            Tab::Appearance => self.render_appearance(cx).into_any_element(),
             Tab::Help => self.render_help(cx).into_any_element(),
         };
 
@@ -304,8 +334,11 @@ impl Render for SettingsView {
             .bg(th.bg)
             .text_color(th.text)
             .text_size(px(crate::theme::TEXT_SIZE))
+            .font_family(appearance::font_family(cx))
             .child(
                 div()
+                    // Names the font in force, for tests (the root already has a selector).
+                    .debug_selector(move || format!("settings-ui-font-{}", font.key()))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -561,6 +594,92 @@ impl SettingsView {
             );
         }
         list
+    }
+
+    fn render_appearance(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let th = theme(cx).clone();
+        let current = appearance::ui_font(cx);
+        let options = UiFont::ALL.iter().map(|&f| {
+            let on = f == current;
+            div()
+                .id(SharedString::from(format!("font-{}", f.key())))
+                .debug_selector(move || format!("settings-font-{}", f.key()))
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .border_1()
+                .border_color(if on { th.accent } else { th.border })
+                .when(on, |d| d.bg(th.chip_bg))
+                .cursor_pointer()
+                .hover(|x| x.bg(th.hover))
+                // A drawn radio mark: "●"/"○" would come from whichever font is in force,
+                // and IBM Plex Sans has neither, so the fallback drew them at another size.
+                .child(
+                    div()
+                        .size(px(14.))
+                        .flex_none()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(if on { th.accent } else { th.faint })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(on, |d| {
+                            d.child(div().size(px(8.)).rounded_full().bg(th.accent))
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .child(div().child(f.label()))
+                        // Each sample in its own font, whichever one is in force.
+                        .child(
+                            div()
+                                .font_family(f.family())
+                                .text_color(th.muted)
+                                .child("Bob dug a big bog by the pond, quickly."),
+                        ),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.choose_font(f, cx)))
+        });
+        let options: Vec<_> = options.collect();
+        div()
+            .id("settings-appearance")
+            .debug_selector(|| "settings-appearance".into())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_y_scroll()
+            .px_4()
+            .py_3()
+            .gap_2()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(HELP_WIDTH))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .pt_3()
+                            .pb_1()
+                            .text_xs()
+                            .text_color(th.faint)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Font"),
+                    )
+                    .child(div().text_xs().text_color(th.muted).child(
+                        "Used for your notes and the interface, in every window, as soon as \
+                         you pick it. Code blocks stay in Menlo.",
+                    ))
+                    .children(options),
+            )
     }
 
     fn render_help(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
