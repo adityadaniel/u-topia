@@ -977,6 +977,100 @@ fn group_icon_stays_on_the_top_line_when_a_name_wraps(cx: &mut TestAppContext) {
     );
 }
 
+/// SR-3: the scope chips filter page-title rows too, not only the grouped blocks. The
+/// separately inserted date match is filtered the same way.
+#[gpui::test]
+fn search_scope_filters_page_titles(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let day_title = app.update(cx, |app, _| {
+        let page = app.store.create_page("Atlas November").unwrap();
+        let b = app.store.ensure_first_block(&page).unwrap();
+        app.store
+            .set_block_text(&page, &b, "zebra plan", None, None)
+            .unwrap();
+        app.store.commit_block(&page, &b).unwrap();
+        let (d, db) = app.store.open_daily(day).unwrap();
+        app.store
+            .set_block_text(&d, &db, "zebra day", None, None)
+            .unwrap();
+        app.store.commit_block(&d, &db).unwrap();
+        app.store.sync_index().unwrap();
+        app.store.page_row(&d).unwrap().unwrap().title
+    });
+
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("november");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("search is open");
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.page_titles()),
+        vec![day_title.clone(), "Atlas November".to_string()],
+        "All shows both the page and the day"
+    );
+
+    let journal = cx
+        .debug_bounds("search-scope-journal")
+        .expect("the Journal chip");
+    cx.simulate_click(journal.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.page_titles()),
+        vec![day_title.clone()],
+        "Journal keeps the day and drops the ordinary page"
+    );
+
+    let pages = cx
+        .debug_bounds("search-scope-pages")
+        .expect("the Pages chip");
+    cx.simulate_click(pages.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.page_titles()),
+        vec!["Atlas November".to_string()],
+        "Pages keeps the ordinary page and drops the day"
+    );
+    assert!(
+        ws.read_with(cx, |w, _| w.jump_palette().is_some()),
+        "the palette is open after the Pages click"
+    );
+
+    let todos = cx
+        .debug_bounds("search-scope-to-dos")
+        .expect("the To-dos chip");
+    cx.simulate_click(todos.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        jump.read_with(cx, |j, _| j.page_titles()).is_empty(),
+        "a page title is not a to-do"
+    );
+
+    // The parser also inserts a date hit that fuzzy titles never matched; it obeys the
+    // same scope.
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("2026-11-02");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("search reopened");
+    assert!(
+        jump.read_with(cx, |j, _| j.page_titles())
+            .contains(&day_title),
+        "the ISO date resolves to the day in All"
+    );
+    let pages = cx
+        .debug_bounds("search-scope-pages")
+        .expect("the Pages chip");
+    cx.simulate_click(pages.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        jump.read_with(cx, |j, _| j.page_titles()).is_empty(),
+        "Pages must not keep the inserted daily date"
+    );
+}
+
 #[gpui::test]
 fn full_search_and_quick_capture(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);

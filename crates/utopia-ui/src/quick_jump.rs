@@ -72,6 +72,17 @@ pub struct JumpPalette {
     _sub: Subscription,
 }
 
+/// Whether the selected scope may list a page title (SR-3): Journal is days only, Pages
+/// is ordinary pages only, To-dos is blocks only, All is everything.
+fn scope_keeps_page(scope: SearchScope, daily: bool) -> bool {
+    match scope {
+        SearchScope::All => true,
+        SearchScope::Journal => daily,
+        SearchScope::Pages => !daily,
+        SearchScope::Todos => false,
+    }
+}
+
 /// A result row's text with the matched terms on a soft accent wash (SR-1). The anchors
 /// come from the store, which computed them against this same plain text.
 fn marked(text: &str, anchors: &[(usize, usize)], th: &Theme) -> StyledText {
@@ -220,18 +231,29 @@ impl JumpPalette {
     fn search_pages(&mut self, q: &str, cx: &mut Context<Self>) {
         let app = self.app.read(cx);
         let store = &app.store;
-        let hits = store.search_titles(q, 12).unwrap_or_default();
+        let all_hits = store.search_titles(q, 12).unwrap_or_default();
         let key = normalize_title(q);
-        let exact = hits.iter().any(|h| {
+        let exact = all_hits.iter().any(|h| {
             normalize_title(&h.title) == key
                 || h.alias.as_deref().map(normalize_title) == Some(key.clone())
         }) || store.find_page(q).ok().flatten().is_some();
-        let mut results: Vec<Row> = hits.into_iter().map(Row::Page).collect();
+        // The chips filter page rows as well as block groups (SR-3).
+        let mut results: Vec<Row> = all_hits
+            .into_iter()
+            .filter(|h| scope_keeps_page(self.scope, h.daily))
+            .map(Row::Page)
+            .collect();
         // Block search lists existing blocks; only quick jump creates a page (SR-5).
-        if self.mode == PaletteMode::Pages && !key.is_empty() && !exact {
+        // Journal and To-dos cannot create a page, and Pages must not create a daily one.
+        let date_like =
+            utopia_core::date::parse_unambiguous_date(&key, store.date_format()).is_some();
+        let can_create = self.mode == PaletteMode::Pages
+            && matches!(self.scope, SearchScope::All | SearchScope::Pages)
+            && (self.scope == SearchScope::All || !date_like);
+        if can_create && !key.is_empty() && !exact {
             results.push(Row::Create(q.trim().to_string()));
         }
-        // A date typed in any accepted form jumps straight to its day.
+        // A date typed in any accepted form jumps straight to its day (if in scope).
         if let Ok(Some(p)) = store.find_page(q) {
             if !results
                 .iter()
@@ -239,16 +261,18 @@ impl JumpPalette {
             {
                 if let Ok(Some(row)) = store.page_row(&p) {
                     let daily = row.is_daily();
-                    results.insert(
-                        0,
-                        Row::Page(TitleHit {
-                            page: p,
-                            title: row.title,
-                            alias: None,
-                            daily,
-                            score: i64::MAX,
-                        }),
-                    );
+                    if scope_keeps_page(self.scope, daily) {
+                        results.insert(
+                            0,
+                            Row::Page(TitleHit {
+                                page: p,
+                                title: row.title,
+                                alias: None,
+                                daily,
+                                score: i64::MAX,
+                            }),
+                        );
+                    }
                 }
             }
         }
@@ -289,6 +313,17 @@ impl JumpPalette {
     /// Whether the list offers "Create page" (quick jump only; SR-5).
     pub fn offers_create(&self) -> bool {
         self.rows.iter().any(|r| matches!(r, Row::Create(_)))
+    }
+
+    /// Page titles currently listed, for the scope tests (SR-3).
+    pub fn page_titles(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Page(h) => Some(h.title.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn selected_hit(&self) -> Option<&BlockHit> {
