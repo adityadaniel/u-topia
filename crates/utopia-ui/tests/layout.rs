@@ -182,8 +182,9 @@ fn quick_jump_is_centered(cx: &mut TestAppContext) {
     let cx = setup(cx);
     cx.simulate_keystrokes("escape cmd-k");
     let p = bounds(cx, "jump-palette");
-    assert!(approx(p.size.width, 520.));
-    let center = f32::from(p.origin.x) + 260.;
+    // SR-5: the one palette is wide enough for the preview; Cmd+K opens it on pages.
+    assert!(approx(p.size.width, 860.));
+    let center = f32::from(p.origin.x) + 430.;
     assert!((center - W / 2.).abs() < 2., "centered horizontally: {p:?}");
     assert!(
         p.origin.y > px(60.) && p.origin.y < px(H / 2.),

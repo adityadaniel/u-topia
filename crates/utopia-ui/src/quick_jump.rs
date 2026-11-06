@@ -196,19 +196,25 @@ impl JumpPalette {
         self.rows.clear();
         self.groups.clear();
         self.selected = 0;
-        match self.mode {
-            PaletteMode::Capture | PaletteMode::Text => {
-                cx.notify();
-                return;
-            }
-            PaletteMode::Search => self.search_blocks(q, cx),
-            PaletteMode::Pages => self.search_pages(q, cx),
+        if matches!(self.mode, PaletteMode::Capture | PaletteMode::Text) {
+            cx.notify();
+            return;
         }
-        self.selected = self
+        // One palette, two modes (SR-5): pages first, then their blocks. Cmd+K starts on
+        // the first page, Cmd+Shift+F on the first block.
+        self.search_pages(q, cx);
+        self.append_block_groups(q, cx);
+        let first_page = self.rows.iter().position(Row::selectable);
+        let first_block = self
             .rows
             .iter()
-            .position(Row::selectable)
-            .unwrap_or_default();
+            .position(|r| matches!(r, Row::Block { .. }));
+        self.selected = if self.mode == PaletteMode::Search {
+            first_block.or(first_page)
+        } else {
+            first_page
+        }
+        .unwrap_or_default();
         self.load_preview(cx);
         cx.notify();
     }
@@ -250,7 +256,8 @@ impl JumpPalette {
         self.rows = results;
     }
 
-    fn search_blocks(&mut self, q: &str, cx: &mut Context<Self>) {
+    /// Append the block hits, grouped, after the page rows (SR-2, SR-5).
+    fn append_block_groups(&mut self, q: &str, cx: &mut Context<Self>) {
         if q.trim().is_empty() {
             return;
         }
@@ -260,13 +267,14 @@ impl JumpPalette {
             .store
             .search_groups_filtered(q, self.scope, self.age, 30)
             .unwrap_or_default();
-        for (gi, g) in groups.iter().enumerate() {
+        let base = self.groups.len();
+        self.groups.extend(groups);
+        for gi in base..self.groups.len() {
             self.rows.push(Row::Group { group: gi });
-            for hi in 0..g.hits.len() {
+            for hi in 0..self.groups[gi].hits.len() {
                 self.rows.push(Row::Block { group: gi, hit: hi });
             }
         }
-        self.groups = groups;
     }
 
     /// Results by page, for the scope tests and the preview (SR-2, SR-3).
@@ -628,7 +636,8 @@ impl Render for JumpPalette {
         let selected = self.selected;
         // Build the chips before borrowing the rows, because their click listeners need a
         // mutable context.
-        let scopes = (self.mode == PaletteMode::Search).then(|| self.scope_bar(&th, cx));
+        let scopes = matches!(self.mode, PaletteMode::Pages | PaletteMode::Search)
+            .then(|| self.scope_bar(&th, cx));
         let preview = self.preview.as_ref().map(|p| self.preview_pane(p, &th));
         let rows = self.rows.iter().enumerate().map(|(i, r)| match r {
             Row::Group { group } => group_header(*group, &self.groups[*group], &th),
@@ -640,6 +649,7 @@ impl Render for JumpPalette {
                 };
                 div()
                     .id(("qj", i))
+                    .debug_selector(move || format!("search-page-{i}"))
                     .flex()
                     .justify_between()
                     .px_3()
@@ -712,12 +722,15 @@ impl Render for JumpPalette {
         });
         div()
             .debug_selector(|| "jump-palette".into())
-            // Search shows a preview beside the results; the small prompts stay narrow.
-            .w(px(if self.mode == PaletteMode::Search {
-                860.
-            } else {
-                520.
-            }))
+            // One palette, two modes (SR-5): the merged list can show a preview, so it is
+            // wide; the small prompts stay narrow.
+            .w(px(
+                if matches!(self.mode, PaletteMode::Pages | PaletteMode::Search) {
+                    860.
+                } else {
+                    520.
+                },
+            ))
             .max_h(px(440.))
             .flex()
             .flex_col()

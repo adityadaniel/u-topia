@@ -875,6 +875,65 @@ fn search_preview_follows_the_selection(cx: &mut TestAppContext) {
     assert_ne!(first.block, second.block);
 }
 
+/// SR-5: Cmd+K and Cmd+Shift+F open the same palette. Pages come first, then grouped
+/// blocks; Cmd+K selects the page, Cmd+Shift+F the first block.
+#[gpui::test]
+fn one_palette_opens_on_pages_or_blocks(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        let page = app.store.create_page("Zebra Notes").unwrap();
+        let b = app.store.ensure_first_block(&page).unwrap();
+        app.store
+            .set_block_text(&page, &b, "zebra in the wild", None, None)
+            .unwrap();
+        app.store.commit_block(&page, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+
+    // Cmd+K: pages first, and the selection starts on the page (no block to preview).
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("quick jump is open");
+    assert!(
+        jump.read_with(cx, |j, _| j.preview().is_none()),
+        "Cmd+K opens on the page row"
+    );
+    let page_row = cx.debug_bounds("search-page-0").expect("the page row");
+    let group = cx
+        .debug_bounds("search-group-0")
+        .expect("the block result is grouped below the pages");
+    assert!(
+        group.origin.y > page_row.origin.y,
+        "pages come first, then blocks: {page_row:?} {group:?}"
+    );
+
+    // Down moves to "Create page", then on to the first block: the preview follows.
+    cx.simulate_keystrokes("down down");
+    cx.run_until_parked();
+    let preview = jump
+        .read_with(cx, |j, _| j.preview().cloned())
+        .expect("the block row is selected");
+    assert_eq!(
+        utopia_core::inline::plain_text(&preview.text),
+        "zebra in the wild"
+    );
+
+    // Cmd+Shift+F is the same palette, opened on the first block.
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("search is open");
+    let preview = jump
+        .read_with(cx, |j, _| j.preview().cloned())
+        .expect("Cmd+Shift+F opens on the block");
+    assert_eq!(preview.page_title, "Zebra Notes");
+}
+
 #[gpui::test]
 fn full_search_and_quick_capture(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);
