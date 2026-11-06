@@ -783,6 +783,60 @@ fn reference_path_parts_open_their_target(cx: &mut TestAppContext) {
     );
 }
 
+/// LR-5: the Unlinked References header carries the count while closed, "Link all" links
+/// every mention at once, and an empty section says so.
+#[gpui::test]
+fn unlinked_references_count_and_link_all(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (m, src) = app.update(cx, |app, _| {
+        let m = app.store.create_page("Mindfulness").unwrap();
+        let src = app.store.create_page("Reading").unwrap();
+        let b = app.store.ensure_first_block(&src).unwrap();
+        app.store
+            .set_block_text(
+                &src,
+                &b,
+                "practising mindfulness daily, then mindfulness again",
+                None,
+                None,
+            )
+            .unwrap();
+        app.store.commit_block(&src, &b).unwrap();
+        app.store.sync_index().unwrap();
+        (m, src)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(m.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    // The count is there before the section is opened.
+    cx.debug_bounds("unlinked-count-2")
+        .expect("the closed header shows how many unlinked mentions there are");
+    let link_all = cx
+        .debug_bounds("link-all")
+        .expect("Link all is offered in the header");
+    cx.simulate_click(link_all.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&app, &src, cx)[0].0,
+        "practising [[Mindfulness]] daily, then [[Mindfulness]] again",
+        "every mention, with the right byte offsets"
+    );
+    app.update(cx, |app, _| {
+        app.store.sync_index().unwrap();
+        assert_eq!(app.store.backlink_count(&m).unwrap(), 1);
+        assert!(app.store.unlinked_references(&m).unwrap().is_empty());
+    });
+    // Opening the now empty section says so, rather than showing a blank space.
+    let header = cx.debug_bounds("unlinked-header").expect("header");
+    cx.simulate_click(header.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.debug_bounds("unlinked-empty")
+        .expect("the empty state names itself");
+    cx.debug_bounds("unlinked-count-0")
+        .expect("and the count is zero");
+}
+
 #[gpui::test]
 fn embeds_render_and_split_panes(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);

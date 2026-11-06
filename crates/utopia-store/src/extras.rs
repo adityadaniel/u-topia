@@ -129,6 +129,52 @@ impl Store {
         Ok(())
     }
 
+    /// "Link all" (LR-5): rewrite every unlinked mention of `page` as a link, in one undo
+    /// step and one transaction. Mentions inside one block are rewritten from the end back,
+    /// so the byte offsets of earlier ones stay valid.
+    pub fn promote_all_mentions(&mut self, page: &PageId) -> Result<usize> {
+        self.sync_index()?;
+        let target = self.page_state(page)?.clone();
+        let title = display_title(&target, &self.date_format);
+        let insert = page_link_text(&title, false);
+        let mentions = self.unlinked_references(page)?;
+        if mentions.is_empty() {
+            return Ok(0);
+        }
+        let mut steps: std::collections::BTreeMap<
+            PageId,
+            std::collections::BTreeMap<BlockId, Vec<Range<usize>>>,
+        > = std::collections::BTreeMap::new();
+        for m in &mentions {
+            steps
+                .entry(m.page.clone())
+                .or_default()
+                .entry(m.block.clone())
+                .or_default()
+                .push(m.range.clone());
+        }
+        let mut page_steps = Vec::with_capacity(steps.len());
+        for (src_page, blocks) in steps {
+            let mut cmds = Vec::new();
+            for (block, mut ranges) in blocks {
+                ranges.sort_by(|a, b| b.start.cmp(&a.start));
+                for range in ranges {
+                    cmds.push(Command::SetBlockText {
+                        id: block.clone(),
+                        edit: utopia_core::TextEdit {
+                            range,
+                            insert: insert.clone(),
+                        },
+                    });
+                }
+            }
+            page_steps.push((src_page, cmds));
+        }
+        let linked = mentions.len();
+        self.execute_multi(page_steps, EditOpts::default())?;
+        Ok(linked)
+    }
+
     // ---------------------------------------------------------------- aliases UI
 
     /// Add an alias (P1 "aliases UI"). Refused when date-shaped or taken by another page

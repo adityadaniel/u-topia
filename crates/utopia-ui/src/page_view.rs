@@ -140,6 +140,8 @@ enum Item {
         open: bool,
     },
     Mention(Mention),
+    /// The unlinked section is open and there is nothing left to link (LR-5).
+    NoMentions,
     /// A day's title in the Daily Notes feed (`page` is None for a blank day).
     DayHeader {
         date: NaiveDate,
@@ -668,30 +670,38 @@ impl PageView {
         }
         self.push_refs(&page, &mut items, cx);
         if self.zoom.is_none() {
-            // Unlinked References (FR-3.9): computed only when expanded, like Roam.
-            if self.unlinked_open
-                && self
-                    .unlinked
-                    .as_ref()
-                    .is_none_or(|(v, _)| *v != refs_version)
-            {
+            // Unlinked References (FR-3.9, LR-5): the header always carries the count, so the
+            // search runs once per page and index version rather than only when opened. It is
+            // skipped while edits are still pending, because that search waits for them
+            // (rule 10); the count catches up when the index does.
+            let stale = self
+                .unlinked
+                .as_ref()
+                .is_none_or(|(v, _)| *v != refs_version);
+            let up_to_date = !self.app.read(cx).store.has_pending();
+            if stale && (self.unlinked_open || up_to_date) {
                 let found = self.app.update(cx, |app, _| {
                     let r = app.store.unlinked_references(&page);
                     app.report(r).unwrap_or_default()
                 });
                 self.unlinked = Some((refs_version, found));
             }
+            let count = self.unlinked.as_ref().map(|(_, m)| m.len());
             let mentions = self
                 .unlinked
                 .as_ref()
                 .map(|(_, m)| m.clone())
                 .filter(|_| self.unlinked_open);
             items.push(Item::UnlinkedHeader {
-                count: mentions.as_ref().map(Vec::len),
+                count,
                 open: self.unlinked_open,
             });
-            for m in mentions.unwrap_or_default() {
-                items.push(Item::Mention(m));
+            if self.unlinked_open {
+                match mentions {
+                    Some(m) if !m.is_empty() => items.extend(m.into_iter().map(Item::Mention)),
+                    Some(_) => items.push(Item::NoMentions),
+                    None => {}
+                }
             }
         }
         self.replace_items(items, cx);
@@ -2206,6 +2216,24 @@ impl PageView {
         cx.notify();
     }
 
+    /// "Link all" in the Unlinked References header (LR-5): one undo step for every mention.
+    fn promote_all(&mut self, cx: &mut Context<Self>) {
+        let Some(page) = self.page.clone() else {
+            return;
+        };
+        if self.unlinked.as_ref().is_none_or(|(_, m)| m.is_empty()) {
+            return;
+        }
+        self.app.update(cx, |app, cx| {
+            let linked = app.store.promote_all_mentions(&page);
+            app.report(linked);
+            app.changed(vec![page.clone()], true, cx);
+        });
+        self.unlinked = None;
+        self.dirty = true;
+        cx.notify();
+    }
+
     fn toggle_checked(&mut self, r: &RowItem, cx: &mut Context<Self>) {
         let (page, block, checked) = (r.page.clone(), r.block.clone(), !r.checked);
         self.app.update(cx, |app, cx| {
@@ -2981,21 +3009,45 @@ impl PageView {
                 .border_t_1()
                 .border_color(th.line)
                 .flex()
-                .justify_between()
+                .items_center()
+                .gap_2()
                 .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.muted)
                 .cursor_pointer()
                 .hover(|s| s.text_color(th.text))
-                .child(format!(
-                    "{} Unlinked References",
-                    if open { "▾" } else { "▸" }
-                ))
-                .child(count.map(|c| c.to_string()).unwrap_or_default())
+                .child(
+                    div()
+                        .debug_selector(move || format!("unlinked-arrow-{open}"))
+                        .child(if open { "▾" } else { "▸" }),
+                )
+                .child(div().child("Unlinked References"))
+                .children(count.map(|c| {
+                    crate::theme::count_chip(c, &th)
+                        .debug_selector(move || format!("unlinked-count-{c}"))
+                }))
+                .child(div().flex_1())
+                .children(count.filter(|c| *c > 0).map(|_| {
+                    quiet_control("link-all", "Link all", &th)
+                        .debug_selector(|| "link-all".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            // The header itself toggles the section.
+                            cx.stop_propagation();
+                            this.promote_all(cx);
+                        }))
+                }))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.unlinked_open = !this.unlinked_open;
                     this.dirty = true;
                     cx.notify();
                 }))
+                .into_any_element(),
+            Item::NoMentions => div()
+                .debug_selector(|| "unlinked-empty".into())
+                .px_6()
+                .py_0p5()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.faint)
+                .child("No unlinked mentions")
                 .into_any_element(),
             Item::Mention(m) => {
                 let th2 = th.clone();

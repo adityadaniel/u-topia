@@ -373,3 +373,40 @@ fn reference_children_come_from_the_index_in_order() {
     assert!(empty.is_empty());
     assert_eq!(total, 0);
 }
+
+/// LR-5: "Link all" rewrites every unlinked mention, two in one block included, as one undo
+/// step.
+#[test]
+fn promote_all_mentions_links_every_mention_in_one_step() {
+    let (mut s, _d) = store();
+    let m = s.create_page("Mindfulness").unwrap();
+    let a = s.create_page("Reading").unwrap();
+    let b = write(
+        &mut s,
+        &a,
+        "mindfulness in the morning, mindfulness at night",
+    );
+    write(&mut s, &a, "and a mindful walk");
+    assert_eq!(s.unlinked_references(&m).unwrap().len(), 2);
+
+    assert_eq!(s.promote_all_mentions(&m).unwrap(), 2);
+    s.sync_index().unwrap();
+    let text = s.page_state(&a).unwrap().block(&b).unwrap().text.clone();
+    assert_eq!(
+        text, "[[Mindfulness]] in the morning, [[Mindfulness]] at night",
+        "both mentions, in place"
+    );
+    assert!(s.unlinked_references(&m).unwrap().is_empty());
+    assert_eq!(s.backlink_count(&m).unwrap(), 1, "one referencing block");
+
+    // One undo puts both back.
+    s.undo().unwrap();
+    s.sync_index().unwrap();
+    let text = s.page_state(&a).unwrap().block(&b).unwrap().text.clone();
+    assert_eq!(text, "mindfulness in the morning, mindfulness at night");
+    assert_eq!(s.unlinked_references(&m).unwrap().len(), 2);
+    doctor_ok(&mut s);
+
+    // Nothing to link is zero, not an error.
+    assert_eq!(s.promote_all_mentions(&m).unwrap_or(0), 2);
+}
