@@ -273,6 +273,7 @@ fn an_unusable_override_keeps_the_default(cx: &mut TestAppContext) {
 mod appearance {
     use chrono::NaiveDate;
     use gpui::{AppContext as _, Modifiers, TestAppContext, VisualTestContext};
+    use utopia_core::PageId;
     use utopia_store::Store;
     use utopia_ui::actions::install_keymap;
     use utopia_ui::app_state::AppState;
@@ -350,6 +351,7 @@ mod appearance {
                 "version": 1,
                 "font": "ibm-plex-sans",
                 "density": "comfortable",
+                "pinned": [],
             }))
         );
         assert!(
@@ -416,6 +418,56 @@ mod appearance {
             Density::Comfortable
         );
         assert_eq!(settings_json(dir.path()).unwrap()["density"], "comfortable");
+    }
+
+    /// SB-3: pins live in settings.json (not keymap.json, never the graph). Settings →
+    /// Appearance says how many there are and can clear them.
+    #[gpui::test]
+    fn pinned_pages_are_local_and_cleared_from_settings(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_main, settings) = open_both(cx, dir.path());
+        let page = PageId("page-a".into());
+        cx.update(|cx| {
+            let on = appearance::toggle_pinned(cx, &page).expect("settings.json is writable");
+            assert!(on);
+        });
+        assert_eq!(
+            settings_json(dir.path()).unwrap()["pinned"],
+            serde_json::json!(["page-a"]),
+            "the pin is local state in settings.json"
+        );
+        assert!(
+            !dir.path().join("keymap.json").exists(),
+            "a pin is not a keybinding"
+        );
+
+        let mut s = VisualTestContext::from_window(settings, cx);
+        s.run_until_parked();
+        assert!(
+            s.debug_bounds("settings-pinned").is_some(),
+            "Settings → Appearance shows the pinned pages"
+        );
+        let clear = s
+            .debug_bounds("settings-clear-pinned")
+            .expect("a Clear control when something is pinned");
+        s.simulate_click(clear.center(), Modifiers::default());
+        s.run_until_parked();
+        assert_eq!(
+            settings_json(dir.path()).unwrap()["pinned"],
+            serde_json::json!([]),
+            "Clear unpins every page"
+        );
+        assert!(s.update(|_, cx| appearance::pinned(cx).is_empty()));
+        // Nothing to clear any more. (The old control's debug bounds linger, so assert on
+        // what replaced it: the status line says the pins are gone.)
+        let view = s
+            .update(|window, _| window.root::<SettingsView>())
+            .flatten()
+            .expect("settings root");
+        assert_eq!(
+            view.update(cx, |v, _| v.status().map(str::to_string)),
+            Some("Unpinned every page.".to_string())
+        );
     }
 
     /// The saved choice is what a new launch comes up with.

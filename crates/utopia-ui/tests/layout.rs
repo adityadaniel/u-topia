@@ -3,6 +3,7 @@
 
 use chrono::NaiveDate;
 use gpui::{px, size, AppContext as _, Bounds, Entity, Pixels, TestAppContext, VisualTestContext};
+use utopia_core::outline;
 use utopia_core::PageId;
 use utopia_store::Store;
 use utopia_ui::actions::install_keymap;
@@ -13,19 +14,50 @@ use utopia_ui::workspace::Workspace;
 const W: f32 = 1280.;
 const H: f32 = 820.;
 
+fn today() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()
+}
+
 fn setup(cx: &mut TestAppContext) -> &mut VisualTestContext {
+    setup_seeded(cx, |_| {})
+}
+
+/// The workspace over a store seeded directly (never through keystrokes): deterministic
+/// content for the sidebar, and no race with the UI's debounce.
+fn setup_seeded(cx: &mut TestAppContext, seed: impl FnOnce(&mut Store)) -> &mut VisualTestContext {
     cx.update(|cx| {
         cx.set_global(Theme::light());
         install_keymap(cx, None);
     });
     let mut store = Store::open_in_memory().unwrap();
-    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    store.set_today(Some(today()));
+    seed(&mut store);
+    store.sync_index().unwrap();
     let app = cx.new(|_| AppState::new(store));
     let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
     cx.simulate_resize(size(px(W), px(H)));
     ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
     cx.run_until_parked();
     cx
+}
+
+/// `n` days of history, two blocks each, so the old two-line preview would have shown
+/// both (SB-1).
+fn seed_days(store: &mut Store, n: usize) {
+    for i in 0..n {
+        let d = today() - chrono::Duration::days(i as i64);
+        let (p, b) = store.open_daily(d).unwrap();
+        store
+            .set_block_text(&p, &b, &format!("Day {i} first block"), None, None)
+            .unwrap();
+        store.commit_block(&p, &b).unwrap();
+        let plan = outline::append_block(store.page_state(&p).unwrap(), None);
+        let second = store.execute_plan(&p, plan, None).unwrap().unwrap().block;
+        store
+            .set_block_text(&p, &second, &format!("Day {i} second block"), None, None)
+            .unwrap();
+        store.commit_block(&p, &second).unwrap();
+    }
 }
 
 /// Today's page on its own (the calendar's "Today"), not the Daily Notes feed.
@@ -50,6 +82,13 @@ fn setup_page(cx: &mut TestAppContext) -> &mut VisualTestContext {
 }
 
 fn bounds(cx: &mut VisualTestContext, sel: &'static str) -> Bounds<Pixels> {
+    bounds_of(cx, sel.to_string())
+}
+
+/// `debug_bounds` only takes a `&'static str`; a test-built selector is leaked for the
+/// duration of the process (a handful of short strings).
+fn bounds_of(cx: &mut VisualTestContext, sel: String) -> Bounds<Pixels> {
+    let sel: &'static str = Box::leak(sel.into_boxed_str());
     cx.run_until_parked();
     cx.debug_bounds(sel)
         .unwrap_or_else(|| panic!("{sel} was not rendered"))
@@ -560,5 +599,380 @@ fn opening_the_page_menu_does_not_move_the_title(cx: &mut TestAppContext) {
     assert_eq!(
         closed, open,
         "the title keeps its bounds when the menu opens"
+    );
+}
+
+/// SB-1: ten days are ten one-line rows, each with a muted block count. At the old
+/// two-preview height three days took half the sidebar; these ten fit without scrolling.
+#[gpui::test]
+fn recent_days_are_one_line_each(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| seed_days(s, 10));
+    cx.simulate_keystrokes("escape");
+    let sidebar = bounds(cx, "left-sidebar");
+    let mut previous: Option<Bounds<Pixels>> = None;
+    for i in 0..10 {
+        let row = bounds_of(cx, format!("recent-day-{i}"));
+        assert!(
+            row.size.height <= px(22.),
+            "row {i} is one line, not a preview block: {row:?}"
+        );
+        let count = bounds_of(cx, format!("recent-day-count-{i}"));
+        assert!(
+            count.origin.x > row.origin.x + row.size.width / 2.
+                && count.origin.x + count.size.width <= row.origin.x + row.size.width + px(0.5),
+            "the count sits at the right edge of row {i}: {count:?} {row:?}"
+        );
+        if let Some(p) = previous {
+            assert!(
+                row.origin.y >= p.origin.y + p.size.height - px(1.),
+                "rows stack: {p:?} {row:?}"
+            );
+        }
+        previous = Some(row);
+    }
+    let last = previous.expect("ten rows");
+    assert!(
+        last.origin.y + last.size.height <= sidebar.origin.y + sidebar.size.height,
+        "ten compact days fit in the sidebar without scrolling: {last:?} {sidebar:?}"
+    );
+}
+
+/// SB-1: a compact row keeps the day's first block one hover away.
+#[gpui::test]
+fn recent_day_hover_shows_its_first_block(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| seed_days(s, 3));
+    cx.simulate_keystrokes("escape");
+    let row = bounds_of(cx, "recent-day-0".into());
+    cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    // gpui waits 500 ms before showing a tooltip.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(700));
+    cx.run_until_parked();
+    let tip = bounds_of(cx, "recent-day-preview".into());
+    assert!(
+        tip.size.width > px(40.) && tip.size.height >= px(12.),
+        "the first block is drawn as a tooltip: {tip:?}"
+    );
+}
+
+/// SB-2: a page that only exists because of a `#tag` gets a `#` in the tag colour;
+/// a page reached through a `[[link]]` does not. One list, display only (FR-2.15).
+#[gpui::test]
+fn tag_pages_get_a_hash_glyph(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| {
+        let (p, b) = s.open_daily(today()).unwrap();
+        s.set_block_text(&p, &b, "#atlas and [[Atlas Launch]]", None, None)
+            .unwrap();
+        s.commit_block(&p, &b).unwrap();
+    });
+    cx.simulate_keystrokes("escape");
+    let glyph = bounds_of(cx, "tag-glyph-atlas".into());
+    let row = bounds_of(cx, "page-row-0".into());
+    assert!(
+        glyph.origin.x >= row.origin.x
+            && glyph.origin.x + glyph.size.width <= row.origin.x + row.size.width + px(0.5),
+        "the glyph sits inside the page row: {glyph:?} {row:?}"
+    );
+    assert!(
+        cx.debug_bounds("tag-glyph-atlas launch").is_none(),
+        "a [[link]] page is not marked as a tag page"
+    );
+}
+
+/// SB-3: a page pinned from its "···" menu sits in a Pinned group above Pages, the pin is
+/// written to settings.json as local state (rule 9), and the row's ✕ unpins it without
+/// opening the page behind the click.
+#[gpui::test]
+fn pinned_pages_sit_above_pages_and_are_local(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| {
+        s.create_page("Alpha").unwrap();
+        s.create_page("Beta").unwrap();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|_, cx| utopia_ui::appearance::install(cx, dir.path()));
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let alpha = PageId::for_title_key("alpha");
+    let beta = PageId::for_title_key("beta");
+    cx.update(|window, cx| {
+        ws.update(cx, |w, cx| {
+            w.open(alpha.clone(), None, None, false, window, cx)
+        })
+    });
+    cx.run_until_parked();
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    let pin = bounds(cx, "page-menu-pin");
+    cx.simulate_click(pin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let pinned_header = bounds(cx, "pinned-header");
+    let pages_header = bounds(cx, "pages-header");
+    let row = bounds_of(cx, "pinned-row-0".into());
+    assert!(
+        pinned_header.origin.y < pages_header.origin.y,
+        "the Pinned group is above Pages: {pinned_header:?} {pages_header:?}"
+    );
+    assert!(
+        row.origin.y >= pinned_header.origin.y
+            && row.origin.y + row.size.height <= pages_header.origin.y + px(0.5),
+        "the pinned row sits between the two headers: {row:?}"
+    );
+    let saved = || -> serde_json::Value {
+        let s = std::fs::read_to_string(dir.path().join("settings.json")).expect("settings.json");
+        serde_json::from_str(&s).expect("settings.json is JSON")
+    };
+    assert_eq!(saved()["pinned"], serde_json::json!([alpha.as_str()]));
+    assert!(
+        !dir.path().join("keymap.json").exists(),
+        "a pin is not a keybinding"
+    );
+    // A new launch reads the pin back from the file.
+    cx.update(|_, cx| {
+        utopia_ui::appearance::install(cx, dir.path());
+        assert_eq!(
+            utopia_ui::appearance::pinned(cx),
+            std::slice::from_ref(&alpha)
+        );
+    });
+
+    // Show another page, then unpin Alpha with the row's ✕. The click must not open Alpha.
+    cx.update(|window, cx| {
+        ws.update(cx, |w, cx| {
+            w.open(beta.clone(), None, None, false, window, cx)
+        })
+    });
+    cx.run_until_parked();
+    let before = pages_header.origin.y;
+    let unpin = bounds_of(cx, "unpin-0".into());
+    cx.simulate_click(unpin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(beta),
+        "unpinning does not follow the row's link"
+    );
+    assert_eq!(saved()["pinned"], serde_json::json!([]));
+    let pages_header = bounds(cx, "pages-header");
+    assert!(
+        pages_header.origin.y < before,
+        "Pages moves up once the Pinned group is gone: {pages_header:?}"
+    );
+}
+
+/// SB-4: the footer is one row — the graph chip, the sync dot and (for an encrypted graph)
+/// a lock — at the bottom of the sidebar. Clicking it opens the sync view as an overlay
+/// above the footer; nothing in the page moves.
+#[gpui::test]
+fn footer_opens_the_sync_view_without_moving_the_page(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape");
+    let sidebar = bounds(cx, "left-sidebar");
+    let footer = bounds(cx, "sidebar-footer");
+    let chip = bounds(cx, "graph-chip");
+    let dot = bounds(cx, "sync-dot-off");
+    assert!(
+        footer.origin.y + footer.size.height <= sidebar.origin.y + sidebar.size.height + px(0.5),
+        "the footer is inside the sidebar: {footer:?} {sidebar:?}"
+    );
+    assert!(
+        footer.origin.y > sidebar.origin.y + sidebar.size.height / 2.,
+        "the footer sits at the bottom: {footer:?} {sidebar:?}"
+    );
+    // One row: the chip and the dot share a centre line.
+    let chip_mid = f32::from(chip.origin.y) + f32::from(chip.size.height) / 2.;
+    let dot_mid = f32::from(dot.origin.y) + f32::from(dot.size.height) / 2.;
+    assert!(
+        (chip_mid - dot_mid).abs() <= 2.,
+        "the chip and the dot are on one row: {chip:?} {dot:?}"
+    );
+    assert!(
+        approx(chip.origin.x, f32::from(footer.origin.x))
+            && f32::from(dot.origin.x + dot.size.width) <= f32::from(footer.right()),
+        "chip left, dot right, both inside the row: {chip:?} {dot:?} {footer:?}"
+    );
+    assert!(
+        cx.debug_bounds("encryption-lock").is_none(),
+        "an in-memory graph is not encrypted"
+    );
+
+    let main = bounds(cx, "main-pane");
+    cx.simulate_click(footer.center(), gpui::Modifiers::default());
+    let popover = bounds(cx, "sync-popover");
+    assert!(
+        f32::from(popover.origin.x) >= f32::from(sidebar.origin.x)
+            && f32::from(popover.right()) <= f32::from(sidebar.right()) + 0.5,
+        "the sync view stays inside the sidebar: {popover:?} {sidebar:?}"
+    );
+    assert!(
+        f32::from(popover.bottom()) <= f32::from(footer.origin.y) + 0.5,
+        "the sync view floats above the footer: {popover:?} {footer:?}"
+    );
+    let after = bounds(cx, "main-pane");
+    assert!(
+        approx(after.origin.x, f32::from(main.origin.x))
+            && approx(after.size.width, f32::from(main.size.width)),
+        "opening the sync view does not move the page: {main:?} {after:?}"
+    );
+
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    assert!(ws.update(cx, |w, _| w.sync_view_open()));
+    cx.simulate_click(footer.center(), gpui::Modifiers::default());
+    assert!(
+        !ws.update(cx, |w, _| w.sync_view_open()),
+        "clicking the footer again closes the sync view"
+    );
+}
+
+/// SB-5: under Journal, a quiet 7-column month strip. Days with an entry get a dot, today
+/// is drawn in the accent, a day click opens that day, and the month name folds the grid.
+#[gpui::test]
+fn month_strip_is_a_quiet_seven_column_grid(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| seed_days(s, 3));
+    cx.simulate_keystrokes("escape");
+    assert!(
+        cx.debug_bounds("left-calendar").is_none(),
+        "the strip starts folded, as the calendar did"
+    );
+    let strip = bounds(cx, "toggle-calendar");
+    cx.simulate_click(strip.center(), gpui::Modifiers::default());
+    let grid = bounds(cx, "left-calendar");
+    assert!(
+        grid.origin.y >= strip.origin.y + strip.size.height - px(0.5),
+        "the grid is under the month name: {grid:?} {strip:?}"
+    );
+
+    // November 2026 starts on a Sunday, so the first Monday-first row is Oct 26–Nov 1.
+    let row = [
+        "2026-10-26",
+        "2026-10-27",
+        "2026-10-28",
+        "2026-10-29",
+        "2026-10-30",
+        "2026-10-31",
+        "2026-11-01",
+    ];
+    let cells: Vec<Bounds<Pixels>> = row
+        .iter()
+        .map(|iso| bounds_of(cx, format!("cal-{iso}")))
+        .collect();
+    for (i, cell) in cells.iter().enumerate() {
+        assert!(
+            approx(cell.origin.y, f32::from(cells[0].origin.y)),
+            "seven columns share a line: {cell:?}"
+        );
+        assert!(
+            approx(cell.size.width, f32::from(cells[0].size.width)),
+            "columns are equally wide: {cell:?}"
+        );
+        if i > 0 {
+            assert!(
+                cell.origin.x > cells[i - 1].origin.x,
+                "columns go left to right: {cell:?}"
+            );
+        }
+        assert!(
+            cell.origin.x >= grid.origin.x
+                && cell.origin.x + cell.size.width <= grid.origin.x + grid.size.width + px(0.5),
+            "cell {i} stays inside the grid: {cell:?} {grid:?}"
+        );
+    }
+
+    // Seeded days (Nov 2, Nov 1, Oct 31) have dots; an untouched day in the month does not.
+    for iso in ["2026-11-02", "2026-11-01", "2026-10-31"] {
+        bounds_of(cx, format!("cal-dot-{iso}"));
+    }
+    assert!(
+        cx.debug_bounds("cal-dot-2026-11-15").is_none(),
+        "a day with no entry has no dot"
+    );
+    // Today is inside the grid it belongs to.
+    let today = bounds_of(cx, "cal-2026-11-02".into());
+    assert!(
+        today.origin.x >= grid.origin.x && today.right() <= grid.right() + px(0.5),
+        "today's cell is in the strip: {today:?} {grid:?}"
+    );
+
+    // Folding and unfolding is one click on the month name; the list below moves with it.
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let recent_before = bounds(cx, "recent-days-header");
+    cx.simulate_click(strip.center(), gpui::Modifiers::default());
+    assert!(!ws.update(cx, |w, _| w.calendar_open()));
+    let recent = bounds(cx, "recent-days-header");
+    assert!(
+        recent.origin.y < recent_before.origin.y,
+        "the folded month gives the list its room back: {recent:?} {recent_before:?}"
+    );
+    cx.simulate_click(strip.center(), gpui::Modifiers::default());
+    assert!(ws.update(cx, |w, _| w.calendar_open()));
+
+    // A day cell opens that day (a draft until written, FR-1.2).
+    let cell = bounds_of(cx, "cal-2026-10-30".into());
+    cx.simulate_click(cell.center(), gpui::Modifiers::default());
+    let day = NaiveDate::from_ymd_opt(2026, 10, 30).unwrap();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(PageId::for_date(day))
+    );
+}
+
+/// ALL-5 in the sidebar: Compact density tightens the journal and page rows too, so the
+/// redesign does not leave one list at the comfortable size.
+#[gpui::test]
+fn compact_density_tightens_sidebar_rows(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| {
+        s.create_page("Alpha").unwrap();
+    });
+    cx.simulate_keystrokes("escape");
+    let before = bounds_of(cx, "page-row-0".into());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("settings.json"),
+        r#"{"version": 1, "density": "compact"}"#,
+    )
+    .unwrap();
+    cx.update(|_, cx| {
+        utopia_ui::appearance::install(cx, dir.path());
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("ui-density-compact").is_some(),
+        "the workspace was drawn again in Compact"
+    );
+    let after = bounds_of(cx, "page-row-0".into());
+    assert!(
+        after.size.height < before.size.height,
+        "a page row is shorter in Compact: {before:?} {after:?}"
+    );
+}
+
+/// SB-3: a written daily note is a page too (§5.5), so it can be pinned. Pins resolve
+/// against every live page, not only the ordinary Pages list (which excludes daily pages).
+#[gpui::test]
+fn pinned_daily_pages_show_above_pages(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    // The page menu is only offered on a live page (a draft day has none).
+    cx.simulate_input("note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    let pin = bounds(cx, "page-menu-pin");
+    cx.simulate_click(pin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let header = bounds(cx, "pinned-header");
+    let row = bounds_of(cx, "pinned-row-0".into());
+    let pages = bounds(cx, "pages-header");
+    assert!(
+        header.origin.y < row.origin.y && row.origin.y + row.size.height <= pages.origin.y,
+        "the pinned day sits in the Pinned group above Pages: {header:?} {row:?} {pages:?}"
     );
 }
