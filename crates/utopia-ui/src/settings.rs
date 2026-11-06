@@ -351,6 +351,10 @@ impl Render for SettingsView {
             .flex()
             .flex_col()
             .flex_1()
+            // A flex child's automatic minimum is its content height. Without this the
+            // scrolling list would grow the column past the window instead of scrolling
+            // inside it, pushing the status line out of reach.
+            .min_h_0()
             .child(body);
 
         div()

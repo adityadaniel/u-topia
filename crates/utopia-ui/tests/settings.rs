@@ -1,6 +1,6 @@
 //! The Settings keybinding editor (§9.1), driven through GPUI's headless test platform.
 
-use gpui::TestAppContext;
+use gpui::{px, size, TestAppContext};
 use utopia_ui::actions::{doc, install_keymap, platform_keys, Overrides, Quit};
 use utopia_ui::settings::{SettingsView, Tab};
 use utopia_ui::theme::Theme;
@@ -167,6 +167,30 @@ fn reset_restores_the_default(cx: &mut TestAppContext) {
         assert_eq!(v.overrides().keys_for(today), platform_keys("cmd-shift-t"));
     });
     assert_eq!(keymap_json(dir.path()).unwrap().trim(), "[]");
+}
+
+/// The Settings body is a scroll region, not a growing column: in a short window the key
+/// rows scroll inside it and the status line stays on screen.
+#[gpui::test]
+fn keybindings_scroll_inside_a_short_window(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("keymap.json"), "{ not json").unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (_view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(720.), px(480.)));
+    cx.run_until_parked();
+    let status = cx
+        .debug_bounds("settings-status")
+        .expect("the unreadable keymap status is shown");
+    assert!(
+        status.origin.y + status.size.height <= px(480.) + px(0.5),
+        "the status line stays inside the window: {status:?}"
+    );
 }
 
 /// A `keymap.json` that cannot be read must not take the window down with it (rule 11).
