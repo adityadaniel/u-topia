@@ -1092,6 +1092,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let th = theme(cx).clone();
+        let density = crate::appearance::density(cx);
         let main = self.main.read(cx);
         let active = page.is_some() && !main.is_journal() && main.page == page;
         div()
@@ -1100,7 +1101,8 @@ impl Workspace {
             .py_0p5()
             .rounded_sm()
             .cursor_pointer()
-            .text_size(px(crate::theme::BODY_SIZE))
+            .text_size(px(density.text_size()))
+            .line_height(px(density.line_height()))
             .text_color(if active { th.accent } else { th.text })
             .when(active, |d| d.bg(th.hover))
             .hover(|s| s.bg(th.hover))
@@ -1127,6 +1129,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let th = theme(cx).clone();
+        let density = crate::appearance::density(cx);
         let main = self.main.read(cx);
         let active = !main.is_journal() && main.page.as_ref() == Some(&page.id);
         let id = page.id.clone();
@@ -1142,7 +1145,8 @@ impl Workspace {
             .py_0p5()
             .rounded_sm()
             .cursor_pointer()
-            .text_size(px(crate::theme::BODY_SIZE))
+            .text_size(px(density.text_size()))
+            .line_height(px(density.line_height()))
             .text_color(if active { th.accent } else { th.text })
             .when(active, |d| d.bg(th.hover))
             .hover(|s| s.bg(th.hover))

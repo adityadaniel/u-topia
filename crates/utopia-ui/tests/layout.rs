@@ -915,5 +915,38 @@ fn month_strip_is_a_quiet_seven_column_grid(cx: &mut TestAppContext) {
     let cell = bounds_of(cx, "cal-2026-10-30".into());
     cx.simulate_click(cell.center(), gpui::Modifiers::default());
     let day = NaiveDate::from_ymd_opt(2026, 10, 30).unwrap();
-    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(PageId::for_date(day)));
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(PageId::for_date(day))
+    );
+}
+
+/// ALL-5 in the sidebar: Compact density tightens the journal and page rows too, so the
+/// redesign does not leave one list at the comfortable size.
+#[gpui::test]
+fn compact_density_tightens_sidebar_rows(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| {
+        s.create_page("Alpha").unwrap();
+    });
+    cx.simulate_keystrokes("escape");
+    let before = bounds_of(cx, "page-row-0".into());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("settings.json"),
+        r#"{"version": 1, "density": "compact"}"#,
+    )
+    .unwrap();
+    cx.update(|_, cx| {
+        utopia_ui::appearance::install(cx, dir.path());
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("ui-density-compact").is_some(),
+        "the workspace was drawn again in Compact"
+    );
+    let after = bounds_of(cx, "page-row-0".into());
+    assert!(
+        after.size.height < before.size.height,
+        "a page row is shorter in Compact: {before:?} {after:?}"
+    );
 }
