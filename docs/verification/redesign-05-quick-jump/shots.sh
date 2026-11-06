@@ -10,7 +10,7 @@
 # Then look at every PNG before using it (AGENTS.md, "Verifying a change").
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
-cd "$here/../.."
+cd "$here/../../.."   # repo root: `here` is docs/verification/<branch>`
 out=target/redesign-05
 mkdir -p "$out/config"
 
@@ -23,12 +23,11 @@ script="
 wait 1200; keys escape; wait 300;
 keys cmd-k; wait 700; shot $here/01-empty.png;
 type atl; wait 500; shot $here/02-typed.png;
-keys cmd-a; type Atlas; wait 500; shot $here/03-create.png;
-keys cmd-a; type >today; wait 500; shot $here/04-commands.png;
+keys cmd-a; type >; wait 600; shot $here/03-commands.png;
 keys escape; wait 300;
 keys cmd-k; type atlas; wait 500; keys enter; wait 900;
-keys cmd-k; wait 700; shot $here/05-empty-recents.png;
-keys cmd-a; type operations; wait 500; shot $here/06-tag-page.png;
+keys cmd-k; wait 700; shot $here/04-empty-recents.png;
+keys cmd-a; type operations; wait 500; shot $here/05-tag-page.png;
 keys escape; wait 300
 "
 

@@ -2,35 +2,26 @@
 
 Branch: `redesign/05-quick-jump` (based on `redesign/00-foundations`).
 
-## What to look for
+Captured with `shots.sh` on 2026-11-06, on the seeded scratch graph (`seed.json` through
+`import-roam`), window 2560×1704, downscaled to 1200 px. Every shot was read before it was
+committed.
 
-| Shot | Idea | What it proves |
-|---|---|---|
-| `01-empty.png` | QJ-1 | Nothing typed: Today, then Yesterday, each with a day icon and its type label. No create row, no matches. |
-| `02-typed.png` | QJ-2, QJ-4 | A page row with the page icon and the type label "Page"; the typed letters are semibold inside the result. |
-| `03-create.png` | QJ-2 | "Create …" is the last row, in the accent colour, under its own hairline, while the matching page stays a result above it. |
-| `04-commands.png` | QJ-5 | After `>`, the actions from `actions::CATALOG` with their keys, in catalog order. |
-| `05-empty-recents.png` | QJ-1 | Today, Yesterday and the page opened last, offered before typing. |
-| `06-tag-page.png` | QJ-2 | A page only a `#tag` ever reached gets the `#` icon and the label "Tag". |
-| `before-quick-jump.png` | — | The previous palette, from `crates/utopia-ui/assets/help/quick-jump.png`: flat rows, a create row that looked like a result, no footer. |
+| File | What it proves |
+|---|---|
+| `before-quick-jump.png` | The old palette, from `crates/utopia-ui/assets/help/quick-jump.png`: flat rows, a create row that looked like a result, no footer. |
+| `01-empty.png` | QJ-1, QJ-3: with nothing typed the palette offers today and yesterday — day dot, date, and "Today"/"Yesterday" as the type label — with the key-hint footer under a hairline. The page behind is exactly where it was. |
+| `02-typed.png` | QJ-2, QJ-4, QJ-3: typing `atl` gives a page row (document icon, "Page" label) with the typed letters semibold, and "＋ Create \"atl\"" last, in the accent colour, under its own hairline; footer visible. |
+| `03-commands.png` | QJ-5: a leading `>` lists `actions::CATALOG` with the keys in force (⇧⌘D, ⇧⌘T, ⇧⌘Y, ⌘[, ⌘], ⌘K, ⇧⌘F, ⌥⌘↓ …). Window commands are dark; editor commands (`Zoom In To Block`, `New Block`, …) are greyed out because no block is in edit, so Enter cannot run them. The list is clipped at the palette's height cap and scrolls, the footer stays put. |
+| `04-empty-recents.png` | QJ-1: after opening `Atlas Launch`, it is the third row under today and yesterday, with a page icon and "Page". The page behind did not move. |
+| `05-tag-page.png` | QJ-2: `operations` — a page only a `#tag` ever reached — gets the purple `#` icon and the type label "Tag". |
 
-QJ-3 (the footer of key hints: "↑↓ move · ↩ open · ⌘↩ open in split · esc") is visible
-at the bottom of every palette shot.
+The review fixes are visible in these shots: character-boundary highlighting (02; non-ASCII
+titles are covered by `quick_jump::tests::match_ranges_stay_on_char_boundaries`), the
+greyed-out editor commands and the scrolling list (03), the live recent list (04), and the
+keys in force (03 shows the catalog defaults; `settings.rs` covers a rebinding).
 
-## Status: shots not captured — the screen was locked
+## Still stale
 
-`docs/verification/redesign-05-quick-jump/shots.sh` is the capture script. On the machine
-this branch was written on the login session stayed locked for the whole session
-(`CGSSessionScreenIsLocked = true`), and a locked screen makes a window capture black —
-all five PNGs came out uniformly black (checked, not assumed), so they were deleted rather
-than committed as false evidence. Run `shots.sh` with the screen unlocked and read every
-PNG before merging; the layout is otherwise covered by
-`crates/utopia-ui/tests/layout.rs` (row order, gutter, right-aligned type labels, palette
-height cap, Compact density, layout stability) and by `crates/utopia-ui/tests/workspace.rs`
-(empty state opens today and a recent page, tag-page labelling, `>` commands running).
-
-## Also stale
-
-`crates/utopia-ui/assets/help/quick-jump.png` (Settings → Help) shows the old palette and is
-embedded with `include_bytes!`. Rerun `cargo run -p xtask -- help-shots` once every redesign
-screen has landed, so the Help tour is regenerated once rather than per branch.
+`crates/utopia-ui/assets/help/quick-jump.png` (Settings → Help) still embeds the old palette.
+Rerun `cargo run -p xtask -- help-shots` once every redesign screen has landed, so the Help
+tour is regenerated once rather than per branch.
