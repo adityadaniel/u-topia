@@ -1852,3 +1852,71 @@ fn sync_dot_turns_amber_when_an_exchange_starts(cx: &mut TestAppContext) {
         "the in-flight dot was never painted"
     );
 }
+
+/// SB-2 under the §15.1 budget: the tag-page classification is published by the commit
+/// that changes the index, so an edit (and the index update after its flush) never runs the
+/// whole-graph query on the UI thread.
+#[gpui::test]
+fn an_edit_does_not_classify_tag_pages_on_the_ui_thread(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("tags.utopia")).unwrap();
+    store.set_today(Some(today()));
+    // "atlas" has no blocks of its own and is reached only through a hashtag.
+    store.create_page("atlas").unwrap();
+    let notes = store.create_page("Notes").unwrap();
+    let block = store.ensure_first_block(&notes).unwrap();
+    store
+        .set_block_text(&notes, &block, "Wrote about #atlas", None, None)
+        .unwrap();
+    store.commit_block(&notes, &block).unwrap();
+    store.sync_index().unwrap();
+
+    let app = cx.new(|_| AppState::new(store));
+    assert_eq!(
+        app.update(cx, |app, _| app.tag_pages.len()),
+        1,
+        "atlas is a tag page at startup"
+    );
+    // AppState classifies once at startup; after that the commit publishes the answer.
+    let scans = app.update(cx, |app, _| app.store.tag_page_scans());
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app.clone(), window, cx));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(notes.clone(), None, Some(block.clone()), false, window, cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_input("!");
+    cx.run_until_parked();
+    app.update(cx, |app, cx| app.flush_now(cx));
+    app.update(cx, |app, _| app.store.sync_index().unwrap());
+    cx.run_until_parked();
+    assert_eq!(
+        app.update(cx, |app, _| app.store.tag_page_scans()),
+        scans,
+        "typing and the index update did not re-classify on this thread"
+    );
+    assert_eq!(
+        app.update(cx, |app, _| app.tag_pages.len()),
+        1,
+        "the set published by the commit is current"
+    );
+
+    // A change that drops the hashtag is published as well.
+    app.update(cx, |app, cx| {
+        app.store
+            .set_block_text(&notes, &block, "Wrote about [[atlas]]", None, None)
+            .unwrap();
+        app.store.commit_block(&notes, &block).unwrap();
+        app.flush_now(cx);
+    });
+    app.update(cx, |app, _| app.store.sync_index().unwrap());
+    cx.run_until_parked();
+    assert!(
+        app.update(cx, |app, _| app.tag_pages.is_empty()),
+        "a plain link is not a hashtag-only page"
+    );
+    assert_eq!(app.update(cx, |app, _| app.store.tag_page_scans()), scans);
+}
