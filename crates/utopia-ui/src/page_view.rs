@@ -445,11 +445,31 @@ impl PageView {
         cx: &mut Context<Self>,
     ) {
         self.rebuild_if_dirty(cx);
-        let row = self.items.iter().find_map(|i| match i {
-            Item::Row(r) if r.block == *block => Some(r.page.clone()),
-            _ => None,
-        });
-        if let Some(page) = row {
+        let page = self
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Row(r) if r.block == *block => Some(r.page.clone()),
+                _ => None,
+            })
+            .or_else(|| {
+                // PG-1: a compact attribute row — or a block hidden under one — has no Row
+                // until it is the editor's target. Find the page that holds it so `edit` can
+                // open the attribute's path around it (search results, backlinks, undo).
+                let pages: Vec<PageId> = match &self.journal {
+                    Some(j) => j.days.clone(),
+                    None => self.page.iter().cloned().collect(),
+                };
+                pages.into_iter().find(|p| {
+                    self.app.update(cx, |app, _| {
+                        app.store
+                            .page_state(p)
+                            .ok()
+                            .is_some_and(|st| st.is_live(block))
+                    })
+                })
+            });
+        if let Some(page) = page {
             self.edit(page, block.clone(), offset, None, window, cx);
         }
     }
@@ -464,17 +484,24 @@ impl PageView {
         cx: &mut Context<Self>,
     ) {
         self.rebuild_if_dirty(cx);
-        // PG-1 folds an attribute block to one compact row; editing it must open it again,
-        // or the editor would have no row to live in.
-        let folded = self
-            .items
-            .iter()
-            .any(|i| matches!(i, Item::Attribute { block: b, .. } if *b == block));
-        if self.row_index(&block).is_none() && !folded {
-            // Not editable here (e.g. the zoom root shown as the header): stop editing
-            // rather than focus an editor no row renders.
-            self.editor.update(cx, |e, cx| e.end(cx));
-            return;
+        let drawn = self.row_index(&block).is_some();
+        if !drawn {
+            // Not drawn right now: a compact attribute row or a block hidden under one
+            // (PG-1). Start the edit anyway and rebuild below, which opens the attribute's
+            // path around the editor. A block this view cannot draw at all — the zoom root,
+            // which the header shows instead, or one that is not on this page — still ends
+            // the edit, so focus is never stranded on an element nothing renders.
+            let zoom_root = self.zoom.as_ref() == Some(&block);
+            let live_here = self.app.update(cx, |app, _| {
+                app.store
+                    .page_state(&page)
+                    .ok()
+                    .is_some_and(|st| st.is_live(&block))
+            });
+            if zoom_root || !live_here {
+                self.editor.update(cx, |e, cx| e.end(cx));
+                return;
+            }
         }
         let host = cx.entity_id();
         self.editor.update(cx, |e, cx| {
@@ -490,15 +517,18 @@ impl PageView {
                 cx,
             )
         });
-        if folded {
-            // Rebuild with the edit target set, so this block is drawn as a row again and
-            // its editor keeps the keystrokes (a focused element that is not rendered gets
-            // none).
+        if !drawn {
+            // Rebuild with the edit target set, so the folded attribute opens and this
+            // block gets a row that can hold the editor (a focused element that is not
+            // rendered gets no keystrokes).
             self.rebuild(cx);
         }
         self.splice_items(self.items.len(), cx);
-        if let Some(ix) = self.row_index(&block) {
-            self.list.scroll_to_reveal_item(ix);
+        match self.row_index(&block) {
+            Some(ix) => self.list.scroll_to_reveal_item(ix),
+            // Still no row (an ordinary collapsed ancestor hides it): stop rather than keep
+            // an editor whose focus handle is not drawn.
+            None => self.editor.update(cx, |e, cx| e.end(cx)),
         }
         cx.notify();
     }
@@ -1173,19 +1203,19 @@ impl PageView {
         }
     }
 
-    /// Put the caret back where an undo/redo says, if that block is shown here.
+    /// Put the caret back where an undo/redo says, if that block can be shown here.
     pub fn restore_caret(&mut self, caret: &Caret, window: &mut Window, cx: &mut Context<Self>) {
         self.rebuild(cx);
-        if self.row_index(&caret.block).is_some() {
-            self.edit(
-                caret.page.clone(),
-                caret.block.clone(),
-                Some(caret.offset),
-                None,
-                window,
-                cx,
-            );
-        }
+        // `edit` opens a folded attribute's path when needed, and declines a block this view
+        // cannot draw.
+        self.edit(
+            caret.page.clone(),
+            caret.block.clone(),
+            Some(caret.offset),
+            None,
+            window,
+            cx,
+        );
     }
 
     fn apply_plan(&mut self, page: &PageId, plan: Plan, cx: &mut Context<Self>) -> Option<Focus> {

@@ -1160,3 +1160,66 @@ fn backspace_merges_into_the_previous_visible_row(cx: &mut TestAppContext) {
         "the hidden child under the attribute is untouched"
     );
 }
+
+/// Finding 3: opening a block through the public focus path (search, query, backlink) works
+/// for a root attribute that Compact draws as one row.
+#[gpui::test]
+fn opening_a_compact_attribute_target_focuses_it(cx: &mut TestAppContext) {
+    use utopia_ui::appearance::AttributeBlocks;
+    let dir = tempfile::tempdir().unwrap();
+    let (cx, ids) = setup_attribute_tree(cx, dir.path(), AttributeBlocks::Compact);
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(
+            w.main_page(cx).expect("a page"),
+            None,
+            Some(ids[0].clone()),
+            false,
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.simulate_input("!");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        block_text(cx, &ids[0]),
+        "status:: x!",
+        "the attribute block was focused and took the keystroke"
+    );
+}
+
+/// Finding 3, the hidden case: a descendant of a compact attribute is revealed with it.
+#[gpui::test]
+fn opening_a_hidden_descendant_reveals_and_focuses_it(cx: &mut TestAppContext) {
+    use utopia_ui::appearance::AttributeBlocks;
+    let dir = tempfile::tempdir().unwrap();
+    let (cx, ids) = setup_attribute_tree(cx, dir.path(), AttributeBlocks::Compact);
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(
+            w.main_page(cx).expect("a page"),
+            None,
+            Some(ids[1].clone()),
+            false,
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.simulate_input(">");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        block_text(cx, &ids[1]),
+        "hidden child>",
+        "the descendant under a compact attribute is reachable"
+    );
+}
