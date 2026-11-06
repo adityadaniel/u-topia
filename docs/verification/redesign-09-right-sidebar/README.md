@@ -51,13 +51,19 @@ paragraph), *Reading*, and today's daily page (three references between them).
   the next commit that re-resolves its links (the app recreates the page then, by design —
   FR-4.14). Scripted deletion through the page menu did not take, so only the empty state is
   captured; the button is covered by `unresolved_references_can_be_created_from_the_sidebar`.
-- **A drag of the resize handle and a folded card.** `UTOPIA_SHOT_SCRIPT` has no drag step and
-  its clicks on the card headers did not register in the run that was captured, so the folded
-  card and the drag are proven by their tests only. `after-stacked-cards.png` shows the two
-  card headers that carry the arrow and the ×.
+- **A drag of the resize handle and a folded card.** `UTOPIA_SHOT_SCRIPT` has no drag step, and
+  its clicks on the card headers, the fold arrow, the pin control and the reference rows did not
+  register in the runs captured here — so those states are proven by their tests only.
+  `after-stacked-cards.png` shows the two card headers that carry the arrow and the ×.
 - **Dark mode**: the system appearance was left unchanged.
 
-One harness note for the next screen: a click into the sidebar lands on the page title's stale
-hitbox if the sidebar is opened *after* the page; opening the sidebar first (then the page)
-makes the click land where the PNG says. Coordinates are content points: half the Retina
-pixels and minus the 28 pt title bar.
+Harness notes for the next screen, both found while capturing this one:
+
+- Coordinates are content points: half the Retina pixels, minus the 28 pt title bar. The window
+  frame in this session was `(640, 278) 1280x852`, content `1280x820`.
+- A click into the sidebar lands on the *page title's* stale hitbox if the sidebar is opened
+  after the page; opening the sidebar first (then the page) makes it land where the PNG says.
+- Even then, a click registered in some runs and missed in the next with the window in the same
+  place (the pointer moved, so the hover style followed it, but no handler ran). Only the
+  Outline capture here came from a click that took. The same clicks pass under the test
+  platform, so this is the AppKit event path, not the widgets.
