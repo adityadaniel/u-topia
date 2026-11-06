@@ -1000,3 +1000,133 @@ fn a_compact_attribute_row_opens_the_block_for_editing(cx: &mut TestAppContext) 
         );
     });
 }
+
+/// A page whose first root is an attribute with one child, followed by an ordinary note.
+/// In Compact (the default) the attribute is one row and its child is hidden with it.
+fn setup_attribute_tree<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &std::path::Path,
+    pref: utopia_ui::appearance::AttributeBlocks,
+) -> (&'a mut VisualTestContext, Vec<utopia_core::BlockId>) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    use utopia_store::EditOpts;
+    let path = dir.to_path_buf();
+    let key = pref.key();
+    std::fs::write(
+        dir.join("settings.json"),
+        format!("{{\"version\": 1, \"attribute-blocks\": \"{key}\"}}\n"),
+    )
+    .unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+        utopia_ui::appearance::install(cx, &path);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = store.create_page("Trellis").unwrap();
+    let attr = BlockId::new();
+    let child = BlockId::new();
+    let note = BlockId::new();
+    store
+        .execute(
+            &page,
+            vec![
+                Command::InsertBlock {
+                    id: attr.clone(),
+                    parent: None,
+                    after: None,
+                    text: "status:: x".into(),
+                    kind: BlockKind::Bullet,
+                },
+                Command::InsertBlock {
+                    id: child.clone(),
+                    parent: Some(attr.clone()),
+                    after: None,
+                    text: "hidden child".into(),
+                    kind: BlockKind::Bullet,
+                },
+                Command::InsertBlock {
+                    id: note.clone(),
+                    parent: None,
+                    after: Some(attr.clone()),
+                    text: "note".into(),
+                    kind: BlockKind::Bullet,
+                },
+            ],
+            EditOpts {
+                no_undo: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    (cx, vec![attr, child, note])
+}
+
+/// A page's block text by id (any depth).
+fn block_text(cx: &mut VisualTestContext, block: &utopia_core::BlockId) -> String {
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let app = ws.update(cx, |w, _| w.app().clone());
+    let page = ws.update(cx, |w, cx| w.main_page(cx)).expect("a page");
+    app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).expect("page state");
+        st.block(block).map(|b| b.text.clone()).unwrap_or_default()
+    })
+}
+
+/// Finding 1: switching to Compact rows while a descendant of an attribute is being edited
+/// must keep that whole ancestor path drawn, or the editor loses its row and its keystrokes.
+#[gpui::test]
+fn switching_to_compact_keeps_the_edited_descendant_rendered(cx: &mut TestAppContext) {
+    use utopia_ui::appearance::{self, AttributeBlocks};
+    let dir = tempfile::tempdir().unwrap();
+    let (cx, ids) = setup_attribute_tree(cx, dir.path(), AttributeBlocks::Blocks);
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(
+            w.main_page(cx).expect("a page"),
+            None,
+            Some(ids[1].clone()),
+            false,
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.simulate_input(">");
+    assert_eq!(block_text(cx, &ids[1]), "hidden child>", "the editor works");
+
+    // Settings → Appearance → Compact rows, while the child is still being edited.
+    cx.update(|_, cx| {
+        appearance::set_attribute_blocks(cx, AttributeBlocks::Compact).unwrap();
+    });
+    cx.run_until_parked();
+
+    cx.simulate_input("!");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        block_text(cx, &ids[1]),
+        "hidden child>!",
+        "keystrokes still reach the edited block after the switch"
+    );
+    assert_eq!(
+        block_text(cx, &ids[2]),
+        "note",
+        "and they went into the block being edited, not another"
+    );
+}

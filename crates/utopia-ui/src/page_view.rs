@@ -2987,6 +2987,34 @@ impl PageView {
     }
 }
 
+/// PG-1 folds a root `key:: value` block into one compact row and hides its children, so
+/// its subtree is not drawn. The subtree holding `editing` stays open: the row that holds
+/// the editor — and its focus handle — must always be rendered, or every keystroke after
+/// the fold is lost (AGENTS.md, "the list keeps rendering the row being edited").
+///
+/// This is the one answer to "is this attribute drawn folded", used by the renderer and by
+/// anything that asks which row the user can see (Backspace's merge, FR-2.5).
+fn is_folded_attribute(
+    st: &utopia_core::PageState,
+    compact: bool,
+    editing: Option<&BlockId>,
+    id: &BlockId,
+) -> bool {
+    if !compact || st.depth(id) != 0 {
+        return false;
+    }
+    let Some(block) = st.block(id) else {
+        return false;
+    };
+    if utopia_core::inline::attribute(&block.text).is_none() {
+        return false;
+    }
+    match editing {
+        Some(active) => active != id && !st.ancestors(active).contains(id),
+        None => true,
+    }
+}
+
 /// Push a page's visible rows, folding each root `key:: value` attribute block into one
 /// compact row (PG-1) when `compact_attributes`. The block and its subtree stay in the
 /// shard; folding is only what this frame draws, and the "…" says children went with it.
@@ -3009,8 +3037,7 @@ fn push_page_rows(
         }
         folded = None;
         let Some(b) = st.block(&id) else { continue };
-        // The block being edited is never folded: its row has to hold the editor.
-        if compact_attributes && depth == 0 && editing != Some(&id) {
+        if compact_attributes && is_folded_attribute(st, true, editing, &id) {
             if let Some((key, value)) = utopia_core::inline::attribute(&b.text) {
                 let children = st.live_children(Some(&id)).len();
                 out.push(Item::Attribute {
