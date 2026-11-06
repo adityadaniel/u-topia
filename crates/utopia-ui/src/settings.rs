@@ -17,8 +17,8 @@
 //! Cmd+Q would quit the app mid-edit.
 
 use gpui::{
-    div, img, prelude::*, px, AnyWindowHandle, App, Context, FocusHandle, Focusable, FontWeight,
-    Keystroke, SharedString, Subscription, Window,
+    div, img, prelude::*, px, AnyWindowHandle, App, Context, Div, FocusHandle, Focusable,
+    FontWeight, Keystroke, SharedString, Subscription, Window,
 };
 use std::path::PathBuf;
 
@@ -27,10 +27,12 @@ use crate::actions::{
 };
 use crate::appearance::{self, Density, UiFont};
 use crate::help::{shot_image, TOPICS};
-use crate::theme::{quiet_control, theme};
+use crate::theme::{quiet_control, theme, Theme};
 
-/// Help prose stops at a readable line length, like the page column does.
-const HELP_WIDTH: f32 = 720.;
+/// Every pane is set in one readable column (ST-1), like the page column does.
+const CONTENT_WIDTH: f32 = 720.;
+/// Help prose stops at the same readable line length.
+const HELP_WIDTH: f32 = CONTENT_WIDTH;
 /// Screenshots are shown at a fixed size. gpui derives an image's aspect ratio from the
 /// decoded bytes, but that lands a frame after layout, so a width alone leaves the element
 /// at its intrinsic height; giving both keeps the box the right shape from the first frame.
@@ -400,29 +402,99 @@ impl Render for SettingsView {
     }
 }
 
+/// A card (ST-1): one per category, a hairline border on the page's surface.
+fn card(th: &Theme) -> Div {
+    div()
+        .w_full()
+        .max_w(px(CONTENT_WIDTH))
+        .mx_auto()
+        // A card is as tall as its rows; the pane scrolls instead of squeezing it.
+        .flex_shrink_0()
+        .rounded_lg()
+        .border_1()
+        .border_color(th.line)
+        .bg(th.surface)
+        .overflow_hidden()
+}
+
+/// The caption at the top of a card.
+fn card_title(th: &Theme, label: &str) -> Div {
+    div()
+        .px_4()
+        .pt_3()
+        .pb_1p5()
+        .text_size(px(crate::theme::CAPTION_SIZE))
+        .text_color(th.faint)
+        .font_weight(FontWeight::MEDIUM)
+        .child(label.to_string())
+}
+
+/// One row inside a card: the hairline between rows is the point of ST-1.
+fn card_row<E: Styled + gpui::prelude::FluentBuilder>(
+    row: E,
+    i: usize,
+    th: &Theme,
+    density: Density,
+) -> E {
+    row.px_4()
+        .py(px(if density == Density::Compact { 7. } else { 11. }))
+        .when(i > 0, |d| d.border_t_1().border_color(th.line))
+}
+
+/// The scroll region every pane shares: one centred readable column.
+fn pane(id: &'static str, selector: &'static str) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || selector.into())
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .px_6()
+        .py_5()
+        .gap_4()
+}
+
+/// A child of [`pane`]: fills the pane, but never past the readable width.
+fn column() -> Div {
+    div()
+        .w_full()
+        .max_w(px(CONTENT_WIDTH))
+        .mx_auto()
+        .flex_shrink_0()
+}
+
+/// A drawn radio mark: "●"/"○" would come from whichever font is in force, and IBM Plex
+/// Sans has neither, so the fallback drew them at another size.
+fn radio(on: bool, th: &Theme) -> Div {
+    div()
+        .size(px(14.))
+        .flex_none()
+        .rounded_full()
+        .border_1()
+        .border_color(if on { th.accent } else { th.faint })
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(on, |d| {
+            d.child(div().size(px(8.)).rounded_full().bg(th.accent))
+        })
+}
+
 impl SettingsView {
     fn render_keybindings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
+        let density = appearance::density(cx);
         let conflicts = self.overrides.conflicts();
         let changed = self.overrides.0.len();
 
-        let mut list = div()
-            .id("settings-keys")
-            .debug_selector(|| "settings-keys".into())
-            .flex()
-            .flex_col()
-            .flex_1()
-            .overflow_y_scroll()
-            .px_4()
-            .py_3()
-            .gap_1();
-
-        list = list.child(
-            div()
+        let mut list = pane("settings-keys", "settings-keys").child(
+            column()
                 .flex()
                 .items_center()
                 .justify_between()
-                .pb_2()
+                .gap_4()
                 .child(
                     div()
                         .text_size(px(crate::theme::CAPTION_SIZE))
@@ -445,7 +517,7 @@ impl SettingsView {
 
         for (a, b) in &conflicts {
             list = list.child(
-                div()
+                column()
                     .px_3()
                     .py_1()
                     .rounded_md()
@@ -462,28 +534,22 @@ impl SettingsView {
         }
 
         for &c in Category::all() {
-            let mut any = false;
-            let mut section = div().flex().flex_col().pt_3().gap_0p5();
-            section = section.child(
-                div()
-                    .pb_1()
-                    .text_size(px(crate::theme::CAPTION_SIZE))
-                    .text_color(th.faint)
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(c.label()),
-            );
-            for d in by_category(c) {
-                any = true;
-                section = section.child(self.render_key_row(d, cx));
+            let rows: Vec<_> = by_category(c).collect();
+            if rows.is_empty() {
+                continue;
             }
-            if any {
-                list = list.child(section);
+            let mut section = card(&th)
+                .debug_selector(move || format!("settings-card-{}", c.label()))
+                .child(card_title(&th, c.label()));
+            for (i, d) in rows.iter().enumerate() {
+                section = section.child(card_row(self.render_key_row(d, cx), i, &th, density));
             }
+            list = list.child(section);
         }
         list
     }
 
-    fn render_key_row(&self, d: &'static ActionDoc, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_key_row(&self, d: &'static ActionDoc, cx: &mut Context<Self>) -> Div {
         let th = theme(cx).clone();
         let capturing = self.capturing.map(|c| c.action) == Some(d.action);
         let keys = self.overrides.keys_for(d);
@@ -510,207 +576,194 @@ impl SettingsView {
         div()
             .debug_selector(move || format!("settings-row-{}", d.action))
             .flex()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .px_3()
-            .py_1p5()
-            .rounded_md()
+            .flex_col()
             .hover(|x| x.bg(th.hover))
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .flex_1()
-                    .child(div().child(d.label))
-                    .child(
-                        div()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.muted)
-                            .child(d.help),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
                     .items_center()
-                    .gap_2()
-                    .child(chip)
+                    .justify_between()
+                    .gap_4()
                     .child(
-                        quiet_control(
-                            SharedString::from(format!("change-{}", d.action)),
-                            if capturing { "Cancel" } else { "Change" },
-                            &th,
-                        )
-                        .debug_selector(move || format!("settings-change-{}", d.action))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                if this.capturing.map(|c| c.action) == Some(d.action) {
-                                    this.cancel_capture();
-                                    cx.notify();
-                                } else {
-                                    this.start_capture(d, window, cx);
-                                }
-                            },
-                        )),
-                    )
-                    .children(changed.then(|| {
                         div()
-                            .id(SharedString::from(format!("reset-{}", d.action)))
-                            .debug_selector(move || format!("settings-reset-{}", d.action))
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.accent)
-                            .cursor_pointer()
-                            .hover(|x| x.bg(th.hover))
-                            .child("Reset")
-                            .on_click(cx.listener(move |this, _, _, cx| this.reset_one(d, cx)))
-                    })),
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .child(div().child(d.label))
+                            .child(
+                                div()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
+                                    .text_color(th.muted)
+                                    .child(d.help),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(chip)
+                            .child(
+                                quiet_control(
+                                    SharedString::from(format!("change-{}", d.action)),
+                                    if capturing { "Cancel" } else { "Change" },
+                                    &th,
+                                )
+                                .debug_selector(move || format!("settings-change-{}", d.action))
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        if this.capturing.map(|c| c.action) == Some(d.action) {
+                                            this.cancel_capture();
+                                            cx.notify();
+                                        } else {
+                                            this.start_capture(d, window, cx);
+                                        }
+                                    },
+                                )),
+                            )
+                            .children(changed.then(|| {
+                                div()
+                                    .id(SharedString::from(format!("reset-{}", d.action)))
+                                    .debug_selector(move || format!("settings-reset-{}", d.action))
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
+                                    .text_color(th.accent)
+                                    .cursor_pointer()
+                                    .hover(|x| x.bg(th.hover))
+                                    .child("Reset")
+                                    .on_click(
+                                        cx.listener(move |this, _, _, cx| this.reset_one(d, cx)),
+                                    )
+                            })),
+                    ),
             )
     }
 
     /// The cheat sheet: everything bound right now, grouped the same way as the editor.
     fn render_shortcuts(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
-        let mut list = div()
-            .id("settings-shortcuts")
-            .debug_selector(|| "settings-shortcuts".into())
-            .flex()
-            .flex_col()
-            .flex_1()
-            .overflow_y_scroll()
-            .px_4()
-            .py_3();
-        list = list.child(
-            div()
-                .pb_2()
+        let density = appearance::density(cx);
+        let mut list = pane("settings-shortcuts", "settings-shortcuts").child(
+            column()
                 .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.muted)
                 .child("Every shortcut in the app, as it is bound now."),
         );
         for &c in Category::all() {
-            let rows = by_category(c).map(|d| {
-                div()
-                    .flex()
-                    .items_baseline()
-                    .justify_between()
-                    .gap_4()
-                    .py_0p5()
-                    .child(div().text_size(px(crate::theme::BODY_SIZE)).child(d.label))
-                    .child(
-                        div()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.muted)
-                            .child(pretty_keys(&self.overrides.keys_for(d))),
-                    )
-            });
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .pt_3()
-                    .child(
-                        div()
-                            .pb_1()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.faint)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(c.label()),
-                    )
-                    .children(rows),
-            );
+            let mut section = card(&th)
+                .debug_selector(move || format!("settings-card-{}", c.label()))
+                .child(card_title(&th, c.label()));
+            for (i, d) in by_category(c).enumerate() {
+                section = section.child(card_row(
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .justify_between()
+                        .gap_4()
+                        .child(div().text_size(px(crate::theme::BODY_SIZE)).child(d.label))
+                        .child(
+                            div()
+                                .text_size(px(crate::theme::CAPTION_SIZE))
+                                .text_color(th.muted)
+                                .child(pretty_keys(&self.overrides.keys_for(d))),
+                        ),
+                    i,
+                    &th,
+                    density,
+                ));
+            }
+            list = list.child(section);
         }
         list
     }
 
     fn render_appearance(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
+        let density = appearance::density(cx);
         let current = appearance::ui_font(cx);
-        let options = UiFont::ALL.iter().map(|&f| {
+
+        let mut fonts = card(&th)
+            .debug_selector(|| "settings-card-Font".into())
+            .child(card_title(&th, "Font"))
+            .child(card_row(
+                div()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(
+                        "Used for your notes and the interface, in every window, as soon \
+                         as you pick it. Code blocks stay in Menlo.",
+                    ),
+                0,
+                &th,
+                density,
+            ));
+        for (i, &f) in UiFont::ALL.iter().enumerate() {
             let on = f == current;
-            div()
-                .id(SharedString::from(format!("font-{}", f.key())))
-                .debug_selector(move || format!("settings-font-{}", f.key()))
-                .flex()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .border_1()
-                .border_color(if on { th.accent } else { th.line })
-                .when(on, |d| d.bg(th.chip_bg))
-                .cursor_pointer()
-                .hover(|x| x.bg(th.hover))
-                // A drawn radio mark: "●"/"○" would come from whichever font is in force,
-                // and IBM Plex Sans has neither, so the fallback drew them at another size.
-                .child(
-                    div()
-                        .size(px(14.))
-                        .flex_none()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(if on { th.accent } else { th.faint })
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(on, |d| {
-                            d.child(div().size(px(8.)).rounded_full().bg(th.accent))
-                        }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .child(div().child(f.label()))
-                        // Each sample in its own font, whichever one is in force.
-                        .child(
-                            div()
-                                .font_family(f.family())
-                                .text_color(th.muted)
-                                .child("Bob dug a big bog by the pond, quickly."),
-                        ),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| this.choose_font(f, cx)))
-        });
-        let options: Vec<_> = options.collect();
+            fonts = fonts.child(card_row(
+                div()
+                    .id(SharedString::from(format!("font-{}", f.key())))
+                    .debug_selector(move || format!("settings-font-{}", f.key()))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .when(on, |d| d.bg(th.chip_bg))
+                    .cursor_pointer()
+                    .hover(|x| x.bg(th.hover))
+                    .child(radio(on, &th))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .child(div().child(f.label()))
+                            // Each sample in its own font, whichever one is in force.
+                            .child(
+                                div()
+                                    .font_family(f.family())
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
+                                    .text_color(th.muted)
+                                    .child("Bob dug a big bog by the pond, quickly."),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_font(f, cx))),
+                i + 1,
+                &th,
+                density,
+            ));
+        }
+
         let current_density = appearance::density(cx);
-        let densities: Vec<_> = Density::ALL
-            .iter()
-            .map(|&d| {
-                let on = d == current_density;
-                let th = th.clone();
+        let mut densities = card(&th)
+            .debug_selector(|| "settings-card-Density".into())
+            .child(card_title(&th, "Density"))
+            .child(card_row(
+                div()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(
+                        "How much space your notes take. Local to this machine, kept in \
+                         settings.json, never synced.",
+                    ),
+                0,
+                &th,
+                density,
+            ));
+        for (i, &d) in Density::ALL.iter().enumerate() {
+            let on = d == current_density;
+            let th = th.clone();
+            densities = densities.child(card_row(
                 div()
                     .id(SharedString::from(format!("density-{}", d.key())))
                     .debug_selector(move || format!("settings-density-{}", d.key()))
                     .flex()
                     .items_center()
                     .gap_3()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if on { th.accent } else { th.line })
                     .when(on, |x| x.bg(th.chip_bg))
                     .cursor_pointer()
                     .hover(|x| x.bg(th.hover))
-                    .child(
-                        div()
-                            .size(px(14.))
-                            .flex_none()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(if on { th.accent } else { th.faint })
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(on, |x| {
-                                x.child(div().size(px(8.)).rounded_full().bg(th.accent))
-                            }),
-                    )
+                    .child(radio(on, &th))
                     .child(
                         div()
                             .flex()
@@ -729,60 +782,16 @@ impl SettingsView {
                                     }),
                             ),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.choose_density(d, cx)))
-            })
-            .collect();
-        div()
-            .id("settings-appearance")
-            .debug_selector(|| "settings-appearance".into())
-            .flex()
-            .flex_col()
-            .flex_1()
-            .overflow_y_scroll()
-            .px_4()
-            .py_3()
-            .gap_2()
-            .child(
-                div()
-                    .w_full()
-                    .max_w(px(HELP_WIDTH))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .pt_3()
-                            .pb_1()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.faint)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Font"),
-                    )
-                    .child(div().text_size(px(crate::theme::CAPTION_SIZE)).text_color(th.muted).child(
-                        "Used for your notes and the interface, in every window, as soon as \
-                         you pick it. Code blocks stay in Menlo.",
-                    ))
-                    .children(options)
-                    .child(
-                        div()
-                            .pt_4()
-                            .pb_1()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.faint)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Density"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.muted)
-                            .child(
-                                "How much space your notes take. Local to this machine, \
-                                 kept in settings.json, never synced.",
-                            ),
-                    )
-                    .children(densities),
-            )
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_density(d, cx))),
+                i + 1,
+                &th,
+                density,
+            ));
+        }
+
+        pane("settings-appearance", "settings-appearance")
+            .child(fonts)
+            .child(densities)
     }
 
     fn render_help(&mut self, cx: &mut Context<Self>) -> impl IntoElement {

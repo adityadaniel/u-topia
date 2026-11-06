@@ -193,6 +193,50 @@ fn keybindings_scroll_inside_a_short_window(cx: &mut TestAppContext) {
     );
 }
 
+/// ST-1: a pane is one centred 720 px column, one card per category, with the rows of a
+/// card touching so the hairline between them is the only separation.
+#[gpui::test]
+fn keybindings_are_a_readable_column_of_cards(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (_view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+
+    let nav = cx
+        .debug_bounds("settings-card-Navigation")
+        .expect("the Navigation card is drawn");
+    let width = f32::from(nav.size.width);
+    assert!((width - 720.).abs() < 1.5, "the column is 720 px: {nav:?}");
+    let left = f32::from(nav.origin.x);
+    let right = 1100. - left - width;
+    assert!(
+        (left - right).abs() < 2.,
+        "the column is centred: {left} left, {right} right"
+    );
+    let app = cx
+        .debug_bounds("settings-card-Application")
+        .expect("the Application card is drawn");
+    assert!(
+        (f32::from(app.origin.x) - left).abs() < 1.5
+            && (f32::from(app.size.width) - width).abs() < 1.5,
+        "every category card shares the column: {app:?}"
+    );
+
+    // Rows are stacked flush; the card's hairline separates them (no gap).
+    let today = cx.debug_bounds("settings-row-GoToday").unwrap();
+    let yesterday = cx.debug_bounds("settings-row-GoYesterday").unwrap();
+    assert!(
+        (f32::from(yesterday.origin.y) - f32::from(today.origin.y + today.size.height)).abs() < 1.,
+        "rows touch: {today:?} then {yesterday:?}"
+    );
+}
+
 /// A `keymap.json` that cannot be read must not take the window down with it (rule 11).
 #[gpui::test]
 fn a_broken_keymap_is_reported_not_fatal(cx: &mut TestAppContext) {
