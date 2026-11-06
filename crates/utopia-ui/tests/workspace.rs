@@ -406,6 +406,67 @@ fn quick_jump_marks_editor_commands_unavailable(cx: &mut TestAppContext) {
     );
 }
 
+/// QJ-1: a page that was opened and then deleted (or merged away, which tombstones the
+/// source) is skipped, and its entry does not use up one of the eight recent slots.
+#[gpui::test]
+fn quick_jump_skips_deleted_recent_pages(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    fn open(ws: &Entity<Workspace>, cx: &mut VisualTestContext, page: PageId) {
+        ws.update_in(cx, |w, window, cx| {
+            w.open(page, None, None, false, window, cx)
+        });
+    }
+    let (reading, trips) = app.update(cx, |app, _| {
+        (
+            app.store.create_page("Reading log").unwrap(),
+            app.store.create_page("Trips").unwrap(),
+        )
+    });
+    open(&ws, cx, reading.clone());
+    open(&ws, cx, trips);
+    cx.run_until_parked();
+    app.update(cx, |app, _| app.store.delete_page(&reading).unwrap());
+    // The UI store is debounced; let the writer catch up so the index is current.
+    app.update(cx, |app, _| app.store.sync_index().unwrap());
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-row-2").is_some(),
+        "the live page is offered"
+    );
+    assert!(
+        cx.debug_bounds("qj-row-3").is_none(),
+        "the deleted page is not offered"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Eight live pages behind a tombstoned one: none of the eight may be displaced, so
+    // nine downs from the top land on the oldest of them.
+    let live: Vec<PageId> = app.update(cx, |app, _| {
+        (0..8)
+            .map(|i| app.store.create_page(&format!("Page {i}")).unwrap())
+            .collect()
+    });
+    for page in &live {
+        open(&ws, cx, page.clone());
+    }
+    let doomed = app.update(cx, |app, _| app.store.create_page("Doomed").unwrap());
+    open(&ws, cx, doomed.clone());
+    cx.run_until_parked();
+    app.update(cx, |app, _| app.store.delete_page(&doomed).unwrap());
+    app.update(cx, |app, _| app.store.sync_index().unwrap());
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down down down down down down down down down enter");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(live[0].clone()),
+        "the tombstone did not take a slot"
+    );
+}
+
 #[gpui::test]
 fn query_blocks_list_results(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);

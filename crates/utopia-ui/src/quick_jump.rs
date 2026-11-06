@@ -297,8 +297,13 @@ impl JumpPalette {
                 break;
             }
             let Ok(Some(row)) = store.page_row(id) else {
-                continue; // deleted, or a draft day that was never written
+                continue; // a draft day that was never written
             };
+            // Deleted pages, and the tombstoned source of a merge, stay in `local_state`
+            // but must not be offered — nor keep a slot from a live page (QJ-1).
+            if !row.is_live() {
+                continue;
+            }
             // Today and yesterday are already the first two rows.
             if row.is_daily() && (row.daily_date == Some(today) || row.daily_date == yesterday) {
                 continue;
