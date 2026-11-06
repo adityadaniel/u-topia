@@ -936,6 +936,10 @@ fn one_palette_opens_on_pages_or_blocks(cx: &mut TestAppContext) {
         .read_with(cx, |j, _| j.preview().cloned())
         .expect("Cmd+Shift+F opens on the block");
     assert_eq!(preview.page_title, "Zebra Notes");
+    assert!(
+        !jump.read_with(cx, |j, _| j.offers_create()),
+        "block search lists existing blocks, it does not offer to create a page"
+    );
 }
 
 #[gpui::test]

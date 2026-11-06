@@ -229,7 +229,8 @@ impl JumpPalette {
                 || h.alias.as_deref().map(normalize_title) == Some(key.clone())
         }) || store.find_page(q).ok().flatten().is_some();
         let mut results: Vec<Row> = hits.into_iter().map(Row::Page).collect();
-        if !key.is_empty() && !exact {
+        // Block search lists existing blocks; only quick jump creates a page (SR-5).
+        if self.mode == PaletteMode::Pages && !key.is_empty() && !exact {
             results.push(Row::Create(q.trim().to_string()));
         }
         // A date typed in any accepted form jumps straight to its day.
@@ -285,6 +286,11 @@ impl JumpPalette {
     /// The selected block's preview (SR-4), `None` when a page row is selected.
     pub fn preview(&self) -> Option<&BlockPreview> {
         self.preview.as_ref()
+    }
+
+    /// Whether the list offers "Create page" (quick jump only; SR-5).
+    pub fn offers_create(&self) -> bool {
+        self.rows.iter().any(|r| matches!(r, Row::Create(_)))
     }
 
     fn selected_hit(&self) -> Option<&BlockHit> {
@@ -671,6 +677,7 @@ impl Render for JumpPalette {
             }
             Row::Create(t) => div()
                 .id(("qj", i))
+                .debug_selector(|| "search-create".into())
                 .px_3()
                 .py_1()
                 .rounded_sm()
