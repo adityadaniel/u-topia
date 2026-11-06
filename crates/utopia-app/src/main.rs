@@ -506,7 +506,7 @@ impl Render for Root {
                         .children(
                             error
                                 .clone()
-                                .map(|e| div().text_color(th.missing_text).child(e)),
+                                .map(|e| div().text_color(th.danger).child(e)),
                         ),
                 )
             }
@@ -546,14 +546,14 @@ impl Render for Root {
                     .children(
                         error
                             .clone()
-                            .map(|e| div().text_color(th.missing_text).child(e)),
+                            .map(|e| div().text_color(th.danger).child(e)),
                     ),
             ),
             RootState::Failed(msg) => shell
                 .flex()
                 .justify_center()
                 .items_center()
-                .child(div().text_color(th.missing_text).child(msg.clone())),
+                .child(div().text_color(th.danger).child(msg.clone())),
         }
     }
 }

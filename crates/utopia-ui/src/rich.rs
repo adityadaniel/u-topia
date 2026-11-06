@@ -143,8 +143,8 @@ impl Builder<'_> {
                         ),
                         ChipState::Missing => (
                             format!(" Missing block (({uid})) "),
-                            self.theme.missing_bg,
-                            Some(self.theme.missing_text),
+                            self.theme.danger_bg,
+                            Some(self.theme.danger),
                         ),
                         ChipState::Cyclic => (
                             " ↻ cyclic reference ".to_string(),

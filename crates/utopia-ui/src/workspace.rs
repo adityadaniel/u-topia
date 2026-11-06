@@ -1092,7 +1092,7 @@ impl Workspace {
             .flex_col()
             .bg(th.sidebar_bg)
             .border_r_1()
-            .border_color(th.border)
+            .border_color(th.line)
             .p_2()
             .child(
                 div()
@@ -1257,7 +1257,7 @@ impl Workspace {
                 .pt_2()
                 .px_2()
                 .border_t_1()
-                .border_color(th.border)
+                .border_color(th.line)
                 .text_xs()
                 .text_color(th.muted)
                 .child(format!("Local · {file}"))
@@ -1266,15 +1266,11 @@ impl Workspace {
                     Some(runner) => {
                         let (line, warn) =
                             status_line(runner.status.as_ref(), self.app.read(cx).store.now());
-                        div()
-                            .when(warn, |d| d.text_color(gpui::rgb(0xd97706)))
-                            .child(line)
+                        div().when(warn, |d| d.text_color(th.warning)).child(line)
                     }
                 })
                 .when_some(notice, |d, n| d.child(div().text_color(th.text).child(n)))
-                .when_some(err, |d, e| {
-                    d.child(div().text_color(th.missing_text).child(e))
-                }),
+                .when_some(err, |d, e| d.child(div().text_color(th.danger).child(e))),
         )
         .into_any_element()
     }
@@ -1395,7 +1391,7 @@ impl Workspace {
                     let mut row = div().flex().flex_col().px_2().py_1().child(
                         div()
                             .text_sm()
-                            .text_color(th.missing_text)
+                            .text_color(th.danger)
                             .child(label.clone()),
                     );
                     if let RefTarget::UnresolvedPage { key } = &o.target {
@@ -1462,7 +1458,7 @@ impl Workspace {
             .gap_1()
             .p_2()
             .border_t_1()
-            .border_color(th.border)
+            .border_color(th.line)
             .child(
                 div()
                     .text_xs()
@@ -1495,7 +1491,7 @@ impl Render for Workspace {
                 .pt_2()
                 .bg(th.sidebar_bg)
                 .border_r_1()
-                .border_color(th.border)
+                .border_color(th.line)
                 .child(
                     div()
                         .id("expand-left")
@@ -1561,7 +1557,7 @@ impl Render for Workspace {
                     .min_w_0()
                     .h_full()
                     .border_l_1()
-                    .border_color(th.border)
+                    .border_color(th.line)
                     .child(sp.clone()),
             );
         }
@@ -1575,9 +1571,9 @@ impl Render for Workspace {
                 .flex_none()
                 .flex()
                 .flex_col()
-                .bg(th.panel_bg)
+                .bg(th.surface)
                 .border_l_1()
-                .border_color(th.border);
+                .border_color(th.line);
             if self.panes.is_empty() && !self.inspector_open {
                 col = col.child(
                     div()
@@ -1593,7 +1589,7 @@ impl Render for Workspace {
                         .flex_1()
                         .min_h(px(140.))
                         .border_b_1()
-                        .border_color(th.border)
+                        .border_color(th.line)
                         .child(p.clone()),
                 );
             }
@@ -1610,7 +1606,7 @@ impl Render for Workspace {
                 .flex()
                 .justify_center()
                 .pt(px(90.))
-                .bg(gpui::hsla(0., 0., 0., 0.18))
+                .bg(th.scrim)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| {

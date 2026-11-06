@@ -265,7 +265,7 @@ impl Render for GraphView {
             .px_4()
             .py_2()
             .border_b_1()
-            .border_color(th.border)
+            .border_color(th.line)
             .child(div().font_weight(gpui::FontWeight::BOLD).child("Graph"))
             .child(
                 self.chip("graph-all", "All pages", !self.local, cx)
@@ -347,7 +347,7 @@ impl Render for GraphView {
                         }
                         if any_faint {
                             if let Ok(p) = faint.build() {
-                                window.paint_path(p, th.border);
+                                window.paint_path(p, th.line);
                             }
                         }
                         if any_strong {

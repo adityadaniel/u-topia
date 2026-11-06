@@ -345,7 +345,7 @@ impl Render for SettingsView {
                     .px_4()
                     .py_3()
                     .border_b_1()
-                    .border_color(th.border)
+                    .border_color(th.line)
                     .child(div().font_weight(FontWeight::BOLD).mr_2().child("Settings"))
                     .children(tabs),
             )
@@ -356,8 +356,8 @@ impl Render for SettingsView {
                     .px_4()
                     .py_2()
                     .border_t_1()
-                    .border_color(th.border)
-                    .bg(th.panel_bg)
+                    .border_color(th.line)
+                    .bg(th.surface)
                     .text_xs()
                     .text_color(th.muted)
                     .child(s)
@@ -404,7 +404,7 @@ impl SettingsView {
                         .py_1()
                         .rounded_md()
                         .border_1()
-                        .border_color(th.border)
+                        .border_color(th.line)
                         .text_xs()
                         .text_color(th.muted)
                         .cursor_pointer()
@@ -420,9 +420,9 @@ impl SettingsView {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(th.missing_bg)
+                    .bg(th.danger_bg)
                     .text_xs()
-                    .text_color(th.missing_text)
+                    .text_color(th.danger)
                     .child(format!(
                         "{} and {} are both on {}.",
                         a.label,
@@ -510,7 +510,7 @@ impl SettingsView {
                             .py_0p5()
                             .rounded_md()
                             .border_1()
-                            .border_color(th.border)
+                            .border_color(th.line)
                             .text_xs()
                             .text_color(th.muted)
                             .cursor_pointer()
@@ -611,7 +611,7 @@ impl SettingsView {
                 .py_2()
                 .rounded_md()
                 .border_1()
-                .border_color(if on { th.accent } else { th.border })
+                .border_color(if on { th.accent } else { th.line })
                 .when(on, |d| d.bg(th.chip_bg))
                 .cursor_pointer()
                 .hover(|x| x.bg(th.hover))
@@ -757,7 +757,7 @@ impl SettingsView {
                         .h(px(HELP_SHOT_HEIGHT))
                         .rounded_md()
                         .border_1()
-                        .border_color(th.border),
+                        .border_color(th.line),
                 ),
             );
         }
@@ -787,7 +787,7 @@ impl SettingsView {
                     .flex_none()
                     .overflow_y_scroll()
                     .border_r_1()
-                    .border_color(th.border)
+                    .border_color(th.line)
                     .bg(th.sidebar_bg)
                     .px_2()
                     .py_3()

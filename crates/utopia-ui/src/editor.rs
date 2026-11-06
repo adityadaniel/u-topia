@@ -1339,9 +1339,9 @@ impl BlockEditor {
                         .mt_1()
                         .w(px(340.))
                         .p_1()
-                        .bg(th.panel_bg)
+                        .bg(th.surface)
                         .border_1()
-                        .border_color(th.border)
+                        .border_color(th.line)
                         .rounded_md()
                         .shadow_md()
                         .children(rows),
