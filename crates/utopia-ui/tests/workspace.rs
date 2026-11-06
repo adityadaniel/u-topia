@@ -715,6 +715,75 @@ fn sidebar_cards_collapse_and_close(cx: &mut TestAppContext) {
     );
 }
 
+/// RS-5 + the focus invariant in AGENTS.md: folding the card that hosts the edit must end
+/// the edit and hand the keyboard back to the workspace, because a focused element that is
+/// no longer rendered gets no keystrokes, so every shortcut would die.
+#[gpui::test]
+fn folding_an_edited_card_gives_the_keyboard_back(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (blank, card) = app.update(cx, |app, _| {
+        // The main pane shows a page with no rows, so the selectors below can only be the
+        // card's.
+        let blank = app.store.create_page("Blank").unwrap();
+        let card = app.store.create_page("Alpha").unwrap();
+        for text in ["one", "two", "three"] {
+            let st = app.store.page_state(&card).unwrap();
+            let after = st.last_child(None, true);
+            let plan = utopia_core::outline::append_block(st, after.as_ref());
+            let done = app.store.execute_plan(&card, plan, None).unwrap().unwrap();
+            app.store
+                .set_block_text(&card, &done.block, text, None, None)
+                .unwrap();
+            app.store.commit_block(&card, &done.block).unwrap();
+        }
+        app.store.sync_index().unwrap();
+        (blank, card)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(blank, None, None, false, window, cx);
+        w.open(card, None, None, true, window, cx);
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    let row = cx
+        .debug_bounds("content-3")
+        .expect("the card's third block");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        ws.update(cx, |w, cx| w.editor().read(cx).target.is_some()),
+        "clicking a block in the card started an edit there"
+    );
+
+    let fold = cx.debug_bounds("pane-collapse-0").expect("the fold arrow");
+    cx.simulate_click(fold.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        ws.update(cx, |w, cx| w.editor().read(cx).target.is_none()),
+        "folding the card ended the edit it hosted"
+    );
+
+    // The keyboard went back to the workspace: Cmd+Shift+\ still closes the sidebar, and
+    // the page takes the width back.
+    let before = cx
+        .debug_bounds("main-pane")
+        .expect("the main pane")
+        .size
+        .width;
+    cx.simulate_keystrokes("cmd-shift-\\");
+    cx.run_until_parked();
+    let after = cx
+        .debug_bounds("main-pane")
+        .expect("the main pane")
+        .size
+        .width;
+    assert!(
+        after > before,
+        "shortcuts still reach the workspace after folding: {before:?} -> {after:?}"
+    );
+}
+
 #[gpui::test]
 fn keystrokes_are_debounced_then_committed(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);

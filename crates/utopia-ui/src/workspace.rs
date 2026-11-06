@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use chrono::NaiveDate;
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Entity, FocusHandle, Focusable, MouseButton,
-    MouseDownEvent, SharedString, Subscription, Task, Window,
+    div, prelude::*, px, AnyElement, Context, Entity, EntityId, FocusHandle, Focusable,
+    MouseButton, MouseDownEvent, SharedString, Subscription, Task, Window,
 };
 use utopia_core::inline::{extract_refs, plain_text};
 use utopia_core::title::normalize_title;
@@ -999,8 +999,44 @@ impl Workspace {
         self.open_date(d.succ_opt().unwrap_or(d), false, false, window, cx);
     }
 
-    fn toggle_right(&mut self, _: &ToggleRightSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        self.right_open = !self.right_open;
+    fn toggle_right(
+        &mut self,
+        _: &ToggleRightSidebar,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.right_open {
+            self.hide_right(window, cx);
+        } else {
+            self.right_open = true;
+            cx.notify();
+        }
+    }
+
+    /// End the edit if `host` owns it and hand the keyboard back to the workspace. Hiding a
+    /// card removes its `PageView` from the window, and a focused element that is not
+    /// rendered gets no keystrokes, so every shortcut would die (AGENTS.md, §13.4).
+    fn end_edit_in(&mut self, host: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        let owned = self
+            .editor
+            .read(cx)
+            .target
+            .as_ref()
+            .is_some_and(|t| t.host == host);
+        if owned {
+            self.editor.update(cx, |e, cx| e.end(cx));
+            window.focus(&self.focus);
+        }
+    }
+
+    /// Close the sidebar, first ending any edit a stacked card hosts — the same invariant as
+    /// folding one card (RS-4, RS-5).
+    fn hide_right(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let hosts: Vec<EntityId> = self.panes.iter().map(|p| p.view.entity_id()).collect();
+        for host in hosts {
+            self.end_edit_in(host, window, cx);
+        }
+        self.right_open = false;
         cx.notify();
     }
 
@@ -2146,10 +2182,7 @@ impl Render for Workspace {
                         .cursor_pointer()
                         .hover(|d| d.bg(th.hover).text_color(th.text))
                         .child("×")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.right_open = false;
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(|this, _, window, cx| this.hide_right(window, cx))),
                 ),
             );
             if self.panes.is_empty() && !self.inspector_open {
@@ -2195,7 +2228,12 @@ impl Render for Workspace {
                                 .cursor_pointer()
                                 .hover(|d| d.text_color(th.text))
                                 .child(if collapsed { "▸" } else { "▾" })
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let host = this.panes.get(i).map(|p| p.view.entity_id());
+                                    let folding = this.panes.get(i).is_some_and(|p| !p.collapsed);
+                                    if let (true, Some(host)) = (folding, host) {
+                                        this.end_edit_in(host, window, cx);
+                                    }
                                     if let Some(pane) = this.panes.get_mut(i) {
                                         pane.collapsed = !pane.collapsed;
                                     }
@@ -2223,8 +2261,10 @@ impl Render for Workspace {
                                 .cursor_pointer()
                                 .hover(|d| d.bg(th.hover).text_color(th.text))
                                 .child("×")
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     if i < this.panes.len() {
+                                        let host = this.panes[i].view.entity_id();
+                                        this.end_edit_in(host, window, cx);
                                         this.panes.remove(i);
                                     }
                                     cx.notify();
