@@ -367,6 +367,44 @@ fn long_day_keeps_its_date_at_the_top(cx: &mut TestAppContext) {
     );
 }
 
+/// DN-3: a row that the list reveals at its top edge (arrowing past the viewport) must
+/// sit below the pinned date, so the caret is never hidden under it while typing.
+#[gpui::test]
+fn revealing_a_row_keeps_the_caret_below_the_pinned_date(cx: &mut TestAppContext) {
+    let (ws, cx) = setup_feed(cx, &[(0, 80)], H);
+    // `setup_feed` leaves editing; open the feed again with the caret in the first block.
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    for _ in 0..30 {
+        cx.simulate_keystrokes("down");
+    }
+    cx.run_until_parked();
+    // Scroll the day far past the block being edited: the next Down moves to a block above
+    // the viewport, which the list reveals at its top edge, where the pinned date is drawn.
+    // Each wheel step only reaches what the list has measured so far, so repeat.
+    for _ in 0..10 {
+        scroll_main(cx, -600.);
+    }
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    // The 31st block (item 32, after the day's heading) is the one now being edited.
+    assert_eq!(
+        ws.update(cx, |w, cx| w.editor().read(cx).field_text().to_string()),
+        "note 30"
+    );
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_sticky_day(cx)),
+        Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()),
+        "the day's date is still pinned"
+    );
+    let pin = bounds(cx, "sticky-day");
+    let row = bounds(cx, "content-32");
+    assert!(
+        row.origin.y >= pin.origin.y + pin.size.height - px(0.5),
+        "the row being edited stays below the pinned date: row {row:?}, pin {pin:?}"
+    );
+}
+
 /// DN-3 with DN-1: a folded day carries its own date in its 36 px row, so the previous
 /// day's heading is not pinned over it.
 #[gpui::test]

@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::NaiveDate;
 use gpui::{
     anchored, deferred, div, list, point, prelude::*, px, AnyElement, Context, Corner, Entity,
-    EventEmitter, FocusHandle, Focusable, ListAlignment, ListState, MouseButton, MouseDownEvent,
-    SharedString, StyledText, Subscription, Window,
+    EventEmitter, FocusHandle, Focusable, ListAlignment, ListOffset, ListState, MouseButton,
+    MouseDownEvent, SharedString, StyledText, Subscription, Window,
 };
 use utopia_core::inline::{extract_refs, plain_text};
 use utopia_core::outline::{self, Focus, Plan};
@@ -34,6 +34,9 @@ const GROUP_PREVIEW: usize = 3;
 const JOURNAL_BATCH: usize = 10;
 /// Widest the page column gets (about 95 characters of body text per line).
 const READABLE_WIDTH: f32 = 760.;
+/// Height of the pinned day heading (DN-3), fixed so that revealing a row can leave room
+/// for it: its padding, the caption line, the date line and the hairline.
+const STICKY_HEIGHT: f32 = 4. + 20. + 34. + 4. + 1.;
 
 #[derive(Debug, Clone)]
 pub enum PageViewEvent {
@@ -525,8 +528,25 @@ impl PageView {
         self.splice_items(self.items.len(), cx);
         if let Some(ix) = self.row_index(&block) {
             self.list.scroll_to_reveal_item(ix);
+            self.leave_room_for_the_pinned_day(ix);
         }
         cx.notify();
+    }
+
+    /// DN-3: an edit target above the viewport is revealed at the list's top edge, where
+    /// the pinned day heading would cover it and its caret. Put the row one heading-height
+    /// down instead, so the caret shows below the pin (the strip above it is the pin).
+    fn leave_room_for_the_pinned_day(&self, ix: usize) {
+        let top = self.list.logical_scroll_top();
+        if top.item_ix != ix || top.offset_in_item > px(0.) {
+            return;
+        }
+        if self.sticky_heading().is_some() {
+            self.list.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: -px(STICKY_HEIGHT),
+            });
+        }
     }
 
     fn row_index(&self, block: &BlockId) -> Option<usize> {
@@ -3050,6 +3070,7 @@ impl Render for PageView {
                                 .debug_selector(|| "sticky-day".into())
                                 .w_full()
                                 .max_w(px(READABLE_WIDTH))
+                                .h(px(STICKY_HEIGHT))
                                 .px_4()
                                 .pt_1()
                                 .pb_1()
@@ -3059,6 +3080,7 @@ impl Render for PageView {
                                 .child(
                                     div()
                                         .text_size(px(crate::theme::CAPTION_SIZE))
+                                        .line_height(px(20.))
                                         .text_color(if h.today { th.accent } else { th.muted })
                                         .child(h.caption.clone()),
                                 )

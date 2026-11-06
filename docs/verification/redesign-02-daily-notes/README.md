@@ -9,6 +9,7 @@ The source changes are covered by `crates/utopia-ui/tests/layout.rs`,
 - `day_captions_name_the_weekday_and_the_neighbours` (DN-2, the caption text)
 - `long_day_keeps_its_date_at_the_top` (DN-3, the pinned heading)
 - `a_folded_day_does_not_keep_the_previous_day_pinned` (DN-3 with DN-1)
+- `revealing_a_row_keeps_the_caret_below_the_pinned_date` (DN-3, keyboard navigation)
 - `opening_the_page_menu_does_not_move_the_title` etc. still pass unchanged
 
 ## Captures
@@ -40,12 +41,18 @@ step used for the hover-only hint.
 | `after-feed-top.png` | Today's caption "Friday · Today" sits above the 28 px date in the accent colour (DN-2), and nothing is pinned at the top of the feed. |
 | `after-feed-sticky.png` | Scrolled into the tail of today: its caption and date stay pinned at the top of the column with a hairline under them (DN-3), while yesterday's open day and the folded days scroll beneath. |
 | `after-feed-folded-hover.png` | Empty days after today and yesterday are one 36 px row each — "Wednesday  November 4th, 2026" and "Tuesday  November 3rd, 2026" in the muted colour — and the row under the pointer shows the faint "Click to start writing" hint (DN-1). |
+| `after-feed-reveal.png` | After arrowing down the day and scrolling past the caret, the revealed row ("Reply to the testers' thread", accent bar and caret at its left) sits **below** the pinned date instead of under it. |
 
 Verified by eye: the captions name the right weekdays for the seeded dates, today's
 caption is the accent colour while the others are muted, the folded rows are 36 px
 and stack without rules, the hint appears only on the hovered row, the pinned date
 covers the rows underneath it and stays inside the 760 px column, and no text
 overflows or clips. Text left of the pin is the feed's own rows (not duplication).
+
+The pin's height is a constant (`STICKY_HEIGHT` in `page_view.rs`, with explicit line
+heights for its two lines), because `PageView::edit` offsets a revealed row by exactly
+that much: a row the list reveals at its top edge shows one heading-height down, below
+the pin, so the caret is never hidden while typing.
 
 Not captured: dark mode (the system appearance was left unchanged) and Compact
 density (the folded row is a fixed 36 px row by design; the rest of the feed keeps
