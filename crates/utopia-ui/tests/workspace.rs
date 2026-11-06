@@ -441,22 +441,43 @@ fn sidebar_stacks_pages(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_reference_row_in_the_sidebar_opens_its_block(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);
-    let (target, source, block) = app.update(cx, |app, _| {
+    let (target, source, block, fold) = app.update(cx, |app, _| {
+        use utopia_core::{BlockId, BlockKind, Command};
         let target = app.store.create_page("Target").unwrap();
         let source = app.store.create_page("Source").unwrap();
-        let b = app.store.ensure_first_block(&source).unwrap();
+        // The referencing block sits under a folded parent, so opening it has to unfold that
+        // parent first.
+        let fold = BlockId::new();
         app.store
-            .set_block_text(
+            .execute(
                 &source,
-                &b,
-                "the note that references [[Target]]",
-                None,
-                None,
+                vec![Command::InsertBlock {
+                    id: fold.clone(),
+                    parent: None,
+                    after: None,
+                    text: "Fold".into(),
+                    kind: BlockKind::Bullet,
+                }],
+                Default::default(),
             )
             .unwrap();
-        app.store.commit_block(&source, &b).unwrap();
+        let b = BlockId::new();
+        app.store
+            .execute(
+                &source,
+                vec![Command::InsertBlock {
+                    id: b.clone(),
+                    parent: Some(fold.clone()),
+                    after: None,
+                    text: "the note that references [[Target]]".into(),
+                    kind: BlockKind::Bullet,
+                }],
+                Default::default(),
+            )
+            .unwrap();
+        app.store.set_collapsed(&fold, true).unwrap();
         app.store.sync_index().unwrap();
-        (target, source, b)
+        (target, source, b, fold)
     });
     ws.update_in(cx, |w, window, cx| {
         w.open(target, None, None, false, window, cx)
@@ -485,6 +506,10 @@ fn a_reference_row_in_the_sidebar_opens_its_block(cx: &mut TestAppContext) {
             .map(|t| t.block.clone())),
         Some(block),
         "the caret is in the block that made the reference"
+    );
+    assert!(
+        !app.read_with(cx, |app, _| app.store.is_collapsed(&fold)),
+        "its folded parent was unfolded to show the row"
     );
 }
 

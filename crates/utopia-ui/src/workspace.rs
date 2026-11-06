@@ -641,9 +641,9 @@ impl Workspace {
             });
             window.set_window_title(&format!("{title} — Utopia"));
             match focus {
-                Some(b) => self
-                    .main
-                    .update(cx, |m, cx| m.focus_block(&b, None, window, cx)),
+                // A reference row or a link can point at a block that is folded away, so
+                // reveal it rather than quietly failing to place the caret (RS-1, RS-3).
+                Some(b) => self.main.update(cx, |m, cx| m.reveal_block(&b, window, cx)),
                 None => window.focus(&self.focus),
             }
         }
