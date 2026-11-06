@@ -620,9 +620,10 @@ fn a_clash_link_reveals_a_row_in_a_tall_category(cx: &mut TestAppContext) {
     );
 }
 
-/// REVIEW finding 3: the filter may hide the clashing row; following the link must reveal it.
+/// The filter may hide the row a clash link points at; following the link must reveal it
+/// rather than only highlighting a row that is not on screen.
 #[gpui::test]
-fn repro_clash_link_reveals_a_filtered_row(cx: &mut TestAppContext) {
+fn a_clash_link_reveals_a_row_the_filter_hides(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let mut o = Overrides::default();
     o.set("GoToday", "cmd-q");

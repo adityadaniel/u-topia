@@ -402,6 +402,10 @@ impl SettingsView {
     /// ST-3: bring the row that shares this key into view and mark it, so "Also used by"
     /// leads somewhere instead of just naming the problem.
     fn jump_to(&mut self, target: &'static ActionDoc, cx: &mut Context<Self>) {
+        // The filter may be hiding the row the link points at; show it before scrolling.
+        if !self.matches(target) {
+            self.clear_filter(cx);
+        }
         self.flash = Some(target.action);
         if let Some(ix) = self.key_list_index(target.action) {
             self.keys_scroll.scroll_to_item(ix);
