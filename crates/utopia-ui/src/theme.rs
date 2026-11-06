@@ -187,6 +187,16 @@ pub const INDENT: f32 = 22.;
 /// The UI caps visual indentation; deeper blocks show a depth badge (§6.1).
 pub const MAX_VISUAL_DEPTH: usize = 12;
 
+/// The point size and line box of an outline heading (PG-3). H1 never passes 20 px, and the
+/// 28 px title stays above all three, so a heading in the outline never competes with it.
+pub fn heading_metrics(level: u8) -> (f32, f32) {
+    match level {
+        1 => (H1_SIZE, 28.),
+        2 => (H2_SIZE, 24.),
+        _ => (H3_SIZE, 22.),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +239,24 @@ mod tests {
         );
         let (text, body) = (TEXT_SIZE, BODY_SIZE);
         assert!(text == body, "the body size is the default text size");
+    }
+
+    /// PG-3: the three outline steps, each below the 28 px title and above the body, on a
+    /// line box that shrinks with them.
+    #[test]
+    fn outline_headings_step_down_from_the_title() {
+        assert_eq!((H1_SIZE, H2_SIZE, H3_SIZE), (20., 17., 15.5));
+        let mut last = TITLE_SIZE;
+        for level in 1..=3 {
+            let (size, line) = heading_metrics(level);
+            assert!(size < last && size > BODY_SIZE, "level {level}: {size}");
+            assert!(line >= size, "the line box holds level {level}: {line}");
+            last = size;
+        }
+        assert!(
+            heading_metrics(1).1 > heading_metrics(2).1
+                && heading_metrics(2).1 > heading_metrics(3).1,
+            "each heading takes less vertical room than the one above it"
+        );
     }
 }

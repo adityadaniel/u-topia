@@ -437,25 +437,35 @@ fn daily_page_menu_does_not_offer_rename(cx: &mut TestAppContext) {
     );
 }
 
-/// ALL-1: page title 28, H1 20, body 15 — measured as line boxes, since the heading used to
-/// draw at 24 px (larger than H1 and close to the title).
+/// ALL-1 / PG-3: page title 28, H1 20, H2 17, H3 15.5 — measured as line boxes, since the
+/// heading used to draw at 24 px (larger than H1 and close to the title).
 #[gpui::test]
 fn type_scale_caps_outline_headings_at_h1(cx: &mut TestAppContext) {
     let cx = setup_page(cx);
     cx.simulate_input("body");
-    cx.simulate_keystrokes("enter");
-    cx.simulate_input("Heading /head");
-    cx.run_until_parked();
-    cx.simulate_keystrokes("enter");
-    cx.run_until_parked();
-    cx.simulate_input(" one");
+    for level in 1..=3 {
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.simulate_input(&format!("h{level} /heading {level}"));
+        cx.run_until_parked();
+        // Enter takes the slash command; the next one splits the block.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+    }
     cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
     let title = bounds(cx, "page-title");
     let body = bounds(cx, "content-1");
     let h1 = bounds(cx, "content-2");
+    let h2 = bounds(cx, "content-3");
+    let h3 = bounds(cx, "content-4");
     assert!(
         title.size.height > h1.size.height,
         "the title outranks H1: {title:?} {h1:?}"
+    );
+    assert!(
+        h1.size.height > h2.size.height && h2.size.height > h3.size.height,
+        "the three heading steps descend: {h1:?} {h2:?} {h3:?}"
     );
     assert!(
         h1.size.height > body.size.height,
@@ -464,6 +474,10 @@ fn type_scale_caps_outline_headings_at_h1(cx: &mut TestAppContext) {
     assert!(
         h1.size.height <= px(utopia_ui::theme::H1_SIZE + 8.),
         "H1 is 20 px on a 28 px line, never the old 24 px: {h1:?}"
+    );
+    assert!(
+        h3.size.height >= px(utopia_ui::theme::H3_SIZE),
+        "H3 still holds its 15.5 px glyphs: {h3:?}"
     );
 }
 

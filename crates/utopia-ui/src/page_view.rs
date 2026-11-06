@@ -1523,10 +1523,10 @@ impl PageView {
         text: &str,
         row_block: &BlockId,
         row: Option<RowItem>,
+        min_h: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let th = theme(cx).clone();
-        let lh = crate::appearance::density(cx).line_height();
         let rendered = {
             let store = &self.app.read(cx).store;
             rich::render(text, &th, &mut |uid| {
@@ -1542,7 +1542,7 @@ impl PageView {
         let links = rendered.links.iter().map(|(r, _)| r.clone()).collect();
         div()
             .flex_1()
-            .min_h(px(lh))
+            .min_h(px(min_h))
             // An editable row shows the I-beam between its links; a read-only one (a query
             // or search hit) is itself clickable, so it keeps its container's pointer.
             .when(row.is_some(), |d| d.cursor_text())
@@ -1586,11 +1586,16 @@ impl PageView {
         let host = cx.entity_id();
         let editing = self.editor.read(cx).is_editing(host, &r.page, &r.block);
         let indent = r.depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT;
+        // PG-3: a heading's own line box, so H3 is not padded out to the body's 24 px.
+        let line = match r.kind {
+            BlockKind::Heading(level) => crate::theme::heading_metrics(level).1,
+            _ => lh,
+        };
         let row = r.clone();
         let content: AnyElement = if editing {
             self.editor.clone().into_any_element()
         } else {
-            self.render_rich(&r.text, &r.block, Some(row.clone()), cx)
+            self.render_rich(&r.text, &r.block, Some(row.clone()), line, cx)
         };
         let arrow = {
             let block = r.block.clone();
@@ -1725,17 +1730,11 @@ impl PageView {
                     .debug_selector(|| format!("content-{ix}"));
                 c = match r.kind {
                     BlockKind::Heading(l) => c
-                        .text_size(px(match l {
-                            1 => crate::theme::H1_SIZE,
-                            2 => crate::theme::H2_SIZE,
-                            _ => crate::theme::H3_SIZE,
-                        }))
-                        .line_height(px(match l {
-                            1 => 28.,
-                            2 => 24.,
-                            _ => 22.,
-                        }))
-                        .font_weight(gpui::FontWeight::BOLD),
+                        .text_size(px(crate::theme::heading_metrics(l).0))
+                        .line_height(px(crate::theme::heading_metrics(l).1))
+                        // PG-3: semibold, not bold. The title stays 28 px, so an outline
+                        // heading never competes with it (ALL-1).
+                        .font_weight(gpui::FontWeight::SEMIBOLD),
                     BlockKind::Quote => c
                         .border_l_2()
                         .border_color(th.faint)
@@ -2288,7 +2287,13 @@ impl PageView {
             Item::QueryHit { depth, hit } => {
                 let page = hit.page.clone();
                 let block = hit.block.clone();
-                let text = self.render_rich(&hit.text, &hit.block, None, cx);
+                let text = self.render_rich(
+                    &hit.text,
+                    &hit.block,
+                    None,
+                    crate::appearance::density(cx).line_height(),
+                    cx,
+                );
                 div()
                     .id(("query-hit", ix))
                     .pl(px(depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT + 32.))
@@ -2561,7 +2566,13 @@ impl PageView {
                     .join(" › ");
                 let page = hit.page.clone();
                 let block = hit.block.clone();
-                let text = self.render_rich(&hit.text, &hit.block, None, cx);
+                let text = self.render_rich(
+                    &hit.text,
+                    &hit.block,
+                    None,
+                    crate::appearance::density(cx).line_height(),
+                    cx,
+                );
                 div()
                     .id(("hit", ix))
                     .px_6()
