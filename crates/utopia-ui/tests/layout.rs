@@ -961,3 +961,59 @@ fn selecting_a_co_reference_chip_filters_and_fills(cx: &mut TestAppContext) {
     cx.run_until_parked();
     bounds(cx, "refs-count-2");
 }
+
+/// LR-1 review fix: the reference controls also render in the 380 px right sidebar. The
+/// filter field keeps 240 px as its preferred width but must give way instead of pushing
+/// the menu buttons past the pane.
+#[gpui::test]
+fn reference_controls_fit_the_sidebar_pane(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_ref_controls(cx);
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, None, true, window, cx)
+    });
+    let side = bounds(cx, "right-sidebar");
+    let row = bounds(cx, "refs-control-row");
+    assert!(
+        row.origin.x >= side.origin.x && row.origin.x + row.size.width <= side.right() + px(0.5),
+        "the control row stays inside the sidebar: {row:?} {side:?}"
+    );
+    let sort = bounds(cx, "refs-sort-menu-title");
+    assert!(
+        sort.origin.x + sort.size.width <= side.right() + px(0.5),
+        "the sort menu is still reachable: {sort:?} {side:?}"
+    );
+    assert!(
+        approx(
+            row.size.height,
+            f32::from(bounds(cx, "refs-date-menu-any-time").size.height)
+        ),
+        "the controls stay on one line instead of wrapping: {row:?}"
+    );
+}
+
+/// LR-1 review fix: a split pane can be narrower than the sidebar. The row must fit there
+/// too, with all three controls still on it.
+#[gpui::test]
+fn reference_controls_fit_a_narrow_split_pane(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_ref_controls(cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    ws.update_in(cx, |w, window, cx| w.open_split(target, window, cx));
+    cx.simulate_resize(size(px(900.), px(700.)));
+    cx.run_until_parked();
+    let split = bounds(cx, "split-0");
+    let row = bounds(cx, "refs-control-row");
+    assert!(
+        row.origin.x >= split.origin.x && row.origin.x + row.size.width <= split.right() + px(0.5),
+        "the control row stays inside the split: {row:?} {split:?}"
+    );
+    let filter = bounds(cx, "refs-filter");
+    assert!(
+        filter.size.width < px(240.),
+        "the field shrank to make room: {filter:?} {split:?}"
+    );
+    let sort = bounds(cx, "refs-sort-menu-title");
+    assert!(
+        sort.origin.x + sort.size.width <= split.right() + px(0.5),
+        "{sort:?} {split:?}"
+    );
+}

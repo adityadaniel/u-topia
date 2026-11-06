@@ -34,8 +34,10 @@ const GROUP_PREVIEW: usize = 3;
 const JOURNAL_BATCH: usize = 10;
 /// Widest the page column gets (about 95 characters of body text per line).
 const READABLE_WIDTH: f32 = 760.;
-/// The reference filter field's width (LR-1); it no longer stretches the whole column.
+/// The reference filter field's preferred width (LR-1); it no longer stretches the column.
 const REF_FILTER_WIDTH: f32 = 240.;
+/// The narrowest the field gets before the pane is too small to show the controls at all.
+const REF_FILTER_MIN_WIDTH: f32 = 90.;
 
 #[derive(Debug, Clone)]
 pub enum PageViewEvent {
@@ -2369,8 +2371,12 @@ impl PageView {
                     .child(
                         div()
                             .debug_selector(|| "refs-filter".into())
-                            .flex_none()
+                            // 240 px is the preferred width; in the 380 px sidebar or a
+                            // narrow split the field gives way so the menu buttons stay
+                            // reachable instead of being clipped (LR-1).
                             .w(px(REF_FILTER_WIDTH))
+                            .min_w(px(REF_FILTER_MIN_WIDTH))
+                            .whitespace_nowrap()
                             .px_2()
                             .border_1()
                             .border_color(th.line)
@@ -2381,6 +2387,7 @@ impl PageView {
                     .child(
                         div()
                             .relative()
+                            .flex_none()
                             .child(
                                 quiet_menu("date-filter", date_label, &th)
                                     .debug_selector(move || format!("refs-date-menu-{date_key}"))
@@ -2406,6 +2413,7 @@ impl PageView {
                     .child(
                         div()
                             .relative()
+                            .flex_none()
                             .child(
                                 quiet_menu("sort", sort_label, &th)
                                     .debug_selector(move || format!("refs-sort-menu-{sort_key}"))
