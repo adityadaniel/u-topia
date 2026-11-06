@@ -610,8 +610,16 @@ impl Workspace {
             cx.subscribe_in(&view, window, |this, _, e: &GraphEvent, window, cx| {
                 this.graph = None;
                 match e {
-                    GraphEvent::Open { page, sidebar } => {
-                        this.open(page.clone(), None, None, *sidebar, window, cx)
+                    GraphEvent::Open {
+                        page,
+                        sidebar,
+                        split,
+                    } => {
+                        if *split {
+                            this.open_split(page.clone(), window, cx);
+                        } else {
+                            this.open(page.clone(), None, None, *sidebar, window, cx);
+                        }
                     }
                     GraphEvent::Close => window.focus(&this.focus),
                 }

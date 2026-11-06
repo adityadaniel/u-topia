@@ -867,6 +867,81 @@ fn graph_sizes_nodes_by_links(cx: &mut TestAppContext) {
     );
 }
 
+/// GR-2: hovering a node floats its card over the canvas without moving the graph.
+#[gpui::test]
+fn graph_hover_shows_a_floating_card(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let graph = ws.update(cx, |w, _| w.graph_view()).expect("graph shown");
+    let alpha = app.update(cx, |a, _| a.store.find_page("Alpha").unwrap().unwrap());
+    let nodes = graph.update(cx, |g, _| g.node_count());
+    let i = (0..nodes)
+        .find(|&i| graph.update(cx, |g, _| g.node_page(i)) == Some(alpha.clone()))
+        .unwrap();
+    let at = graph.update(cx, |g, _| g.node_screen_pos(i)).unwrap();
+    let canvas = cx.debug_bounds("graph-canvas").unwrap();
+    cx.simulate_mouse_move(at, None, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(graph.update(cx, |g, _| g.hovered()), Some(i));
+    let card = cx.debug_bounds("graph-tooltip").expect("hover card");
+    assert!(
+        f32::from(card.size.width) > 100.,
+        "the card has a readable width"
+    );
+    assert_eq!(
+        cx.debug_bounds("graph-canvas").unwrap(),
+        canvas,
+        "the card floats; it does not move the canvas"
+    );
+    // Moving away clears the hover state (the test platform keeps old debug bounds, so
+    // assert on the view, per AGENTS.md).
+    cx.simulate_mouse_move(
+        canvas.origin + point(px(4.), px(4.)),
+        None,
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert_eq!(graph.update(cx, |g, _| g.hovered()), None);
+}
+
+/// GR-2: a plain click opens the page; ⌘-click opens it in a split.
+#[gpui::test]
+fn graph_cmd_click_opens_a_split(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let graph = ws.update(cx, |w, _| w.graph_view()).expect("graph shown");
+    let main = ws.update(cx, |w, cx| w.main_page(cx)).unwrap();
+    let alpha = app.update(cx, |a, _| a.store.find_page("Alpha").unwrap().unwrap());
+    let nodes = graph.update(cx, |g, _| g.node_count());
+    let i = (0..nodes)
+        .find(|&i| graph.update(cx, |g, _| g.node_page(i)) == Some(alpha.clone()))
+        .unwrap();
+    let at = graph.update(cx, |g, _| g.node_screen_pos(i)).unwrap();
+    let cmd = Modifiers {
+        platform: true,
+        ..Default::default()
+    };
+    cx.simulate_click(at, cmd);
+    cx.run_until_parked();
+    assert!(ws.update(cx, |w, _| w.graph_view()).is_none());
+    assert_eq!(ws.update(cx, |w, cx| w.split_pages(cx)), vec![alpha]);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(main),
+        "the main page stays put"
+    );
+}
+
 #[gpui::test]
 fn dropped_files_become_attachments(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);
