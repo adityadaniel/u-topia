@@ -758,3 +758,107 @@ fn reference_counts_sit_next_to_the_name(cx: &mut TestAppContext) {
         "right next to it: {group_count:?} {group:?}"
     );
 }
+
+/// "Atlas Launch" → heading "Risks" → a block that links to "Target", so the reference has a
+/// path above it.
+fn setup_nested_refs(
+    cx: &mut TestAppContext,
+) -> (
+    &mut VisualTestContext,
+    Entity<Workspace>,
+    PageId,
+    Vec<utopia_core::BlockId>,
+) {
+    use utopia_core::{BlockKind, Command};
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let target = store.create_page("Target").unwrap();
+    let atlas = store.create_page("Atlas Launch").unwrap();
+    let risks = utopia_core::BlockId::new();
+    let risky = utopia_core::BlockId::new();
+    store
+        .execute(
+            &atlas,
+            vec![
+                Command::InsertBlock {
+                    id: risks.clone(),
+                    parent: None,
+                    after: None,
+                    text: "Risks".into(),
+                    kind: BlockKind::Heading(2),
+                },
+                Command::InsertBlock {
+                    id: risky.clone(),
+                    parent: Some(risks.clone()),
+                    after: None,
+                    text: "The beta date depends on [[Target]]".into(),
+                    kind: BlockKind::Bullet,
+                },
+            ],
+            Default::default(),
+        )
+        .unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    (cx, ws, target, vec![risks, risky])
+}
+
+/// LR-3: a referencing block nested under "Risks" shows "Atlas Launch › Risks" as one caption
+/// line above it, and each part is its own click target.
+#[gpui::test]
+fn reference_shows_the_full_path_above_the_block(cx: &mut TestAppContext) {
+    let (cx, _, _, _) = setup_nested_refs(cx);
+    let hit = first_hit(cx);
+    cx.run_until_parked();
+    let (page, ancestor) = (0..40)
+        .find_map(|ix| {
+            let page: &'static str = Box::leak(format!("hit-path-part-{ix}-0").into_boxed_str());
+            let ancestor: &'static str =
+                Box::leak(format!("hit-path-part-{ix}-1").into_boxed_str());
+            Some((cx.debug_bounds(page)?, cx.debug_bounds(ancestor)?))
+        })
+        .expect("a path above the reference");
+    let path = cx
+        .debug_bounds("hit-path-7")
+        .or_else(|| {
+            (0..40).find_map(|ix| {
+                let sel: &'static str = Box::leak(format!("hit-path-{ix}").into_boxed_str());
+                cx.debug_bounds(sel)
+            })
+        })
+        .expect("a path line was rendered");
+    assert!(
+        path.origin.y + path.size.height <= hit.origin.y + px(0.5),
+        "the path sits above the block: {path:?} {hit:?}"
+    );
+    assert!(
+        path.size.height <= px(24.),
+        "one 12.5 px line, not a stacked crumb list: {path:?}"
+    );
+    assert!(
+        ancestor.origin.x >= page.origin.x + page.size.width - px(1.),
+        "the ancestor follows the page name: {ancestor:?} {page:?}"
+    );
+    assert!(
+        approx(page.origin.y, f32::from(ancestor.origin.y)),
+        "both parts on the same line: {page:?} {ancestor:?}"
+    );
+    let (left, right) = column(cx);
+    assert!(
+        f32::from(page.origin.x) >= left
+            && f32::from(ancestor.origin.x + ancestor.size.width) <= right + 0.5,
+        "the path stays inside the column: {path:?} ({left}, {right})"
+    );
+}

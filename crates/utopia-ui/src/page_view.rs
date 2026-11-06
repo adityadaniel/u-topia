@@ -120,7 +120,12 @@ enum Item {
         count: usize,
         scheduled: bool,
     },
-    Hit(RefHit),
+    /// A referencing block (LR-3): the group's page title travels with it so the path above
+    /// the block can be drawn without a store read at paint time.
+    Hit {
+        hit: RefHit,
+        page_title: SharedString,
+    },
     More {
         page: PageId,
         hidden: usize,
@@ -872,7 +877,10 @@ impl PageView {
                 GROUP_PREVIEW
             };
             for h in g.hits.iter().take(limit) {
-                items.push(Item::Hit(h.clone()));
+                items.push(Item::Hit {
+                    hit: h.clone(),
+                    page_title: g.page.title.clone().into(),
+                });
             }
             if g.hits.len() > limit {
                 items.push(Item::More {
@@ -2757,16 +2765,73 @@ impl PageView {
                     }))
                     .into_any_element()
             }
-            Item::Hit(hit) => {
-                let crumbs = hit
-                    .breadcrumb
-                    .iter()
-                    .map(|(_, t)| t.chars().take(30).collect::<String>())
-                    .collect::<Vec<_>>()
-                    .join(" › ");
+            Item::Hit { hit, page_title } => {
                 let page = hit.page.clone();
                 let block = hit.block.clone();
                 let text = self.render_rich(&hit.text, &hit.block, None, cx);
+                // LR-3: the full path above the block, page first, each part clickable. A
+                // block that sits directly on its page has no ancestors, and the group header
+                // right above already names that page, so it gets no path line.
+                let path = (!hit.breadcrumb.is_empty()).then(|| {
+                    let mut line = div()
+                        .debug_selector(|| format!("hit-path-{ix}"))
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_1()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.faint);
+                    let target = page.clone();
+                    line = line.child(
+                        div()
+                            .id(SharedString::from(format!("path-page-{ix}")))
+                            .debug_selector(|| format!("hit-path-part-{ix}-0"))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(th.accent))
+                            .child(page_title.clone())
+                            .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                                // The hit row under the path opens the block; the page part
+                                // opens the page itself.
+                                cx.stop_propagation();
+                                this.editor.update(cx, |ed, cx| ed.end(cx));
+                                cx.emit(PageViewEvent::Open {
+                                    page: target.clone(),
+                                    zoom: None,
+                                    focus: None,
+                                    sidebar: e.modifiers().shift,
+                                });
+                            })),
+                    );
+                    for (i, (ancestor, caption)) in hit.breadcrumb.iter().enumerate() {
+                        let label: String = caption.chars().take(40).collect();
+                        let label = if label.is_empty() {
+                            "(empty)".to_string()
+                        } else {
+                            label
+                        };
+                        let target = page.clone();
+                        let ancestor = ancestor.clone();
+                        line = line.child(div().child("›")).child(
+                            div()
+                                .id(SharedString::from(format!("path-part-{ix}-{i}")))
+                                .debug_selector(|| format!("hit-path-part-{ix}-{}", i + 1))
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(th.accent))
+                                .child(label)
+                                .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.editor.update(cx, |ed, cx| ed.end(cx));
+                                    cx.emit(PageViewEvent::Open {
+                                        page: target.clone(),
+                                        zoom: None,
+                                        focus: Some(ancestor.clone()),
+                                        sidebar: e.modifiers().shift,
+                                    });
+                                })),
+                        );
+                    }
+                    line.into_any_element()
+                });
                 div()
                     .id(("hit", ix))
                     .px_6()
@@ -2774,14 +2839,7 @@ impl PageView {
                     .flex()
                     .flex_col()
                     .cursor_pointer()
-                    .when(!crumbs.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .text_size(px(crate::theme::CAPTION_SIZE))
-                                .text_color(th.faint)
-                                .child(format!("› {crumbs}")),
-                        )
-                    })
+                    .children(path)
                     .child(
                         div()
                             .flex()

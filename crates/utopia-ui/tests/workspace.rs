@@ -705,6 +705,84 @@ fn unlinked_references_link_button(cx: &mut TestAppContext) {
     });
 }
 
+/// LR-3: the path above a reference is clickable part by part. The page part opens the
+/// referencing page; an ancestor part opens it with that ancestor focused.
+#[gpui::test]
+fn reference_path_parts_open_their_target(cx: &mut TestAppContext) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    let (app, ws, cx) = setup(cx);
+    let (target, atlas, risks) = app.update(cx, |app, _| {
+        let target = app.store.create_page("Target").unwrap();
+        let atlas = app.store.create_page("Atlas Launch").unwrap();
+        let risks = BlockId::new();
+        let risky = BlockId::new();
+        app.store
+            .execute(
+                &atlas,
+                vec![
+                    Command::InsertBlock {
+                        id: risks.clone(),
+                        parent: None,
+                        after: None,
+                        text: "Risks".into(),
+                        kind: BlockKind::Heading(2),
+                    },
+                    Command::InsertBlock {
+                        id: risky,
+                        parent: Some(risks.clone()),
+                        after: None,
+                        text: "The beta date depends on [[Target]]".into(),
+                        kind: BlockKind::Bullet,
+                    },
+                ],
+                Default::default(),
+            )
+            .unwrap();
+        app.store.sync_index().unwrap();
+        (target, atlas, risks)
+    });
+    let path_part = |cx: &mut VisualTestContext, part: usize| {
+        cx.run_until_parked();
+        (0..40)
+            .find_map(|ix| {
+                let sel: &'static str =
+                    Box::leak(format!("hit-path-part-{ix}-{part}").into_boxed_str());
+                cx.debug_bounds(sel)
+            })
+            .expect("a path part was rendered")
+    };
+
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    let page_part = path_part(cx, 0);
+    cx.simulate_click(page_part.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(atlas.clone()),
+        "the page part opens the page the reference lives on"
+    );
+
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    let ancestor_part = path_part(cx, 1);
+    cx.simulate_click(ancestor_part.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(atlas));
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.block.clone())),
+        Some(risks),
+        "the ancestor part focuses that block"
+    );
+}
+
 #[gpui::test]
 fn embeds_render_and_split_panes(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);
