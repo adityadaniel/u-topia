@@ -1039,3 +1039,42 @@ fn sr_4_preview_has_path_children_and_state() {
     // No panic on user data: a missing block is `None`, never an error.
     assert!(s.preview_block(&BlockId("nope".into())).unwrap().is_none());
 }
+
+/// SR-3: the age window is part of the query. A pile of older matches must not starve the
+/// candidate list: 305 October blocks used to fill the 10x over-fetch before one Today
+/// block was ever looked at, so Today came back empty.
+#[test]
+fn sr_3_age_window_is_applied_before_the_limit() {
+    use utopia_store::{SearchAge, SearchScope};
+
+    let ts = |m, d, h| {
+        date(2026, m, d)
+            .and_hms_opt(h, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis()
+    };
+    let mut s = store();
+    s.set_clock(Some(ts(11, 2, 18)));
+    let (day, b) = s.open_daily(date(2026, 11, 2)).unwrap();
+    s.set_block_text(&day, &b, "zebra newest", None, None)
+        .unwrap();
+    s.commit_block(&day, &b).unwrap();
+
+    s.set_clock(Some(ts(10, 1, 18)));
+    let old = s.create_page("Archive").unwrap();
+    for i in 0..305 {
+        write(&mut s, &old, &format!("zebra old {i}"));
+    }
+    s.set_clock(Some(ts(11, 2, 18)));
+    s.sync_index().unwrap();
+
+    let hits = s
+        .search_blocks_filtered("zebra", SearchScope::All, SearchAge::Today, 30)
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.page == day),
+        "Today must still find the day's block (got {} hits)",
+        hits.len()
+    );
+}

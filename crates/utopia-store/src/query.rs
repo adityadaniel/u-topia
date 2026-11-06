@@ -427,16 +427,6 @@ pub const PREVIEW_CHILDREN: usize = 6;
 struct SearchRow {
     hit: BlockHit,
     daily: Option<NaiveDate>,
-    updated_at: i64,
-}
-
-impl SearchRow {
-    fn day(&self) -> Option<NaiveDate> {
-        self.daily.or_else(|| {
-            chrono::DateTime::from_timestamp_millis(self.updated_at)
-                .map(|t| t.with_timezone(&chrono::Local).date_naive())
-        })
-    }
 }
 
 impl Store {
@@ -682,22 +672,31 @@ impl Store {
                 daily: r
                     .get::<_, Option<String>>(4)?
                     .and_then(|d| utopia_core::date::parse_iso(&d)),
-                updated_at: r.get(5)?,
             })
         };
-        // Over-fetch so an age window can drop rows without starving the list.
+        // The age window is part of the query, not a filter applied after the limit: a
+        // handful of old matches must never push an eligible one out of the candidates.
+        // Daily hits are dated by their day, other blocks by the local date of their last
+        // edit (the same day `RefQuery::since` uses).
+        let since = age.since(self.today()).map(|d| d.to_string());
         let fetch = (limit.max(1) * 10) as i64;
+        let window = "AND (:since IS NULL
+                        OR COALESCE(p.daily_date,
+                             date(b.updated_at / 1000, 'unixepoch', 'localtime')) >= :since)";
         let mut rows = if terms.is_empty() {
             let sql = format!(
-                "SELECT b.id, b.page_id, p.title, b.text, p.daily_date, b.updated_at
+                "SELECT b.id, b.page_id, p.title, b.text, p.daily_date
                  FROM block b JOIN page p ON p.id=b.page_id
                  WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL AND b.text <> ''
-                   AND {} ORDER BY b.updated_at DESC LIMIT ?1",
+                   AND {} {window} ORDER BY b.updated_at DESC LIMIT :limit",
                 scope.condition()
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt
-                .query_map([fetch], map)?
+                .query_map(
+                    rusqlite::named_params! { ":since": since, ":limit": fetch },
+                    map,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         } else {
@@ -705,24 +704,28 @@ impl Store {
             // match, which is what made common terms slow); then prefer blocks containing
             // the whole query as typed.
             let sql = format!(
-                "SELECT f.block_id, b.page_id, p.title, b.text, p.daily_date, b.updated_at
+                "SELECT f.block_id, b.page_id, p.title, b.text, p.daily_date
                  FROM block_fts f
                  JOIN block b ON b.rowid=f.rowid JOIN page p ON p.id=b.page_id
-                 WHERE block_fts MATCH ?1 AND b.deleted_at IS NULL AND p.deleted_at IS NULL
-                   AND {} ORDER BY f.rowid DESC LIMIT ?2",
+                 WHERE block_fts MATCH :q AND b.deleted_at IS NULL AND p.deleted_at IS NULL
+                   AND {} {window} ORDER BY f.rowid DESC LIMIT :limit",
                 scope.condition()
             );
             let mut stmt = self.conn.prepare_cached(&sql)?;
             let mut rows = stmt
-                .query_map(params![terms.join(" "), fetch], map)?
+                .query_map(
+                    rusqlite::named_params! {
+                        ":q": terms.join(" "),
+                        ":since": since,
+                        ":limit": fetch,
+                    },
+                    map,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let needle = query.trim().to_lowercase();
             rows.sort_by_key(|h| !h.hit.text.to_lowercase().contains(&needle));
             rows
         };
-        if let Some(since) = age.since(self.today()) {
-            rows.retain(|r| r.day().is_none_or(|d| d >= since));
-        }
         rows.truncate(limit);
         Ok(rows)
     }
