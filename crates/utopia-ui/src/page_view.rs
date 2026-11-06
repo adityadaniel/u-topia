@@ -421,7 +421,7 @@ impl PageView {
                             plan.and_then(|p| app.store.execute_plan(&page, p, None))
                                 .map(|f| f.map(|f| f.block))
                         }
-                        None => app.store.ensure_first_block(&page).map(Some),
+                        None => start_note(&mut app.store, &page).map(Some),
                     };
                     let b = app.report(r).flatten();
                     app.changed(vec![page.clone()], true, cx);
@@ -885,11 +885,7 @@ impl PageView {
     fn start_day(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
         let target = self.app.update(cx, |app, cx| {
             let r = app.store.draft_daily(date).and_then(|page| {
-                let first = app.store.page_state(&page)?.live_roots().first().cloned();
-                let block = match first {
-                    Some(b) => b,
-                    None => app.store.ensure_first_block(&page)?,
-                };
+                let block = start_note(&mut app.store, &page)?;
                 Ok((page, block))
             });
             let t = app.report(r);
@@ -2728,6 +2724,7 @@ impl PageView {
             }
             Item::Empty => div()
                 .id("empty")
+                .debug_selector(|| "empty".into())
                 .px_4()
                 .py_1()
                 .pl(px(32.))
@@ -3023,6 +3020,50 @@ impl PageView {
             }
         }
     }
+}
+
+/// The block a "Click to start writing" prompt writes into (FR-1.2): a new root block after
+/// whatever the page already has. Not `ensure_first_block` alone — on a page whose only
+/// blocks are attributes that hands back the attribute, and typing rewrites its key (PG-1).
+fn start_note(
+    store: &mut utopia_store::Store,
+    page: &PageId,
+) -> Result<BlockId, utopia_store::StoreError> {
+    let (reuse, has_roots) = {
+        let st = store.page_state(page)?;
+        let roots = st.live_roots();
+        // A day's draft starts with one empty block (FR-1.2): write into it, so clicking a
+        // blank day stays free of writes until the first keystroke.
+        let reuse = match roots.as_slice() {
+            [only] if st.block(only).is_some_and(|b| b.text.is_empty()) => Some(only.clone()),
+            _ => None,
+        };
+        (reuse, !roots.is_empty())
+    };
+    if let Some(block) = reuse {
+        return Ok(block);
+    }
+    if !has_roots {
+        return store.ensure_first_block(page);
+    }
+    // The borrow of the shard ends here, before the write.
+    let after = store.page_state(page)?.last_child(None, false);
+    let id = BlockId::new();
+    store.execute(
+        page,
+        vec![utopia_core::Command::InsertBlock {
+            id: id.clone(),
+            parent: None,
+            after,
+            text: String::new(),
+            kind: BlockKind::Bullet,
+        }],
+        utopia_store::EditOpts {
+            no_undo: true,
+            ..Default::default()
+        },
+    )?;
+    Ok(id)
 }
 
 /// PG-1 folds a root `key:: value` block into one compact row and hides its children, so

@@ -1071,6 +1071,23 @@ fn setup_attribute_tree<'a>(
     (cx, vec![attr, child, note])
 }
 
+/// The texts of a page's live root blocks, in order.
+fn root_texts(cx: &mut VisualTestContext) -> Vec<String> {
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let app = ws.update(cx, |w, _| w.app().clone());
+    let page = ws.update(cx, |w, cx| w.main_page(cx)).expect("a page");
+    app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).expect("page state");
+        st.live_roots()
+            .iter()
+            .map(|b| st.block(b).expect("block").text.clone())
+            .collect()
+    })
+}
+
 /// A page's block text by id (any depth).
 fn block_text(cx: &mut VisualTestContext, block: &utopia_core::BlockId) -> String {
     let ws = cx
@@ -1222,4 +1239,145 @@ fn opening_a_hidden_descendant_reveals_and_focuses_it(cx: &mut TestAppContext) {
         "hidden child>",
         "the descendant under a compact attribute is reachable"
     );
+}
+
+/// Finding 4: on a page whose only block is a compact attribute, "Click to start writing"
+/// must add a note, not type into the attribute's key.
+#[gpui::test]
+fn starting_a_note_on_an_attribute_only_page_appends_a_block(cx: &mut TestAppContext) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    use utopia_store::EditOpts;
+    use utopia_ui::appearance::AttributeBlocks;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("settings.json"),
+        "{\"version\": 1, \"attribute-blocks\": \"compact\"}\n",
+    )
+    .unwrap();
+    let path = dir.path().to_path_buf();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+        utopia_ui::appearance::install(cx, &path);
+    });
+    assert_eq!(
+        cx.update(|cx| utopia_ui::appearance::attribute_blocks(cx)),
+        AttributeBlocks::Compact
+    );
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = store.create_page("Trellis").unwrap();
+    let attr = BlockId::new();
+    store
+        .execute(
+            &page,
+            vec![Command::InsertBlock {
+                id: attr.clone(),
+                parent: None,
+                after: None,
+                text: "status:: x".into(),
+                kind: BlockKind::Bullet,
+            }],
+            EditOpts {
+                no_undo: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    let prompt = bounds(cx, "empty");
+    cx.simulate_click(prompt.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_input("note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        root_texts(cx),
+        vec!["status:: x".to_string(), "note".to_string()],
+        "a new block holds the note; the attribute is untouched"
+    );
+}
+
+/// Finding 4, the feed: an attribute-only day's "Click to start writing" adds a block too.
+#[gpui::test]
+fn starting_a_note_on_an_attribute_only_day_appends_a_block(cx: &mut TestAppContext) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    use utopia_store::EditOpts;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+        utopia_ui::appearance::install(cx, &path);
+    });
+    let today = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(today));
+    // Yesterday: one attribute only. Every other day of the feed has a note, so yesterday's
+    // prompt is the only "Click to start writing" in the feed.
+    let page = store
+        .ensure_daily_page(today - chrono::Duration::days(1))
+        .unwrap();
+    store
+        .execute(
+            &page,
+            vec![Command::InsertBlock {
+                id: BlockId::new(),
+                parent: None,
+                after: None,
+                text: "status:: x".into(),
+                kind: BlockKind::Bullet,
+            }],
+            EditOpts {
+                no_undo: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    for back in 0..10 {
+        if back == 1 {
+            continue;
+        }
+        let day = store
+            .ensure_daily_page(today - chrono::Duration::days(back))
+            .unwrap();
+        let b = store.ensure_first_block(&day).unwrap();
+        store
+            .set_block_text(&day, &b, &format!("note {back}"), None, None)
+            .unwrap();
+        store.commit_block(&day, &b).unwrap();
+    }
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    let prompt = bounds(cx, "day-empty");
+    cx.simulate_click(prompt.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_input("note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let app = ws.update(cx, |w, _| w.app().clone());
+    app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).expect("page state");
+        let texts: Vec<String> = st
+            .live_roots()
+            .iter()
+            .map(|b| st.block(b).expect("block").text.clone())
+            .collect();
+        assert_eq!(texts, vec!["status:: x".to_string(), "note".to_string()]);
+    });
 }
