@@ -500,6 +500,58 @@ fn the_key_chip_records_and_resets(cx: &mut TestAppContext) {
     });
 }
 
+/// ST-3: a clash is an amber line under each of the two rows, and its link jumps to the
+/// other row instead of only naming it.
+#[gpui::test]
+fn a_clash_is_shown_inline_and_links_to_the_other_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+
+    let today = doc("GoToday").unwrap();
+    view.update_in(cx, |v, window, cx| v.start_capture(today, window, cx));
+    cx.simulate_keystrokes(&platform_keys("cmd-shift-y"));
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.overrides().conflicts().len()),
+        1
+    );
+
+    let chip = cx
+        .debug_bounds("settings-chip-GoToday")
+        .expect("the rebound row's key chip");
+    let line = cx
+        .debug_bounds("settings-clash-GoToday")
+        .expect("the clash line under the row");
+    assert!(
+        f32::from(line.origin.y) >= f32::from(chip.origin.y + chip.size.height) - 1.,
+        "the line sits under the row's own line: {chip:?} then {line:?}"
+    );
+    // Both rows say who else uses the keys, so whichever one you are looking at, it shows.
+    assert!(
+        cx.debug_bounds("settings-clash-GoYesterday").is_some(),
+        "the other row carries the line too"
+    );
+
+    let link = cx
+        .debug_bounds("settings-clash-link-GoYesterday")
+        .expect("the other action is a link");
+    cx.simulate_click(link.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.flashed()),
+        Some("GoYesterday"),
+        "the link jumps to the other row"
+    );
+}
+
 /// A `keymap.json` that cannot be read must not take the window down with it (rule 11).
 #[gpui::test]
 fn a_broken_keymap_is_reported_not_fatal(cx: &mut TestAppContext) {

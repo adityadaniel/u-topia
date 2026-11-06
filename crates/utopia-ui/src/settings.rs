@@ -22,7 +22,7 @@
 
 use gpui::{
     div, img, prelude::*, px, AnyWindowHandle, App, Context, Div, Entity, FocusHandle, Focusable,
-    FontWeight, Keystroke, SharedString, Subscription, Window,
+    FontWeight, Keystroke, ScrollHandle, SharedString, Subscription, Window,
 };
 use std::path::PathBuf;
 
@@ -40,6 +40,10 @@ use crate::theme::{quiet_control, theme, Theme};
 const CONTENT_WIDTH: f32 = 720.;
 /// The tab list down the left side, as System Settings has it (ST-5).
 const RAIL_WIDTH: f32 = 220.;
+/// The children a key list draws before its first category card: the toolbar and the
+/// filter field. `ScrollHandle::scroll_to_item` counts them, so a clash link can bring the
+/// card that holds the other row into view (ST-3).
+const KEY_LIST_LEADING: usize = 2;
 /// Screenshots are shown at a fixed size. gpui derives an image's aspect ratio from the
 /// decoded bytes, but that lands a frame after layout, so a width alone leaves the element
 /// at its intrinsic height; giving both keeps the box the right shape from the first frame.
@@ -140,6 +144,10 @@ pub struct SettingsView {
     /// The filter at the top of the key list (ST-4), by name, description or key.
     search: Entity<LineInput>,
     query: String,
+    /// The row a clash link jumped to (ST-3), kept highlighted for a moment.
+    flash: Option<&'static str>,
+    /// The scrolling key list, so a clash link can bring the other row into view.
+    keys_scroll: ScrollHandle,
     focus: FocusHandle,
     _subs: Vec<Subscription>,
 }
@@ -200,6 +208,8 @@ impl SettingsView {
             topic: 0,
             search,
             query: String::new(),
+            flash: None,
+            keys_scroll: ScrollHandle::default(),
             focus: cx.focus_handle(),
             _subs: subs,
         }
@@ -361,6 +371,39 @@ impl SettingsView {
     /// What is typed in the filter field (ST-4).
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// The row a clash link just jumped to, while it stays highlighted (ST-3).
+    pub fn flashed(&self) -> Option<&'static str> {
+        self.flash
+    }
+
+    /// ST-3: bring the row that shares this key into view and mark it, so "Also used by"
+    /// leads somewhere instead of just naming the problem.
+    fn jump_to(&mut self, target: &'static ActionDoc, cx: &mut Context<Self>) {
+        self.flash = Some(target.action);
+        if let Some(ix) = self
+            .visible_groups()
+            .iter()
+            .position(|(c, _)| *c == target.category)
+        {
+            self.keys_scroll.scroll_to_item(KEY_LIST_LEADING + ix);
+        }
+        let me = cx.entity().downgrade();
+        let flash = target.action;
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1800))
+                .await;
+            let _ = me.update(cx, |this, cx| {
+                if this.flash == Some(flash) {
+                    this.flash = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     /// ST-4: the actions the filter lets through, in catalog order.
@@ -757,6 +800,7 @@ impl SettingsView {
         };
 
         let mut list = pane("settings-keys", "settings-keys")
+            .track_scroll(&self.keys_scroll)
             .child(
                 column()
                     .flex()
@@ -777,24 +821,6 @@ impl SettingsView {
             )
             .child(self.render_search(cx));
 
-        for (a, b) in &conflicts {
-            list = list.child(
-                column()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .bg(th.danger_bg)
-                    .text_size(px(crate::theme::CAPTION_SIZE))
-                    .text_color(th.danger)
-                    .child(format!(
-                        "{} and {} are both on {}.",
-                        a.label,
-                        b.label,
-                        pretty_keys(&self.overrides.keys_for(a))
-                    )),
-            );
-        }
-
         if groups.is_empty() {
             list = list.child(
                 column()
@@ -812,18 +838,43 @@ impl SettingsView {
                 .debug_selector(move || format!("settings-card-{}", category.label()))
                 .child(card_title(&th, category.label()));
             for (i, d) in rows.iter().enumerate() {
-                section = section.child(card_row(self.render_key_row(d, cx), i, &th, density));
+                section = section.child(card_row(
+                    self.render_key_row(d, &conflicts, cx),
+                    i,
+                    &th,
+                    density,
+                ));
             }
             list = list.child(section);
         }
         list
     }
 
-    fn render_key_row(&self, d: &'static ActionDoc, cx: &mut Context<Self>) -> Div {
+    fn render_key_row(
+        &self,
+        d: &'static ActionDoc,
+        conflicts: &[(&'static ActionDoc, &'static ActionDoc)],
+        cx: &mut Context<Self>,
+    ) -> Div {
         let th = theme(cx).clone();
         let capturing = self.capturing.map(|c| c.action) == Some(d.action);
         let keys = self.overrides.keys_for(d);
         let changed = self.overrides.is_changed(d.action);
+        let flashed = self.flash == Some(d.action);
+        // ST-3: whoever else answers to these keys in the same place, said under the row
+        // itself rather than in a banner at the top of the window.
+        let others: Vec<&'static ActionDoc> = conflicts
+            .iter()
+            .filter_map(|(a, b)| {
+                if a.action == d.action {
+                    Some(*b)
+                } else if b.action == d.action {
+                    Some(*a)
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         // ST-2: the key chip *is* the control. Click it and it waits for the next
         // combination; there is no separate Change button to hunt for.
@@ -872,11 +923,12 @@ impl SettingsView {
                 .on_click(cx.listener(move |this, _, _, cx| this.reset_one(d, cx)))
         });
 
-        div()
+        let mut row = div()
             .debug_selector(move || format!("settings-row-{}", d.action))
             .flex()
             .flex_col()
             .hover(|x| x.bg(th.hover))
+            .when(flashed, |x| x.bg(th.banner_bg))
             .child(
                 div()
                     .flex()
@@ -904,7 +956,36 @@ impl SettingsView {
                             .children(reset)
                             .child(chip),
                     ),
-            )
+            );
+
+        if !others.is_empty() {
+            let mut line = div()
+                .debug_selector(move || format!("settings-clash-{}", d.action))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .pt_1()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.warning)
+                .child("Also used by");
+            for (i, other) in others.iter().copied().enumerate() {
+                if i > 0 {
+                    line = line.child(div().child("and"));
+                }
+                line = line.child(
+                    div()
+                        .id(SharedString::from(format!("clash-{}", other.action)))
+                        .debug_selector(move || format!("settings-clash-link-{}", other.action))
+                        .cursor_pointer()
+                        .hover(|x| x.text_color(th.text))
+                        .child(other.label)
+                        .on_click(cx.listener(move |this, _, _, cx| this.jump_to(other, cx))),
+                );
+            }
+            row = row.child(line);
+        }
+        row
     }
 
     /// The cheat sheet: everything bound right now, grouped the same way as the editor.
