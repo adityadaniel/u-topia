@@ -2,7 +2,9 @@
 //! headless test platform: keystrokes in, store state out.
 
 use chrono::NaiveDate;
-use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+use gpui::{
+    point, px, size, AppContext as _, Entity, Modifiers, TestAppContext, VisualTestContext,
+};
 use utopia_core::PageId;
 use utopia_store::Store;
 use utopia_ui::actions::install_keymap;
@@ -828,6 +830,41 @@ fn graph_view_lays_out_and_opens_pages(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     assert!(ws.update(cx, |w, _| w.graph_view()).is_none());
+}
+
+/// GR-1: pages grow with their link count, from 6 px to 18 px across.
+#[gpui::test]
+fn graph_sizes_nodes_by_links(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] [[Alpha]] [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let graph = ws.update(cx, |w, _| w.graph_view()).expect("graph shown");
+    let alpha = app.update(cx, |a, _| a.store.find_page("Alpha").unwrap().unwrap());
+    let today = today_page(&app, cx);
+    let nodes = graph.update(cx, |g, _| g.node_count());
+    assert_eq!(nodes, 3);
+    let mut node = |page: &PageId| {
+        (0..nodes)
+            .find(|&i| graph.update(cx, |g, _| g.node_page(i)).as_ref() == Some(page))
+            .unwrap()
+    };
+    let (today_i, alpha_i) = (node(&today), node(&alpha));
+    let (today_r, alpha_r) = graph.update(cx, |g, _| {
+        (
+            g.node_radius(today_i).unwrap(),
+            g.node_radius(alpha_i).unwrap(),
+        )
+    });
+    // Today links to Alpha twice and Beta once, so it has the larger degree.
+    assert!(today_r > alpha_r, "{today_r} > {alpha_r}");
+    assert!(
+        (3. ..=9.).contains(&alpha_r) && (3. ..=9.).contains(&today_r),
+        "diameters stay between 6 and 18 px: {alpha_r} {today_r}"
+    );
 }
 
 #[gpui::test]

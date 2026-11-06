@@ -2,6 +2,10 @@
 //! thread. Drag to pan, scroll to zoom, click a node to open its page (shift-click opens
 //! it in the right sidebar). "Local" limits the graph to two links around the page that
 //! was open.
+//!
+//! The redesign's first graph change (GR-1) is a view change only: nodes grow from 6 px to
+//! 18 px with their distinct link count, and the page the graph was opened from keeps a
+//! 2 px accent ring.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -19,6 +23,9 @@ use crate::theme::{quiet_control, theme};
 
 const LAYOUT_ITERATIONS: usize = 160;
 const MARGIN: f32 = 48.;
+/// GR-1: a node's diameter runs from 6 px to 18 px across the graph's degree range.
+const MIN_DIAMETER: f32 = 6.;
+const MAX_DIAMETER: f32 = 18.;
 
 pub enum GraphEvent {
     Open { page: PageId, sidebar: bool },
@@ -32,6 +39,8 @@ pub struct GraphView {
     local: bool,
     include_daily: bool,
     graph: PageGraph,
+    /// Largest degree in `graph`; sizes nodes relative to it (GR-1).
+    max_degree: usize,
     pos: Vec<(f32, f32)>,
     laid_out: bool,
     pan: Point<Pixels>,
@@ -65,6 +74,7 @@ impl GraphView {
             // default leaves the picture nearly empty.
             include_daily: true,
             graph: PageGraph::default(),
+            max_degree: 0,
             pos: Vec::new(),
             laid_out: false,
             pan: point(px(0.), px(0.)),
@@ -106,6 +116,14 @@ impl GraphView {
         self.graph.nodes.get(i).map(|n| n.page.clone())
     }
 
+    /// Radius in px, from 3 (6 px across) to 9 (18 px across), for tests (GR-1).
+    pub fn node_radius(&self, i: usize) -> Option<f32> {
+        self.graph
+            .nodes
+            .get(i)
+            .map(|n| Self::radius(n.degree, self.max_degree))
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         let opts = GraphOptions {
             center: self.local.then(|| self.origin.clone()).flatten(),
@@ -118,8 +136,10 @@ impl GraphView {
             app.report(r).unwrap_or_default()
         });
         let n = graph.nodes.len();
+        let max_degree = graph.nodes.iter().map(|n| n.degree).max().unwrap_or(0);
         let edges: Vec<(usize, usize)> = graph.edges.iter().map(|e| (e.0, e.1)).collect();
         self.graph = graph;
+        self.max_degree = max_degree;
         self.laid_out = false;
         self.hover = None;
         self.pan = point(px(0.), px(0.));
@@ -153,8 +173,18 @@ impl GraphView {
         )
     }
 
-    fn radius(degree: usize) -> f32 {
-        (3. + (degree as f32).sqrt() * 1.6).min(14.)
+    /// GR-1: the diameter grows linearly from 6 px (least connected) to 18 px (most
+    /// connected). A graph where every page has one link stays at the minimum.
+    fn diameter(degree: usize, max_degree: usize) -> f32 {
+        if max_degree <= 1 {
+            return MIN_DIAMETER;
+        }
+        let t = degree.saturating_sub(1) as f32 / (max_degree - 1) as f32;
+        MIN_DIAMETER + (MAX_DIAMETER - MIN_DIAMETER) * t.clamp(0., 1.)
+    }
+
+    fn radius(degree: usize, max_degree: usize) -> f32 {
+        Self::diameter(degree, max_degree) / 2.
     }
 
     fn hit(&self, at: Point<Pixels>) -> Option<usize> {
@@ -166,7 +196,8 @@ impl GraphView {
         for (i, n) in self.graph.nodes.iter().enumerate() {
             let p = self.to_screen(self.pos[i], b);
             let d = f32::from((p.x - at.x).abs()).hypot(f32::from((p.y - at.y).abs()));
-            if d <= Self::radius(n.degree) + 4. && best.is_none_or(|(_, bd)| d < bd) {
+            let r = Self::radius(n.degree, self.max_degree);
+            if d <= r + 4. && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((i, d));
             }
         }
@@ -300,7 +331,8 @@ impl Render for GraphView {
         let edges = self.graph.edges.clone();
         let (pan, zoom, hover) = (self.pan, self.zoom, self.hover);
         let bounds_cell = self.bounds.clone();
-        let center_page = self.local.then(|| self.origin.clone()).flatten();
+        let origin_page = self.origin.clone();
+        let max_degree = self.max_degree;
         let font = window.text_style().font();
         let empty = nodes.is_empty();
         let body = div()
@@ -357,10 +389,11 @@ impl Render for GraphView {
                         // best-connected pages (more as you zoom in).
                         let label_budget = ((30. * zoom * zoom) as usize).max(12);
                         for (i, n) in nodes.iter().enumerate() {
-                            let r = GraphView::radius(n.degree);
+                            let r = GraphView::radius(n.degree, max_degree);
                             let p = at(screen[i]);
-                            let is_center = center_page.as_ref() == Some(&n.page);
-                            let color = if hover == Some(i) || is_center {
+                            let is_origin = origin_page.as_ref() == Some(&n.page);
+                            let is_hover = hover == Some(i);
+                            let color = if is_hover {
                                 th.accent
                             } else if n.daily {
                                 th.tag
@@ -369,12 +402,26 @@ impl Render for GraphView {
                             };
                             let nb = Bounds::centered_at(p, gpui::size(px(r * 2.), px(r * 2.)));
                             window.paint_quad(gpui::fill(nb, color).corner_radii(px(r)));
-                            if hover == Some(i) || is_center || i < label_budget {
+                            if is_origin {
+                                // GR-1: the page the graph was opened from keeps a 2 px
+                                // accent ring, whether or not it is the local centre.
+                                let ring = Bounds::centered_at(
+                                    p,
+                                    gpui::size(px(r * 2. + 4.), px(r * 2. + 4.)),
+                                );
+                                window.paint_quad(
+                                    gpui::fill(ring, gpui::transparent_black())
+                                        .border_widths(px(2.))
+                                        .border_color(th.accent)
+                                        .corner_radii(px(r + 2.)),
+                                );
+                            }
+                            if is_hover || is_origin || i < label_budget {
                                 let text: SharedString = n.title.clone().into();
                                 let run = TextRun {
                                     len: text.len(),
                                     font: font.clone(),
-                                    color: if hover == Some(i) { th.text } else { th.muted },
+                                    color: if is_hover { th.text } else { th.muted },
                                     background_color: None,
                                     underline: None,
                                     strikethrough: None,
@@ -416,5 +463,26 @@ impl Render for GraphView {
             .bg(th.bg)
             .child(header)
             .child(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GR-1: the smallest page draws at 6 px across and the most connected at 18 px; the
+    /// size never leaves that band, and a graph without a degree spread stays at the minimum.
+    #[test]
+    fn node_size_spans_six_to_eighteen_px() {
+        assert_eq!(GraphView::diameter(1, 1), 6.);
+        assert_eq!(GraphView::diameter(1, 5), 6.);
+        assert_eq!(GraphView::diameter(5, 5), 18.);
+        assert_eq!(GraphView::diameter(3, 5), 12.);
+        for max in 1..20 {
+            for degree in 0..=max {
+                let d = GraphView::diameter(degree, max);
+                assert!((6. ..=18.).contains(&d), "{degree}/{max} -> {d}");
+            }
+        }
     }
 }
