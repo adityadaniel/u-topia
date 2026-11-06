@@ -225,6 +225,51 @@ fn search_preview_sits_in_the_right_half(cx: &mut TestAppContext) {
     );
 }
 
+/// SR-4/SR-5: the 720 px minimum window must contain the widened palette, input, chips,
+/// list and preview. A fixed 860 px dialog hung off both sides.
+#[gpui::test]
+fn search_palette_fits_the_minimum_window(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_input("zebra crossing");
+    cx.simulate_keystrokes("escape");
+    cx.simulate_resize(size(px(720.), px(480.)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-shift-f");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let palette = bounds(cx, "jump-palette");
+    assert!(
+        palette.origin.x >= px(0.) && palette.right() <= px(720.) + px(0.5),
+        "the palette stays in the window horizontally: {palette:?}"
+    );
+    assert!(
+        palette.origin.y >= px(0.) && palette.bottom() <= px(480.) + px(0.5),
+        "and vertically: {palette:?}"
+    );
+    let input = bounds(cx, "search-input");
+    let scopes = bounds(cx, "search-scopes");
+    for b in [input, scopes] {
+        assert!(
+            b.origin.x >= palette.origin.x && b.right() <= palette.right() + px(0.5),
+            "controls stay inside the palette: {b:?} {palette:?}"
+        );
+    }
+    let results = bounds(cx, "jump-results");
+    let preview = bounds(cx, "search-preview");
+    assert!(
+        preview.right() <= palette.right() + px(0.5),
+        "the preview fits: {preview:?} {palette:?}"
+    );
+    assert!(
+        results.right() <= preview.origin.x + px(0.5),
+        "the list ends before the narrow preview: {results:?} {preview:?}"
+    );
+    assert!(
+        preview.size.width >= px(240.),
+        "the preview keeps a readable width: {preview:?}"
+    );
+}
+
 /// SR-3: the scope chips sit under the field inside the palette, and the "Any time" menu
 /// floats over the results without moving them (deferred + anchored, like the page menu).
 #[gpui::test]

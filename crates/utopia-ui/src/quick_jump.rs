@@ -460,7 +460,15 @@ impl JumpPalette {
     }
 
     /// The right half: the selected block's path, text, state and first children (SR-4).
-    fn preview_pane(&self, p: &BlockPreview, th: &Theme) -> gpui::Stateful<gpui::Div> {
+    /// `width` and `height` come from the palette so a narrow window shrinks the pane
+    /// instead of clipping it.
+    fn preview_pane(
+        &self,
+        p: &BlockPreview,
+        th: &Theme,
+        width: f32,
+        height: f32,
+    ) -> gpui::Stateful<gpui::Div> {
         let mut crumbs: Vec<String> = vec![p.page_title.clone()];
         crumbs.extend(p.path.iter().map(|(_, t)| {
             let mut s: String = t.chars().take(40).collect();
@@ -477,9 +485,9 @@ impl JumpPalette {
         let mut pane = div()
             .id("search-preview")
             .debug_selector(|| "search-preview".into())
-            .w(px(340.))
+            .w(px(width))
             .flex_none()
-            .max_h(px(340.))
+            .max_h(px(height))
             .overflow_y_scroll()
             .pl_3()
             .border_l_1()
@@ -667,14 +675,27 @@ impl JumpPalette {
 }
 
 impl Render for JumpPalette {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let selected = self.selected;
+        // One palette, two modes (SR-5): the merged list can show a preview, so it is
+        // wide; the small prompts stay narrow. Either way it must fit the window: the app
+        // supports a 720 px window, where a fixed 860 px dialog would hang off both sides.
+        let wide = matches!(self.mode, PaletteMode::Pages | PaletteMode::Search);
+        let viewport = window.viewport_size();
+
+        let wanted: f32 = if wide { 860. } else { 520. };
+        let width = wanted.min(f32::from(viewport.width) - 24.).max(280.);
+        let max_h = (f32::from(viewport.height) - 100.).clamp(220., 440.);
+        let pane_h = (max_h - 100.).clamp(120., 340.);
+        let preview_w = (width * 0.4).clamp(240., 340.);
         // Build the chips before borrowing the rows, because their click listeners need a
         // mutable context.
-        let scopes = matches!(self.mode, PaletteMode::Pages | PaletteMode::Search)
-            .then(|| self.scope_bar(&th, cx));
-        let preview = self.preview.as_ref().map(|p| self.preview_pane(p, &th));
+        let scopes = wide.then(|| self.scope_bar(&th, cx));
+        let preview = self
+            .preview
+            .as_ref()
+            .map(|p| self.preview_pane(p, &th, preview_w, pane_h));
         let rows = self.rows.iter().enumerate().map(|(i, r)| match r {
             Row::Group { group } => group_header(*group, &self.groups[*group], &th),
             Row::Page(h) => {
@@ -759,16 +780,8 @@ impl Render for JumpPalette {
         });
         div()
             .debug_selector(|| "jump-palette".into())
-            // One palette, two modes (SR-5): the merged list can show a preview, so it is
-            // wide; the small prompts stay narrow.
-            .w(px(
-                if matches!(self.mode, PaletteMode::Pages | PaletteMode::Search) {
-                    860.
-                } else {
-                    520.
-                },
-            ))
-            .max_h(px(440.))
+            .w(px(width))
+            .max_h(px(max_h))
             .flex()
             .flex_col()
             .bg(th.surface)
@@ -787,6 +800,7 @@ impl Render for JumpPalette {
             )
             .child(
                 div()
+                    .debug_selector(|| "search-input".into())
                     .px_2()
                     .py_1()
                     .border_1()
@@ -800,14 +814,14 @@ impl Render for JumpPalette {
                     .id("jump-results-row")
                     .flex()
                     .gap_2()
-                    .max_h(px(340.))
+                    .max_h(px(pane_h))
                     .child(
                         div()
                             .id("jump-results")
                             .debug_selector(|| "jump-results".into())
                             .flex_1()
                             .min_w_0()
-                            .max_h(px(340.))
+                            .max_h(px(pane_h))
                             .overflow_y_scroll()
                             .child(div().flex().flex_col().children(rows)),
                     )
