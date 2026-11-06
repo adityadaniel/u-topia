@@ -541,7 +541,7 @@ fn a_clash_is_shown_inline_and_links_to_the_other_row(cx: &mut TestAppContext) {
     );
 
     let link = cx
-        .debug_bounds("settings-clash-link-GoYesterday")
+        .debug_bounds("settings-clash-link-GoToday-GoYesterday")
         .expect("the other action is a link");
     cx.simulate_click(link.center(), gpui::Modifiers::default());
     cx.run_until_parked();
@@ -572,7 +572,7 @@ fn a_clash_link_scrolls_to_the_other_card(cx: &mut TestAppContext) {
     assert_eq!(view.read_with(cx, |v, _| v.key_list_offset()), 0.);
 
     let link = cx
-        .debug_bounds("settings-clash-link-Quit")
+        .debug_bounds("settings-clash-link-GoToday-Quit")
         .expect("Quit is linked under Today");
     cx.simulate_click(link.center(), gpui::Modifiers::default());
     cx.run_until_parked();
@@ -604,7 +604,7 @@ fn a_clash_link_reveals_a_row_in_a_tall_category(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let pane = cx.debug_bounds("settings-keys").unwrap();
     let link = cx
-        .debug_bounds("settings-clash-link-SelectAll")
+        .debug_bounds("settings-clash-link-Newline-SelectAll")
         .expect("the link under New Block");
     cx.simulate_click(link.center(), gpui::Modifiers::default());
     cx.run_until_parked();
@@ -648,7 +648,7 @@ fn a_clash_link_reveals_a_row_the_filter_hides(cx: &mut TestAppContext) {
         "the target is hidden: {filtered:?}"
     );
     let link = cx
-        .debug_bounds("settings-clash-link-Quit")
+        .debug_bounds("settings-clash-link-GoToday-Quit")
         .expect("the link under Today");
     let pane = cx.debug_bounds("settings-keys").unwrap();
     cx.simulate_click(link.center(), gpui::Modifiers::default());
@@ -668,10 +668,11 @@ fn a_clash_link_reveals_a_row_the_filter_hides(cx: &mut TestAppContext) {
     );
 }
 
-/// REVIEW finding 4: two rows linking to the same action used to share one element ID.
-/// Clicking the later link must record its own click.
+/// Two rows can link to the same action. Each link is scoped to its own row, so the second
+/// row's link (which shares the target with the first) is still live: GPUI element ids are
+/// nested under the row, not shared across rows.
 #[gpui::test]
-fn repro_both_rows_clash_links_work(cx: &mut TestAppContext) {
+fn the_second_rows_clash_link_is_live(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let mut o = Overrides::default();
     o.set("GoToday", "cmd-q");
@@ -686,14 +687,22 @@ fn repro_both_rows_clash_links_work(cx: &mut TestAppContext) {
         cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
     cx.simulate_resize(size(px(1100.), px(760.)));
     cx.run_until_parked();
-    // Both Today and Yesterday link to Quit; the duplicate `clash-Quit` ID means one of the
-    // two links shares its mouse state with the other.
+    // Yesterday's link to Quit is the later of the two rows' "Also used by Quit" links.
     let link = cx
-        .debug_bounds("settings-clash-link-Quit")
-        .expect("a link to Quit");
+        .debug_bounds("settings-clash-link-GoYesterday-Quit")
+        .expect("Yesterday's link to Quit");
     cx.simulate_click(link.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    assert_eq!(view.read_with(cx, |v, _| v.flashed()), Some("Quit"));
+    assert_eq!(
+        view.read_with(cx, |v, _| v.flashed()),
+        Some("Quit"),
+        "the second row's link to the same action is live"
+    );
+    // And the first row's link to the same action still exists under its own id.
+    let first = cx
+        .debug_bounds("settings-clash-link-GoToday-Quit")
+        .expect("Today's link to Quit");
+    assert!(first.size.width > px(0.));
 }
 
 /// A `keymap.json` that cannot be read must not take the window down with it (rule 11).

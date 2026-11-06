@@ -931,7 +931,7 @@ impl SettingsView {
         d: &'static ActionDoc,
         conflicts: &[(&'static ActionDoc, &'static ActionDoc)],
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> gpui::Stateful<Div> {
         let th = theme(cx).clone();
         let capturing = self.capturing.map(|c| c.action) == Some(d.action);
         let keys = self.overrides.keys_for(d);
@@ -1000,6 +1000,10 @@ impl SettingsView {
         });
 
         let mut row = div()
+            // The row's id scopes everything inside it (chips, reset marks, clash links):
+            // two rows may link to the same action, and their elements must not share one
+            // GPUI element id.
+            .id(SharedString::from(format!("row-{}", d.action)))
             .debug_selector(move || format!("settings-row-{}", d.action))
             .flex()
             .flex_col()
@@ -1046,14 +1050,20 @@ impl SettingsView {
                 .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.warning)
                 .child("Also used by");
+            let source = d.action;
             for (i, other) in others.iter().copied().enumerate() {
                 if i > 0 {
                     line = line.child(div().child("and"));
                 }
                 line = line.child(
                     div()
-                        .id(SharedString::from(format!("clash-{}", other.action)))
-                        .debug_selector(move || format!("settings-clash-link-{}", other.action))
+                        .id(SharedString::from(format!(
+                            "clash-{}-{}",
+                            source, other.action
+                        )))
+                        .debug_selector(move || {
+                            format!("settings-clash-link-{}-{}", source, other.action)
+                        })
                         .underline()
                         .cursor_pointer()
                         .hover(|x| x.text_color(th.text))
