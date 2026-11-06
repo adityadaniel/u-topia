@@ -758,3 +758,70 @@ fn pinned_pages_sit_above_pages_and_are_local(cx: &mut TestAppContext) {
         "Pages moves up once the Pinned group is gone: {pages_header:?}"
     );
 }
+
+/// SB-4: the footer is one row — the graph chip, the sync dot and (for an encrypted graph)
+/// a lock — at the bottom of the sidebar. Clicking it opens the sync view as an overlay
+/// above the footer; nothing in the page moves.
+#[gpui::test]
+fn footer_opens_the_sync_view_without_moving_the_page(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape");
+    let sidebar = bounds(cx, "left-sidebar");
+    let footer = bounds(cx, "sidebar-footer");
+    let chip = bounds(cx, "graph-chip");
+    let dot = bounds(cx, "sync-dot-off");
+    assert!(
+        footer.origin.y + footer.size.height <= sidebar.origin.y + sidebar.size.height + px(0.5),
+        "the footer is inside the sidebar: {footer:?} {sidebar:?}"
+    );
+    assert!(
+        footer.origin.y > sidebar.origin.y + sidebar.size.height / 2.,
+        "the footer sits at the bottom: {footer:?} {sidebar:?}"
+    );
+    // One row: the chip and the dot share a centre line.
+    let chip_mid = f32::from(chip.origin.y) + f32::from(chip.size.height) / 2.;
+    let dot_mid = f32::from(dot.origin.y) + f32::from(dot.size.height) / 2.;
+    assert!(
+        (chip_mid - dot_mid).abs() <= 2.,
+        "the chip and the dot are on one row: {chip:?} {dot:?}"
+    );
+    assert!(
+        approx(chip.origin.x, f32::from(footer.origin.x))
+            && f32::from(dot.origin.x + dot.size.width) <= f32::from(footer.right()),
+        "chip left, dot right, both inside the row: {chip:?} {dot:?} {footer:?}"
+    );
+    assert!(
+        cx.debug_bounds("encryption-lock").is_none(),
+        "an in-memory graph is not encrypted"
+    );
+
+    let main = bounds(cx, "main-pane");
+    cx.simulate_click(footer.center(), gpui::Modifiers::default());
+    let popover = bounds(cx, "sync-popover");
+    assert!(
+        f32::from(popover.origin.x) >= f32::from(sidebar.origin.x)
+            && f32::from(popover.right()) <= f32::from(sidebar.right()) + 0.5,
+        "the sync view stays inside the sidebar: {popover:?} {sidebar:?}"
+    );
+    assert!(
+        f32::from(popover.bottom()) <= f32::from(footer.origin.y) + 0.5,
+        "the sync view floats above the footer: {popover:?} {footer:?}"
+    );
+    let after = bounds(cx, "main-pane");
+    assert!(
+        approx(after.origin.x, f32::from(main.origin.x))
+            && approx(after.size.width, f32::from(main.size.width)),
+        "opening the sync view does not move the page: {main:?} {after:?}"
+    );
+
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    assert!(ws.update(cx, |w, _| w.sync_view_open()));
+    cx.simulate_click(footer.center(), gpui::Modifiers::default());
+    assert!(
+        !ws.update(cx, |w, _| w.sync_view_open()),
+        "clicking the footer again closes the sync view"
+    );
+}

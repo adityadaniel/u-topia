@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use chrono::NaiveDate;
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Entity, FocusHandle, Focusable, MouseButton,
-    MouseDownEvent, SharedString, Subscription, Task, Window,
+    anchored, deferred, div, prelude::*, px, AnyElement, Context, Entity, FocusHandle, Focusable,
+    MouseButton, MouseDownEvent, SharedString, Subscription, Task, Window,
 };
 use utopia_core::inline::{extract_refs, plain_text};
 use utopia_core::title::normalize_title;
@@ -23,7 +23,9 @@ use crate::graph_view::{GraphEvent, GraphView};
 use crate::page_view::{PageView, PageViewEvent};
 use crate::pdf_view::{PdfEvent, PdfView};
 use crate::quick_jump::{JumpPalette, PaletteMode, QuickJumpEvent};
-use crate::sync_runner::{exchange_owned, status_line, BoxTransport, SyncRunner};
+use crate::sync_runner::{
+    exchange_owned, status_line, sync_dot, BoxTransport, SyncDot, SyncRunner,
+};
 use crate::theme::{quiet_control, theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +112,12 @@ pub struct Workspace {
     today: NaiveDate,
     new_day: bool,
     backup_dir: Option<PathBuf>,
+    /// The graph is encrypted at rest (SB-4): read once at startup, never in `render`.
+    encrypted: bool,
+    /// The sync target as a line without secrets (SB-4), e.g. "Relay · http://…".
+    sync_target: Option<String>,
+    /// The footer's sync view is open (SB-4); it floats above the footer.
+    sync_open: bool,
     sync: Option<SyncRunner>,
     focus: FocusHandle,
     subs: Vec<Subscription>,
@@ -157,6 +165,12 @@ impl Workspace {
                 .map_or(default, |v| v == "1")
         };
         let (left_open, calendar_open) = (flag("left_sidebar", true), flag("calendar", false));
+        // `is_encrypted` opens the file, so it belongs here and not in `render` (rule 10).
+        let encrypted = app
+            .read(cx)
+            .store
+            .path()
+            .is_some_and(utopia_store::is_encrypted);
         let mut me = Self {
             app,
             editor,
@@ -179,6 +193,9 @@ impl Workspace {
             today,
             new_day: false,
             backup_dir,
+            encrypted,
+            sync_target: None,
+            sync_open: false,
             sync: None,
             focus: cx.focus_handle(),
             subs,
@@ -229,6 +246,11 @@ impl Workspace {
     /// Start background sync for `cfg`: relay or folder, optionally end-to-end encrypted,
     /// with realtime notices from a relay (§12). Local editing never waits on it.
     pub fn enable_sync(&mut self, cfg: crate::sync_runner::SyncConfig, cx: &mut Context<Self>) {
+        // Say where sync goes without the token or passphrase (never shown, §15.6).
+        self.sync_target = Some(match &cfg.target {
+            crate::sync_runner::SyncTarget::Relay { url, .. } => format!("Relay · {url}"),
+            crate::sync_runner::SyncTarget::Folder(dir) => format!("Folder · {}", dir.display()),
+        });
         let client = self.app.update(cx, |app, _| {
             utopia_sync::SyncEngine::new(&app.store).map(|e| e.client_id().to_string())
         });
@@ -932,6 +954,11 @@ impl Workspace {
         self.calendar_open
     }
 
+    /// Whether the footer's sync view is open (SB-4).
+    pub fn sync_view_open(&self) -> bool {
+        self.sync_open
+    }
+
     fn toggle_refs(&mut self, _: &ToggleReferences, _: &mut Window, cx: &mut Context<Self>) {
         if self.right_open && self.inspector_open {
             self.inspector_open = false;
@@ -1393,39 +1420,158 @@ impl Workspace {
             scroll = scroll.child(self.sidebar_page_row(i, &page, tagged, false, cx));
         }
         col = col.child(scroll);
-        let (file, err, notice) = {
-            let app = self.app.read(cx);
-            (
-                app.store
-                    .path()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "in-memory graph".into()),
-                app.last_error.clone(),
-                app.notice.clone(),
-            )
+        col.child(self.render_footer(cx)).into_any_element()
+    }
+
+    /// SB-4: one status row — a chip with the graph file's name, the sync dot and, when the
+    /// graph is encrypted at rest, a lock. Clicking it opens the sync view, which floats
+    /// above the footer so opening it never moves the page.
+    fn render_footer(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let th = theme(cx).clone();
+        let app = self.app.read(cx);
+        let file = app
+            .store
+            .path()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "in-memory graph".into());
+        let (err, notice) = (app.last_error.clone(), app.notice.clone());
+        let dot = sync_dot(self.sync.as_ref());
+        let dot_color = match dot {
+            SyncDot::Off => th.faint,
+            SyncDot::Synced => th.success,
+            SyncDot::Syncing => th.warning,
+            SyncDot::Error => th.danger,
         };
-        col.child(
-            div()
-                .pt_2()
-                .px_2()
-                .border_t_1()
-                .border_color(th.line)
-                .text_size(px(crate::theme::CAPTION_SIZE))
-                .text_color(th.muted)
-                .child(format!("Local · {file}"))
-                .child(match &self.sync {
-                    None => div().child("Sync: off (local only)"),
-                    Some(runner) => {
-                        let (line, warn) =
-                            status_line(runner.status.as_ref(), self.app.read(cx).store.now());
-                        div().when(warn, |d| d.text_color(th.warning)).child(line)
-                    }
-                })
-                .when_some(notice, |d, n| d.child(div().text_color(th.text).child(n)))
-                .when_some(err, |d, e| d.child(div().text_color(th.danger).child(e))),
-        )
-        .into_any_element()
+        let open = self.sync_open;
+        div()
+            .relative()
+            .pt_2()
+            .px_2()
+            .border_t_1()
+            .border_color(th.line)
+            .text_size(px(crate::theme::CAPTION_SIZE))
+            .text_color(th.muted)
+            .child(
+                div()
+                    .id("sidebar-footer")
+                    .debug_selector(|| "sidebar-footer".into())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .rounded_sm()
+                    .hover(|d| d.bg(th.hover))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sync_open = !this.sync_open;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .debug_selector(|| "graph-chip".into())
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_md()
+                            .bg(th.chip_bg)
+                            .child(file),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("sync-dot-{}", dot.key()))
+                            .flex_none()
+                            .size(px(7.))
+                            .rounded_full()
+                            .bg(dot_color),
+                    )
+                    .when(self.encrypted, |d| {
+                        d.child(
+                            div()
+                                .id("encryption-lock")
+                                .debug_selector(|| "encryption-lock".into())
+                                .flex_none()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .tooltip(|_, cx| {
+                                    cx.new(|_| SidebarTooltip {
+                                        text: "Encrypted at rest".into(),
+                                    })
+                                    .into()
+                                })
+                                // A drawn lock: the bundled IBM Plex Sans has no 🔒 glyph.
+                                .child(
+                                    div()
+                                        .w(px(6.))
+                                        .h(px(4.))
+                                        .border_1()
+                                        .border_b_0()
+                                        .rounded_t_sm()
+                                        .border_color(th.muted),
+                                )
+                                .child(div().w(px(8.)).h(px(6.)).rounded_sm().bg(th.muted)),
+                        )
+                    })
+                    .children(open.then(|| {
+                        deferred(
+                            anchored()
+                                .anchor(gpui::Corner::BottomLeft)
+                                .offset(gpui::point(px(0.), px(-6.)))
+                                .child(self.sync_popover(cx)),
+                        )
+                        .with_priority(1)
+                    })),
+            )
+            .when_some(notice, |d, n| d.child(div().text_color(th.text).child(n)))
+            .when_some(err, |d, e| d.child(div().text_color(th.danger).child(e)))
+    }
+
+    /// The sync view the footer opens (SB-4): what sync is doing, where it goes and whether
+    /// this graph is encrypted at rest. Read-only; settings come from the environment (§15.6).
+    fn sync_popover(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let th = theme(cx).clone();
+        let (line, warn) = match &self.sync {
+            None => ("Off — this graph stays on this machine.".to_string(), false),
+            Some(runner) => status_line(runner.status.as_ref(), self.app.read(cx).store.now()),
+        };
+        let target = self
+            .sync_target
+            .clone()
+            .unwrap_or_else(|| "No relay or folder configured.".to_string());
+        div()
+            .id("sync-popover")
+            .debug_selector(|| "sync-popover".into())
+            .w(px(232.))
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .bg(th.surface)
+            .border_1()
+            .border_color(th.line)
+            .rounded_md()
+            .shadow_md()
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(th.text)
+                    .child("Sync"),
+            )
+            .child(div().when(warn, |d| d.text_color(th.warning)).child(line))
+            .child(div().child(target))
+            .child(div().child(if self.encrypted {
+                "Encrypted at rest."
+            } else {
+                "Not encrypted at rest."
+            }))
+            .when(self.sync.is_none(), |d| {
+                d.child(div().text_color(th.faint).child(
+                    "Set UTOPIA_SYNC_URL or UTOPIA_SYNC_FOLDER, then reopen the graph, to sync.",
+                ))
+            })
     }
 
     fn render_inspector(&mut self, cx: &mut Context<Self>) -> AnyElement {
