@@ -29,13 +29,19 @@ icon per tab).
   left of the chip.
 - **ST-3 — clashes inline.** `settings-clash.png`: the config's `keymap.json` puts Today on
   ⇧⌘Y, which Yesterday already uses. Each of the two rows carries an amber line, "Also used
-  by Yesterday" / "Also used by Today", with the other action underlined and clickable; the
-  link scrolls the list to that row and highlights it for a moment (asserted by
-  `a_clash_link_scrolls_to_the_other_card`).
+  by Yesterday" / "Also used by Today", with the other action underlined and clickable. The
+  link scrolls the list to the target *row* (not just its category: `a_clash_link_reveals_a_row_in_a_tall_category`),
+  clears a filter that hides it (`a_clash_link_reveals_a_row_the_filter_hides`), and every
+  link is scoped to its row so two rows linking to the same action both stay live
+  (`the_second_rows_clash_link_is_live`). A cross-category jump is asserted by
+  `a_clash_link_scrolls_to_the_other_card`.
 - **ST-5 — the Sync tab.** `settings-sync.png`: this scratch graph syncs nowhere, so the
   pane says sync is off, names the graph id, and explains that the transport (relay or
   shared folder) and its secrets come from the environment and the keychain at launch. No
-  token or passphrase is shown (`sync_facts_never_carry_secrets`).
+  token or passphrase is shown (`sync_facts_never_carry_secrets`), and the enabled facts are
+  published only once a runner actually starts: a transport that cannot be built or a LAN
+  discovery that finds nothing leaves the pane saying sync is off
+  (`a_sync_that_cannot_start_does_not_claim_to_be_on`).
 - **ST-5 — Help without a second sidebar.** `settings-help.png`: the topics are chips under
   the pane title, the prose is one 720 px column and the 640 px screenshots fit instead of
   being clipped by an inner nav.
