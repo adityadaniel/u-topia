@@ -3,7 +3,8 @@
 //!
 //! One shell is shared by every palette mode (quick jump, full-text search, quick capture,
 //! free text). In page mode it has a useful empty state — today, yesterday and the pages
-//! opened last (QJ-1) and labelled rows with an icon per type (QJ-2).
+//! opened last (QJ-1) — labelled rows with an icon per type (QJ-2) and a footer of key
+//! hints (QJ-3).
 //!
 //! All of this is view state. Rows come from the index (`Store::search_titles`,
 //! `Store::tag_pages`) when the query changes, never while painting (rule 3), and nothing
@@ -526,6 +527,12 @@ impl Render for JumpPalette {
                 .border_color(th.line)
                 .child(el)
         });
+        let hints = match self.mode {
+            PaletteMode::Pages => "↑↓ move · ↩ open · ⌘↩ open in split · esc",
+            PaletteMode::Search => "↑↓ move · ↩ open · ⌘↩ open beside · esc",
+            PaletteMode::Capture => "↩ save to today · esc",
+            PaletteMode::Text => "↩ confirm · esc",
+        };
         div()
             .debug_selector(|| "jump-palette".into())
             .w(px(520.))
@@ -565,6 +572,17 @@ impl Render for JumpPalette {
                     .overflow_y_scroll()
                     .children(rows)
                     .children(create_row),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "jump-footer".into())
+                    .border_t_1()
+                    .border_color(th.line)
+                    .pt_1()
+                    .px_1()
+                    .text_size(px(CAPTION_SIZE))
+                    .text_color(th.faint)
+                    .child(hints),
             )
     }
 }

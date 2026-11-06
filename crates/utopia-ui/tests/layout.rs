@@ -240,6 +240,30 @@ fn quick_jump_empty_state_lists_today_and_yesterday(cx: &mut TestAppContext) {
     );
 }
 
+/// QJ-3: the key hints are a footer under the results, with a hairline above them.
+#[gpui::test]
+fn quick_jump_footer_sits_under_the_results(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape cmd-k");
+    let palette = bounds(cx, "jump-palette");
+    let footer = bounds(cx, "jump-footer");
+    let last_row = bounds(cx, "qj-row-1");
+    let results = bounds(cx, "jump-results");
+    assert!(
+        footer.origin.y >= results.origin.y + results.size.height - px(0.5),
+        "the footer follows the list: {footer:?} {results:?}"
+    );
+    assert!(
+        footer.origin.y >= last_row.origin.y + last_row.size.height - px(0.5),
+        "and the last row: {footer:?} {last_row:?}"
+    );
+    assert!(
+        footer.origin.y + footer.size.height <= palette.origin.y + palette.size.height + px(0.5),
+        "the footer is inside the palette: {footer:?} {palette:?}"
+    );
+    assert!(approx(footer.size.width, 520. - 18.), "{footer:?}");
+}
+
 /// QJ-2: "Create page" is the last row, below a hairline of its own.
 #[gpui::test]
 fn quick_jump_create_row_is_last(cx: &mut TestAppContext) {
@@ -370,6 +394,11 @@ fn quick_jump_caps_its_height(cx: &mut TestAppContext) {
         palette.size.height <= px(440.) + px(0.5),
         "the palette caps its height: {palette:?}"
     );
+    let footer = bounds(cx, "jump-footer");
+    assert!(
+        footer.origin.y + footer.size.height <= palette.origin.y + palette.size.height + px(0.5),
+        "the footer stays inside: {footer:?} {palette:?}"
+    );
     assert!(
         cx.debug_bounds("qj-row-9").is_some(),
         "all ten rows are offered, and the list scrolls"
@@ -393,10 +422,10 @@ fn quick_jump_works_at_compact_density(cx: &mut TestAppContext) {
         yesterday.origin.y > today.origin.y,
         "{today:?} {yesterday:?}"
     );
+    let footer = bounds(cx, "jump-footer");
     assert!(
-        yesterday.origin.y + yesterday.size.height
-            <= palette.origin.y + palette.size.height + px(0.5),
-        "Compact keeps the rows inside: {yesterday:?} {palette:?}"
+        footer.origin.y + footer.size.height <= palette.origin.y + palette.size.height + px(0.5),
+        "Compact keeps the footer inside: {footer:?} {palette:?}"
     );
 }
 
