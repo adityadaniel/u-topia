@@ -238,6 +238,39 @@ fn daily_notes_feed_stacks_days(cx: &mut TestAppContext) {
     );
 }
 
+/// DN-1: after today and yesterday (which always stay open), an empty day is one 36 px
+/// row, and those rows stack.
+#[gpui::test]
+fn feed_folds_empty_days_to_one_row(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape");
+    // Yesterday is empty but open (DN-1).
+    let yesterday = bounds(cx, "day-title");
+    assert!(
+        cx.debug_bounds("day-empty").is_some(),
+        "yesterday's hint row"
+    );
+    // Two days back is the first folded row: one 36 px row per empty day.
+    let folded = bounds(cx, "day-folded-2026-10-31");
+    let next = bounds(cx, "day-folded-2026-10-30");
+    assert!(approx(folded.size.height, 36.), "one row: {folded:?}");
+    assert!(
+        folded.origin.y > yesterday.origin.y,
+        "{folded:?} {yesterday:?}"
+    );
+    assert!(
+        approx(next.origin.y - folded.origin.y, 36.),
+        "folded days stack: {folded:?} {next:?}"
+    );
+    // The row stays inside the readable column, like the days above it.
+    let (left, right) = column(cx);
+    let (x0, x1) = (
+        f32::from(folded.origin.x),
+        f32::from(folded.origin.x + folded.size.width),
+    );
+    assert!(x0 >= left && x1 <= right + 0.5, "{folded:?}");
+}
+
 /// Several hundred characters with no newline: a referencing block that must wrap.
 const LONG: &str = "A deliberately long note that keeps going without any newline so that \
     it has to wrap at the readable column: the beta needs twenty testers invited by hand, \

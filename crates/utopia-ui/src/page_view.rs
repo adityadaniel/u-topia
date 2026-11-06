@@ -140,7 +140,14 @@ enum Item {
         today: bool,
         first: bool,
     },
-    /// A day in the feed with no blocks.
+    /// A day in the feed with nothing on it, folded to one 36 px row (DN-1).
+    DayFolded {
+        date: NaiveDate,
+        weekday: SharedString,
+        title: SharedString,
+    },
+    /// The click-to-start row under an open day that has no blocks yet (today and
+    /// yesterday always stay open, DN-1).
     DayEmpty {
         date: NaiveDate,
     },
@@ -345,6 +352,14 @@ impl PageView {
             .as_ref()
             .map(|j| j.days.clone())
             .unwrap_or_default()
+    }
+
+    /// How many days the feed shows open, with a date heading (DN-1), for scripts.
+    pub fn open_day_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| matches!(i, Item::DayHeader { .. }))
+            .count()
     }
 
     fn show(&mut self, page: PageId, zoom: Option<BlockId>, cx: &mut Context<Self>) {
@@ -752,30 +767,51 @@ impl PageView {
         self.header = header;
         let mut items = Vec::new();
         let mut ids = Vec::new();
+        let yesterday = today_date.pred_opt();
         for (i, day) in days.into_iter().enumerate() {
-            items.push(Item::DayHeader {
-                date: day.date,
-                page: day.page.clone(),
-                title: day.title.into(),
-                caption: day_caption(day.date, today_date).into(),
-                today: day.date == today_date,
-                first: i == 0,
-            });
-            if day.rows.is_empty() {
-                items.push(Item::DayEmpty { date: day.date });
+            // Like Roam's feed: Linked References under the day when it has any, and no
+            // Unlinked References (those stay on the day's own page). A day with
+            // references is not empty even when it has no blocks, so it stays open.
+            let refs = day
+                .page
+                .as_ref()
+                .and_then(|p| refs_cache.get(p))
+                .filter(|r| !r.groups.is_empty());
+            // DN-1: a day with nothing on it folds to one 36 px row. Today and yesterday
+            // always stay open, so the day the caret starts in always shows its heading;
+            // folding is a view change only, the day is still written on its first key.
+            let open =
+                !day.rows.is_empty() || refs.is_some() || i == 0 || Some(day.date) == yesterday;
+            if open {
+                items.push(Item::DayHeader {
+                    date: day.date,
+                    page: day.page.clone(),
+                    title: day.title.into(),
+                    caption: day_caption(day.date, today_date).into(),
+                    today: day.date == today_date,
+                    first: i == 0,
+                });
+                if day.rows.is_empty() {
+                    items.push(Item::DayEmpty { date: day.date });
+                }
+            } else {
+                items.push(Item::DayFolded {
+                    date: day.date,
+                    weekday: utopia_core::date::weekday_name_of(day.date).into(),
+                    title: day.title.into(),
+                });
             }
             items.extend(day.rows);
-            let Some(page) = day.page else { continue };
-            // Like Roam's feed: Linked References under the day when it has any, and no
-            // Unlinked References (those stay on the day's own page).
-            if let Some(refs) = refs_cache.get(&page).filter(|r| !r.groups.is_empty()) {
-                items.push(Item::RefsHeader {
-                    title: "Linked References".into(),
-                    count: refs.shown(),
-                });
-                self.push_ref_groups(&page, refs, true, &mut items);
+            if let Some(page) = day.page {
+                if let Some(refs) = refs {
+                    items.push(Item::RefsHeader {
+                        title: "Linked References".into(),
+                        count: refs.shown(),
+                    });
+                    self.push_ref_groups(&page, refs, true, &mut items);
+                }
+                ids.push(page);
             }
-            ids.push(page);
         }
         items.push(Item::JournalEnd);
         if let Some(j) = &mut self.journal {
@@ -2477,6 +2513,45 @@ impl PageView {
                         })),
                 )
                 .into_any_element(),
+            // DN-1: a day with nothing on it is one 36 px row. The whole row is the click
+            // target; the hint only shows on hover, and no page is written until the first
+            // keystroke (FR-1.2).
+            Item::DayFolded {
+                date,
+                weekday,
+                title,
+            } => {
+                let group: SharedString = format!("day-folded-{ix}").into();
+                div()
+                    .id(("day-folded", ix))
+                    .debug_selector(move || format!("day-folded-{}", utopia_core::date::iso(date)))
+                    .group(group.clone())
+                    .h(px(36.))
+                    .px_4()
+                    .pl(px(32.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(crate::theme::BODY_SIZE))
+                    .text_color(th.muted)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(th.hover))
+                    .child(weekday)
+                    .child(title)
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.faint)
+                            .opacity(0.)
+                            .group_hover(group, |s| s.opacity(1.))
+                            .child("Click to start writing"),
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.start_day(date, window, cx)),
+                    )
+                    .into_any_element()
+            }
             Item::DayEmpty { date } => div()
                 .id(("day-empty", ix))
                 .debug_selector(|| "day-empty".into())
@@ -2893,14 +2968,6 @@ impl Render for PageView {
     }
 }
 
-fn human_size(n: u64) -> String {
-    match n {
-        0..1024 => format!("{n} B"),
-        1024..1_048_576 => format!("{:.0} KB", n as f64 / 1024.),
-        _ => format!("{:.1} MB", n as f64 / 1_048_576.),
-    }
-}
-
 /// DN-2: the caption above a day in the feed: "Thursday · Today", "Wednesday ·
 /// Yesterday", or just "Monday". Display only (§10.3: a day's identity is its date).
 fn day_caption(date: NaiveDate, today: NaiveDate) -> String {
@@ -2909,6 +2976,14 @@ fn day_caption(date: NaiveDate, today: NaiveDate) -> String {
         0 => format!("{weekday} · Today"),
         1 => format!("{weekday} · Yesterday"),
         _ => weekday.to_string(),
+    }
+}
+
+fn human_size(n: u64) -> String {
+    match n {
+        0..1024 => format!("{n} B"),
+        1024..1_048_576 => format!("{:.0} KB", n as f64 / 1024.),
+        _ => format!("{:.1} MB", n as f64 / 1_048_576.),
     }
 }
 

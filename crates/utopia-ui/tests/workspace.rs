@@ -1079,6 +1079,37 @@ fn feed_blank_day_is_written_by_typing(cx: &mut TestAppContext) {
     assert_eq!(day_texts(&app, written[0], cx), ["filled in later"]);
 }
 
+/// DN-1: an empty day after today and yesterday is one row; clicking it starts writing
+/// there, and the day opens (with its heading) once it has a block. Clicking alone writes
+/// nothing (FR-1.2).
+#[gpui::test]
+fn folded_empty_day_opens_on_a_click(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.open_journal_days(cx)),
+        2,
+        "today and yesterday stay open"
+    );
+    let day = today() - chrono::Duration::days(4);
+    let selector: &'static str =
+        Box::leak(format!("day-folded-{}", utopia_core::date::iso(day)).into_boxed_str());
+    let row = cx.debug_bounds(selector).expect("a folded empty day");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(daily_count(&app, cx), 0, "clicking is not writing");
+    cx.simulate_input("picked up later");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(day_texts(&app, day, cx), ["picked up later"]);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.open_journal_days(cx)),
+        3,
+        "the day now shows its date and its block"
+    );
+}
+
 #[gpui::test]
 fn shortcuts_work_after_scrolling_the_caret_away(cx: &mut TestAppContext) {
     let (_app, ws, cx) = setup(cx);
