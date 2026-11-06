@@ -1,0 +1,71 @@
+[
+ {
+  "title": "Atlas Launch",
+  "children": [
+   {
+    "string": "status:: in progress"
+   },
+   {
+    "string": "owner:: [[Ana Lovelace]]"
+   },
+   {
+    "string": "A beta for twenty testers, invited by hand"
+   },
+   {
+    "string": "Import from the old format",
+    "children": [
+     {
+      "string": "Keep the import path unchanged, so old files still open"
+     },
+     {
+      "string": "The migration notes go out before the end of the month"
+     }
+    ]
+   },
+   {
+    "string": "{{[[TODO]]}} Write the migration notes"
+   }
+  ]
+ },
+ {
+  "title": "Ana Lovelace",
+  "children": [
+   {
+    "string": "Designs the onboarding flow."
+   },
+   {
+    "string": "Runs the weekly review with [[Atlas Launch]] on the table."
+   }
+  ]
+ },
+ {
+  "title": "Library",
+  "children": [
+   {
+    "string": "Reading list for the winter."
+   },
+   {
+    "string": "Borrowed by [[Ana Lovelace]]"
+   }
+  ]
+ },
+ {
+  "title": "November 6th, 2026",
+  "children": [
+   {
+    "string": "Met [[Ana Lovelace]] about #operations"
+   },
+   {
+    "string": "Shipped the palette rework"
+   }
+  ]
+ },
+ {
+  "title": "November 5th, 2026",
+  "children": [
+   {
+    "string": "Reviewed [[Atlas Launch]] with the team"
+   }
+  ]
+ }
+]
