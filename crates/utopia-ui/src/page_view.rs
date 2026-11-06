@@ -1026,6 +1026,11 @@ impl PageView {
                     None
                 };
                 let collapsed = self.app.read(cx).store.collapsed_set().clone();
+                // PG-1 hides the children of a compact attribute row, so Backspace must merge
+                // into the previous row the user can *see*, not into a hidden descendant
+                // (FR-2.5). Visibility here is the renderer's, not the store's alone.
+                let compact = self.zoom.is_none() && self.attributes_are_compact();
+                let editing = t.block.clone();
                 let now = self.app.read(cx).store.now();
                 self.run_plan(
                     &t.page,
@@ -1034,7 +1039,10 @@ impl PageView {
                             st,
                             &t.block,
                             zoom.as_ref(),
-                            &|b| collapsed.contains(b),
+                            &|b| {
+                                collapsed.contains(b)
+                                    || is_folded_attribute(st, compact, Some(&editing), b)
+                            },
                             now,
                         )
                     },

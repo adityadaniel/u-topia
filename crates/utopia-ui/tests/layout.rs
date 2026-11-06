@@ -1130,3 +1130,33 @@ fn switching_to_compact_keeps_the_edited_descendant_rendered(cx: &mut TestAppCon
         "and they went into the block being edited, not another"
     );
 }
+
+/// Finding 2: Backspace at the start of the block after a folded attribute merges into the
+/// previous *displayed* row (the attribute), not into its hidden child (FR-2.5).
+#[gpui::test]
+fn backspace_merges_into_the_previous_visible_row(cx: &mut TestAppContext) {
+    use utopia_ui::appearance::AttributeBlocks;
+    let dir = tempfile::tempdir().unwrap();
+    let (cx, ids) = setup_attribute_tree(cx, dir.path(), AttributeBlocks::Compact);
+    let attr = bounds(cx, "attr-1");
+    assert!(attr.size.height > px(0.));
+    let note = bounds(cx, "content-2");
+    // The caret at the start of "note": click just inside its left edge.
+    cx.simulate_click(
+        gpui::point(note.origin.x + px(1.), note.origin.y + px(8.)),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert_eq!(
+        block_text(cx, &ids[0]),
+        "status:: xnote",
+        "the note joined the previous visible row"
+    );
+    assert_eq!(
+        block_text(cx, &ids[1]),
+        "hidden child",
+        "the hidden child under the attribute is untouched"
+    );
+}
