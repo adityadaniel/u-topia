@@ -327,7 +327,6 @@ fn date_filter_on_linked_references() {
 #[test]
 fn reference_children_come_from_the_index_in_order() {
     let (mut s, _d) = store();
-    let target = s.create_page("Target").unwrap();
     let src = s.create_page("Source").unwrap();
     let parent = write(&mut s, &src, "the plan depends on [[Target]]");
     let mut kids = Vec::new();
