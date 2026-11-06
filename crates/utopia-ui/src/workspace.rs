@@ -1043,7 +1043,7 @@ impl Workspace {
             .py_0p5()
             .rounded_sm()
             .cursor_pointer()
-            .text_sm()
+            .text_size(px(crate::theme::BODY_SIZE))
             .text_color(if active { th.accent } else { th.text })
             .when(active, |d| d.bg(th.hover))
             .hover(|s| s.bg(th.hover))
@@ -1065,7 +1065,7 @@ impl Workspace {
             div()
                 .mt_3()
                 .px_2()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(th.muted)
                 .child(title)
@@ -1110,7 +1110,7 @@ impl Workspace {
                                     .id("open-jump")
                                     .px_1()
                                     .rounded_sm()
-                                    .text_xs()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
                                     .text_color(th.muted)
                                     .cursor_pointer()
                                     .hover(|s| s.bg(th.hover))
@@ -1125,7 +1125,7 @@ impl Workspace {
                                     .debug_selector(|| "collapse-left".into())
                                     .px_1()
                                     .rounded_sm()
-                                    .text_xs()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
                                     .text_color(th.muted)
                                     .cursor_pointer()
                                     .hover(|s| s.bg(th.hover))
@@ -1209,7 +1209,7 @@ impl Workspace {
                 div()
                     .flex()
                     .flex_col()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.muted)
                     .children(
                         preview
@@ -1231,7 +1231,7 @@ impl Workspace {
             scroll = scroll.child(
                 div()
                     .px_2()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.faint)
                     .child("Type [[ or # to make a page."),
             );
@@ -1258,7 +1258,7 @@ impl Workspace {
                 .px_2()
                 .border_t_1()
                 .border_color(th.line)
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.muted)
                 .child(format!("Local · {file}"))
                 .child(match &self.sync {
@@ -1285,7 +1285,7 @@ impl Workspace {
             div()
                 .id(id)
                 .px_2()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .rounded_sm()
                 .cursor_pointer()
                 .text_color(if this.tab == t { th.accent } else { th.muted })
@@ -1381,7 +1381,7 @@ impl Workspace {
                     body = body.child(
                         div()
                             .px_2()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.faint)
                             .child("Every reference resolves."),
                     );
@@ -1390,7 +1390,7 @@ impl Workspace {
                     let block = o.from_block.clone();
                     let mut row = div().flex().flex_col().px_2().py_1().child(
                         div()
-                            .text_sm()
+                            .text_size(px(crate::theme::BODY_SIZE))
                             .text_color(th.danger)
                             .child(label.clone()),
                     );
@@ -1402,7 +1402,7 @@ impl Workspace {
                             div()
                                 .id(id)
                                 .px_1()
-                                .text_xs()
+                                .text_size(px(crate::theme::CAPTION_SIZE))
                                 .rounded_sm()
                                 .text_color(th.accent)
                                 .cursor_pointer()
@@ -1461,7 +1461,7 @@ impl Workspace {
             .border_color(th.line)
             .child(
                 div()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(th.muted)
                     .child("REFERENCES"),
@@ -1497,7 +1497,7 @@ impl Render for Workspace {
                         .id("expand-left")
                         .px_1()
                         .rounded_sm()
-                        .text_xs()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
                         .text_color(th.muted)
                         .cursor_pointer()
                         .hover(|s| s.bg(th.hover))
@@ -1517,7 +1517,7 @@ impl Render for Workspace {
                     .justify_center()
                     .py_1()
                     .bg(th.banner_bg)
-                    .text_sm()
+                    .text_size(px(crate::theme::BODY_SIZE))
                     .cursor_pointer()
                     .child("It's a new day → open today")
                     .on_click(cx.listener(|this, _, window, cx| this.open_journal(window, cx))),
@@ -1533,7 +1533,7 @@ impl Render for Workspace {
                         .justify_center()
                         .py_1()
                         .bg(th.banner_bg)
-                        .text_sm()
+                        .text_size(px(crate::theme::BODY_SIZE))
                         .child(text),
                 );
             }
@@ -1578,7 +1578,7 @@ impl Render for Workspace {
                 col = col.child(
                     div()
                         .p_4()
-                        .text_sm()
+                        .text_size(px(crate::theme::BODY_SIZE))
                         .text_color(th.faint)
                         .child("Shift-click a link to open it here."),
                 );

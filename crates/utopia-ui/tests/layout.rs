@@ -390,3 +390,33 @@ fn left_sidebar_collapses_to_a_rail(cx: &mut TestAppContext) {
     let cal = bounds(cx, "left-calendar");
     assert!(cal.origin.y > toggle.origin.y);
 }
+
+/// ALL-1: page title 28, H1 20, body 15 — measured as line boxes, since the heading used to
+/// draw at 24 px (larger than H1 and close to the title).
+#[gpui::test]
+fn type_scale_caps_outline_headings_at_h1(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    cx.simulate_input("body");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("Heading /head");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_input(" one");
+    cx.simulate_keystrokes("escape");
+    let title = bounds(cx, "page-title");
+    let body = bounds(cx, "content-1");
+    let h1 = bounds(cx, "content-2");
+    assert!(
+        title.size.height > h1.size.height,
+        "the title outranks H1: {title:?} {h1:?}"
+    );
+    assert!(
+        h1.size.height > body.size.height,
+        "H1 outranks body: {h1:?} {body:?}"
+    );
+    assert!(
+        h1.size.height <= px(utopia_ui::theme::H1_SIZE + 8.),
+        "H1 is 20 px on a 28 px line, never the old 24 px: {h1:?}"
+    );
+}

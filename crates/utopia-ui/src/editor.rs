@@ -1321,7 +1321,12 @@ impl BlockEditor {
                 .when(i == ac.selected, |d| d.bg(th.hover))
                 .child(div().text_color(th.text).child(label))
                 .when_some(detail, |d, s| {
-                    d.child(div().text_xs().text_color(th.muted).child(s))
+                    d.child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(s),
+                    )
                 })
                 .on_mouse_down(
                     MouseButton::Left,

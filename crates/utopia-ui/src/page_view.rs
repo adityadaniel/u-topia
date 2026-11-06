@@ -1593,7 +1593,7 @@ impl PageView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.faint)
                 .when(r.has_children, |d| {
                     d.cursor_pointer()
@@ -1620,7 +1620,7 @@ impl PageView {
                 .justify_center()
                 .cursor_pointer()
                 .when(r.kind == BlockKind::Numbered, |d| {
-                    d.text_sm()
+                    d.text_size(px(crate::theme::BODY_SIZE))
                         .text_color(th.muted)
                         .child(format!("{}.", r.number))
                 })
@@ -1700,14 +1700,14 @@ impl PageView {
                 c = match r.kind {
                     BlockKind::Heading(l) => c
                         .text_size(px(match l {
-                            1 => 24.,
-                            2 => 20.,
-                            _ => 17.,
+                            1 => crate::theme::H1_SIZE,
+                            2 => crate::theme::H2_SIZE,
+                            _ => crate::theme::H3_SIZE,
                         }))
                         .line_height(px(match l {
-                            1 => 34.,
-                            2 => 30.,
-                            _ => 26.,
+                            1 => 28.,
+                            2 => 24.,
+                            _ => 22.,
                         }))
                         .font_weight(gpui::FontWeight::BOLD),
                     BlockKind::Quote => c
@@ -1732,7 +1732,7 @@ impl PageView {
                     div()
                         .ml_1()
                         .px_1()
-                        .text_xs()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
                         .text_color(th.muted)
                         .bg(th.chip_bg)
                         .rounded_sm()
@@ -1754,7 +1754,7 @@ impl PageView {
             .px_2()
             .py_0p5()
             .rounded_sm()
-            .text_xs()
+            .text_size(px(crate::theme::CAPTION_SIZE))
             .text_color(th.muted)
             .cursor_pointer()
             .hover(|s| s.bg(th.hover))
@@ -1833,7 +1833,7 @@ impl PageView {
                 .flex()
                 .flex_wrap()
                 .gap_1()
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.muted);
             crumbs = crumbs.child(
                 div()
@@ -1883,7 +1883,8 @@ impl PageView {
         };
         let title_el: AnyElement = match &self.rename {
             Some(input) => div()
-                .text_size(px(26.))
+                .text_size(px(crate::theme::TITLE_SIZE))
+                .line_height(px(34.))
                 .border_b_1()
                 .border_color(th.accent)
                 .child(input.clone())
@@ -1891,7 +1892,8 @@ impl PageView {
             None => div()
                 .id("title")
                 .debug_selector(|| "page-title".into())
-                .text_size(px(if self.compact { 20. } else { 28. }))
+                .text_size(px(crate::theme::TITLE_SIZE))
+                .line_height(px(34.))
                 .font_weight(gpui::FontWeight::BOLD)
                 .text_color(if h.deleted { th.muted } else { th.text })
                 .cursor_pointer()
@@ -1926,7 +1928,12 @@ impl PageView {
         }
         if self.zoom.is_none() && !h.attributes.is_empty() {
             // Page metadata header (P1, W7): the page's `Key:: value` blocks at a glance.
-            let mut grid = div().flex().flex_col().gap_0p5().py_1().text_sm();
+            let mut grid = div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .py_1()
+                .text_size(px(crate::theme::BODY_SIZE));
             for (k, v) in &h.attributes {
                 grid = grid.child(
                     div()
@@ -1944,7 +1951,7 @@ impl PageView {
                 .flex_wrap()
                 .items_center()
                 .gap_1()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.muted);
             if !h.aliases.is_empty() {
                 row = row.child("Also known as:");
@@ -2086,7 +2093,7 @@ impl PageView {
                     .id(("filter", i))
                     .px_2()
                     .rounded_md()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .bg(th.chip_bg)
                     .text_color(th.accent)
                     .cursor_pointer()
@@ -2107,7 +2114,7 @@ impl PageView {
                     .id(("suggest", i))
                     .px_2()
                     .rounded_md()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.muted)
                     .border_1()
                     .border_color(th.line)
@@ -2141,7 +2148,7 @@ impl PageView {
                             .border_1()
                             .border_color(th.line)
                             .rounded_md()
-                            .text_sm()
+                            .text_size(px(crate::theme::BODY_SIZE))
                             .child(self.filter.clone()),
                     )
                     .child({
@@ -2199,7 +2206,7 @@ impl PageView {
             Item::Row(r) => self.render_row(ix, &r, cx),
             Item::Notice { depth, text } => div()
                 .pl(px(depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT + 32.))
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.muted)
                 .child(text)
                 .into_any_element(),
@@ -2207,7 +2214,7 @@ impl PageView {
                 .debug_selector(|| "query-header".into())
                 .pl(px(depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT + 32.))
                 .pt_1()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.muted)
                 .child(label)
                 .into_any_element(),
@@ -2229,7 +2236,7 @@ impl PageView {
                             .flex_none()
                             .w(px(160.))
                             .overflow_hidden()
-                            .text_sm()
+                            .text_size(px(crate::theme::BODY_SIZE))
                             .text_color(th.accent)
                             .child(hit.page_title.clone()),
                     )
@@ -2305,13 +2312,18 @@ impl PageView {
                                     .py_0p5()
                                     .rounded_md()
                                     .bg(th.chip_bg)
-                                    .text_sm()
+                                    .text_size(px(crate::theme::BODY_SIZE))
                                     .when(path.is_some(), |d| {
                                         d.cursor_pointer().hover(|s| s.bg(th.hover))
                                     })
                                     .child(icon)
                                     .child(blob.name.clone())
-                                    .child(div().text_xs().text_color(th.faint).child(detail)),
+                                    .child(
+                                        div()
+                                            .text_size(px(crate::theme::CAPTION_SIZE))
+                                            .text_color(th.faint)
+                                            .child(detail),
+                                    ),
                             )
                             .on_click(cx.listener(move |_, _, _, cx| match (kind, &open_path) {
                                 (BlobKind::Pdf, Some(_)) => cx.emit(PageViewEvent::OpenPdf {
@@ -2351,7 +2363,8 @@ impl PageView {
                 .child(
                     div()
                         .id(("day-title", ix))
-                        .text_size(px(if self.compact { 20. } else { 28. }))
+                        .text_size(px(crate::theme::TITLE_SIZE))
+                        .line_height(px(34.))
                         .font_weight(gpui::FontWeight::BOLD)
                         .cursor_pointer()
                         .hover(|s| s.text_color(th.accent))
@@ -2398,7 +2411,7 @@ impl PageView {
                     .px_4()
                     .pt_8()
                     .pb(px(120.))
-                    .text_sm()
+                    .text_size(px(crate::theme::BODY_SIZE))
                     .text_color(th.faint)
                     .child("Loading older days…")
                     .into_any_element()
@@ -2413,7 +2426,7 @@ impl PageView {
                 .border_color(th.line)
                 .flex()
                 .justify_between()
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.muted)
                 .child(title)
                 .child(count.to_string())
@@ -2440,7 +2453,7 @@ impl PageView {
                             .when(scheduled, |d| {
                                 d.child(
                                     div()
-                                        .text_xs()
+                                        .text_size(px(crate::theme::CAPTION_SIZE))
                                         .text_color(th.tag)
                                         .child("Scheduled for this day"),
                                 )
@@ -2454,7 +2467,7 @@ impl PageView {
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.muted)
                             .child(count.to_string()),
                     )
@@ -2489,7 +2502,7 @@ impl PageView {
                     .when(!crumbs.is_empty(), |d| {
                         d.child(
                             div()
-                                .text_xs()
+                                .text_size(px(crate::theme::CAPTION_SIZE))
                                 .text_color(th.faint)
                                 .child(format!("› {crumbs}")),
                         )
@@ -2522,7 +2535,7 @@ impl PageView {
             Item::More { page, hidden } => div()
                 .id(("more", ix))
                 .px_6()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.accent)
                 .cursor_pointer()
                 .child(format!("+{hidden} more"))
@@ -2531,7 +2544,7 @@ impl PageView {
             Item::NoRefs => div()
                 .px_4()
                 .pb_6()
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.faint)
                 .child("No linked references yet.")
                 .into_any_element(),
@@ -2546,7 +2559,7 @@ impl PageView {
                 .border_color(th.line)
                 .flex()
                 .justify_between()
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.muted)
                 .cursor_pointer()
                 .child(format!(
@@ -2587,7 +2600,7 @@ impl PageView {
                             .flex_col()
                             .child(
                                 div()
-                                    .text_xs()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
                                     .text_color(th.accent)
                                     .child(m.page_title.clone()),
                             )
@@ -2599,7 +2612,7 @@ impl PageView {
                             .debug_selector(|| format!("link-{ix}"))
                             .px_2()
                             .rounded_sm()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.accent)
                             .border_1()
                             .border_color(th.line)

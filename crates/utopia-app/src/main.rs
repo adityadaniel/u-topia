@@ -481,7 +481,7 @@ impl Render for Root {
                         .gap_2()
                         .child(
                             div()
-                                .text_size(px(24.))
+                                .text_size(px(utopia_ui::theme::H1_SIZE))
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .child("Welcome to Utopia"),
                         )
@@ -499,7 +499,7 @@ impl Render for Root {
                                 .rounded_md()
                                 .child(input.clone()),
                         )
-                        .child(div().text_xs().text_color(th.faint).child(format!(
+                        .child(div().text_size(px(utopia_ui::theme::CAPTION_SIZE)).text_color(th.faint).child(format!(
                             "Creates {}/<name>.utopia",
                             paths::graphs_dir().display()
                         )))
@@ -521,7 +521,7 @@ impl Render for Root {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(24.))
+                            .text_size(px(utopia_ui::theme::H1_SIZE))
                             .font_weight(gpui::FontWeight::BOLD)
                             .child("This graph is locked"),
                     )
@@ -540,7 +540,7 @@ impl Render for Root {
                             .rounded_md()
                             .child(input.clone()),
                     )
-                    .child(div().text_xs().text_color(th.faint).child(
+                    .child(div().text_size(px(utopia_ui::theme::CAPTION_SIZE)).text_color(th.faint).child(
                         "Tip: store it in the keychain (service utopia-db) to unlock automatically.",
                     ))
                     .children(

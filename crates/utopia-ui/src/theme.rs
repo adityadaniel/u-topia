@@ -109,7 +109,17 @@ pub fn theme(cx: &App) -> &Theme {
     cx.global::<Theme>()
 }
 
-pub const TEXT_SIZE: f32 = 15.;
+/// The one type scale (ALL-1): titles, outline headings, body and captions. Page titles
+/// and day headings share `TITLE_SIZE`; an outline heading never draws larger than H1.
+pub const TITLE_SIZE: f32 = 28.;
+pub const H1_SIZE: f32 = 20.;
+pub const H2_SIZE: f32 = 17.;
+pub const H3_SIZE: f32 = 15.5;
+pub const BODY_SIZE: f32 = 15.;
+pub const CAPTION_SIZE: f32 = 12.5;
+/// Body text and leading at the default (Comfortable) density. `Density` in
+/// [`crate::appearance`] picks these or the compact pair.
+pub const TEXT_SIZE: f32 = BODY_SIZE;
 pub const LINE_HEIGHT: f32 = 24.;
 pub const INDENT: f32 = 22.;
 /// The UI caps visual indentation; deeper blocks show a depth badge (§6.1).
@@ -140,4 +150,22 @@ mod tests {
         assert_ne!(l.danger, l.accent, "danger is not the link colour");
     }
 
+    /// ALL-1: the scale is ordered and an outline heading never passes H1.
+    #[test]
+    fn type_scale_is_ordered() {
+        let scale = [
+            TITLE_SIZE,
+            H1_SIZE,
+            H2_SIZE,
+            H3_SIZE,
+            BODY_SIZE,
+            CAPTION_SIZE,
+        ];
+        assert!(
+            scale.windows(2).all(|w| w[0] > w[1]),
+            "the scale descends: {scale:?}"
+        );
+        let (text, body) = (TEXT_SIZE, BODY_SIZE);
+        assert!(text == body, "the body size is the default text size");
+    }
 }

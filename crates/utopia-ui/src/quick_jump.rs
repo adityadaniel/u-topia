@@ -261,7 +261,12 @@ impl Render for JumpPalette {
                 .cursor_pointer()
                 .when(i == self.selected, |d| d.bg(th.hover))
                 .child(div().text_color(th.text).child(label))
-                .child(div().text_xs().text_color(th.muted).child(detail))
+                .child(
+                    div()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.muted)
+                        .child(detail),
+                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, e: &MouseDownEvent, w, cx| {
@@ -285,7 +290,7 @@ impl Render for JumpPalette {
             .child(
                 div()
                     .px_1()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.muted)
                     .child(self.title),
             )

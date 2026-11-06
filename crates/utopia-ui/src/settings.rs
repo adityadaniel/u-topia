@@ -308,7 +308,7 @@ impl Render for SettingsView {
                 .py_1()
                 .rounded_md()
                 .cursor_pointer()
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
                 .when(!on, |d| d.text_color(th.muted))
                 .child(t.label())
@@ -358,7 +358,7 @@ impl Render for SettingsView {
                     .border_t_1()
                     .border_color(th.line)
                     .bg(th.surface)
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.muted)
                     .child(s)
             }))
@@ -388,7 +388,7 @@ impl SettingsView {
                 .items_center()
                 .justify_between()
                 .pb_2()
-                .child(div().text_xs().text_color(th.muted).child(if changed == 0 {
+                .child(div().text_size(px(crate::theme::CAPTION_SIZE)).text_color(th.muted).child(if changed == 0 {
                     "Pick Change, then press the keys you want.".to_string()
                 } else {
                     format!(
@@ -405,7 +405,7 @@ impl SettingsView {
                         .rounded_md()
                         .border_1()
                         .border_color(th.line)
-                        .text_xs()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
                         .text_color(th.muted)
                         .cursor_pointer()
                         .hover(|d| d.bg(th.hover))
@@ -421,7 +421,7 @@ impl SettingsView {
                     .py_1()
                     .rounded_md()
                     .bg(th.danger_bg)
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.danger)
                     .child(format!(
                         "{} and {} are both on {}.",
@@ -438,7 +438,7 @@ impl SettingsView {
             section = section.child(
                 div()
                     .pb_1()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.faint)
                     .font_weight(FontWeight::MEDIUM)
                     .child(c.label()),
@@ -466,7 +466,7 @@ impl SettingsView {
                 .rounded_md()
                 .bg(th.banner_bg)
                 .text_color(th.accent)
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .child("Press keys… (esc to keep)")
         } else {
             div()
@@ -474,7 +474,7 @@ impl SettingsView {
                 .py_0p5()
                 .rounded_md()
                 .bg(th.chip_bg)
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.text)
                 .child(pretty_keys(&keys))
         };
@@ -494,7 +494,12 @@ impl SettingsView {
                     .flex_col()
                     .flex_1()
                     .child(div().child(d.label))
-                    .child(div().text_xs().text_color(th.muted).child(d.help)),
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(d.help),
+                    ),
             )
             .child(
                 div()
@@ -511,7 +516,7 @@ impl SettingsView {
                             .rounded_md()
                             .border_1()
                             .border_color(th.line)
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.muted)
                             .cursor_pointer()
                             .hover(|x| x.bg(th.hover))
@@ -532,7 +537,7 @@ impl SettingsView {
                             .px_2()
                             .py_0p5()
                             .rounded_md()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.accent)
                             .cursor_pointer()
                             .hover(|x| x.bg(th.hover))
@@ -557,7 +562,7 @@ impl SettingsView {
         list = list.child(
             div()
                 .pb_2()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.muted)
                 .child("Every shortcut in the app, as it is bound now."),
         );
@@ -569,10 +574,10 @@ impl SettingsView {
                     .justify_between()
                     .gap_4()
                     .py_0p5()
-                    .child(div().text_sm().child(d.label))
+                    .child(div().text_size(px(crate::theme::BODY_SIZE)).child(d.label))
                     .child(
                         div()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.muted)
                             .child(pretty_keys(&self.overrides.keys_for(d))),
                     )
@@ -585,7 +590,7 @@ impl SettingsView {
                     .child(
                         div()
                             .pb_1()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.faint)
                             .font_weight(FontWeight::MEDIUM)
                             .child(c.label()),
@@ -669,12 +674,12 @@ impl SettingsView {
                         div()
                             .pt_3()
                             .pb_1()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.faint)
                             .font_weight(FontWeight::MEDIUM)
                             .child("Font"),
                     )
-                    .child(div().text_xs().text_color(th.muted).child(
+                    .child(div().text_size(px(crate::theme::CAPTION_SIZE)).text_color(th.muted).child(
                         "Used for your notes and the interface, in every window, as soon as \
                          you pick it. Code blocks stay in Menlo.",
                     ))
@@ -694,7 +699,7 @@ impl SettingsView {
                 .py_1p5()
                 .rounded_md()
                 .cursor_pointer()
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
                 .when(!on, |d| d.text_color(th.text).hover(|x| x.bg(th.hover)))
                 .child(t.title)
@@ -721,10 +726,15 @@ impl SettingsView {
                             .py_0p5()
                             .rounded_md()
                             .bg(th.chip_bg)
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .child(pretty_keys(&self.overrides.keys_for(d))),
                     )
-                    .child(div().text_xs().text_color(th.muted).child(d.label))
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(d.label),
+                    )
             })
             .collect();
 
@@ -738,13 +748,13 @@ impl SettingsView {
             .gap_3()
             .child(
                 div()
-                    .text_size(px(22.))
+                    .text_size(px(crate::theme::H1_SIZE))
                     .font_weight(FontWeight::BOLD)
                     .child(t.title),
             )
             .child(div().text_color(th.muted).child(t.summary));
         for p in t.body {
-            column = column.child(div().text_sm().child(*p));
+            column = column.child(div().text_size(px(crate::theme::BODY_SIZE)).child(*p));
         }
         if !shortcuts.is_empty() {
             column = column.child(div().flex().flex_wrap().gap_3().pt_1().children(shortcuts));

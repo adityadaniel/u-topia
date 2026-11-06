@@ -238,7 +238,7 @@ impl GraphView {
             .px_2()
             .py_0p5()
             .rounded_md()
-            .text_sm()
+            .text_size(px(crate::theme::BODY_SIZE))
             .cursor_pointer()
             .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
             .when(!on, |d| d.text_color(th.muted).hover(|s| s.bg(th.hover)))
@@ -285,11 +285,16 @@ impl Render for GraphView {
                     })),
             )
             .child(div().flex_1())
-            .child(div().text_xs().text_color(th.faint).child(format!(
-                "{} pages · {} links",
-                self.graph.nodes.len(),
-                self.graph.edges.len()
-            )))
+            .child(
+                div()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.faint)
+                    .child(format!(
+                        "{} pages · {} links",
+                        self.graph.nodes.len(),
+                        self.graph.edges.len()
+                    )),
+            )
             .child(
                 self.chip("graph-close", "Close", false, cx)
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(GraphEvent::Close))),

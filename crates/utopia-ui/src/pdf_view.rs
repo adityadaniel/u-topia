@@ -419,17 +419,22 @@ impl Render for PdfView {
                     .font_weight(gpui::FontWeight::BOLD)
                     .child(self.name.clone()),
             )
-            .child(div().text_xs().text_color(th.faint).child(format!(
-                "{count} pages · {} highlights · drag over a page to highlight",
-                self.highlights.len()
-            )))
+            .child(
+                div()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.faint)
+                    .child(format!(
+                        "{count} pages · {} highlights · drag over a page to highlight",
+                        self.highlights.len()
+                    )),
+            )
             .child(div().flex_1())
             .when_some(self.path.clone(), |d, p| {
                 d.child(
                     div()
                         .id("pdf-external")
                         .px_2()
-                        .text_sm()
+                        .text_size(px(crate::theme::BODY_SIZE))
                         .text_color(th.muted)
                         .cursor_pointer()
                         .hover(|s| s.text_color(th.accent))
@@ -441,7 +446,7 @@ impl Render for PdfView {
                 div()
                     .id("pdf-close")
                     .px_2()
-                    .text_sm()
+                    .text_size(px(crate::theme::BODY_SIZE))
                     .cursor_pointer()
                     .hover(|s| s.text_color(th.accent))
                     .child("Close")
