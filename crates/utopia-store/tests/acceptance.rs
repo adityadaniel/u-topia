@@ -926,7 +926,6 @@ fn sr_2_search_groups_results_by_page() {
 /// by the local date of their last edit.
 #[test]
 fn sr_3_search_scopes_and_age() {
-    use chrono::TimeZone as _;
     use utopia_core::BlockKind;
     use utopia_store::{SearchAge, SearchScope};
 
@@ -1049,7 +1048,6 @@ fn sr_4_preview_has_path_children_and_state() {
 /// block was ever looked at, so Today came back empty.
 #[test]
 fn sr_3_age_window_is_applied_before_the_limit() {
-    use chrono::TimeZone as _;
     use utopia_store::{SearchAge, SearchScope};
 
     let ts = |m, d, h| {

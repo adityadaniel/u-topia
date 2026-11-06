@@ -702,7 +702,6 @@ fn search_groups_results_under_their_page(cx: &mut TestAppContext) {
 /// and opening it is the only thing that happens (the chips do not move).
 #[gpui::test]
 fn search_scope_and_age_filter_the_results(cx: &mut TestAppContext) {
-    use chrono::TimeZone as _;
     use utopia_core::BlockKind;
     let (app, ws, cx) = setup(cx);
     // Local noon, so the block's local edit date is the intended day in every timezone.
@@ -1082,7 +1081,9 @@ fn search_scrolls_the_selected_block_into_view(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);
     app.update(cx, |app, _| {
         for i in 1..=12 {
-            app.store.create_page(&format!("Zebra Page {i:02}")).unwrap();
+            app.store
+                .create_page(&format!("Zebra Page {i:02}"))
+                .unwrap();
         }
         let atlas = app.store.create_page("Atlas").unwrap();
         let b = app.store.ensure_first_block(&atlas).unwrap();
