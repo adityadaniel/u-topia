@@ -837,6 +837,11 @@ impl Workspace {
         self.main.read(cx).journal_days()
     }
 
+    /// The date whose heading is pinned at the top of the feed (DN-3), for scripts.
+    pub fn main_sticky_day(&self, cx: &gpui::App) -> Option<NaiveDate> {
+        self.main.read(cx).sticky_day()
+    }
+
     /// How many days the feed shows open, with a date heading (DN-1), for scripts.
     pub fn open_journal_days(&self, cx: &gpui::App) -> usize {
         self.main.read(cx).open_day_count()

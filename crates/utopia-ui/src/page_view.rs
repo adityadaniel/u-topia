@@ -155,6 +155,21 @@ enum Item {
     JournalEnd,
 }
 
+/// A day heading in the feed, kept so the sticky header can find the day at the top of
+/// the viewport without walking the items in `render` (DN-3, rule 10).
+#[derive(Debug, Clone)]
+struct DayHeading {
+    /// Index of the day's [`Item::DayHeader`] in `items`.
+    ix: usize,
+    /// One past the day's last item, so a folded day (whose own date is in its row) does
+    /// not pin the previous day's heading over it.
+    end: usize,
+    date: NaiveDate,
+    title: SharedString,
+    caption: SharedString,
+    today: bool,
+}
+
 /// One calendar day of the feed while it is being built.
 struct FeedDay {
     date: NaiveDate,
@@ -239,6 +254,8 @@ pub struct PageView {
     calendar_month: NaiveDate,
     /// Set while showing the Daily Notes feed; `page` is then today's page.
     journal: Option<Journal>,
+    /// The feed's day headings, in item order, for the sticky header (DN-3).
+    day_headings: Vec<DayHeading>,
     /// The page header's "···" menu is open (ALL-3).
     page_menu: bool,
     dirty: bool,
@@ -307,6 +324,7 @@ impl PageView {
             alias_input: None,
             calendar_month: today,
             journal: None,
+            day_headings: Vec::new(),
             page_menu: false,
             dirty: true,
             _subs: subs,
@@ -352,6 +370,30 @@ impl PageView {
             .as_ref()
             .map(|j| j.days.clone())
             .unwrap_or_default()
+    }
+
+    /// The day heading pinned to the top of the feed at the current scroll offset
+    /// (DN-3): the last heading at or above the first visible item, unless that heading
+    /// is itself exactly at the top. A binary search over the loaded days, so `render`
+    /// does no more work than the offset it already reads (rule 10).
+    fn sticky_heading(&self) -> Option<&DayHeading> {
+        self.journal.as_ref()?;
+        let top = self.list.logical_scroll_top();
+        let ix = self
+            .day_headings
+            .partition_point(|h| h.ix <= top.item_ix)
+            .checked_sub(1)?;
+        let heading = &self.day_headings[ix];
+        if top.item_ix >= heading.end {
+            return None;
+        }
+        let at_top = heading.ix == top.item_ix && top.offset_in_item <= px(0.5);
+        (!at_top).then_some(heading)
+    }
+
+    /// The date whose heading is stuck at the top of the feed, for scripts (DN-3).
+    pub fn sticky_day(&self) -> Option<NaiveDate> {
+        self.sticky_heading().map(|h| h.date)
     }
 
     /// How many days the feed shows open, with a date heading (DN-1), for scripts.
@@ -532,6 +574,10 @@ impl PageView {
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.dirty = false;
+        if self.journal.is_none() {
+            // Only the feed pins a day heading (DN-3).
+            self.day_headings.clear();
+        }
         let Some(page) = self.page.clone() else {
             self.replace_items(Vec::new(), cx);
             return;
@@ -767,6 +813,7 @@ impl PageView {
         self.header = header;
         let mut items = Vec::new();
         let mut ids = Vec::new();
+        let mut headings = Vec::new();
         let yesterday = today_date.pred_opt();
         for (i, day) in days.into_iter().enumerate() {
             // Like Roam's feed: Linked References under the day when it has any, and no
@@ -782,12 +829,24 @@ impl PageView {
             // folding is a view change only, the day is still written on its first key.
             let open =
                 !day.rows.is_empty() || refs.is_some() || i == 0 || Some(day.date) == yesterday;
+            // The day's heading, for the sticky header, when the day is open.
+            let mut heading = None;
             if open {
+                let caption: SharedString = day_caption(day.date, today_date).into();
+                heading = Some(headings.len());
+                headings.push(DayHeading {
+                    ix: items.len(),
+                    end: items.len(),
+                    date: day.date,
+                    title: day.title.clone().into(),
+                    caption: caption.clone(),
+                    today: day.date == today_date,
+                });
                 items.push(Item::DayHeader {
                     date: day.date,
                     page: day.page.clone(),
                     title: day.title.into(),
-                    caption: day_caption(day.date, today_date).into(),
+                    caption,
                     today: day.date == today_date,
                     first: i == 0,
                 });
@@ -812,8 +871,12 @@ impl PageView {
                 }
                 ids.push(page);
             }
+            if let Some(h) = heading {
+                headings[h].end = items.len();
+            }
         }
         items.push(Item::JournalEnd);
+        self.day_headings = headings;
         if let Some(j) = &mut self.journal {
             j.days = ids;
             j.loading = false;
@@ -2946,25 +3009,69 @@ impl Render for PageView {
         self.rebuild_if_dirty(cx);
         let th = theme(cx).clone();
         let view = cx.entity();
-        div().size_full().bg(th.bg).child(
-            list(self.list.clone(), move |ix, window, cx| {
-                // List items are laid out as roots, which shrink to their content; a
-                // full-width wrapper gives margins, spacers and rules the column's width.
-                // The column stops at a readable line length and stays centred, like Roam.
-                div()
-                    .w_full()
-                    .flex()
-                    .justify_center()
-                    .child(
-                        div()
-                            .w_full()
-                            .max_w(px(READABLE_WIDTH))
-                            .child(view.update(cx, |this, cx| this.render_item(ix, window, cx))),
-                    )
-                    .into_any_element()
+        // DN-3: the day the column is inside stays at the top of the column while a long
+        // day scrolls. Reading the offset and one heading is all `render` does for it.
+        let sticky = self.sticky_heading().cloned();
+        div()
+            .size_full()
+            .bg(th.bg)
+            .relative()
+            .child(
+                list(self.list.clone(), move |ix, window, cx| {
+                    // List items are laid out as roots, which shrink to their content; a
+                    // full-width wrapper gives margins, spacers and rules the column's width.
+                    // The column stops at a readable line length and stays centred, like Roam.
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div().w_full().max_w(px(READABLE_WIDTH)).child(
+                                view.update(cx, |this, cx| this.render_item(ix, window, cx)),
+                            ),
+                        )
+                        .into_any_element()
+                })
+                .size_full(),
+            )
+            .when_some(sticky, |d, h| {
+                // Drawn after the list so it paints above the rows, and with no hitbox of
+                // its own, so a click at the top of the column still reaches the block.
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .debug_selector(|| "sticky-day".into())
+                                .w_full()
+                                .max_w(px(READABLE_WIDTH))
+                                .px_4()
+                                .pt_1()
+                                .pb_1()
+                                .bg(th.bg)
+                                .border_b_1()
+                                .border_color(th.line)
+                                .child(
+                                    div()
+                                        .text_size(px(crate::theme::CAPTION_SIZE))
+                                        .text_color(if h.today { th.accent } else { th.muted })
+                                        .child(h.caption.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(crate::theme::TITLE_SIZE))
+                                        .line_height(px(34.))
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .child(h.title.clone()),
+                                ),
+                        ),
+                )
             })
-            .size_full(),
-        )
     }
 }
 

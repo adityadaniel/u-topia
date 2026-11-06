@@ -3,8 +3,8 @@
 
 use chrono::NaiveDate;
 use gpui::{px, size, AppContext as _, Bounds, Entity, Pixels, TestAppContext, VisualTestContext};
-use utopia_core::PageId;
-use utopia_store::Store;
+use utopia_core::{BlockId, BlockKind, Command, PageId};
+use utopia_store::{EditOpts, Store};
 use utopia_ui::actions::install_keymap;
 use utopia_ui::app_state::AppState;
 use utopia_ui::theme::{Theme, INDENT};
@@ -269,6 +269,127 @@ fn feed_folds_empty_days_to_one_row(cx: &mut TestAppContext) {
         f32::from(folded.origin.x + folded.size.width),
     );
     assert!(x0 >= left && x1 <= right + 0.5, "{folded:?}");
+}
+
+/// A feed whose days hold `blocks` blocks each (`(days ago, blocks)`), in a window `h`
+/// tall; every other day is left unwritten so the feed folds it (DN-1).
+fn setup_feed<'a>(
+    cx: &'a mut TestAppContext,
+    blocks: &[(i64, usize)],
+    h: f32,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let today = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(today));
+    for &(back, n) in blocks {
+        let date = today - chrono::Duration::days(back);
+        let page = store.draft_daily(date).unwrap();
+        let mut after = store.page_state(&page).unwrap().last_child(None, false);
+        let mut cmds = Vec::new();
+        for i in 0..n {
+            let id = BlockId::new();
+            cmds.push(Command::InsertBlock {
+                id: id.clone(),
+                parent: None,
+                after: after.clone(),
+                text: format!("note {i}"),
+                kind: BlockKind::Bullet,
+            });
+            after = Some(id);
+        }
+        store
+            .execute(
+                &page,
+                cmds,
+                EditOpts {
+                    no_undo: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(h)));
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    (ws, cx)
+}
+
+/// Scroll the main pane by `dy` pixels (negative scrolls down).
+fn scroll_main(cx: &mut VisualTestContext, dy: f32) {
+    let main = bounds(cx, "main-pane");
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: main.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(dy))),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+}
+
+/// DN-3: while a long day scrolls, its date stays at the top of the column, with a
+/// hairline under it; at the top of the feed nothing is pinned.
+#[gpui::test]
+fn long_day_keeps_its_date_at_the_top(cx: &mut TestAppContext) {
+    let (ws, cx) = setup_feed(cx, &[(0, 40)], H);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_sticky_day(cx)),
+        None,
+        "the day is at the top of the feed: nothing is pinned"
+    );
+    let main = bounds(cx, "main-pane");
+    scroll_main(cx, -600.);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_sticky_day(cx)),
+        Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()),
+        "the day being scrolled keeps its heading"
+    );
+    let pin = bounds(cx, "sticky-day");
+    assert!(
+        approx(pin.origin.y, f32::from(main.origin.y)),
+        "pinned to the top of the column: {pin:?} {main:?}"
+    );
+    assert!(pin.size.height >= px(30.), "a readable heading: {pin:?}");
+    let (left, right) = column(cx);
+    let (x0, x1) = (
+        f32::from(pin.origin.x),
+        f32::from(pin.origin.x + pin.size.width),
+    );
+    assert!(
+        x0 >= left && x1 <= right + 0.5,
+        "inside the column: {pin:?}"
+    );
+}
+
+/// DN-3 with DN-1: a folded day carries its own date in its 36 px row, so the previous
+/// day's heading is not pinned over it.
+#[gpui::test]
+fn a_folded_day_does_not_keep_the_previous_day_pinned(cx: &mut TestAppContext) {
+    // A short window, so the feed can scroll down to the folded days.
+    let (ws, cx) = setup_feed(cx, &[(0, 1), (1, 1), (4, 12)], 400.);
+    assert_eq!(ws.update(cx, |w, cx| w.main_sticky_day(cx)), None);
+    let main = bounds(cx, "main-pane");
+    let folded = bounds(cx, "day-folded-2026-10-31");
+    // Slide the first folded row to the top of the column, a few pixels past its edge.
+    let delta = f32::from(folded.origin.y - main.origin.y) + 4.;
+    assert!(delta > 0.);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_sticky_day(cx)),
+        None,
+        "still at the top of the feed"
+    );
+    scroll_main(cx, -delta);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_sticky_day(cx)),
+        None,
+        "a folded day's own row is its heading: nothing is pinned above it"
+    );
 }
 
 /// Several hundred characters with no newline: a referencing block that must wrap.
