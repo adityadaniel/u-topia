@@ -926,18 +926,22 @@ fn sr_2_search_groups_results_by_page() {
 /// by the local date of their last edit.
 #[test]
 fn sr_3_search_scopes_and_age() {
+    use chrono::TimeZone as _;
     use utopia_core::BlockKind;
     use utopia_store::{SearchAge, SearchScope};
 
+    // Seed at local noon so "the block was edited today" holds in every timezone.
     let ts = |y, m, d, h| {
         date(y, m, d)
             .and_hms_opt(h, 0, 0)
             .unwrap()
-            .and_utc()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap()
             .timestamp_millis()
     };
     let mut s = store();
-    s.set_clock(Some(ts(2026, 11, 2, 18)));
+    s.set_clock(Some(ts(2026, 11, 2, 12)));
     let atlas = s.create_page("Atlas").unwrap();
     write(&mut s, &atlas, "atlas launch");
     let (day, db) = s.open_daily(date(2026, 11, 2)).unwrap();
@@ -950,10 +954,10 @@ fn sr_3_search_scopes_and_age() {
         .unwrap();
 
     // An older block, written before the window.
-    s.set_clock(Some(ts(2026, 10, 1, 18)));
+    s.set_clock(Some(ts(2026, 10, 1, 12)));
     let old = s.create_page("Old").unwrap();
     write(&mut s, &old, "atlas old");
-    s.set_clock(Some(ts(2026, 11, 2, 18)));
+    s.set_clock(Some(ts(2026, 11, 2, 12)));
     s.sync_index().unwrap();
 
     let pages = |s: &Store, scope, age| -> Vec<String> {
@@ -1045,28 +1049,31 @@ fn sr_4_preview_has_path_children_and_state() {
 /// block was ever looked at, so Today came back empty.
 #[test]
 fn sr_3_age_window_is_applied_before_the_limit() {
+    use chrono::TimeZone as _;
     use utopia_store::{SearchAge, SearchScope};
 
     let ts = |m, d, h| {
         date(2026, m, d)
             .and_hms_opt(h, 0, 0)
             .unwrap()
-            .and_utc()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap()
             .timestamp_millis()
     };
     let mut s = store();
-    s.set_clock(Some(ts(11, 2, 18)));
+    s.set_clock(Some(ts(11, 2, 12)));
     let (day, b) = s.open_daily(date(2026, 11, 2)).unwrap();
     s.set_block_text(&day, &b, "zebra newest", None, None)
         .unwrap();
     s.commit_block(&day, &b).unwrap();
 
-    s.set_clock(Some(ts(10, 1, 18)));
+    s.set_clock(Some(ts(10, 1, 12)));
     let old = s.create_page("Archive").unwrap();
     for i in 0..305 {
         write(&mut s, &old, &format!("zebra old {i}"));
     }
-    s.set_clock(Some(ts(11, 2, 18)));
+    s.set_clock(Some(ts(11, 2, 12)));
     s.sync_index().unwrap();
 
     let hits = s
@@ -1076,5 +1083,49 @@ fn sr_3_age_window_is_applied_before_the_limit() {
         hits.iter().any(|h| h.page == day),
         "Today must still find the day's block (got {} hits)",
         hits.len()
+    );
+}
+
+/// SR-3: Today and the past windows end today. A future daily page (reachable through
+/// day navigation) must not pass Today or Past week/month/year; Any time still has it.
+#[test]
+fn sr_3_age_window_excludes_future_days() {
+    use utopia_store::{SearchAge, SearchScope};
+
+    let mut s = store();
+    let (today, b) = s.open_daily(date(2026, 11, 2)).unwrap();
+    s.set_block_text(&today, &b, "zebra today", None, None)
+        .unwrap();
+    s.commit_block(&today, &b).unwrap();
+    let (tomorrow, b) = s.open_daily(date(2026, 11, 3)).unwrap();
+    s.set_block_text(&tomorrow, &b, "zebra tomorrow", None, None)
+        .unwrap();
+    s.commit_block(&tomorrow, &b).unwrap();
+    s.sync_index().unwrap();
+
+    let days = |age| -> Vec<Option<NaiveDate>> {
+        let mut d: Vec<_> = s
+            .search_blocks_filtered("zebra", SearchScope::All, age, 30)
+            .unwrap()
+            .into_iter()
+            .map(|h| s.page_row(&h.page).unwrap().and_then(|p| p.daily_date))
+            .collect();
+        d.sort();
+        d
+    };
+    assert_eq!(
+        days(SearchAge::Today),
+        vec![Some(date(2026, 11, 2))],
+        "tomorrow is not Today"
+    );
+    assert_eq!(
+        days(SearchAge::Week),
+        vec![Some(date(2026, 11, 2))],
+        "nor in the past week"
+    );
+    assert_eq!(
+        days(SearchAge::AnyTime),
+        vec![Some(date(2026, 11, 2)), Some(date(2026, 11, 3))],
+        "Any time is unrestricted"
     );
 }

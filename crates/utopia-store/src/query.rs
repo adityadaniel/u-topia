@@ -324,6 +324,15 @@ impl SearchAge {
             SearchAge::Year => back(364),
         }
     }
+
+    /// Last day that still counts: today for every window, `None` for Any time. A future
+    /// daily page is reachable by navigation, so it must not pass "Today" or "Past week".
+    pub fn until(self, today: NaiveDate) -> Option<NaiveDate> {
+        match self {
+            SearchAge::AnyTime => None,
+            _ => Some(today),
+        }
+    }
 }
 
 /// Byte ranges in `plain` matched by `query`'s terms, for search highlighting (SR-1).
@@ -678,11 +687,16 @@ impl Store {
         // handful of old matches must never push an eligible one out of the candidates.
         // Daily hits are dated by their day, other blocks by the local date of their last
         // edit (the same day `RefQuery::since` uses).
-        let since = age.since(self.today()).map(|d| d.to_string());
+        let today = self.today();
+        let since = age.since(today).map(|d| d.to_string());
+        let until = age.until(today).map(|d| d.to_string());
         let fetch = (limit.max(1) * 10) as i64;
         let window = "AND (:since IS NULL
                         OR COALESCE(p.daily_date,
-                             date(b.updated_at / 1000, 'unixepoch', 'localtime')) >= :since)";
+                             date(b.updated_at / 1000, 'unixepoch', 'localtime')) >= :since)
+                     AND (:until IS NULL
+                        OR COALESCE(p.daily_date,
+                             date(b.updated_at / 1000, 'unixepoch', 'localtime')) <= :until)";
         let mut rows = if terms.is_empty() {
             let sql = format!(
                 "SELECT b.id, b.page_id, p.title, b.text, p.daily_date
@@ -694,7 +708,11 @@ impl Store {
             let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt
                 .query_map(
-                    rusqlite::named_params! { ":since": since, ":limit": fetch },
+                    rusqlite::named_params! {
+                        ":since": since,
+                        ":until": until,
+                        ":limit": fetch,
+                    },
                     map,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -717,6 +735,7 @@ impl Store {
                     rusqlite::named_params! {
                         ":q": terms.join(" "),
                         ":since": since,
+                        ":until": until,
                         ":limit": fetch,
                     },
                     map,
