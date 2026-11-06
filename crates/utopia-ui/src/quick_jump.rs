@@ -3,19 +3,20 @@
 //!
 //! One shell is shared by every palette mode (quick jump, full-text search, quick capture,
 //! free text). In page mode it has a useful empty state — today, yesterday and the pages
-//! opened last (QJ-1) — labelled rows with an icon per type (QJ-2) and a footer of key
-//! hints (QJ-3).
+//! opened last (QJ-1) — labelled rows with an icon per type (QJ-2), the typed letters in
+//! semibold (QJ-4) and a footer of key hints (QJ-3).
 //!
 //! All of this is view state. Rows come from the index (`Store::search_titles`,
 //! `Store::tag_pages`) when the query changes, never while painting (rule 3), and nothing
 //! here writes a shard.
 
 use std::collections::HashSet;
+use std::ops::Range;
 
 use chrono::NaiveDate;
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Entity, EventEmitter, FontWeight, MouseButton,
-    MouseDownEvent, Subscription, Window,
+    div, prelude::*, px, AnyElement, Context, Entity, EventEmitter, FontWeight, HighlightStyle,
+    MouseButton, MouseDownEvent, StyledText, Subscription, Window,
 };
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, PageId};
@@ -414,11 +415,34 @@ impl JumpPalette {
         }
     }
 
-    /// One result row: icon, label and type label (QJ-2).
-    fn row(&self, i: usize, item: &QjItem, cx: &mut Context<Self>) -> AnyElement {
+    /// One result row: icon, label with the match in semibold (QJ-4), type label.
+    fn row(&self, i: usize, item: &QjItem, needle: &str, cx: &mut Context<Self>) -> AnyElement {
         let th = theme(cx).clone();
         let (kind, label, detail) = self.row_parts(item);
         let selected = i == self.selected;
+        let marks: Vec<(Range<usize>, HighlightStyle)> = if kind == RowKind::Create {
+            Vec::new()
+        } else {
+            highlight_ranges(&label, needle)
+                .into_iter()
+                .map(|r| {
+                    (
+                        r,
+                        HighlightStyle {
+                            font_weight: Some(FontWeight::SEMIBOLD),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect()
+        };
+        let text: AnyElement = if marks.is_empty() {
+            div().child(label).into_any_element()
+        } else {
+            div()
+                .child(StyledText::new(label).with_highlights(marks))
+                .into_any_element()
+        };
         let accent = kind == RowKind::Create;
         div()
             .id(("qj", i))
@@ -440,7 +464,7 @@ impl JumpPalette {
                     .flex_1()
                     .min_w(px(0.))
                     .truncate()
-                    .child(label),
+                    .child(text),
             )
             .child(
                 div()
@@ -507,10 +531,12 @@ fn row_icon(i: usize, kind: RowKind, th: &Theme) -> AnyElement {
 impl Render for JumpPalette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
+        let query = self.input.read(cx).text().to_string();
+        let needle = query.strip_prefix('>').unwrap_or(&query).to_string();
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut create: Option<AnyElement> = None;
         for (i, item) in self.results.iter().enumerate() {
-            let el = self.row(i, item, cx);
+            let el = self.row(i, item, &needle, cx);
             if matches!(item, QjItem::Create(_)) {
                 create = Some(el);
             } else {
@@ -584,5 +610,72 @@ impl Render for JumpPalette {
                     .text_color(th.faint)
                     .child(hints),
             )
+    }
+}
+
+/// Byte ranges of the typed letters inside `label`, for the semibold match (QJ-4). A
+/// contiguous, case-insensitive match wins, so `ana` bolds just the `ana` of `Dana`;
+/// otherwise the letters of the fuzzy subsequence are marked one at a time, which is why
+/// `dn` still shows what made `Dana` a result. Case folding can change byte lengths, so
+/// the contiguous pass is only trusted when the folded text has the same length.
+fn highlight_ranges(label: &str, needle: &str) -> Vec<Range<usize>> {
+    let needle = needle.trim();
+    if needle.is_empty() || label.is_empty() {
+        return Vec::new();
+    }
+    let lower_label = label.to_lowercase();
+    let lower_needle = needle.to_lowercase();
+    if lower_label.len() == label.len() && lower_needle.len() == needle.len() {
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(i) = lower_label[from..].find(&lower_needle) {
+            let start = from + i;
+            out.push(start..start + needle.len());
+            from = start + needle.len();
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    let mut out = Vec::new();
+    let mut it = label.char_indices();
+    for want in lower_needle.chars() {
+        let mut found = None;
+        for (i, c) in it.by_ref() {
+            let mut lower = c.to_lowercase();
+            if lower.next() == Some(want) && lower.next().is_none() {
+                found = Some((i, c));
+                break;
+            }
+        }
+        let Some((i, c)) = found else {
+            return Vec::new();
+        };
+        out.push(i..i + c.len_utf8());
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// QJ-4: the typed letters are marked inside the result, and nothing else is.
+    #[test]
+    fn the_match_is_marked() {
+        assert_eq!(highlight_ranges("Dana", "dan"), vec![0..3]);
+        assert_eq!(highlight_ranges("Dana", "ANA"), vec![1..4]);
+        // Every occurrence is marked, not just the first.
+        assert_eq!(
+            highlight_ranges("Atlas launch", "a"),
+            vec![0..1, 3..4, 7..8]
+        );
+        // A fuzzy match marks the letters it matched.
+        assert_eq!(highlight_ranges("Dana", "dn"), vec![0..1, 2..3]);
+        assert!(highlight_ranges("Dana", "x").is_empty());
+        assert!(highlight_ranges("Dana", "").is_empty());
+        // Ranges are byte ranges into the label, so a non-ASCII title stays intact.
+        assert_eq!(highlight_ranges("Café notes", "é"), vec![3..5]);
+        assert_eq!(highlight_ranges("Café notes", "notes"), vec![6..11]);
     }
 }
