@@ -681,17 +681,16 @@ impl PageView {
         self.push_refs(&page, &mut items, cx);
         if self.zoom.is_none() {
             // Unlinked References (FR-3.9, LR-5): the header always carries the count, so the
-            // search runs once per page and index version rather than only when opened. It is
-            // skipped while edits are still pending, because that search waits for them
-            // (rule 10); the count catches up when the index does.
+            // search runs once per page and index version rather than only when opened. It
+            // reads the index without flushing or waiting for the writer, so it is safe in a
+            // render (rule 10); it catches up when the index does.
             let stale = self
                 .unlinked
                 .as_ref()
                 .is_none_or(|(v, _)| *v != refs_version);
-            let up_to_date = !self.app.read(cx).store.has_pending();
-            if stale && (self.unlinked_open || up_to_date) {
+            if stale {
                 let found = self.app.update(cx, |app, _| {
-                    let r = app.store.unlinked_references(&page);
+                    let r = app.store.unlinked_references_now(&page);
                     app.report(r).unwrap_or_default()
                 });
                 self.unlinked = Some((refs_version, found));

@@ -442,3 +442,42 @@ fn promote_all_mentions_keeps_overlapping_mentions_apart() {
     assert!(s.unlinked_references(&ny).unwrap().is_empty());
     doctor_ok(&mut s);
 }
+
+/// LR-5 review fix (rule 10): the reference panel's count is read from the index as it
+/// stands. Reading it must not flush a pending edit, and "nothing pending" is not the same
+/// as "the index is current": `flush` empties the queue long before the writer has
+/// committed.
+#[test]
+fn unlinked_count_reads_the_index_without_flushing() {
+    let (mut s, _d) = store();
+    let m = s.create_page("Mindfulness").unwrap();
+    let src = s.create_page("Reading").unwrap();
+    // From here on, edits stay in the shard until the debounced flush, as in the UI.
+    s.set_debounced(true).unwrap();
+    let b = s.ensure_first_block(&src).unwrap();
+    s.set_block_text(&src, &b, "practising mindfulness daily", None, None)
+        .unwrap();
+    assert!(s.has_pending(), "the edit waits for the debounced flush");
+
+    assert!(
+        s.unlinked_references_now(&m).unwrap().is_empty(),
+        "the index has not seen the new block yet"
+    );
+    assert!(
+        s.has_pending(),
+        "reading the count must not flush the pending edit"
+    );
+
+    // The old guard: after a flush the queue is empty while the writer may still be
+    // running, so a page drawn in that window waited on disk commits.
+    s.flush().unwrap();
+    assert!(
+        !s.has_pending(),
+        "flush empties the queue before the writer is done"
+    );
+
+    // The blocking form makes the edit durable first and then sees it; the panel uses the
+    // non-blocking form and catches up when the index reports it is durable.
+    assert_eq!(s.unlinked_references(&m).unwrap().len(), 1);
+    assert_eq!(s.unlinked_references_now(&m).unwrap().len(), 1);
+}

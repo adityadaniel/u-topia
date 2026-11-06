@@ -51,8 +51,22 @@ impl Store {
 
     /// Plain-text mentions of the page's title or aliases outside any reference, in
     /// other pages' live blocks (FR-3.9). Found through FTS, confirmed by the parser.
+    /// This form makes pending edits durable first, so it must not run in a render path:
+    /// use [`Store::unlinked_references_now`] for that.
     pub fn unlinked_references(&mut self, page: &PageId) -> Result<Vec<Mention>> {
         self.sync_index()?;
+        self.unlinked_mentions(page)
+    }
+
+    /// The same mentions, read from the index as it stands: no flush and no wait for the
+    /// writer (LR-5, rule 10). The answer can lag one commit; the caller runs it again when
+    /// the index reports it is durable.
+    pub fn unlinked_references_now(&mut self, page: &PageId) -> Result<Vec<Mention>> {
+        self.read_barrier()?;
+        self.unlinked_mentions(page)
+    }
+
+    fn unlinked_mentions(&mut self, page: &PageId) -> Result<Vec<Mention>> {
         let st = self.page_state(page)?.clone();
         let mut names = vec![display_title(&st, &self.date_format)];
         names.extend(st.meta.aliases.iter().cloned());
