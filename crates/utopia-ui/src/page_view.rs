@@ -34,6 +34,8 @@ const GROUP_PREVIEW: usize = 3;
 const JOURNAL_BATCH: usize = 10;
 /// Widest the page column gets (about 95 characters of body text per line).
 const READABLE_WIDTH: f32 = 760.;
+/// The reference filter field's width (LR-1); it no longer stretches the whole column.
+const REF_FILTER_WIDTH: f32 = 240.;
 
 #[derive(Debug, Clone)]
 pub enum PageViewEvent {
@@ -179,6 +181,13 @@ struct Header {
     attributes: Vec<(String, String)>,
 }
 
+/// Which of the reference controls has its menu open (LR-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlMenu {
+    Date,
+    Sort,
+}
+
 #[derive(Clone)]
 struct DraggedBlock {
     page: PageId,
@@ -215,9 +224,12 @@ pub struct PageView {
     refs: LinkedRefs,
     refs_key: Option<(PageId, Option<BlockId>, u64)>,
     query: RefQuery,
-    suggestions: Vec<(PageId, String)>,
+    /// Co-reference chips offered under the controls: page, title, hit count (LR-1).
+    suggestions: Vec<(PageId, String, usize)>,
     filter_titles: BTreeMap<PageId, String>,
     expanded_groups: HashSet<PageId>,
+    /// A reference control's menu is open (LR-1). Local view state, never persisted.
+    controls_menu: Option<ControlMenu>,
     open_embeds: HashSet<(BlockId, String)>,
     rename: Option<Entity<LineInput>>,
     filter: Entity<LineInput>,
@@ -287,6 +299,7 @@ impl PageView {
             suggestions: Vec::new(),
             filter_titles: BTreeMap::new(),
             expanded_groups: HashSet::new(),
+            controls_menu: None,
             open_embeds: HashSet::new(),
             rename: None,
             filter,
@@ -367,6 +380,7 @@ impl PageView {
             self.expanded_groups = saved.into_iter().map(PageId).collect();
         }
         self.page_menu = false;
+        self.controls_menu = None;
         self.refs_key = None;
         self.dirty = true;
         self.rebuild(cx);
@@ -869,8 +883,13 @@ impl PageView {
         }
     }
 
-    /// Pages co-referenced by the current results, for "+ filter" chips (FR-3.10).
-    fn compute_suggestions(&self, page: &PageId, cx: &mut Context<Self>) -> Vec<(PageId, String)> {
+    /// Pages co-referenced by the current results, with how many hits mention them, for the
+    /// co-reference chips (FR-3.10, LR-1).
+    fn compute_suggestions(
+        &self,
+        page: &PageId,
+        cx: &mut Context<Self>,
+    ) -> Vec<(PageId, String, usize)> {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         for g in &self.refs.groups {
             for h in &g.hits {
@@ -884,19 +903,19 @@ impl PageView {
         let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let store = &self.app.read(cx).store;
-        let mut out: Vec<(PageId, String)> = Vec::new();
-        for (target, _) in ranked {
+        let mut out: Vec<(PageId, String, usize)> = Vec::new();
+        for (target, count) in ranked {
             if let Ok(Some(id)) = store.find_page(&target) {
                 if id != *page
                     && !self.query.also.contains(&id)
-                    && !out.iter().any(|(p, _)| *p == id)
+                    && !out.iter().any(|(p, _, _)| *p == id)
                 {
                     let title = store
                         .page_row(&id)
                         .ok()
                         .flatten()
                         .map_or(target.clone(), |r| r.title);
-                    out.push((id, title));
+                    out.push((id, title, count));
                 }
             }
             if out.len() >= 6 {
@@ -2144,13 +2163,21 @@ impl PageView {
         cx.notify();
     }
 
+    /// LR-1: one control row (filter field, then the date and sort menu buttons) and the
+    /// co-reference chips on the line below it. Menus float over the page, so opening one
+    /// never moves the references (ALL-3).
     fn render_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         let th = theme(cx).clone();
         let sort_label = match self.query.sort {
-            RefSort::Title => "Sort: title",
-            RefSort::Recency => "Sort: recent",
+            RefSort::Title => "Title",
+            RefSort::Recency => "Recent",
         };
-        let mut chips = div().flex().flex_wrap().gap_1().items_center();
+        let mut chips = div()
+            .debug_selector(|| "refs-chips".into())
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .items_center();
         for (i, f) in self.query.also.iter().enumerate() {
             let id = f.clone();
             let title = self
@@ -2176,12 +2203,18 @@ impl PageView {
                     })),
             );
         }
-        for (i, (id, title)) in self.suggestions.iter().enumerate() {
+        for (i, (id, title, count)) in self.suggestions.iter().enumerate() {
             let id = id.clone();
             let t = title.clone();
+            // The chip carries its own count ("Ana Lovelace 3"), so a co-reference can be
+            // judged before it narrows the results.
             chips = chips.child(
                 div()
                     .id(("suggest", i))
+                    .debug_selector(move || format!("suggest-chip-{i}"))
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .px_2()
                     .rounded_md()
                     .text_size(px(crate::theme::CAPTION_SIZE))
@@ -2190,7 +2223,13 @@ impl PageView {
                     .border_color(th.line)
                     .cursor_pointer()
                     .hover(|s| s.bg(th.hover))
-                    .child(format!("+ {title}"))
+                    .child(title.clone())
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.faint)
+                            .child(count.to_string()),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.query.also.push(id.clone());
                         this.filter_titles.insert(id.clone(), t.clone());
@@ -2200,7 +2239,28 @@ impl PageView {
                     })),
             );
         }
+        let (date_label, date_key) = match self.query.since {
+            None => ("Any time".to_string(), "any-time"),
+            Some(d) => {
+                let today = self.app.read(cx).store.today();
+                (
+                    format!("Last {} days", (today - d).num_days() + 1),
+                    match (today - d).num_days() + 1 {
+                        7 => "last-7-days",
+                        30 => "last-30-days",
+                        _ => "custom",
+                    },
+                )
+            }
+        };
+        let sort_key = match self.query.sort {
+            RefSort::Title => "title",
+            RefSort::Recency => "recent",
+        };
+        let date_open = self.controls_menu == Some(ControlMenu::Date);
+        let sort_open = self.controls_menu == Some(ControlMenu::Sort);
         div()
+            .debug_selector(|| "refs-controls".into())
             .flex()
             .flex_col()
             .gap_1()
@@ -2208,12 +2268,15 @@ impl PageView {
             .pb_2()
             .child(
                 div()
+                    .debug_selector(|| "refs-control-row".into())
                     .flex()
                     .items_center()
                     .gap_2()
                     .child(
                         div()
-                            .flex_1()
+                            .debug_selector(|| "refs-filter".into())
+                            .flex_none()
+                            .w(px(REF_FILTER_WIDTH))
                             .px_2()
                             .border_1()
                             .border_color(th.line)
@@ -2221,44 +2284,178 @@ impl PageView {
                             .text_size(px(crate::theme::BODY_SIZE))
                             .child(self.filter.clone()),
                     )
-                    .child({
-                        let label = match self.query.since {
-                            None => "Any time".to_string(),
-                            Some(d) => {
-                                let today = self.app.read(cx).store.today();
-                                format!("Last {} days", (today - d).num_days() + 1)
-                            }
-                        };
-                        quiet_menu("date-filter", label, &th).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                // Any time → last 7 days → last 30 days → any time.
-                                let today = this.app.read(cx).store.today();
-                                let span = this.query.since.map(|d| (today - d).num_days() + 1);
-                                this.query.since = match span {
-                                    None => today.checked_sub_days(chrono::Days::new(6)),
-                                    Some(7) => today.checked_sub_days(chrono::Days::new(29)),
-                                    _ => None,
-                                };
-                                this.refs_key = None;
-                                this.dirty = true;
-                                cx.notify();
-                            },
-                        ))
-                    })
-                    .child(quiet_menu("sort", sort_label, &th).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.query.sort = match this.query.sort {
-                                RefSort::Title => RefSort::Recency,
-                                RefSort::Recency => RefSort::Title,
-                            };
-                            this.refs_key = None;
-                            this.dirty = true;
-                            cx.notify();
-                        },
-                    ))),
+                    .child(
+                        div()
+                            .relative()
+                            .child(
+                                quiet_menu("date-filter", date_label, &th)
+                                    .debug_selector(move || {
+                                        format!("refs-date-menu-{date_key}").into()
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.controls_menu = if date_open {
+                                            None
+                                        } else {
+                                            Some(ControlMenu::Date)
+                                        };
+                                        cx.notify();
+                                    })),
+                            )
+                            .children(date_open.then(|| {
+                                deferred(
+                                    anchored()
+                                        .anchor(Corner::TopLeft)
+                                        .offset(point(px(0.), px(6.)))
+                                        .child(self.controls_menu_popup(ControlMenu::Date, cx)),
+                                )
+                                .with_priority(1)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .child(
+                                quiet_menu("sort", sort_label, &th)
+                                    .debug_selector(move || {
+                                        format!("refs-sort-menu-{sort_key}").into()
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.controls_menu = if sort_open {
+                                            None
+                                        } else {
+                                            Some(ControlMenu::Sort)
+                                        };
+                                        cx.notify();
+                                    })),
+                            )
+                            .children(sort_open.then(|| {
+                                deferred(
+                                    anchored()
+                                        .anchor(Corner::TopLeft)
+                                        .offset(point(px(0.), px(6.)))
+                                        .child(self.controls_menu_popup(ControlMenu::Sort, cx)),
+                                )
+                                .with_priority(1)
+                            })),
+                    ),
             )
             .child(chips)
             .into_any_element()
+    }
+
+    /// The menu behind a reference control (LR-1): plain choices, the current one marked.
+    fn controls_menu_popup(
+        &self,
+        menu: ControlMenu,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let th = theme(cx).clone();
+        let today = self.app.read(cx).store.today();
+        let date_span = self.query.since.map(|d| (today - d).num_days() + 1);
+        // (selector suffix, label, choice: days for the date menu, sort for the other,
+        // selected right now).
+        let items: Vec<(
+            &'static str,
+            &'static str,
+            Option<u64>,
+            Option<RefSort>,
+            bool,
+        )> = match menu {
+            ControlMenu::Date => vec![
+                (
+                    "refs-date-option-any-time",
+                    "Any time",
+                    None,
+                    None,
+                    date_span.is_none(),
+                ),
+                (
+                    "refs-date-option-last-7-days",
+                    "Last 7 days",
+                    Some(7),
+                    None,
+                    date_span == Some(7),
+                ),
+                (
+                    "refs-date-option-last-30-days",
+                    "Last 30 days",
+                    Some(30),
+                    None,
+                    date_span == Some(30),
+                ),
+            ],
+            ControlMenu::Sort => vec![
+                (
+                    "refs-sort-option-title",
+                    "Title",
+                    None,
+                    Some(RefSort::Title),
+                    self.query.sort == RefSort::Title,
+                ),
+                (
+                    "refs-sort-option-recent",
+                    "Recent",
+                    None,
+                    Some(RefSort::Recency),
+                    self.query.sort == RefSort::Recency,
+                ),
+            ],
+        };
+        let rows = items.into_iter().map(|(selector, label, days, sort, on)| {
+            div()
+                .id(selector)
+                .debug_selector(move || selector.into())
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .text_size(px(crate::theme::CONTROL_SIZE))
+                .text_color(th.text)
+                .cursor_pointer()
+                .hover(|s| s.bg(th.hover))
+                .child(label)
+                .child(if on {
+                    div().text_color(th.accent).child("✓")
+                } else {
+                    div()
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(days) = days {
+                        this.query.since = this
+                            .app
+                            .read(cx)
+                            .store
+                            .today()
+                            .checked_sub_days(chrono::Days::new(days - 1));
+                    } else if let Some(sort) = sort {
+                        this.query.sort = sort;
+                    } else {
+                        this.query.since = None;
+                    }
+                    this.controls_menu = None;
+                    this.refs_key = None;
+                    this.dirty = true;
+                    cx.notify();
+                }))
+        });
+        div()
+            .id("refs-menu-popup")
+            .debug_selector(|| "refs-menu-popup".into())
+            .occlude()
+            .w(px(160.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .bg(th.surface)
+            .border_1()
+            .border_color(th.line)
+            .rounded_md()
+            .shadow_md()
+            .children(rows)
     }
 
     fn render_item(

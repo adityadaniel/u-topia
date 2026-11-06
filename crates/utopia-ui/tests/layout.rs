@@ -563,6 +563,125 @@ fn opening_the_page_menu_does_not_move_the_title(cx: &mut TestAppContext) {
     );
 }
 
+/// A graph whose "Target" page has two referencing blocks that also mention "Ana Lovelace",
+/// so the reference controls offer a co-reference chip with a count (LR-1).
+fn setup_ref_controls(
+    cx: &mut TestAppContext,
+) -> (&mut VisualTestContext, Entity<Workspace>, PageId) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let target = store.create_page("Target").unwrap();
+    store.create_page("Ana Lovelace").unwrap();
+    let src = store.create_page("Source").unwrap();
+    let b = store.ensure_first_block(&src).unwrap();
+    store
+        .set_block_text(
+            &src,
+            &b,
+            "A note about [[Target]] with [[Ana Lovelace]], and [[Target]] again",
+            None,
+            None,
+        )
+        .unwrap();
+    store.commit_block(&src, &b).unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    (cx, ws, target)
+}
+
+/// LR-1: one control row — a 240 px filter field, then the date and sort menus as buttons —
+/// and the co-reference chips (with their counts) wrapping on the line below it.
+#[gpui::test]
+fn reference_controls_are_one_row_with_chips_below(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_controls(cx);
+    let filter = bounds(cx, "refs-filter");
+    let row = bounds(cx, "refs-control-row");
+    let date = bounds(cx, "refs-date-menu-any-time");
+    let sort = bounds(cx, "refs-sort-menu-title");
+    assert!(
+        approx(filter.size.width, 240.),
+        "a 240 px field: {filter:?}"
+    );
+    assert!(
+        approx(
+            date.origin.y + date.size.height / 2.,
+            f32::from(row.origin.y) + f32::from(row.size.height) / 2.
+        ),
+        "the date menu sits on the same row as the field: {date:?} {row:?}"
+    );
+    assert!(
+        date.origin.x >= filter.origin.x + filter.size.width,
+        "after the field: {date:?} {filter:?}"
+    );
+    assert!(sort.origin.x >= date.origin.x + date.size.width, "{sort:?}");
+    // Both are quiet control buttons (ALL-3): the same compact height, not a form field.
+    assert!(
+        approx(sort.size.height, f32::from(date.size.height)) && sort.size.height <= px(34.),
+        "compact menu buttons: {sort:?} {date:?}"
+    );
+    let chips = bounds(cx, "refs-chips");
+    let chip = bounds(cx, "suggest-chip-0");
+    assert!(
+        chips.origin.y >= row.origin.y + row.size.height - px(0.5),
+        "co-reference chips wrap onto the next line: {chips:?} {row:?}"
+    );
+    assert!(
+        chip.origin.y >= row.origin.y + row.size.height - px(0.5),
+        "a chip is below the control row: {chip:?}"
+    );
+}
+
+/// ALL-3/LR-1: the filter menus float over the page. Opening one must not move the controls
+/// or the references under them.
+#[gpui::test]
+fn a_reference_menu_floats_without_moving_the_layout(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_controls(cx);
+    let row_before = bounds(cx, "refs-control-row");
+    let hit_before = first_hit(cx);
+    assert!(
+        cx.debug_bounds("refs-menu-popup").is_none(),
+        "no menu until the control is clicked"
+    );
+    let date = bounds(cx, "refs-date-menu-any-time");
+    cx.simulate_click(date.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let popup = bounds(cx, "refs-menu-popup");
+    assert!(
+        popup.origin.y >= date.origin.y + date.size.height - px(1.),
+        "the menu opens below its control: {popup:?} {date:?}"
+    );
+    assert!(
+        approx(
+            row_before.origin.y,
+            f32::from(bounds(cx, "refs-control-row").origin.y)
+        ) && approx(hit_before.origin.y, f32::from(first_hit(cx).origin.y)),
+        "opening the menu takes no space in the column"
+    );
+    // Picking a choice applies it (the label and its state change) and closes the menu.
+    let option = bounds(cx, "refs-date-option-last-7-days");
+    cx.simulate_click(option.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    bounds(cx, "refs-date-menu-last-7-days");
+    let sort = bounds(cx, "refs-sort-menu-title");
+    cx.simulate_click(sort.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let recent = bounds(cx, "refs-sort-option-recent");
+    cx.simulate_click(recent.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    bounds(cx, "refs-sort-menu-recent");
+}
 /// ALL-3 follow-up: the page menu is drawn over the page, so it must also take the clicks
 /// meant for it. Without `occlude` the "Delete page" item is visible but never fires (found
 /// while building the reference menus).
