@@ -1,10 +1,8 @@
-//! Quick jump (Cmd+K, §9.1): fuzzy titles and aliases; Enter opens, Shift/Cmd+Enter opens
-//! in the sidebar, and a novel title offers "Create". Dates resolve to daily pages.
-//!
-//! The same palette is full-text search (Cmd+Shift+F) and the small capture/answer prompts.
-//! Search results are grouped under their page or day (SR-2) and the matched words are
-//! washed with the accent colour (SR-1); anchors come from the store, which computed them
-//! against the plain text the row draws.
+//! Quick jump (Cmd+K) and full-text search (Cmd+Shift+F) share one palette (SR-5): fuzzy
+//! page titles first, then the matching blocks grouped under their page or day (SR-2).
+//! Enter opens, Shift/Cmd+Enter opens in the sidebar, and a novel title offers "Create".
+//! Dates resolve to daily pages. Matched words are washed in the accent colour (SR-1) and
+//! the selected block is previewed beside the list (SR-4).
 
 use gpui::{
     anchored, deferred, div, point, prelude::*, px, Context, Corner, Entity, EventEmitter,
@@ -21,9 +19,9 @@ use crate::theme::{quiet_control, quiet_menu, theme, Theme};
 /// What the palette is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteMode {
-    /// Cmd+K: titles, aliases and dates.
+    /// Cmd+K: pages first, then blocks; the selection starts on the first page.
     Pages,
-    /// Cmd+Shift+F: full-text search over block bodies (P1, FTS5).
+    /// Cmd+Shift+F: the same list over block bodies (P1, FTS5); starts on the first block.
     Search,
     /// Cmd+Shift+Space: one line appended to today's note (FR-2.19).
     Capture,
