@@ -20,7 +20,7 @@ use crate::editor::{BlockEditor, EditTarget, EditorEvent};
 use crate::field::Goal;
 use crate::line_input::{LineInput, LineInputEvent};
 use crate::rich::{self, ChipState, LinkTarget};
-use crate::theme::{quiet_control, quiet_danger, quiet_menu, theme, INDENT, LINE_HEIGHT, MAX_VISUAL_DEPTH};
+use crate::theme::{quiet_control, quiet_danger, quiet_menu, theme, INDENT, MAX_VISUAL_DEPTH};
 
 /// Transclusions stop expanding at this depth (FR-4.5).
 const MAX_EMBED_DEPTH: u8 = 3;
@@ -1526,6 +1526,7 @@ impl PageView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let th = theme(cx).clone();
+        let lh = crate::appearance::density(cx).line_height();
         let rendered = {
             let store = &self.app.read(cx).store;
             rich::render(text, &th, &mut |uid| {
@@ -1541,7 +1542,7 @@ impl PageView {
         let links = rendered.links.iter().map(|(r, _)| r.clone()).collect();
         div()
             .flex_1()
-            .min_h(px(LINE_HEIGHT))
+            .min_h(px(lh))
             // An editable row shows the I-beam between its links; a read-only one (a query
             // or search hit) is itself clickable, so it keeps its container's pointer.
             .when(row.is_some(), |d| d.cursor_text())
@@ -1579,6 +1580,9 @@ impl PageView {
 
     fn render_row(&self, ix: usize, r: &RowItem, cx: &mut Context<Self>) -> AnyElement {
         let th = theme(cx).clone();
+        let density = crate::appearance::density(cx);
+        let lh = density.line_height();
+        let vpad = density.block_spacing() / 2.;
         let host = cx.entity_id();
         let editing = self.editor.read(cx).is_editing(host, &r.page, &r.block);
         let indent = r.depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT;
@@ -1593,7 +1597,7 @@ impl PageView {
             div()
                 .id(("arrow", ix))
                 .w(px(14.))
-                .h(px(LINE_HEIGHT))
+                .h(px(lh))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1618,7 +1622,7 @@ impl PageView {
             div()
                 .id(("bullet", ix))
                 .w(px(18.))
-                .h(px(LINE_HEIGHT))
+                .h(px(lh))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1672,6 +1676,7 @@ impl PageView {
             .items_start()
             .pl(px(indent))
             .pr_2()
+            .py(px(vpad))
             // ALL-4: the focused block is marked by a 2 px accent bar, not by a heavier
             // text colour (the caret already moves). Absolutely placed so it costs no
             // layout shift when editing starts.
@@ -1683,7 +1688,7 @@ impl PageView {
                         .left(px(indent))
                         .top(px(0.))
                         .w(px(2.))
-                        .h(px(LINE_HEIGHT))
+                        .h(px(lh))
                         .bg(th.accent),
                 )
             })
@@ -1703,7 +1708,7 @@ impl PageView {
                         .id(("todo", ix))
                         .debug_selector(|| format!("todo-{ix}"))
                         .w(px(20.))
-                        .h(px(LINE_HEIGHT))
+                        .h(px(lh))
                         .flex()
                         .items_center()
                         .cursor_pointer()

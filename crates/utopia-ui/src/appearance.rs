@@ -7,10 +7,11 @@
 //! versioned object meant to grow more general preferences:
 //!
 //! ```json
-//! { "version": 1, "font": "system" }
+//! { "version": 1, "font": "system", "density": "comfortable" }
 //! ```
 //!
-//! `font` is `"system"` (the default) or `"ibm-plex-sans"`. A missing file means defaults; an
+//! `font` is `"system"` (the default) or `"ibm-plex-sans"`; `density` is
+//! `"comfortable"` (the default) or `"compact"` (ALL-5). A missing file means defaults; an
 //! unreadable file, an unknown value or a newer version is logged and read as far as it can
 //! be, never a panic (rule 11). Keys this version does not know are kept when the file is
 //! rewritten, so a newer release's preferences survive a round trip through an older one.
@@ -20,6 +21,7 @@ use serde_json::{Map, Value};
 use std::path::Path;
 
 use crate::fonts::{register_ibm_plex_sans, IBM_PLEX_SANS};
+use crate::theme::{BODY_SIZE, LINE_HEIGHT};
 
 pub const FILE: &str = "settings.json";
 pub const VERSION: u64 = 1;
@@ -65,10 +67,65 @@ impl UiFont {
     }
 }
 
+/// How tightly blocks are set (ALL-5). Local to the machine, like the font.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Density {
+    /// The body at 15 px on 24 px lines, as before the setting existed.
+    #[default]
+    Comfortable,
+    /// 13.5 px body, 18 px lines and 4 px between blocks.
+    Compact,
+}
+
+impl Density {
+    pub const ALL: &'static [Density] = &[Density::Comfortable, Density::Compact];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Density::Comfortable => "comfortable",
+            Density::Compact => "compact",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|d| d.key() == key)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Density::Comfortable => "Comfortable",
+            Density::Compact => "Compact",
+        }
+    }
+
+    pub fn text_size(self) -> f32 {
+        match self {
+            Density::Comfortable => BODY_SIZE,
+            Density::Compact => 13.5,
+        }
+    }
+
+    pub fn line_height(self) -> f32 {
+        match self {
+            Density::Comfortable => LINE_HEIGHT,
+            Density::Compact => 18.,
+        }
+    }
+
+    /// Space between two blocks. Rows take half of it above and half below.
+    pub fn block_spacing(self) -> f32 {
+        match self {
+            Density::Comfortable => 0.,
+            Density::Compact => 4.,
+        }
+    }
+}
+
 /// What `settings.json` holds.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Prefs {
     pub font: UiFont,
+    pub density: Density,
     /// Keys this version does not understand, written back untouched.
     rest: Map<String, Value>,
 }
@@ -107,13 +164,34 @@ impl Prefs {
                 UiFont::default()
             }
         };
-        (Self { font, rest }, warnings)
+        let density = match rest.remove("density") {
+            None => Density::default(),
+            Some(Value::String(s)) => Density::from_key(&s).unwrap_or_else(|| {
+                warnings.push(format!("{FILE}: unknown density {s:?}; using Comfortable"));
+                Density::default()
+            }),
+            Some(v) => {
+                warnings.push(format!(
+                    "{FILE}: density should be a string, not {v}; using Comfortable"
+                ));
+                Density::default()
+            }
+        };
+        (
+            Self {
+                font,
+                density,
+                rest,
+            },
+            warnings,
+        )
     }
 
     pub fn to_json(&self) -> String {
         let mut m = Map::new();
         m.insert("version".into(), VERSION.into());
         m.insert("font".into(), self.font.key().into());
+        m.insert("density".into(), self.density.key().into());
         for (k, v) in &self.rest {
             m.insert(k.clone(), v.clone());
         }
@@ -176,10 +254,23 @@ pub fn font_family(cx: &App) -> SharedString {
     ui_font(cx).family().into()
 }
 
+/// The density in force. Comfortable when nothing was installed (tests, early startup).
+pub fn density(cx: &App) -> Density {
+    cx.try_global::<Appearance>()
+        .map_or(Density::default(), |a| a.prefs.density)
+}
+
 /// Switch font in every open window now, and remember it in `config_dir/settings.json`.
 /// A failed write is returned, not fatal: the font still applies for this session.
 pub fn set_font(cx: &mut App, font: UiFont, config_dir: &Path) -> std::io::Result<()> {
     apply(cx, font);
+    cx.global::<Appearance>().prefs.save(config_dir)
+}
+
+/// Switch density in every open window now and remember it (rule 9: local UI state).
+pub fn set_density(cx: &mut App, density: Density, config_dir: &Path) -> std::io::Result<()> {
+    cx.default_global::<Appearance>().prefs.density = density;
+    cx.refresh_windows();
     cx.global::<Appearance>().prefs.save(config_dir)
 }
 
@@ -208,13 +299,18 @@ mod tests {
     fn round_trip() {
         let p = Prefs {
             font: UiFont::IbmPlexSans,
+            density: Density::Compact,
             ..Default::default()
         };
         let json = p.to_json();
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             v,
-            serde_json::json!({"version": 1, "font": "ibm-plex-sans"})
+            serde_json::json!({
+                "version": 1,
+                "font": "ibm-plex-sans",
+                "density": "compact",
+            })
         );
         assert_eq!(Prefs::from_json(&json), (p, vec![]));
     }
@@ -238,6 +334,16 @@ mod tests {
     #[test]
     fn missing_keys_are_defaults_without_complaint() {
         assert_eq!(Prefs::from_json("{}"), (Prefs::default(), vec![]));
+        assert_eq!(Prefs::default().density, Density::Comfortable);
+    }
+
+    /// An unknown density is the comfortable one, said out loud, never a panic (rule 11).
+    #[test]
+    fn an_unknown_density_falls_back_to_comfortable() {
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "density": "tiny"}"#);
+        assert_eq!(p.density, Density::Comfortable);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("tiny"), "{warnings:?}");
     }
 
     /// A newer release's file: what we know is read, the rest is kept for it.

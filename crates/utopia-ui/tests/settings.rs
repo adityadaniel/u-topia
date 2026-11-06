@@ -252,7 +252,7 @@ mod appearance {
     use utopia_store::Store;
     use utopia_ui::actions::install_keymap;
     use utopia_ui::app_state::AppState;
-    use utopia_ui::appearance::{self, UiFont};
+    use utopia_ui::appearance::{self, Density, UiFont};
     use utopia_ui::settings::{SettingsView, Tab};
     use utopia_ui::theme::Theme;
     use utopia_ui::workspace::Workspace;
@@ -322,7 +322,11 @@ mod appearance {
 
         assert_eq!(
             settings_json(dir.path()),
-            Some(serde_json::json!({"version": 1, "font": "ibm-plex-sans"}))
+            Some(serde_json::json!({
+                "version": 1,
+                "font": "ibm-plex-sans",
+                "density": "comfortable",
+            }))
         );
         assert!(
             !dir.path().join("keymap.json").exists(),
@@ -340,6 +344,54 @@ mod appearance {
             "system",
             "switching back is saved"
         );
+    }
+
+    /// ALL-5: density is a local preference like the font. Picking Compact applies to every
+    /// open window and is written to settings.json; Comfortable can be picked back.
+    #[gpui::test]
+    fn choosing_density_applies_everywhere_and_is_saved(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, settings) = open_both(cx, dir.path());
+        assert_eq!(
+            cx.update(|cx| appearance::density(cx)),
+            Density::Comfortable
+        );
+        assert!(settings_json(dir.path()).is_none(), "nothing saved yet");
+        {
+            let mut w = VisualTestContext::from_window(main, cx);
+            assert!(w.debug_bounds("ui-density-comfortable").is_some());
+        }
+
+        let mut s = VisualTestContext::from_window(settings, cx);
+        s.run_until_parked();
+        assert!(s.debug_bounds("settings-ui-density-comfortable").is_some());
+        let option = s
+            .debug_bounds("settings-density-compact")
+            .expect("the Compact choice is shown");
+        s.simulate_click(option.center(), Modifiers::default());
+        s.run_until_parked();
+
+        assert_eq!(s.update(|_, cx| appearance::density(cx)), Density::Compact);
+        assert!(s.debug_bounds("settings-ui-density-compact").is_some());
+        let mut w = VisualTestContext::from_window(main, cx);
+        w.run_until_parked();
+        assert!(
+            w.debug_bounds("ui-density-compact").is_some(),
+            "the main window was redrawn compact without being asked"
+        );
+        let saved = settings_json(dir.path()).expect("settings.json written");
+        assert_eq!(saved["density"], "compact");
+        assert_eq!(saved["font"], "system", "the font is kept");
+
+        // And back: Comfortable is explicit in the file, like System.
+        let option = s.debug_bounds("settings-density-comfortable").unwrap();
+        s.simulate_click(option.center(), Modifiers::default());
+        s.run_until_parked();
+        assert_eq!(
+            s.update(|_, cx| appearance::density(cx)),
+            Density::Comfortable
+        );
+        assert_eq!(settings_json(dir.path()).unwrap()["density"], "comfortable");
     }
 
     /// The saved choice is what a new launch comes up with.

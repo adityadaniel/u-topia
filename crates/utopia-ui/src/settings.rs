@@ -6,8 +6,9 @@
 //! - **Shortcuts** — the cheat sheet of everything currently bound, which is also what the
 //!   Help menu's "Keyboard Shortcuts" opens.
 //! - **Appearance** — the font notes and the interface are set in (System or the bundled
-//!   IBM Plex Sans). Applies to every window at once; kept in `settings.json`
-//!   ([`crate::appearance`]), not in `keymap.json`.
+//!   IBM Plex Sans) and how densely blocks are set (Comfortable or Compact). Applies to
+//!   every window at once; kept in `settings.json` ([`crate::appearance`]), not in
+//!   `keymap.json`.
 //! - **Help** — a tour of the app's features, with screenshots taken from the app itself.
 //!
 //! Capture uses a gpui *keystroke interceptor* rather than a key-down handler on purpose:
@@ -24,7 +25,7 @@ use std::path::PathBuf;
 use crate::actions::{
     by_category, canonical_keys, doc, pretty_keys, reinstall, ActionDoc, Category, Overrides,
 };
-use crate::appearance::{self, UiFont};
+use crate::appearance::{self, Density, UiFont};
 use crate::help::{shot_image, TOPICS};
 use crate::theme::{quiet_control, theme};
 
@@ -281,6 +282,26 @@ impl SettingsView {
         });
         cx.notify();
     }
+
+    /// Settings → Appearance: switch density in every window and remember it (ALL-5).
+    pub fn choose_density(&mut self, density: Density, cx: &mut Context<Self>) {
+        let before = appearance::density(cx);
+        self.status = Some(
+            match appearance::set_density(cx, density, &self.config_dir) {
+                Err(e) => format!(
+                    "{} applies now, but could not save {}: {e}",
+                    density.label(),
+                    appearance::FILE
+                )
+                .into(),
+                Ok(()) if before == density => {
+                    format!("The density is already {}.", density.label()).into()
+                }
+                Ok(()) => format!("The density is now {}.", density.label()).into(),
+            },
+        );
+        cx.notify();
+    }
 }
 
 /// gpui sends modifier presses through as keystrokes with no real key on some layouts.
@@ -299,6 +320,7 @@ fn has_modifier(ks: &Keystroke) -> bool {
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
+        let density = appearance::density(cx);
         let tabs = Tab::all().iter().map(|&t| {
             let on = t == self.tab;
             div()
@@ -323,6 +345,13 @@ impl Render for SettingsView {
             Tab::Appearance => self.render_appearance(cx).into_any_element(),
             Tab::Help => self.render_help(cx).into_any_element(),
         };
+        // One debug selector per element: the body names the font, the header the density.
+        let body = div()
+            .debug_selector(move || format!("settings-ui-font-{}", font.key()))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .child(body);
 
         div()
             .debug_selector(|| "settings".into())
@@ -333,12 +362,14 @@ impl Render for SettingsView {
             .flex_col()
             .bg(th.bg)
             .text_color(th.text)
-            .text_size(px(crate::theme::TEXT_SIZE))
+            .text_size(px(density.text_size()))
+            .line_height(px(density.line_height()))
             .font_family(appearance::font_family(cx))
             .child(
                 div()
-                    // Names the font in force, for tests (the root already has a selector).
-                    .debug_selector(move || format!("settings-ui-font-{}", font.key()))
+                    // Names the density in force, for tests (the root names the font; an
+                    // element carries only one debug selector).
+                    .debug_selector(move || format!("settings-ui-density-{}", density.key()))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -642,6 +673,61 @@ impl SettingsView {
                 .on_click(cx.listener(move |this, _, _, cx| this.choose_font(f, cx)))
         });
         let options: Vec<_> = options.collect();
+        let current_density = appearance::density(cx);
+        let densities: Vec<_> = Density::ALL
+            .iter()
+            .map(|&d| {
+                let on = d == current_density;
+                let th = th.clone();
+                div()
+                    .id(SharedString::from(format!("density-{}", d.key())))
+                    .debug_selector(move || format!("settings-density-{}", d.key()))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if on { th.accent } else { th.line })
+                    .when(on, |x| x.bg(th.chip_bg))
+                    .cursor_pointer()
+                    .hover(|x| x.bg(th.hover))
+                    .child(
+                        div()
+                            .size(px(14.))
+                            .flex_none()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(if on { th.accent } else { th.faint })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(on, |x| {
+                                x.child(div().size(px(8.)).rounded_full().bg(th.accent))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .child(div().child(d.label()))
+                            .child(
+                                div()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
+                                    .text_color(th.muted)
+                                    .child(match d {
+                                        Density::Comfortable => {
+                                            "15 px body on 24 px lines, as before."
+                                        }
+                                        Density::Compact => "13.5 px body and 4 px between blocks.",
+                                    }),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_density(d, cx)))
+            })
+            .collect();
         div()
             .id("settings-appearance")
             .debug_selector(|| "settings-appearance".into())
@@ -672,7 +758,26 @@ impl SettingsView {
                         "Used for your notes and the interface, in every window, as soon as \
                          you pick it. Code blocks stay in Menlo.",
                     ))
-                    .children(options),
+                    .children(options)
+                    .child(
+                        div()
+                            .pt_4()
+                            .pb_1()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.faint)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Density"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(
+                                "How much space your notes take. Local to this machine, \
+                                 kept in settings.json, never synced.",
+                            ),
+                    )
+                    .children(densities),
             )
     }
 

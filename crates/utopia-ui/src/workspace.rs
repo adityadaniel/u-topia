@@ -1457,6 +1457,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh(cx);
         let th = theme(cx).clone();
+        let density = crate::appearance::density(cx);
         let left = if self.left_open {
             self.render_left(cx)
         } else {
@@ -1519,17 +1520,23 @@ impl Render for Workspace {
                 );
             }
         }
-        let mut panes_row = div().flex_1().min_h_0().flex().flex_row().child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .map(|d| match (&self.graph, &self.pdf) {
-                    (Some(g), _) => d.child(g.clone()),
-                    (None, Some(p)) => d.child(p.clone()),
-                    (None, None) => d.child(self.main.clone()),
-                }),
-        );
+        let mut panes_row = div()
+            .debug_selector(move || format!("ui-density-{}", density.key()))
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_row()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .map(|d| match (&self.graph, &self.pdf) {
+                        (Some(g), _) => d.child(g.clone()),
+                        (None, Some(p)) => d.child(p.clone()),
+                        (None, None) => d.child(self.main.clone()),
+                    }),
+            );
         for (i, sp) in self.splits.iter().enumerate() {
             panes_row = panes_row.child(
                 div()
@@ -1635,8 +1642,8 @@ impl Render for Workspace {
             .flex_row()
             .bg(th.bg)
             .text_color(th.text)
-            .text_size(px(crate::theme::TEXT_SIZE))
-            .line_height(px(crate::theme::LINE_HEIGHT))
+            .text_size(px(density.text_size()))
+            .line_height(px(density.line_height()))
             .font_family(font.family())
             .child(left)
             .child(main_col)

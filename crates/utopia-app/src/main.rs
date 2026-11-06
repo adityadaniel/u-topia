@@ -463,12 +463,13 @@ impl Root {
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
+        let density = utopia_ui::appearance::density(cx);
         let shell = div()
             .size_full()
             .bg(th.bg)
             .text_color(th.text)
-            .text_size(px(utopia_ui::theme::TEXT_SIZE))
-            .line_height(px(utopia_ui::theme::LINE_HEIGHT))
+            .text_size(px(density.text_size()))
+            .line_height(px(density.line_height()))
             .font_family(utopia_ui::appearance::font_family(cx));
         match &self.state {
             RootState::Ready(ws) => shell.child(ws.clone()),

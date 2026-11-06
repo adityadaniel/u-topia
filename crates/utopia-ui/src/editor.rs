@@ -1402,7 +1402,7 @@ impl Render for BlockEditor {
             .debug_selector(|| "block-editor".into())
             .track_focus(&self.focus)
             .w_full()
-            .min_h(px(crate::theme::LINE_HEIGHT))
+            .min_h(px(crate::appearance::density(cx).line_height()))
             .cursor_text()
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::insert_above))

@@ -460,3 +460,43 @@ fn focused_block_has_an_accent_bar(cx: &mut TestAppContext) {
         "the bar sits left of the block text: {bar:?} {content:?}"
     );
 }
+
+/// ALL-5: Compact shrinks the body and adds 4 px between blocks; both are measurable, and
+/// the setting applies to the open window without a restart.
+#[gpui::test]
+fn compact_density_is_tighter(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_input("one");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("two");
+    cx.simulate_keystrokes("escape");
+    let body_before = bounds(cx, "content-1").size.height;
+    let row_before = bounds(cx, "row-1").size.height;
+
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|_window, cx| {
+        utopia_ui::appearance::set_density(cx, utopia_ui::appearance::Density::Compact, dir.path())
+            .unwrap();
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("ui-density-compact").is_some(),
+        "the open window re-rendered at the new density"
+    );
+    let body_after = bounds(cx, "content-1").size.height;
+    let row_after = bounds(cx, "row-1").size.height;
+    assert!(
+        approx(body_after, 18.),
+        "Compact body is 13.5 px on an 18 px line: {body_after:?}"
+    );
+    assert!(
+        body_after < body_before && row_after < row_before,
+        "Compact is tighter: body {body_before:?} -> {body_after:?}, \
+         row {row_before:?} -> {row_after:?}"
+    );
+    assert!(
+        approx(row_after - body_after, 4.),
+        "4 px of block spacing: row {row_after:?}, body {body_after:?}"
+    );
+}
