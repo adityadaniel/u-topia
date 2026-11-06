@@ -35,6 +35,7 @@ they were retaken.
 |---|---|
 | `after-references.png` | LR-1: one control row — a 240 px filter field, then `Any time ▾` and `Title ▾` as menu buttons — with the co-reference chip (`Atlas Launch 1`) and its count on the line below. LR-2: `Linked References`, `November 6th, 2026`, `Atlas Launch` and `Reading` each carry their count as a chip right after the name. LR-3: `Atlas Launch › Risks` above the nested hit. LR-4: two children inline under the first hit and `+1 more`. LR-5: `Unlinked References 2` with `Link all`, closed. |
 | `after-date-menu.png` | LR-1: the date control opens a floating menu with the current choice marked, over the references, without moving them (the layout below is identical to `after-references.png`). |
+| `after-co-reference-selected.png` | LR-1: clicking the `Atlas Launch 1` chip selects it — it fills with the soft accent and an `×`, and the references narrow to the three hits that also mention it. |
 | `after-references-no-children.png` | LR-4: the same page with Settings → Appearance → "Children shown in references" set to 0: no child inline, one `+3 more` chip. |
 | `after-unlinked-open.png` | LR-5: the section open — each mention keeps its page name, the matched text is marked, and each row has a `Link` button; `Link all` sits in the header. |
 | `after-link-all.png` | LR-5: after `Link all`, both mentions became links (they now appear as a `Reading 2` group), the count is 0, and the section says `No unlinked mentions`. |
