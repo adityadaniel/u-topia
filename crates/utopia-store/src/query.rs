@@ -214,6 +214,91 @@ pub struct BlockGroup {
     pub hits: Vec<BlockHit>,
 }
 
+/// Where a search may look (SR-3). The chips under the field: All · Journal · Pages · To-dos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum SearchScope {
+    #[default]
+    All,
+    /// Blocks on daily pages.
+    Journal,
+    /// Blocks on ordinary pages.
+    Pages,
+    /// To-do blocks, done and not done.
+    Todos,
+}
+
+impl SearchScope {
+    pub const ALL: &'static [SearchScope] = &[
+        SearchScope::All,
+        SearchScope::Journal,
+        SearchScope::Pages,
+        SearchScope::Todos,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchScope::All => "All",
+            SearchScope::Journal => "Journal",
+            SearchScope::Pages => "Pages",
+            SearchScope::Todos => "To-dos",
+        }
+    }
+
+    /// The SQL condition on `block b` / `page p` for this scope.
+    fn condition(self) -> &'static str {
+        match self {
+            SearchScope::All => "1",
+            SearchScope::Journal => "p.kind='daily'",
+            SearchScope::Pages => "p.kind='page'",
+            SearchScope::Todos => "b.block_type='todo'",
+        }
+    }
+}
+
+/// How far back a search looks (SR-3's "Any time" menu). Daily hits are dated by their
+/// day; other blocks by the local date of their last edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum SearchAge {
+    #[default]
+    AnyTime,
+    Today,
+    Week,
+    Month,
+    Year,
+}
+
+impl SearchAge {
+    pub const ALL: &'static [SearchAge] = &[
+        SearchAge::AnyTime,
+        SearchAge::Today,
+        SearchAge::Week,
+        SearchAge::Month,
+        SearchAge::Year,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchAge::AnyTime => "Any time",
+            SearchAge::Today => "Today",
+            SearchAge::Week => "Past week",
+            SearchAge::Month => "Past month",
+            SearchAge::Year => "Past year",
+        }
+    }
+
+    /// First day that still counts, `today - n` for the windows (both ends included).
+    pub fn since(self, today: NaiveDate) -> Option<NaiveDate> {
+        let back = |n: u64| today.checked_sub_days(chrono::Days::new(n));
+        match self {
+            SearchAge::AnyTime => None,
+            SearchAge::Today => Some(today),
+            SearchAge::Week => back(6),
+            SearchAge::Month => back(29),
+            SearchAge::Year => back(364),
+        }
+    }
+}
+
 /// Byte ranges in `plain` matched by `query`'s terms, for search highlighting (SR-1).
 ///
 /// FTS5 picks *which* blocks match; this locates the same prefix terms in the plain text
@@ -305,6 +390,23 @@ pub fn fuzzy_score(needle: &str, hay: &str) -> Option<i64> {
         }
     }
     Some(score - hay.len() as i64)
+}
+
+/// A raw search row before grouping or truncation: the hit plus the day an age window
+/// is measured against.
+struct SearchRow {
+    hit: BlockHit,
+    daily: Option<NaiveDate>,
+    updated_at: i64,
+}
+
+impl SearchRow {
+    fn day(&self) -> Option<NaiveDate> {
+        self.daily.or_else(|| {
+            chrono::DateTime::from_timestamp_millis(self.updated_at)
+                .map(|t| t.with_timezone(&chrono::Local).date_naive())
+        })
+    }
 }
 
 impl Store {
@@ -504,67 +606,126 @@ impl Store {
 
     /// Block search for `((` autocomplete (FR-4.2): FTS5 prefix match over live bodies.
     pub fn search_blocks(&self, query: &str, limit: usize) -> Result<Vec<BlockHit>> {
+        self.search_blocks_filtered(query, SearchScope::All, SearchAge::AnyTime, limit)
+    }
+
+    /// Block search through the scope and age chips (SR-3). The scope narrows the SQL
+    /// query; the age window is applied to the hit's day (a daily page's date, or the
+    /// local date of the block's last edit) before the limit cuts the list.
+    pub fn search_blocks_filtered(
+        &self,
+        query: &str,
+        scope: SearchScope,
+        age: SearchAge,
+        limit: usize,
+    ) -> Result<Vec<BlockHit>> {
+        Ok(self
+            .search_raw(query, scope, age, limit)?
+            .into_iter()
+            .map(|r| r.hit)
+            .collect())
+    }
+
+    fn search_raw(
+        &self,
+        query: &str,
+        scope: SearchScope,
+        age: SearchAge,
+        limit: usize,
+    ) -> Result<Vec<SearchRow>> {
         self.read_barrier()?;
         let terms: Vec<String> = query
             .split(|c: char| !c.is_alphanumeric())
             .filter(|t| !t.is_empty())
             .map(|t| format!("\"{}\"*", t.replace('"', "")))
             .collect();
-        let sql_recent =
-            "SELECT b.id, b.page_id, p.title, b.text FROM block b JOIN page p ON p.id=b.page_id
-             WHERE b.deleted_at IS NULL AND b.text <> '' ORDER BY b.updated_at DESC LIMIT ?1";
         let map = |r: &Row<'_>| {
             let text: String = r.get(3)?;
-            Ok(BlockHit {
-                block: BlockId(r.get(0)?),
-                page: PageId(r.get(1)?),
-                page_title: r.get(2)?,
-                anchors: match_anchors(&plain_text(&text), query),
-                text,
+            Ok(SearchRow {
+                hit: BlockHit {
+                    block: BlockId(r.get(0)?),
+                    page: PageId(r.get(1)?),
+                    page_title: r.get(2)?,
+                    anchors: match_anchors(&plain_text(&text), query),
+                    text,
+                },
+                daily: r
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|d| utopia_core::date::parse_iso(&d)),
+                updated_at: r.get(5)?,
             })
         };
-        if terms.is_empty() {
-            let mut stmt = self.conn.prepare(sql_recent)?;
+        // Over-fetch so an age window can drop rows without starving the list.
+        let fetch = (limit.max(1) * 10) as i64;
+        let mut rows = if terms.is_empty() {
+            let sql = format!(
+                "SELECT b.id, b.page_id, p.title, b.text, p.daily_date, b.updated_at
+                 FROM block b JOIN page p ON p.id=b.page_id
+                 WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL AND b.text <> ''
+                   AND {} ORDER BY b.updated_at DESC LIMIT ?1",
+                scope.condition()
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt
-                .query_map([limit as i64], map)?
+                .query_map([fetch], map)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            return Ok(rows);
+            rows
+        } else {
+            // Newest matches first, straight off the FTS doclist (no scoring of every
+            // match, which is what made common terms slow); then prefer blocks containing
+            // the whole query as typed.
+            let sql = format!(
+                "SELECT f.block_id, b.page_id, p.title, b.text, p.daily_date, b.updated_at
+                 FROM block_fts f
+                 JOIN block b ON b.rowid=f.rowid JOIN page p ON p.id=b.page_id
+                 WHERE block_fts MATCH ?1 AND b.deleted_at IS NULL AND p.deleted_at IS NULL
+                   AND {} ORDER BY f.rowid DESC LIMIT ?2",
+                scope.condition()
+            );
+            let mut stmt = self.conn.prepare_cached(&sql)?;
+            let mut rows = stmt
+                .query_map(params![terms.join(" "), fetch], map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let needle = query.trim().to_lowercase();
+            rows.sort_by_key(|h| !h.hit.text.to_lowercase().contains(&needle));
+            rows
+        };
+        if let Some(since) = age.since(self.today()) {
+            rows.retain(|r| r.day().is_none_or(|d| d >= since));
         }
-        // Newest matches first, straight off the FTS doclist (no scoring of every match,
-        // which is what made common terms slow); then prefer blocks containing the whole
-        // query as typed.
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT f.block_id, b.page_id, p.title, b.text FROM block_fts f
-             JOIN block b ON b.rowid=f.rowid JOIN page p ON p.id=b.page_id
-             WHERE block_fts MATCH ?1 ORDER BY f.rowid DESC LIMIT ?2",
-        )?;
-        let mut rows = stmt
-            .query_map(params![terms.join(" "), (limit.max(1) * 10) as i64], map)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let needle = query.trim().to_lowercase();
-        rows.sort_by_key(|h| !h.text.to_lowercase().contains(&needle));
         rows.truncate(limit);
         Ok(rows)
     }
 
-    /// Block search grouped under the page or day each hit lives on (SR-2). Groups keep
-    /// the order of their best hit, so the newest page stays first; hits inside a group
-    /// keep the flat search order.
+    /// Block search grouped under the page or day each hit lives on (SR-2, SR-3). Groups
+    /// keep the order of their best hit, so the newest page stays first; hits inside a
+    /// group keep the flat search order.
     pub fn search_groups(&self, query: &str, limit: usize) -> Result<Vec<BlockGroup>> {
-        let hits = self.search_blocks(query, limit)?;
+        self.search_groups_filtered(query, SearchScope::All, SearchAge::AnyTime, limit)
+    }
+
+    /// [`Store::search_groups`] through the scope and age chips (SR-3).
+    pub fn search_groups_filtered(
+        &self,
+        query: &str,
+        scope: SearchScope,
+        age: SearchAge,
+        limit: usize,
+    ) -> Result<Vec<BlockGroup>> {
+        let rows = self.search_raw(query, scope, age, limit)?;
         let mut groups: Vec<BlockGroup> = Vec::new();
         let mut index: HashMap<PageId, usize> = HashMap::new();
-        for hit in hits {
+        for row in rows {
+            let hit = row.hit;
             if let Some(&i) = index.get(&hit.page) {
                 groups[i].hits.push(hit);
                 continue;
             }
             index.insert(hit.page.clone(), groups.len());
-            let daily = self.page_row(&hit.page)?.is_some_and(|p| p.is_daily());
             groups.push(BlockGroup {
                 page: hit.page.clone(),
                 title: hit.page_title.clone(),
-                daily,
+                daily: row.daily.is_some(),
                 hits: vec![hit],
             });
         }

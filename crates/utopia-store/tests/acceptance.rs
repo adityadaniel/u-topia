@@ -920,3 +920,78 @@ fn sr_2_search_groups_results_by_page() {
     assert_eq!(notes.page, b);
     assert_eq!(notes.hits.len(), 1);
 }
+
+/// SR-3: the scope chips narrow to daily pages, ordinary pages or to-dos, and the age
+/// menu drops hits older than the window. A daily hit is dated by its day, other blocks
+/// by the local date of their last edit.
+#[test]
+fn sr_3_search_scopes_and_age() {
+    use utopia_core::BlockKind;
+    use utopia_store::{SearchAge, SearchScope};
+
+    let ts = |y, m, d, h| {
+        date(y, m, d)
+            .and_hms_opt(h, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis()
+    };
+    let mut s = store();
+    s.set_clock(Some(ts(2026, 11, 2, 18)));
+    let atlas = s.create_page("Atlas").unwrap();
+    write(&mut s, &atlas, "atlas launch");
+    let (day, db) = s.open_daily(date(2026, 11, 2)).unwrap();
+    s.set_block_text(&day, &db, "atlas daily note", None, None)
+        .unwrap();
+    s.commit_block(&day, &db).unwrap();
+    let work = s.create_page("Work").unwrap();
+    let todo = write(&mut s, &work, "atlas todo");
+    s.set_block_kind(&work, &todo, BlockKind::Todo, false)
+        .unwrap();
+
+    // An older block, written before the window.
+    s.set_clock(Some(ts(2026, 10, 1, 18)));
+    let old = s.create_page("Old").unwrap();
+    write(&mut s, &old, "atlas old");
+    s.set_clock(Some(ts(2026, 11, 2, 18)));
+    s.sync_index().unwrap();
+
+    let pages = |s: &Store, scope, age| -> Vec<String> {
+        let mut v: Vec<String> = s
+            .search_blocks_filtered("atlas", scope, age, 50)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.page_title)
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        pages(&s, SearchScope::All, SearchAge::AnyTime),
+        vec!["Atlas", "November 2nd, 2026", "Old", "Work"]
+    );
+    assert_eq!(
+        pages(&s, SearchScope::Journal, SearchAge::AnyTime),
+        vec!["November 2nd, 2026"]
+    );
+    assert_eq!(
+        pages(&s, SearchScope::Pages, SearchAge::Today),
+        vec!["Atlas", "Work"],
+        "the October note is outside Today"
+    );
+    assert_eq!(
+        pages(&s, SearchScope::Todos, SearchAge::AnyTime),
+        vec!["Work"]
+    );
+    let daily = s
+        .search_groups_filtered("atlas", SearchScope::Journal, SearchAge::Today, 30)
+        .unwrap();
+    assert_eq!(daily.len(), 1);
+    assert!(daily[0].daily && daily[0].hits.len() == 1);
+    assert_eq!(
+        s.search_blocks_filtered("atlas", SearchScope::All, SearchAge::Year, 50)
+            .unwrap()
+            .len(),
+        4
+    );
+}

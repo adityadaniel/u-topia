@@ -698,6 +698,100 @@ fn search_groups_results_under_their_page(cx: &mut TestAppContext) {
     );
 }
 
+/// SR-3: the scope chips narrow the grouped results; the age menu drops older hits,
+/// and opening it is the only thing that happens (the chips do not move).
+#[gpui::test]
+fn search_scope_and_age_filter_the_results(cx: &mut TestAppContext) {
+    use utopia_core::BlockKind;
+    let (app, ws, cx) = setup(cx);
+    let ts = |m: u32, d: u32, h| {
+        NaiveDate::from_ymd_opt(2026, m, d)
+            .unwrap()
+            .and_hms_opt(h, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis()
+    };
+    app.update(cx, |app, _| {
+        // Now: a page and today's day both mention the zebra.
+        app.store.set_clock(Some(ts(11, 2, 18)));
+        let atlas = app.store.create_page("Atlas").unwrap();
+        let b = app.store.ensure_first_block(&atlas).unwrap();
+        app.store
+            .set_block_text(&atlas, &b, "zebra plan", None, None)
+            .unwrap();
+        app.store.commit_block(&atlas, &b).unwrap();
+        let (day, db) = app.store.open_daily(today()).unwrap();
+        app.store
+            .set_block_text(&day, &db, "zebra day", None, None)
+            .unwrap();
+        app.store.commit_block(&day, &db).unwrap();
+        // Last month: an old note outside the Today window.
+        app.store.set_clock(Some(ts(10, 1, 18)));
+        let old = app.store.create_page("Old").unwrap();
+        let b = app.store.ensure_first_block(&old).unwrap();
+        app.store
+            .set_block_text(&old, &b, "zebra old", None, None)
+            .unwrap();
+        app.store
+            .set_block_kind(&old, &b, BlockKind::Todo, false)
+            .unwrap();
+        app.store.set_clock(Some(ts(11, 2, 18)));
+        app.store.sync_index().unwrap();
+    });
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("the palette is open");
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.groups().len()),
+        3,
+        "three pages, grouped"
+    );
+
+    let journal = cx
+        .debug_bounds("search-scope-journal")
+        .expect("the Journal chip");
+    cx.simulate_click(journal.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.scope()),
+        utopia_store::SearchScope::Journal
+    );
+    let groups = jump.read_with(cx, |j, _| j.groups().to_vec());
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    assert!(groups[0].daily, "only the day is left: {groups:?}");
+
+    // Pages + Today keeps the current page and drops last month's note.
+    let pages = cx
+        .debug_bounds("search-scope-pages")
+        .expect("the Pages chip");
+    cx.simulate_click(pages.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let age = cx.debug_bounds("search-age").expect("the age control");
+    cx.simulate_click(age.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let today_item = cx
+        .debug_bounds("search-age-today")
+        .expect("Today in the age menu");
+    cx.simulate_click(today_item.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        ws.read_with(cx, |w, _| w.jump_palette().is_some()),
+        "the palette is still open (the scrim did not swallow the menu click)"
+    );
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.age()),
+        utopia_store::SearchAge::Today
+    );
+    let titles: Vec<String> = jump.read_with(cx, |j, _| {
+        j.groups().iter().map(|g| g.title.clone()).collect()
+    });
+    assert_eq!(titles, vec!["Atlas".to_string()], "October is out of Today");
+}
+
 #[gpui::test]
 fn full_search_and_quick_capture(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);

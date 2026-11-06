@@ -7,16 +7,16 @@
 //! against the plain text the row draws.
 
 use gpui::{
-    div, prelude::*, px, Context, Entity, EventEmitter, HighlightStyle, MouseButton,
-    MouseDownEvent, StyledText, Subscription, Window,
+    anchored, deferred, div, point, prelude::*, px, Context, Corner, Entity, EventEmitter,
+    HighlightStyle, MouseButton, MouseDownEvent, StyledText, Subscription, Window,
 };
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, PageId};
-use utopia_store::{BlockGroup, TitleHit};
+use utopia_store::{BlockGroup, SearchAge, SearchScope, TitleHit};
 
 use crate::app_state::AppState;
 use crate::line_input::{LineInput, LineInputEvent};
-use crate::theme::{theme, Theme};
+use crate::theme::{quiet_control, quiet_menu, theme, Theme};
 
 /// What the palette is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +66,9 @@ pub struct JumpPalette {
     selected: usize,
     title: &'static str,
     mode: PaletteMode,
+    scope: SearchScope,
+    age: SearchAge,
+    age_menu: bool,
     _sub: Subscription,
 }
 
@@ -177,6 +180,9 @@ impl JumpPalette {
             selected: 0,
             title,
             mode,
+            scope: SearchScope::default(),
+            age: SearchAge::default(),
+            age_menu: false,
             _sub: sub,
         };
         me.search("", cx);
@@ -248,7 +254,7 @@ impl JumpPalette {
             .app
             .read(cx)
             .store
-            .search_groups(q, 30)
+            .search_groups_filtered(q, self.scope, self.age, 30)
             .unwrap_or_default();
         for (gi, g) in groups.iter().enumerate() {
             self.rows.push(Row::Group { group: gi });
@@ -257,6 +263,25 @@ impl JumpPalette {
             }
         }
         self.groups = groups;
+    }
+
+    /// Results by page, for the scope tests and the preview (SR-2, SR-3).
+    pub fn groups(&self) -> &[BlockGroup] {
+        &self.groups
+    }
+
+    pub fn scope(&self) -> SearchScope {
+        self.scope
+    }
+
+    pub fn age(&self) -> SearchAge {
+        self.age
+    }
+
+    /// Re-run the same query under a new chip (SR-3). The typed text stays in the field.
+    fn refilter(&mut self, cx: &mut Context<Self>) {
+        let q = self.input.read(cx).text().to_string();
+        self.search(&q, cx);
     }
 
     fn step(&mut self, d: isize, cx: &mut Context<Self>) {
@@ -336,10 +361,110 @@ impl JumpPalette {
     }
 }
 
+impl JumpPalette {
+    /// The scope and age chips under the field (SR-3). Only search has scopes; quick jump
+    /// still searches titles.
+    fn scope_bar(&self, th: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let mut bar = div()
+            .id("search-scopes")
+            .debug_selector(|| "search-scopes".into())
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_1();
+        for &s in SearchScope::ALL {
+            let selected = s == self.scope;
+            let key = s.label().to_lowercase().replace(' ', "-");
+            bar = bar.child(
+                quiet_control(
+                    gpui::ElementId::Name(format!("search-scope-{key}").into()),
+                    s.label(),
+                    th,
+                )
+                .debug_selector(move || format!("search-scope-{key}"))
+                .when(selected, |d| d.bg(th.chip_bg).text_color(th.accent))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.scope = s;
+                    this.age_menu = false;
+                    this.refilter(cx);
+                })),
+            );
+        }
+        let menu_open = self.age_menu;
+        bar.child(div().flex_1()).child(
+            div()
+                .relative()
+                .child(
+                    quiet_menu("search-age", self.age.label(), th)
+                        .debug_selector(|| "search-age".into())
+                        .when(menu_open, |d| d.bg(th.chip_bg).text_color(th.accent))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.age_menu = !this.age_menu;
+                            cx.notify();
+                        })),
+                )
+                .children(menu_open.then(|| {
+                    deferred(
+                        anchored()
+                            .anchor(Corner::TopRight)
+                            .offset(point(px(0.), px(6.)))
+                            .child(self.age_popup(th, cx)),
+                    )
+                    .with_priority(1)
+                })),
+        )
+    }
+
+    /// The "Any time" menu, drawn deferred so opening it never moves the chips or the
+    /// results (the lesson from screen 00's page menu).
+    fn age_popup(&self, th: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let mut menu = div()
+            .id("search-age-popup")
+            .debug_selector(|| "search-age-popup".into())
+            .w(px(170.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .bg(th.surface)
+            .border_1()
+            .border_color(th.line)
+            .rounded_md()
+            .shadow_md()
+            // The results list is underneath: stop the mouse-down here or a row would
+            // choose itself before the menu item's click runs (found by the scope test).
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        for &a in SearchAge::ALL {
+            let selected = a == self.age;
+            let key = a.label().to_lowercase().replace(' ', "-");
+            menu = menu.child(
+                quiet_control(
+                    gpui::ElementId::Name(format!("search-age-item-{key}").into()),
+                    a.label(),
+                    th,
+                )
+                .debug_selector(move || format!("search-age-{key}"))
+                .w_full()
+                .justify_start()
+                .when(selected, |d| d.bg(th.chip_bg).text_color(th.accent))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.age = a;
+                    this.age_menu = false;
+                    this.refilter(cx);
+                })),
+            );
+        }
+        menu
+    }
+}
+
 impl Render for JumpPalette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let selected = self.selected;
+        // Build the chips before borrowing the rows, because their click listeners need a
+        // mutable context.
+        let scopes = (self.mode == PaletteMode::Search).then(|| self.scope_bar(&th, cx));
         let rows = self.rows.iter().enumerate().map(|(i, r)| match r {
             Row::Group { group } => group_header(*group, &self.groups[*group], &th),
             Row::Page(h) => {
@@ -449,6 +574,7 @@ impl Render for JumpPalette {
                     .rounded_md()
                     .child(self.input.clone()),
             )
+            .children(scopes)
             .child(
                 div()
                     .id("jump-results")

@@ -718,6 +718,11 @@ impl Workspace {
         self.graph.clone()
     }
 
+    /// The open palette, for tests that read the results it is showing.
+    pub fn jump_palette(&self) -> Option<Entity<JumpPalette>> {
+        self.jump.as_ref().map(|(j, _)| j.clone())
+    }
+
     /// Full-text search with `text` already typed (`utopia://search`).
     pub fn search_for(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.full_search(&FullSearch, window, cx);
@@ -1591,22 +1596,36 @@ impl Render for Workspace {
                 .id("jump-overlay")
                 .absolute()
                 .size_full()
-                .flex()
-                .justify_center()
-                .pt(px(90.))
-                .bg(th.scrim)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.jump = None;
-                        window.focus(&this.focus);
-                        cx.notify();
-                    }),
+                // The scrim is a sibling behind the palette, not its background: a menu
+                // deferred out of the palette (the age menu) must not be dismissed by the
+                // same click that chooses an item.
+                .child(
+                    div()
+                        .id("jump-scrim")
+                        .absolute()
+                        .size_full()
+                        .bg(th.scrim)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.jump = None;
+                                window.focus(&this.focus);
+                                cx.notify();
+                            }),
+                        ),
                 )
                 .child(
                     div()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(j.clone()),
+                        .absolute()
+                        .size_full()
+                        .flex()
+                        .justify_center()
+                        .pt(px(90.))
+                        .child(
+                            div()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(j.clone()),
+                        ),
                 )
         });
         let _ = window;

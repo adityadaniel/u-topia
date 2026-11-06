@@ -191,6 +191,43 @@ fn quick_jump_is_centered(cx: &mut TestAppContext) {
     );
 }
 
+/// SR-3: the scope chips sit under the field inside the palette, and the "Any time" menu
+/// floats over the results without moving them (deferred + anchored, like the page menu).
+#[gpui::test]
+fn search_scope_row_and_age_menu(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    let palette = bounds(cx, "jump-palette");
+    let scopes = bounds(cx, "search-scopes");
+    assert!(
+        scopes.origin.y > palette.origin.y + px(60.),
+        "under the field: {scopes:?} {palette:?}"
+    );
+    assert!(
+        scopes.origin.x >= palette.origin.x && scopes.right() <= palette.right() + px(0.5),
+        "inside the palette: {scopes:?} {palette:?}"
+    );
+    let age = bounds(cx, "search-age");
+    assert!(
+        age.right() <= palette.right() + px(0.5),
+        "the age control stays inside: {age:?}"
+    );
+    cx.simulate_click(age.center(), gpui::Modifiers::default());
+    let popup = bounds(cx, "search-age-popup");
+    assert!(
+        popup.origin.y >= age.origin.y + age.size.height - px(1.),
+        "the menu opens below its control: {popup:?} {age:?}"
+    );
+    assert!(
+        popup.origin.x >= palette.origin.x
+            && popup.right() <= px(W)
+            && popup.origin.y + popup.size.height <= px(H),
+        "the menu stays in the window: {popup:?}"
+    );
+    let after = bounds(cx, "search-scopes");
+    assert_eq!(scopes, after, "opening the menu does not move the chips");
+}
+
 #[gpui::test]
 fn minimum_window_size_still_lays_out(cx: &mut TestAppContext) {
     let cx = setup(cx);
