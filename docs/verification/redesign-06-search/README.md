@@ -31,8 +31,9 @@ on the first page.
 - `search_preview_follows_the_selection` — a page selection has no preview; the first
   block's preview has its path and state; ↓ moves to the next block and the preview
   follows.
-- `search_scope_filters_page_titles` — Journal/Pages/To-dos filter title rows too, and the
-  inserted ISO-date hit obeys the same scope.
+- `search_scope_filters_page_titles` — Journal/Pages/To-dos filter title rows too, the
+  inserted ISO-date hit obeys the same scope, and Enter cannot create an out-of-scope page
+  when no row is eligible.
 - `one_palette_opens_on_pages_or_blocks` — ⌘K selects the page row that sits above the
   grouped blocks and offers Create page; ⌘⇧F selects the first block and offers no Create.
 - `search_scrolls_the_selected_block_into_view` — twelve title rows fill the viewport and
@@ -77,14 +78,14 @@ Dark mode was not captured; the system appearance was left alone.
 
 ```
 cargo fmt --all -- --check          (no output)
-cargo build --workspace             Finished `dev` profile ... in 7.62s
+cargo build --workspace             Finished `dev` profile ... in 10.39s
 cargo test --workspace              295 passed, 0 failed (36 suites)
   tests/acceptance.rs               38 passed
   tests/layout.rs                   20 passed
   tests/settings.rs                 13 passed
   tests/workspace.rs                56 passed
 cargo clippy --workspace --all-targets -- -D warnings
-                                    Finished `dev` profile ... in 3.81s
+                                    Finished `dev` profile ... in 4.67s
 ```
 
 One earlier run failed `utopia-syncd --test http::lan_relay_serves_and_is_discoverable`
