@@ -535,6 +535,105 @@ fn compact_density_is_tighter(cx: &mut TestAppContext) {
     );
 }
 
+/// A page whose outline holds a quote, then a code block that names its language (PG-5):
+/// items are 0 header, 1 quote, 2 code.
+fn setup_quote_and_code(
+    cx: &mut TestAppContext,
+) -> (&mut VisualTestContext, Vec<utopia_core::BlockId>) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    use utopia_store::EditOpts;
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = store.create_page("Types").unwrap();
+    // A quote, a code block that names its language, and a plain bullet to measure against.
+    let rows = [
+        (BlockKind::Quote, "Ship the small thing that works."),
+        (BlockKind::Code, "rust\nfn main() {}"),
+        (BlockKind::Bullet, "plain"),
+    ];
+    let mut ids = Vec::new();
+    let mut cmds = Vec::new();
+    let mut prev: Option<BlockId> = None;
+    for (kind, text) in rows {
+        let id = BlockId::new();
+        cmds.push(Command::InsertBlock {
+            id: id.clone(),
+            parent: None,
+            after: prev.clone(),
+            text: text.to_string(),
+            kind,
+        });
+        prev = Some(id.clone());
+        ids.push(id);
+    }
+    store
+        .execute(
+            &page,
+            cmds,
+            EditOpts {
+                no_undo: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    (cx, ids)
+}
+
+/// PG-5: a quote is set off from the outline by its bar and padding, and a code block's
+/// language sits at the top right of its card, above the code, not as a line of code.
+#[gpui::test]
+fn quote_is_indented_and_code_names_its_language(cx: &mut TestAppContext) {
+    let (cx, ids) = setup_quote_and_code(cx);
+    let text = |cx: &mut VisualTestContext, block: &utopia_core::BlockId| {
+        // `debug_bounds` takes a `&'static str`; leaking a few test selectors is fine.
+        let sel: &'static str = Box::leak(format!("text-{}", block.0).into_boxed_str());
+        bounds(cx, sel)
+    };
+    let quote = text(cx, &ids[0]);
+    let code = text(cx, &ids[1]);
+    let bullet = text(cx, &ids[2]);
+    let card = bounds(cx, "content-2");
+    let lang = bounds(cx, "code-language-2");
+    let row = bounds(cx, "row-2");
+    // 2 px bar plus 8 px padding for the quote, the card's 8 px padding for the code.
+    assert!(
+        approx(quote.origin.x - bullet.origin.x, 10.),
+        "the quote's bar and padding inset its text: {quote:?} {bullet:?}"
+    );
+    assert!(
+        approx(code.origin.x - bullet.origin.x, 8.),
+        "the code sits inside its card: {code:?} {bullet:?}"
+    );
+    assert!(
+        lang.origin.y < code.origin.y,
+        "the label is above the first line of code: {lang:?} {code:?}"
+    );
+    assert!(
+        lang.origin.x + lang.size.width <= card.right() + px(1.),
+        "the label stays inside the card: {lang:?} {card:?}"
+    );
+    assert!(
+        card.right() - (lang.origin.x + lang.size.width) < px(12.),
+        "the label is right-aligned in the card: {lang:?} {card:?}"
+    );
+    assert!(
+        row.size.height >= card.size.height,
+        "the card takes its own room in the outline: {row:?} {card:?}"
+    );
+}
+
 /// A fresh page window for one menu state, so no debug bounds from the other state linger.
 fn page_title_with_menu(cx: &mut TestAppContext, menu_open: bool) -> Bounds<Pixels> {
     cx.update(|cx| {

@@ -19,6 +19,9 @@ pub struct Theme {
     pub surface: Hsla,
     pub text: Hsla,
     pub muted: Hsla,
+    /// The warm grey a quotation is set in (PG-5): grey with the page's paper temperature,
+    /// not the cooler interface `muted`.
+    pub quote: Hsla,
     pub faint: Hsla,
     pub line: Hsla,
     pub hover: Hsla,
@@ -51,6 +54,7 @@ impl Theme {
             surface: rgb(0xfafaf9).into(),
             text: rgb(0x1f2328).into(),
             muted: rgb(0x6b7076).into(),
+            quote: rgb(0x6d6357).into(),
             faint: rgb(0xa8acb1).into(),
             line: rgb(0xe4e4e1).into(),
             hover: rgb(0xeeeeec).into(),
@@ -79,6 +83,7 @@ impl Theme {
             surface: rgb(0x202124).into(),
             text: rgb(0xe6e6e3).into(),
             muted: rgb(0xa0a4a8).into(),
+            quote: rgb(0xb3a795).into(),
             faint: rgb(0x6b6f74).into(),
             line: rgb(0x34363a).into(),
             hover: rgb(0x2c2e31).into(),
@@ -170,6 +175,8 @@ pub fn quiet_menu(
 
 /// Label size for controls, between body and caption.
 pub const CONTROL_SIZE: f32 = 13.;
+/// The one monospace family: code blocks (PG-5), whatever font the notes are set in.
+pub const MONO: &str = "Menlo";
 
 /// The one type scale (ALL-1): titles, outline headings, body and captions. Page titles
 /// and day headings share `TITLE_SIZE`; an outline heading never draws larger than H1.
@@ -210,6 +217,7 @@ mod tests {
         for (a, b) in [
             (l.text, d.text),
             (l.muted, d.muted),
+            (l.quote, d.quote),
             (l.line, d.line),
             (l.surface, d.surface),
             (l.accent, d.accent),

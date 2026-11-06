@@ -1518,12 +1518,15 @@ impl PageView {
         }
     }
 
+    /// `prefix` is how many bytes of the block's text `text` starts after (a code block's
+    /// language line, PG-5), so a click still puts the caret at the right offset.
     fn render_rich(
         &self,
         text: &str,
         row_block: &BlockId,
         row: Option<RowItem>,
         min_h: f32,
+        prefix: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let th = theme(cx).clone();
@@ -1537,12 +1540,14 @@ impl PageView {
             StyledText::new(rendered.text.clone()).with_highlights(rendered.highlights.clone());
         let layout = styled.layout().clone();
         let same = rendered.text.as_ref() == text;
-        let source_len = text.len();
+        let end = prefix + text.len();
         let row2 = row.clone();
         let links = rendered.links.iter().map(|(r, _)| r.clone()).collect();
+        let text_sel = format!("text-{}", row_block.0);
         div()
             .flex_1()
             .min_h(px(min_h))
+            .debug_selector(move || text_sel.clone())
             // An editable row shows the I-beam between its links; a read-only one (a query
             // or search hit) is itself clickable, so it keeps its container's pointer.
             .when(row.is_some(), |d| d.cursor_text())
@@ -1560,8 +1565,8 @@ impl PageView {
                     }
                     if let Some(r) = &row2 {
                         let caret = match ix {
-                            Ok(i) | Err(i) if same => i.min(source_len),
-                            _ => source_len,
+                            Ok(i) | Err(i) if same => (prefix + i).min(end),
+                            _ => end,
                         };
                         cx.stop_propagation();
                         this.edit(
@@ -1591,11 +1596,21 @@ impl PageView {
             BlockKind::Heading(level) => crate::theme::heading_metrics(level).1,
             _ => lh,
         };
+        // PG-5: a code block whose first line is a language name shows it as the card's
+        // label instead of drawing it as the first line of code. View only: the block's
+        // text is unchanged, and while editing the raw text (label line included) is shown.
+        let code = (r.kind == BlockKind::Code && !editing)
+            .then(|| code_language(&r.text))
+            .flatten();
+        let (shown, prefix) = match &code {
+            Some((_, body, skip)) => (*body, *skip),
+            None => (r.text.as_str(), 0),
+        };
         let row = r.clone();
         let content: AnyElement = if editing {
             self.editor.clone().into_any_element()
         } else {
-            self.render_rich(&r.text, &r.block, Some(row.clone()), line, cx)
+            self.render_rich(shown, &r.block, Some(row.clone()), line, prefix, cx)
         };
         let arrow = {
             let block = r.block.clone();
@@ -1735,18 +1750,40 @@ impl PageView {
                         // PG-3: semibold, not bold. The title stays 28 px, so an outline
                         // heading never competes with it (ALL-1).
                         .font_weight(gpui::FontWeight::SEMIBOLD),
+                    // PG-5: a 2 px accent bar and a warm grey italic, not the interface
+                    // muted grey.
                     BlockKind::Quote => c
                         .border_l_2()
-                        .border_color(th.faint)
+                        .border_color(th.accent)
                         .pl_2()
-                        .text_color(th.muted)
+                        .text_color(th.quote)
                         .italic(),
-                    BlockKind::Code => c
-                        .font_family("Menlo")
-                        .text_size(px(13.))
-                        .bg(th.code_bg)
-                        .px_1()
-                        .rounded_sm(),
+                    // PG-5: a surface card in Menlo, 6 px corners, with the language (when
+                    // the block names one) at the top right.
+                    BlockKind::Code => {
+                        let card = c
+                            .bg(th.surface)
+                            .border_1()
+                            .border_color(th.line)
+                            .rounded_md()
+                            .px_2()
+                            .py_1()
+                            .font_family(crate::theme::MONO)
+                            .text_size(px(13.));
+                        match &code {
+                            Some((lang, _, _)) => card.child(
+                                div()
+                                    .debug_selector(|| format!("code-language-{ix}"))
+                                    .flex()
+                                    .justify_end()
+                                    .pb_0p5()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
+                                    .text_color(th.muted)
+                                    .child(lang.clone()),
+                            ),
+                            None => card,
+                        }
+                    }
                     BlockKind::Todo if r.checked => c.text_color(th.faint).line_through(),
                     _ => c,
                 };
@@ -2292,6 +2329,7 @@ impl PageView {
                     &hit.block,
                     None,
                     crate::appearance::density(cx).line_height(),
+                    0,
                     cx,
                 );
                 div()
@@ -2571,6 +2609,7 @@ impl PageView {
                     &hit.block,
                     None,
                     crate::appearance::density(cx).line_height(),
+                    0,
                     cx,
                 );
                 div()
@@ -2707,6 +2746,87 @@ impl PageView {
             }
         }
     }
+}
+
+/// Language names a code block may announce on its first line (PG-5). A Roam/Markdown
+/// fence imports as `"rust\nfn main() { … }"` (see `docs/unslop-audit.md`), so a first line
+/// that is exactly one of these names is drawn as the card's label rather than as code.
+/// The list is closed: a single word that happens to be code (`return`, `fn`) stays code.
+const CODE_LANGUAGES: &[&str] = &[
+    "bash",
+    "c",
+    "c#",
+    "c++",
+    "clojure",
+    "cpp",
+    "cs",
+    "css",
+    "dart",
+    "diff",
+    "elixir",
+    "erlang",
+    "f#",
+    "go",
+    "golang",
+    "haskell",
+    "html",
+    "ini",
+    "java",
+    "javascript",
+    "js",
+    "json",
+    "jsx",
+    "julia",
+    "kotlin",
+    "lua",
+    "makefile",
+    "markdown",
+    "md",
+    "nim",
+    "nix",
+    "objc",
+    "objective-c",
+    "ocaml",
+    "perl",
+    "php",
+    "plaintext",
+    "py",
+    "python",
+    "r",
+    "ruby",
+    "rust",
+    "scala",
+    "sh",
+    "shell",
+    "sql",
+    "swift",
+    "tex",
+    "text",
+    "toml",
+    "ts",
+    "tsx",
+    "typescript",
+    "vb",
+    "xml",
+    "yaml",
+    "yml",
+    "zig",
+    "zsh",
+];
+
+/// `(language, the rest of the block, bytes skipped)` when a code block's first line names
+/// its language (PG-5). The block keeps its text; this only decides what is drawn.
+fn code_language(text: &str) -> Option<(String, &str, usize)> {
+    let (first, rest) = text.split_once('\n')?;
+    let word = first.trim();
+    if word.is_empty()
+        || word.len() > 16
+        || !CODE_LANGUAGES.iter().any(|l| l.eq_ignore_ascii_case(word))
+    {
+        return None;
+    }
+    let skip = first.len() + 1;
+    Some((word.to_string(), rest, skip))
 }
 
 /// Uids of `{{embed: ((uid))}}` blocks, which always render expanded (P1 block embeds).
@@ -2887,5 +3007,44 @@ fn human_size(n: u64) -> String {
         0..1024 => format!("{n} B"),
         1024..1_048_576 => format!("{:.0} KB", n as f64 / 1024.),
         _ => format!("{:.1} MB", n as f64 / 1_048_576.),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PG-5: a fenced code block's first line is its language, shown as the card's label.
+    /// Anything else stays the first line of code, so a block of real code is never eaten.
+    #[test]
+    fn a_code_blocks_language_is_its_first_line_when_it_names_one() {
+        let (lang, body, skip) = code_language("rust\nfn main() {}").expect("rust is a language");
+        assert_eq!(lang, "rust");
+        assert_eq!(body, "fn main() {}");
+        assert_eq!(&"rust\nfn main() {}"[skip..], body);
+
+        // Case and a trailing space on the label line are tolerated.
+        let (lang, body, _) = code_language("Rust  \nfn main() {}").unwrap();
+        assert_eq!((lang.as_str(), body), ("Rust", "fn main() {}"));
+
+        // A label with no code under it still labels the (empty) card.
+        assert_eq!(
+            code_language("sql\n").map(|(l, b, _)| (l, b)),
+            Some(("sql".into(), ""))
+        );
+
+        // Ordinary code, prose and unknown words keep every line they have.
+        for text in [
+            "fn main() {}",
+            "return\n1",
+            "the quick brown fox\njumps",
+            "",
+            "rustup update\nx",
+            "python3\nx",
+            "averylongwordthatisnotalanguagename\ncode",
+        ] {
+            assert_eq!(code_language(text), None, "{text:?}");
+        }
+        assert!(!CODE_LANGUAGES.is_empty());
     }
 }
