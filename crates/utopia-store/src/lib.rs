@@ -230,6 +230,12 @@ impl Store {
         self.persister.tag_pages()
     }
 
+    /// How many whole-graph tag classifications the commit path has run (tests, SB-2). One
+    /// is enough: later commits update only the pages they can affect.
+    pub fn tag_page_full_scans(&self) -> u64 {
+        self.persister.tag_scans()
+    }
+
     /// How many full tag-page classifications this store's own connection has run. The
     /// commit path classifies on the writer, so this stays put while the UI edits.
     pub fn tag_page_scans(&self) -> u64 {

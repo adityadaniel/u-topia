@@ -545,3 +545,58 @@ fn co_reference_counts_use_the_filter_predicate() {
         .unwrap();
     assert!(co.iter().all(|c| c.page != bob));
 }
+
+/// SB-2 review fix: the tag-page classification is published after a commit, but only the
+/// pages a commit can affect are reclassified. One whole-graph scan is enough, no matter
+/// how many refs the graph holds.
+#[test]
+fn tag_classification_is_updated_incrementally() {
+    let (mut s, _d) = store();
+    let src = s.create_page("Notes").unwrap();
+    let tag = write(&mut s, &src, "see #alpha here");
+    s.sync_index().unwrap();
+    let alpha = s.find_page("alpha").unwrap().expect("the tag made a page");
+    let note = write(&mut s, &src, "an ordinary note");
+    s.sync_index().unwrap();
+    let full = s.tag_page_full_scans();
+    assert_eq!(full, 1, "the first commit classifies once");
+    assert!(s.tag_pages().unwrap().contains(&alpha));
+
+    // Writing an unrelated block does not rescan the graph, and keeps the answer.
+    s.set_block_text(&src, &note, "an ordinary note, edited", None, None)
+        .unwrap();
+    s.commit_block(&src, &note).unwrap();
+    assert_eq!(s.tag_page_full_scans(), full, "no whole-graph scan");
+    assert!(s.tag_pages().unwrap().contains(&alpha), "still a tag page");
+
+    // The same block's tag becoming a link takes the page out of the set.
+    s.set_block_text(&src, &tag, "see [[alpha]] here", None, None)
+        .unwrap();
+    s.commit_block(&src, &tag).unwrap();
+    assert_eq!(s.tag_page_full_scans(), full);
+    assert!(
+        !s.tag_pages().unwrap().contains(&alpha),
+        "a [[link]] is not a tag"
+    );
+    assert_eq!(
+        s.tag_pages().unwrap(),
+        s.hashtag_only_pages().unwrap(),
+        "the published set matches a full classification"
+    );
+
+    // A tag again: back in, still without a scan.
+    s.set_block_text(&src, &tag, "see #alpha here", None, None)
+        .unwrap();
+    s.commit_block(&src, &tag).unwrap();
+    assert!(s.tag_pages().unwrap().contains(&alpha));
+    assert_eq!(s.tag_page_full_scans(), full);
+
+    // Removing the last reference drops it (a page that lost every ref cannot be a tag
+    // page), which the incremental path has to notice without a scan.
+    s.set_block_text(&src, &tag, "nothing to see", None, None)
+        .unwrap();
+    s.commit_block(&src, &tag).unwrap();
+    assert!(!s.tag_pages().unwrap().contains(&alpha));
+    assert!(s.tag_pages().unwrap().is_empty());
+    assert_eq!(s.tag_page_full_scans(), full);
+}

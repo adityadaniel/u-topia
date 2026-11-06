@@ -974,6 +974,73 @@ impl Store {
     }
 }
 
+/// Whether `page` is a hashtag-only page, classified on its own (SB-2). `None` means the
+/// page cannot be one at all (it has blocks, is not a page, or is deleted); `Some(true)` is
+/// a tag page. Used by the writer to update only the entries a commit can change.
+pub(crate) fn classify_tag_page(conn: &Connection, page: &PageId) -> Result<Option<bool>> {
+    let title_key: Option<String> = conn
+        .query_row(
+            "SELECT p.title_key FROM page p
+             WHERE p.id=?1 AND p.deleted_at IS NULL AND p.kind = 'page'
+               AND NOT EXISTS (SELECT 1 FROM block b WHERE b.page_id = p.id
+                                 AND b.deleted_at IS NULL AND trim(b.text) <> '')",
+            [page.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(title_key) = title_key else {
+        return Ok(None);
+    };
+    let mut keys = HashSet::from([title_key]);
+    let mut aliases = conn.prepare_cached("SELECT alias_key FROM alias WHERE page_id=?1")?;
+    for row in aliases.query_map([page.as_str()], |r| r.get::<_, String>(0))? {
+        keys.insert(row?);
+    }
+    let mut texts = conn.prepare_cached(
+        "SELECT b.text FROM ref r JOIN block b ON b.id = r.src_block_id
+         WHERE r.dst_page_id=?1 AND b.deleted_at IS NULL",
+    )?;
+    let mut any = false;
+    let mut all_tags = true;
+    for row in texts.query_map([page.as_str()], |r| r.get::<_, String>(0))? {
+        let text = row?;
+        for r in extract_refs(&text) {
+            if r.is_page_like() && keys.contains(&normalize_title(&r.target)) {
+                any = true;
+                all_tags &= r.kind == RefKind::Tag;
+            }
+        }
+    }
+    Ok(Some(any && all_tags))
+}
+
+/// Pages referenced by any block of `sources` right now (SB-2): a commit can change the
+/// classification of these, so the writer updates just their entries.
+pub(crate) fn dst_pages_of_sources(
+    conn: &Connection,
+    sources: &[PageId],
+) -> Result<HashSet<PageId>> {
+    let mut out = HashSet::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT dst_page_id FROM ref
+         WHERE src_page_id=?1 AND dst_kind='page' AND dst_page_id IS NOT NULL",
+    )?;
+    for page in sources {
+        for row in stmt.query_map([page.as_str()], |r| r.get::<_, String>(0))? {
+            out.insert(PageId(row?));
+        }
+    }
+    Ok(out)
+}
+
+/// Whether anything references `page` at all (SB-2): a published tag page whose last
+/// reference went away is no longer one, and this is the cheap way to notice.
+pub(crate) fn has_any_ref(conn: &Connection, page: &PageId) -> Result<bool> {
+    let mut stmt =
+        conn.prepare_cached("SELECT 1 FROM ref WHERE dst_page_id=?1 AND dst_kind='page' LIMIT 1")?;
+    Ok(stmt.exists([page.as_str()])?)
+}
+
 /// The classification itself, over any connection: the writer publishes it after every
 /// commit, so the UI thread never runs it (SB-2, §15.1). The body re-reads reference spans
 /// from the source blocks because `ref` stores the resolved edge only.

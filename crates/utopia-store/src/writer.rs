@@ -111,20 +111,72 @@ pub(crate) struct Shared {
     /// The tag-page classification as of the last committed job (SB-2). Published here,
     /// off the UI thread, so an index update never runs the whole-graph query.
     tag_pages: Mutex<Option<HashSet<PageId>>>,
+    /// How many whole-graph classifications this writer has run. Only the first commit
+    /// needs one; later commits update the pages they can affect (SB-2).
+    tag_scans: std::sync::atomic::AtomicU64,
 }
 
 impl Shared {
-    /// Classify the committed index and publish it. Only meaningful after a commit, which
-    /// is the only thing that can change the answer; a failure leaves the previous set.
-    fn publish_tag_pages(&self, conn: &Connection) {
-        match crate::query::hashtag_only_pages(conn) {
-            Ok(pages) => {
-                if let Ok(mut slot) = self.tag_pages.lock() {
-                    *slot = Some(pages);
+    /// Update the published tag-page classification after a commit (SB-2). Only the pages
+    /// the commit wrote, the pages their blocks reference, and published pages whose last
+    /// reference went away can change; everything else keeps its entry, so no commit has to
+    /// re-tokenize the whole graph. The first commit (before there is a set) classifies
+    /// once. A failure leaves the previous set in place.
+    fn publish_tag_pages(&self, conn: &Connection, job: &Job) {
+        let mut slot = match self.tag_pages.lock() {
+            Ok(slot) => slot,
+            Err(_) => return,
+        };
+        let Some(mut set) = slot.clone() else {
+            self.tag_scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match crate::query::hashtag_only_pages(conn) {
+                Ok(pages) => *slot = Some(pages),
+                Err(e) => eprintln!("utopia: tag pages: {e}"),
+            }
+            return;
+        };
+        let written: Vec<PageId> = job.pages.iter().map(|p| p.page.clone()).collect();
+        let mut affected: HashSet<PageId> = written.iter().cloned().collect();
+        match crate::query::dst_pages_of_sources(conn, &written) {
+            Ok(referenced) => affected.extend(referenced),
+            Err(e) => {
+                eprintln!("utopia: tag pages: {e}");
+                return;
+            }
+        }
+        // A published page can only lose a reference through a page this commit wrote. If
+        // it has no references at all now, it cannot be a tag page any more.
+        for page in set.iter() {
+            if affected.contains(page) {
+                continue;
+            }
+            match crate::query::has_any_ref(conn, page) {
+                Ok(true) => {}
+                Ok(false) => {
+                    affected.insert(page.clone());
+                }
+                Err(e) => {
+                    eprintln!("utopia: tag pages: {e}");
+                    return;
                 }
             }
-            Err(e) => eprintln!("utopia: tag pages: {e}"),
         }
+        for page in affected {
+            match crate::query::classify_tag_page(conn, &page) {
+                Ok(Some(true)) => {
+                    set.insert(page);
+                }
+                Ok(_) => {
+                    set.remove(&page);
+                }
+                Err(e) => {
+                    eprintln!("utopia: tag pages: {e}");
+                    return;
+                }
+            }
+        }
+        *slot = Some(set);
     }
 }
 
@@ -202,7 +254,7 @@ impl Persister {
                         Msg::Job(seq, job) => {
                             let r = write_job(&mut conn, &job);
                             if r.is_ok() {
-                                s2.publish_tag_pages(&conn);
+                                s2.publish_tag_pages(&conn, &job);
                             }
                             if let Ok(mut p) = s2.progress.lock() {
                                 p.completed = seq;
@@ -229,7 +281,7 @@ impl Persister {
         match self {
             Persister::Inline { shared } => {
                 write_job(conn, &job)?;
-                shared.publish_tag_pages(conn);
+                shared.publish_tag_pages(conn, &job);
                 Ok(())
             }
             Persister::Thread {
@@ -274,6 +326,15 @@ impl Persister {
             Persister::Thread { shared, .. } => shared,
         };
         shared.tag_pages.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// How many whole-graph tag classifications this writer has run (tests, SB-2).
+    pub fn tag_scans(&self) -> u64 {
+        let shared = match self {
+            Persister::Inline { shared } => shared,
+            Persister::Thread { shared, .. } => shared,
+        };
+        shared.tag_scans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Wait for every submitted job; report (and clear) the first failure.
