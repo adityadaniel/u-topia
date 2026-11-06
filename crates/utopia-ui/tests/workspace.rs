@@ -467,6 +467,46 @@ fn quick_jump_skips_deleted_recent_pages(cx: &mut TestAppContext) {
     );
 }
 
+/// QJ-5: the palette lists the keys in force. A binding changed in Settings replaces the
+/// default, so the palette must find (and show) the new chord, not the old one (§9.1).
+#[gpui::test]
+fn quick_jump_finds_commands_by_the_keys_in_force(cx: &mut TestAppContext) {
+    let (_app, _ws, cx) = setup(cx);
+    cx.update(|_window, cx| {
+        let mut o = utopia_ui::actions::Overrides::default();
+        o.set("GoToday", "alt-cmd-t");
+        utopia_ui::actions::reinstall(cx, &o);
+    });
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input(">alt-cmd-t");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-command-0-GoToday").is_some(),
+        "the rebound chord finds Today"
+    );
+}
+
+/// The flip side in a fresh window, so no earlier frame can leave a stale debug bound:
+/// once rebound, the replaced default is no longer advertised or searched.
+#[gpui::test]
+fn quick_jump_drops_a_replaced_default_key(cx: &mut TestAppContext) {
+    let (_app, _ws, cx) = setup(cx);
+    cx.update(|_window, cx| {
+        let mut o = utopia_ui::actions::Overrides::default();
+        o.set("GoToday", "alt-cmd-t");
+        utopia_ui::actions::reinstall(cx, &o);
+    });
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input(">cmd-shift-t");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-command-0-GoToday").is_none(),
+        "no command answers to the replaced default any more"
+    );
+}
+
 #[gpui::test]
 fn query_blocks_list_results(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);

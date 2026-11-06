@@ -23,7 +23,7 @@ use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, PageId};
 use utopia_store::{BlockHit, TitleHit};
 
-use crate::actions::{platform_keys, pretty_keys, ActionDoc, CATALOG};
+use crate::actions::{active_keys, pretty_keys, ActionDoc, CATALOG};
 use crate::app_state::AppState;
 use crate::editor::BlockEditor;
 use crate::line_input::{LineInput, LineInputEvent};
@@ -215,7 +215,10 @@ impl JumpPalette {
         }
         // QJ-5: a leading `>` lists the command catalog instead of pages.
         if let Some(rest) = q.strip_prefix('>') {
-            self.results = commands(rest).into_iter().map(QjItem::Command).collect();
+            self.results = commands(rest, |d| active_keys(cx, d))
+                .into_iter()
+                .map(QjItem::Command)
+                .collect();
             self.tags.clear();
             self.select_first();
             cx.notify();
@@ -428,8 +431,9 @@ impl JumpPalette {
         d.context.is_none() || self.editor.read(cx).target.is_some()
     }
 
-    /// What a row says, how it is labelled and what it is (QJ-2).
-    fn row_parts(&self, item: &QjItem) -> (RowKind, String, String) {
+    /// What a row says, how it is labelled and what it is (QJ-2). `bound` is the keys in
+    /// force for a command row, which is what the palette shows instead of the default.
+    fn row_parts(&self, item: &QjItem, bound: Option<&str>) -> (RowKind, String, String) {
         match item {
             QjItem::Page(h) => {
                 let kind = if h.daily {
@@ -457,18 +461,27 @@ impl JumpPalette {
                     .collect(),
                 b.page_title.clone(),
             ),
+            // The keys actually bound, not the catalog default: a rebinding in Settings
+            // applies at once, so the row must not advertise the chord it replaced (§9.1).
             QjItem::Command(d) => (
                 RowKind::Command,
                 d.label.to_string(),
-                pretty_keys(&platform_keys(d.keys)),
+                pretty_keys(bound.unwrap_or(d.keys)),
             ),
         }
     }
 
     /// One result row: icon, label with the match in semibold (QJ-4), type label.
-    fn row(&self, i: usize, item: &QjItem, needle: &str, cx: &mut Context<Self>) -> AnyElement {
+    fn row(
+        &self,
+        i: usize,
+        item: &QjItem,
+        needle: &str,
+        bound: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let th = theme(cx).clone();
-        let (kind, label, detail) = self.row_parts(item);
+        let (kind, label, detail) = self.row_parts(item, bound);
         let selected = i == self.selected;
         let marks: Vec<(Range<usize>, HighlightStyle)> = if kind == RowKind::Create {
             Vec::new()
@@ -613,10 +626,26 @@ impl Render for JumpPalette {
         let th = theme(cx).clone();
         let query = self.input.read(cx).text().to_string();
         let needle = query.strip_prefix('>').unwrap_or(&query).to_string();
+        // The keys in force, read once per frame rather than per row: a rebinding in
+        // Settings replaces the default, and the palette must show what actually works.
+        let bound: Vec<Option<String>> = self
+            .results
+            .iter()
+            .map(|r| match r {
+                QjItem::Command(d) => Some(active_keys(cx, d)),
+                _ => None,
+            })
+            .collect();
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut create: Option<AnyElement> = None;
         for (i, item) in self.results.iter().enumerate() {
-            let el = self.row(i, item, &needle, cx);
+            let el = self.row(
+                i,
+                item,
+                &needle,
+                bound.get(i).and_then(|k| k.as_deref()),
+                cx,
+            );
             if matches!(item, QjItem::Create(_)) {
                 create = Some(el);
             } else {
@@ -695,20 +724,22 @@ impl Render for JumpPalette {
 }
 
 /// The commands a `>` query lists (QJ-5), in catalog order so an empty query reads as a
-/// menu grouped by category. Matches the label, the category, and the keys either as
-/// `keymap.json` spells them or as the row shows them.
-fn commands(query: &str) -> Vec<&'static ActionDoc> {
+/// menu grouped by category. Matches the label, the category, and the keys in force —
+/// either as `keymap.json` spells them or as the row shows them — so after a rebinding the
+/// command is found by its new chord and not by the default it replaced.
+fn commands(query: &str, keys: impl Fn(&ActionDoc) -> String) -> Vec<&'static ActionDoc> {
     let q = query.trim().to_lowercase();
     CATALOG
         .iter()
         .filter(|d| {
-            q.is_empty()
-                || d.label.to_lowercase().contains(&q)
+            if q.is_empty() {
+                return true;
+            }
+            let bound = keys(d);
+            d.label.to_lowercase().contains(&q)
                 || d.category.label().to_lowercase().contains(&q)
-                || d.keys.to_lowercase().contains(&q)
-                || pretty_keys(&platform_keys(d.keys))
-                    .to_lowercase()
-                    .contains(&q)
+                || bound.to_lowercase().contains(&q)
+                || pretty_keys(&bound).to_lowercase().contains(&q)
         })
         .collect()
 }
@@ -829,23 +860,41 @@ mod tests {
         assert_eq!(highlight_ranges("ẞİ", "i"), vec![3..5]);
     }
 
-    /// QJ-5: `>` lists the catalog, filtered by label, category or key.
+    /// QJ-5: `>` lists the catalog, filtered by label, category or key. `keys` is the
+    /// chord in force; with the defaults installed that is the catalog's own.
     #[test]
     fn commands_come_from_the_catalog() {
-        assert_eq!(commands("").len(), CATALOG.len());
-        let today = commands("today");
+        let defaults = |d: &ActionDoc| crate::actions::platform_keys(d.keys);
+        assert_eq!(commands("", defaults).len(), CATALOG.len());
+        let today = commands("today", defaults);
         assert!(
             today.iter().any(|d| d.action == "GoToday"),
             "{:?}",
             today.iter().map(|d| d.action).collect::<Vec<_>>()
         );
-        assert!(commands("navigation")
+        assert!(commands("navigation", defaults)
             .iter()
             .all(|d| d.category.label() == "Navigation"));
-        assert!(commands("cmd-shift-g")
+        assert!(commands("cmd-shift-g", defaults)
             .iter()
             .any(|d| d.action == "ShowGraph"));
-        assert!(commands("⇧⌘G").iter().any(|d| d.action == "ShowGraph"));
-        assert!(commands("nonsense-nothing").is_empty());
+        assert!(commands("⇧⌘G", defaults)
+            .iter()
+            .any(|d| d.action == "ShowGraph"));
+        assert!(commands("nonsense-nothing", defaults).is_empty());
+        // A command is found by the chord that is in force, not by the one it replaced.
+        let rebound = |d: &ActionDoc| {
+            if d.action == "GoToday" {
+                "alt-cmd-t".to_string()
+            } else {
+                crate::actions::platform_keys(d.keys)
+            }
+        };
+        assert!(commands("alt-cmd-t", rebound)
+            .iter()
+            .any(|d| d.action == "GoToday"));
+        assert!(!commands("cmd-shift-t", rebound)
+            .iter()
+            .any(|d| d.action == "GoToday"));
     }
 }

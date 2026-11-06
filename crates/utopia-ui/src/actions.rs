@@ -1000,6 +1000,31 @@ impl Overrides {
     }
 }
 
+/// The keys the app has bound for an action right now, in `keymap.json` spelling.
+///
+/// The palette lists commands with their keys, so it has to read the live keymap rather
+/// than [`CATALOG`]: [`install`] drops a rebinding's default, and a palette that still
+/// advertised it would show a chord that no longer works (§9.1, QJ-5). Falls back to the
+/// catalog default when nothing is bound yet (a test app before `install`).
+pub fn active_keys(cx: &App, d: &ActionDoc) -> String {
+    let Some(action) = action_for(d.action) else {
+        return platform_keys(d.keys);
+    };
+    let bindings = cx.key_bindings();
+    let map = bindings.borrow();
+    // The last binding added wins: `install` adds the user's overrides after the defaults.
+    map.bindings_for_action(action.as_ref())
+        .last()
+        .map(|b| {
+            b.keystrokes()
+                .iter()
+                .map(|k| k.unparse())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_else(|| platform_keys(d.keys))
+}
+
 /// Install default bindings, then the user's overrides on top. A rebound action loses its
 /// default keys: gpui would otherwise keep both, and the old keys would go on firing while
 /// Settings shows only the new ones. An override that cannot be bound (empty or invalid
