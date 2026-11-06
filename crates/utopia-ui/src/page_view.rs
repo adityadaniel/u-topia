@@ -87,6 +87,17 @@ pub struct RowItem {
 enum Item {
     Header,
     Row(RowItem),
+    /// A page attribute (`key:: value`) drawn as one compact muted row (PG-1). View only:
+    /// the block stays the source, and "Show as blocks" draws it in full again.
+    Attribute {
+        depth: usize,
+        key: String,
+        value: String,
+        block: BlockId,
+        /// Children folded away with the block, marked with "…" so nothing vanishes
+        /// silently; "Show as blocks" brings them back.
+        children: usize,
+    },
     Notice {
         depth: usize,
         text: SharedString,
@@ -237,6 +248,9 @@ pub struct PageView {
     /// The row the pointer is over, so its bullet can read as a drag handle and its
     /// collapse arrow can appear (PG-4). Local UI state, never persisted (rule 9).
     hovered_row: Option<BlockId>,
+    /// How attribute blocks are drawn (PG-1), mirrored from `settings.json` so a change
+    /// made in Settings rebuilds this page's rows.
+    attribute_blocks: crate::appearance::AttributeBlocks,
     dirty: bool,
     _subs: Vec<Subscription>,
 }
@@ -305,6 +319,7 @@ impl PageView {
             journal: None,
             page_menu: false,
             hovered_row: None,
+            attribute_blocks: crate::appearance::attribute_blocks(cx),
             dirty: true,
             _subs: subs,
         }
@@ -449,7 +464,13 @@ impl PageView {
         cx: &mut Context<Self>,
     ) {
         self.rebuild_if_dirty(cx);
-        if self.row_index(&block).is_none() {
+        // PG-1 folds an attribute block to one compact row; editing it must open it again,
+        // or the editor would have no row to live in.
+        let folded = self
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Attribute { block: b, .. } if *b == block));
+        if self.row_index(&block).is_none() && !folded {
             // Not editable here (e.g. the zoom root shown as the header): stop editing
             // rather than focus an editor no row renders.
             self.editor.update(cx, |e, cx| e.end(cx));
@@ -469,6 +490,12 @@ impl PageView {
                 cx,
             )
         });
+        if folded {
+            // Rebuild with the edit target set, so this block is drawn as a row again and
+            // its editor keeps the keystrokes (a focused element that is not rendered gets
+            // none).
+            self.rebuild(cx);
+        }
         self.splice_items(self.items.len(), cx);
         if let Some(ix) = self.row_index(&block) {
             self.list.scroll_to_reveal_item(ix);
@@ -483,6 +510,11 @@ impl PageView {
     }
 
     fn rebuild_if_dirty(&mut self, cx: &mut Context<Self>) {
+        let preference = crate::appearance::attribute_blocks(cx);
+        if self.attribute_blocks != preference {
+            self.attribute_blocks = preference;
+            self.dirty = true;
+        }
         if self.dirty {
             self.rebuild(cx);
         }
@@ -531,6 +563,8 @@ impl PageView {
         }
         let zoom = self.zoom.clone();
         let open_embeds = self.open_embeds.clone();
+        let compact_attributes = self.zoom.is_none() && self.attributes_are_compact();
+        let editing = self.editing_block(cx.entity_id(), cx);
         let refs_version = self.app.read(cx).refs_version;
         let need_refs = self.refs_key != Some((page.clone(), zoom.clone(), refs_version));
         let query = self.query.clone();
@@ -571,29 +605,19 @@ impl PageView {
                 }
             }
             let mut rows = Vec::new();
-            for (id, depth) in st.visible_rows(zoom.as_ref(), &|b| collapsed.contains(b)) {
-                let b = st.block(&id).expect("visible row exists");
-                let item = RowItem {
-                    page: page.clone(),
-                    block: id.clone(),
-                    text: b.text.clone(),
-                    depth,
-                    has_children: st.has_live_children(&id),
-                    collapsed: collapsed.contains(&id),
-                    embed: 0,
-                    kind: b.kind,
-                    checked: b.checked,
-                    number: st.index_in_parent(&id, true).map_or(1, |i| i + 1),
-                };
-                push_with_embeds(
-                    app,
-                    item,
-                    &open_embeds,
-                    &collapsed,
-                    &mut vec![id.clone()],
-                    &mut rows,
-                );
-            }
+            // The header only exists on a whole page, so only there do we fold attributes
+            // into compact rows (PG-1); a zoomed view keeps its blocks as they are.
+            push_page_rows(
+                app,
+                &st,
+                &page,
+                zoom.as_ref(),
+                &collapsed,
+                &open_embeds,
+                compact_attributes,
+                editing.as_ref(),
+                &mut rows,
+            );
             let refs = if need_refs {
                 Some(match &zoom {
                     Some(z) => {
@@ -636,7 +660,9 @@ impl PageView {
             self.replace_items(items, cx);
             return;
         }
-        if rows.is_empty() {
+        // A page whose only root blocks are folded attributes (PG-1) still needs somewhere
+        // to click to start writing.
+        if !rows.iter().any(|i| matches!(i, Item::Row(_))) {
             items.push(Item::Empty);
         }
         for r in rows {
@@ -675,6 +701,8 @@ impl PageView {
 
     fn rebuild_journal(&mut self, today: PageId, limit: usize, cx: &mut Context<Self>) {
         let open_embeds = self.open_embeds.clone();
+        let compact_attributes = self.attributes_are_compact();
+        let editing = self.editing_block(cx.entity_id(), cx);
         let refs_version = self.app.read(cx).refs_version;
         let mut refs_cache = match &mut self.journal {
             Some(j) if j.refs_version == refs_version => std::mem::take(&mut j.refs),
@@ -710,29 +738,17 @@ impl PageView {
                     .filter(|(_, st)| st.meta.deleted_at.is_none());
                 if let Some((page, st)) = st {
                     day.title = utopia_store::display_title(&st, &fmt);
-                    for (id, depth) in st.visible_rows(None, &|b| collapsed.contains(b)) {
-                        let b = st.block(&id).expect("visible row exists");
-                        let item = RowItem {
-                            page: page.clone(),
-                            block: id.clone(),
-                            text: b.text.clone(),
-                            depth,
-                            has_children: st.has_live_children(&id),
-                            collapsed: collapsed.contains(&id),
-                            embed: 0,
-                            kind: b.kind,
-                            checked: b.checked,
-                            number: st.index_in_parent(&id, true).map_or(1, |i| i + 1),
-                        };
-                        push_with_embeds(
-                            app,
-                            item,
-                            &open_embeds,
-                            &collapsed,
-                            &mut vec![id.clone()],
-                            &mut day.rows,
-                        );
-                    }
+                    push_page_rows(
+                        app,
+                        &st,
+                        &page,
+                        None,
+                        &collapsed,
+                        &open_embeds,
+                        compact_attributes,
+                        editing.as_ref(),
+                        &mut day.rows,
+                    );
                     if !refs_cache.contains_key(&page) {
                         let refs = app
                             .store
@@ -763,7 +779,7 @@ impl PageView {
                 title: day.title.into(),
                 first: i == 0,
             });
-            if day.rows.is_empty() {
+            if !day.rows.iter().any(|i| matches!(i, Item::Row(_))) {
                 items.push(Item::DayEmpty { date: day.date });
             }
             items.extend(day.rows);
@@ -787,6 +803,39 @@ impl PageView {
             j.refs_version = refs_version;
         }
         self.replace_items(items, cx);
+    }
+
+    /// The block this view is editing, if any: its row must be drawn as a row (PG-1).
+    fn editing_block(&self, host: gpui::EntityId, cx: &gpui::App) -> Option<BlockId> {
+        self.editor
+            .read(cx)
+            .target
+            .as_ref()
+            .filter(|t| t.host == host)
+            .map(|t| t.block.clone())
+    }
+
+    /// PG-1: an attribute block is drawn as one compact row unless the preference says to
+    /// show the blocks.
+    fn attributes_are_compact(&self) -> bool {
+        self.attribute_blocks == crate::appearance::AttributeBlocks::Compact
+    }
+
+    /// "Show as blocks" / "Show as attributes" in the header, and a click on a compact row:
+    /// flip the preference, remember it, and rebuild the outline (PG-1).
+    fn set_attribute_blocks(
+        &mut self,
+        blocks: crate::appearance::AttributeBlocks,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = crate::appearance::set_attribute_blocks(cx, blocks) {
+            self.app.update(cx, |app, _| {
+                app.last_error = Some(format!("could not save settings.json: {e}"))
+            });
+        }
+        self.attribute_blocks = blocks;
+        self.dirty = true;
+        cx.notify();
     }
 
     /// Load the next batch of older days into the feed (once per batch).
@@ -1537,11 +1586,8 @@ impl PageView {
                         app.store.export_opml(&dir.join("graph.opml"))?;
                         Ok::<_, utopia_store::StoreError>(n)
                     })();
-                    match app.report(r) {
-                        Some(n) => {
-                            app.notice = Some(format!("Exported {n} pages to {}", dir.display()))
-                        }
-                        None => {}
+                    if let Some(n) = app.report(r) {
+                        app.notice = Some(format!("Exported {n} pages to {}", dir.display()));
                     }
                     app.changed(Vec::new(), false, cx);
                 });
@@ -2199,9 +2245,13 @@ impl PageView {
         }
         if self.zoom.is_none() && !h.attributes.is_empty() {
             // Page metadata header (P1, W7): the page's `Key:: value` blocks at a glance.
+            // PG-1 keeps it, and adds the toggle that decides whether the blocks are drawn
+            // in full under it or folded to one muted row each.
             let mut grid = div()
                 .flex()
                 .flex_col()
+                .flex_1()
+                .min_w_0()
                 .gap_0p5()
                 .py_1()
                 .text_size(px(crate::theme::BODY_SIZE));
@@ -2214,7 +2264,44 @@ impl PageView {
                         .child(div().text_color(th.text).child(v.clone())),
                 );
             }
-            col = col.child(grid);
+            let on = !self.attributes_are_compact();
+            let toggle = div()
+                .id("attribute-blocks-toggle")
+                .debug_selector(|| "attribute-blocks-toggle".into())
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(if on { th.text } else { th.muted })
+                .cursor_pointer()
+                .hover(|d| d.bg(th.hover).text_color(th.text))
+                .child(
+                    div()
+                        .size(px(10.))
+                        .flex_none()
+                        .rounded(px(2.))
+                        .border_1()
+                        .border_color(if on { th.accent } else { th.faint })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .font_family(crate::theme::MONO)
+                        .text_size(px(8.))
+                        .when(on, |d| d.bg(th.accent).text_color(th.bg).child("✓")),
+                )
+                .child("Show as blocks")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let next = if on {
+                        crate::appearance::AttributeBlocks::Compact
+                    } else {
+                        crate::appearance::AttributeBlocks::Blocks
+                    };
+                    this.set_attribute_blocks(next, cx);
+                }));
+            col = col.child(div().flex().items_start().gap_2().child(grid).child(toggle));
         }
         col.into_any_element()
     }
@@ -2424,6 +2511,41 @@ impl PageView {
         match item {
             Item::Header => self.render_header(cx),
             Item::Row(r) => self.render_row(ix, &r, cx),
+            // PG-1: the attribute's block, folded to the one line the header already
+            // carries. A click shows the blocks again, which is what the row means.
+            Item::Attribute {
+                depth,
+                key,
+                value,
+                block,
+                children,
+            } => {
+                div()
+                    .id(("attr", ix))
+                    .debug_selector(|| format!("attr-{ix}"))
+                    .pl(px(depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT + 32.))
+                    .pr_2()
+                    .py_0p5()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(crate::theme::CONTROL_SIZE))
+                    .line_height(px(18.))
+                    .text_color(th.muted)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(th.text))
+                    .child(format!("{key} · {value}"))
+                    .when(children > 0, |d| {
+                        d.child(div().text_color(th.faint).child(format!("… {children}")))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        // Reveal the block and start editing it: the row is a shortcut to
+                        // the real block, not a second copy of the data.
+                        this.set_attribute_blocks(crate::appearance::AttributeBlocks::Blocks, cx);
+                        this.focus_block(&block, Some(0), window, cx);
+                    }))
+                    .into_any_element()
+            }
             Item::Notice { depth, text } => div()
                 .pl(px(depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT + 32.))
                 .text_size(px(crate::theme::BODY_SIZE))
@@ -2862,6 +2984,66 @@ impl PageView {
                     .into_any_element()
             }
         }
+    }
+}
+
+/// Push a page's visible rows, folding each root `key:: value` attribute block into one
+/// compact row (PG-1) when `compact_attributes`. The block and its subtree stay in the
+/// shard; folding is only what this frame draws, and the "…" says children went with it.
+#[allow(clippy::too_many_arguments)]
+fn push_page_rows(
+    app: &mut AppState,
+    st: &utopia_core::PageState,
+    page: &PageId,
+    zoom: Option<&BlockId>,
+    collapsed: &HashSet<BlockId>,
+    open_embeds: &HashSet<(BlockId, String)>,
+    compact_attributes: bool,
+    editing: Option<&BlockId>,
+    out: &mut Vec<Item>,
+) {
+    let mut folded: Option<usize> = None;
+    for (id, depth) in st.visible_rows(zoom, &|b| collapsed.contains(b)) {
+        if folded.is_some_and(|d| depth > d) {
+            continue;
+        }
+        folded = None;
+        let Some(b) = st.block(&id) else { continue };
+        // The block being edited is never folded: its row has to hold the editor.
+        if compact_attributes && depth == 0 && editing != Some(&id) {
+            if let Some((key, value)) = utopia_core::inline::attribute(&b.text) {
+                let children = st.live_children(Some(&id)).len();
+                out.push(Item::Attribute {
+                    depth,
+                    key,
+                    value: plain_text(&b.text[value]),
+                    block: id.clone(),
+                    children,
+                });
+                folded = Some(depth);
+                continue;
+            }
+        }
+        let item = RowItem {
+            page: page.clone(),
+            block: id.clone(),
+            text: b.text.clone(),
+            depth,
+            has_children: st.has_live_children(&id),
+            collapsed: collapsed.contains(&id),
+            embed: 0,
+            kind: b.kind,
+            checked: b.checked,
+            number: st.index_in_parent(&id, true).map_or(1, |i| i + 1),
+        };
+        push_with_embeds(
+            app,
+            item,
+            open_embeds,
+            collapsed,
+            &mut vec![id.clone()],
+            out,
+        );
     }
 }
 

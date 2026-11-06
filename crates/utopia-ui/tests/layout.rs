@@ -851,3 +851,152 @@ fn page_menu_opens_the_graph(cx: &mut TestAppContext) {
         "and it is drawn over the page"
     );
 }
+
+/// A page with two `key:: value` root blocks and one ordinary block (PG-1), with
+/// `settings.json` living in `dir` so a toggle can be checked on disk.
+fn setup_attribute_page<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &std::path::Path,
+) -> &'a mut VisualTestContext {
+    use utopia_core::{BlockId, BlockKind, Command};
+    use utopia_store::EditOpts;
+    let path = dir.to_path_buf();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+        utopia_ui::appearance::install(cx, &path);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = store.create_page("Trellis").unwrap();
+    let mut prev: Option<BlockId> = None;
+    let mut cmds = Vec::new();
+    for (kind, text) in [
+        (BlockKind::Bullet, "status:: dogfooding"),
+        (BlockKind::Bullet, "owner:: Ana"),
+        (BlockKind::Bullet, "An ordinary note"),
+    ] {
+        let id = BlockId::new();
+        cmds.push(Command::InsertBlock {
+            id: id.clone(),
+            parent: None,
+            after: prev.clone(),
+            text: text.to_string(),
+            kind,
+        });
+        prev = Some(id);
+    }
+    store
+        .execute(
+            &page,
+            cmds,
+            EditOpts {
+                no_undo: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    cx
+}
+
+/// PG-1: an attribute block is one compact muted row, not a second full block under the
+/// metadata header; the blocks themselves are not drawn until they are asked for.
+#[gpui::test]
+fn attributes_are_shown_once_as_compact_rows(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let cx = setup_attribute_page(cx, dir.path());
+    let first = bounds(cx, "attr-1");
+    let second = bounds(cx, "attr-2");
+    let note = bounds(cx, "content-3");
+    assert!(
+        first.origin.y < second.origin.y && second.origin.y < note.origin.y,
+        "the attributes read as a compact list above the notes: {first:?} {second:?} {note:?}"
+    );
+    assert!(
+        cx.debug_bounds("content-1").is_none(),
+        "the attribute block is not also drawn as a full block"
+    );
+    assert!(
+        first.size.height < px(24.),
+        "a compact row, less than a full block line: {first:?}"
+    );
+    let toggle = bounds(cx, "attribute-blocks-toggle");
+    let title = bounds(cx, "page-title");
+    assert!(
+        toggle.origin.y > title.origin.y + title.size.height,
+        "the toggle belongs to the metadata header, under the title: {toggle:?} {title:?}"
+    );
+}
+
+/// PG-1: the "Show as blocks" toggle brings the blocks back — it switches the preference,
+/// applies at once and is written to settings.json (never into the graph, rule 9).
+#[gpui::test]
+fn show_as_blocks_reveals_the_blocks_and_is_saved(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let cx = setup_attribute_page(cx, dir.path());
+    assert!(
+        cx.update(|_, cx| utopia_ui::appearance::attribute_blocks(cx))
+            == utopia_ui::appearance::AttributeBlocks::Compact,
+        "the default keeps each attribute to one row"
+    );
+    let toggle = bounds(cx, "attribute-blocks-toggle");
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| utopia_ui::appearance::attribute_blocks(cx)),
+        utopia_ui::appearance::AttributeBlocks::Blocks
+    );
+    let block = bounds(cx, "content-1");
+    assert!(
+        block.size.height >= px(20.),
+        "the attribute's block is drawn in full again: {block:?}"
+    );
+    let saved = std::fs::read_to_string(dir.path().join("settings.json")).expect("saved");
+    let v: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(v["attribute-blocks"], "blocks", "{saved}");
+}
+
+/// PG-1: a compact attribute row is a way into its block, not a dead end — clicking it
+/// shows the blocks and puts the caret in the block, where keystrokes land.
+#[gpui::test]
+fn a_compact_attribute_row_opens_the_block_for_editing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let cx = setup_attribute_page(cx, dir.path());
+    let attr = bounds(cx, "attr-1");
+    cx.simulate_click(attr.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_, cx| utopia_ui::appearance::attribute_blocks(cx))
+            == utopia_ui::appearance::AttributeBlocks::Blocks
+    );
+    assert!(
+        cx.debug_bounds("focus-bar-1").is_some(),
+        "the block's editor is in its row"
+    );
+    cx.simulate_input("!");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let app = ws.update(cx, |w, _| w.app().clone());
+    let page = ws.update(cx, |w, cx| w.main_page(cx)).expect("a page");
+    app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).expect("page state");
+        let first = st.live_roots().first().cloned().expect("one block");
+        assert_eq!(
+            st.block(&first).expect("the block").text,
+            "!status:: dogfooding",
+            "typing went into the attribute's own block"
+        );
+    });
+}
