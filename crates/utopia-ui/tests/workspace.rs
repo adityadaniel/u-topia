@@ -630,6 +630,74 @@ fn slash_extract_block_to_page(cx: &mut TestAppContext) {
     );
 }
 
+/// SR-2: full-text results sit under a header per page, with the page's blocks indented
+/// beneath and the icon on the header's first line.
+#[gpui::test]
+fn search_groups_results_under_their_page(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        let notes = app.store.create_page("Notes").unwrap();
+        let b = app.store.ensure_first_block(&notes).unwrap();
+        app.store
+            .set_block_text(&notes, &b, "the atlas is late", None, None)
+            .unwrap();
+        app.store.commit_block(&notes, &b).unwrap();
+        let atlas = app.store.create_page("Atlas").unwrap();
+        for text in ["atlas launch plan", "atlas risks"] {
+            let plan =
+                utopia_core::outline::append_block(app.store.page_state(&atlas).unwrap(), None);
+            let b = app
+                .store
+                .execute_plan(&atlas, plan, None)
+                .unwrap()
+                .unwrap()
+                .block;
+            app.store
+                .set_block_text(&atlas, &b, text, None, None)
+                .unwrap();
+            app.store.commit_block(&atlas, &b).unwrap();
+            app.store.sync_index().unwrap();
+        }
+    });
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("jump-palette").is_some(),
+        "the search palette opened"
+    );
+    cx.simulate_input("atlas");
+    cx.run_until_parked();
+    let atlas_header = cx
+        .debug_bounds("search-group-0")
+        .expect("a header per page");
+    let icon = cx.debug_bounds("search-group-icon-0").expect("an icon");
+    let title = cx
+        .debug_bounds("search-group-title-0")
+        .expect("the page name");
+    assert!(
+        (f32::from(icon.origin.y) - f32::from(title.origin.y)).abs() < 1.5,
+        "the icon aligns with the top line (SR-2): {icon:?} {title:?}"
+    );
+    let hit = cx
+        .debug_bounds("search-hit-text-0-0")
+        .expect("the first block of the page");
+    let hit2 = cx
+        .debug_bounds("search-hit-0-1")
+        .expect("the page's second block in the same group");
+    assert!(
+        f32::from(hit.origin.x) > f32::from(title.origin.x) + 8.0,
+        "blocks are indented under their page: {hit:?} {title:?}"
+    );
+    assert!(
+        hit.origin.y > atlas_header.origin.y && hit2.origin.y > hit.origin.y,
+        "the group's blocks stack below its header: {atlas_header:?} {hit:?} {hit2:?}"
+    );
+    assert!(
+        cx.debug_bounds("search-hit-1-0").is_some(),
+        "the next page starts a new group"
+    );
+}
+
 #[gpui::test]
 fn full_search_and_quick_capture(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);

@@ -1,5 +1,10 @@
 //! Quick jump (Cmd+K, §9.1): fuzzy titles and aliases; Enter opens, Shift/Cmd+Enter opens
 //! in the sidebar, and a novel title offers "Create". Dates resolve to daily pages.
+//!
+//! The same palette is full-text search (Cmd+Shift+F) and the small capture/answer prompts.
+//! Search results are grouped under their page or day (SR-2) and the matched words are
+//! washed with the accent colour (SR-1); anchors come from the store, which computed them
+//! against the plain text the row draws.
 
 use gpui::{
     div, prelude::*, px, Context, Entity, EventEmitter, HighlightStyle, MouseButton,
@@ -7,39 +12,11 @@ use gpui::{
 };
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, PageId};
-use utopia_store::{BlockHit, TitleHit};
+use utopia_store::{BlockGroup, TitleHit};
 
 use crate::app_state::AppState;
 use crate::line_input::{LineInput, LineInputEvent};
-use crate::theme::theme;
-
-/// A result row's text with the matched terms on a soft accent wash (SR-1). The anchors
-/// come from the store, which computed them against this same plain text.
-fn marked(text: &str, anchors: &[(usize, usize)], th: &crate::theme::Theme) -> StyledText {
-    let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = anchors
-        .iter()
-        .filter(|(a, b)| {
-            a < b && *b <= text.len() && text.is_char_boundary(*a) && text.is_char_boundary(*b)
-        })
-        .map(|&(a, b)| {
-            (
-                a..b,
-                HighlightStyle {
-                    background_color: Some(th.accent.opacity(0.16)),
-                    ..Default::default()
-                },
-            )
-        })
-        .collect();
-    StyledText::new(text.to_string()).with_highlights(highlights)
-}
-
-#[derive(Debug, Clone)]
-pub enum QjItem {
-    Page(TitleHit),
-    Create(String),
-    Block(BlockHit),
-}
+use crate::theme::{theme, Theme};
 
 /// What the palette is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,14 +42,93 @@ pub enum QuickJumpEvent {
     Dismissed,
 }
 
+/// One drawn line in the result list. Group headers name the page or day their blocks
+/// belong to; they are not selectable, so arrow keys step over them.
+#[derive(Debug, Clone)]
+enum Row {
+    Page(TitleHit),
+    Create(String),
+    Group { group: usize },
+    Block { group: usize, hit: usize },
+}
+
+impl Row {
+    fn selectable(&self) -> bool {
+        !matches!(self, Row::Group { .. })
+    }
+}
+
 pub struct JumpPalette {
     app: Entity<AppState>,
     pub input: Entity<LineInput>,
-    results: Vec<QjItem>,
+    rows: Vec<Row>,
+    groups: Vec<BlockGroup>,
     selected: usize,
     title: &'static str,
     mode: PaletteMode,
     _sub: Subscription,
+}
+
+/// A result row's text with the matched terms on a soft accent wash (SR-1). The anchors
+/// come from the store, which computed them against this same plain text.
+fn marked(text: &str, anchors: &[(usize, usize)], th: &Theme) -> StyledText {
+    let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = anchors
+        .iter()
+        .filter(|(a, b)| {
+            a < b && *b <= text.len() && text.is_char_boundary(*a) && text.is_char_boundary(*b)
+        })
+        .map(|&(a, b)| {
+            (
+                a..b,
+                HighlightStyle {
+                    background_color: Some(th.accent.opacity(0.16)),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    StyledText::new(text.to_string()).with_highlights(highlights)
+}
+
+/// The page/day header of a result group: an icon on the top line, the name and the block
+/// count. `items_start` keeps the icon with the first line when a long title wraps (SR-2).
+fn group_header(group: usize, g: &BlockGroup, th: &Theme) -> gpui::Stateful<gpui::Div> {
+    let icon = if g.daily { "◷" } else { "▤" };
+    div()
+        .id(("search-group", group))
+        .debug_selector(move || format!("search-group-{group}"))
+        .flex()
+        .items_start()
+        .gap_2()
+        .px_3()
+        .pt_2()
+        .pb_1()
+        .child(
+            div()
+                .debug_selector(move || format!("search-group-icon-{group}"))
+                .w(px(14.))
+                .flex_none()
+                .text_color(th.muted)
+                .child(icon),
+        )
+        .child(
+            div()
+                .debug_selector(move || format!("search-group-title-{group}"))
+                .flex_1()
+                .min_w_0()
+                .text_color(th.text)
+                .child(g.title.clone()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .px_2()
+                .rounded_md()
+                .bg(th.chip_bg)
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted)
+                .child(format!("{}", g.hits.len())),
+        )
 }
 
 impl EventEmitter<QuickJumpEvent> for JumpPalette {}
@@ -116,7 +172,8 @@ impl JumpPalette {
         let mut me = Self {
             app,
             input,
-            results: Vec::new(),
+            rows: Vec::new(),
+            groups: Vec::new(),
             selected: 0,
             title,
             mode,
@@ -127,51 +184,49 @@ impl JumpPalette {
     }
 
     fn search(&mut self, q: &str, cx: &mut Context<Self>) {
+        self.rows.clear();
+        self.groups.clear();
+        self.selected = 0;
         match self.mode {
             PaletteMode::Capture | PaletteMode::Text => {
-                self.results.clear();
                 cx.notify();
                 return;
             }
-            PaletteMode::Search => {
-                let hits = if q.trim().is_empty() {
-                    Vec::new()
-                } else {
-                    self.app
-                        .read(cx)
-                        .store
-                        .search_blocks(q, 30)
-                        .unwrap_or_default()
-                };
-                self.results = hits.into_iter().map(QjItem::Block).collect();
-                self.selected = 0;
-                cx.notify();
-                return;
-            }
-            PaletteMode::Pages => {}
+            PaletteMode::Search => self.search_blocks(q, cx),
+            PaletteMode::Pages => self.search_pages(q, cx),
         }
-        let store = &self.app.read(cx).store;
+        self.selected = self
+            .rows
+            .iter()
+            .position(Row::selectable)
+            .unwrap_or_default();
+        cx.notify();
+    }
+
+    fn search_pages(&mut self, q: &str, cx: &mut Context<Self>) {
+        let app = self.app.read(cx);
+        let store = &app.store;
         let hits = store.search_titles(q, 12).unwrap_or_default();
         let key = normalize_title(q);
         let exact = hits.iter().any(|h| {
             normalize_title(&h.title) == key
                 || h.alias.as_deref().map(normalize_title) == Some(key.clone())
         }) || store.find_page(q).ok().flatten().is_some();
-        let mut results: Vec<QjItem> = hits.into_iter().map(QjItem::Page).collect();
+        let mut results: Vec<Row> = hits.into_iter().map(Row::Page).collect();
         if !key.is_empty() && !exact {
-            results.push(QjItem::Create(q.trim().to_string()));
+            results.push(Row::Create(q.trim().to_string()));
         }
         // A date typed in any accepted form jumps straight to its day.
         if let Ok(Some(p)) = store.find_page(q) {
             if !results
                 .iter()
-                .any(|r| matches!(r, QjItem::Page(h) if h.page == p))
+                .any(|r| matches!(r, Row::Page(h) if h.page == p))
             {
                 if let Ok(Some(row)) = store.page_row(&p) {
                     let daily = row.is_daily();
                     results.insert(
                         0,
-                        QjItem::Page(TitleHit {
+                        Row::Page(TitleHit {
                             page: p,
                             title: row.title,
                             alias: None,
@@ -182,16 +237,41 @@ impl JumpPalette {
                 }
             }
         }
-        self.results = results;
-        self.selected = 0;
-        cx.notify();
+        self.rows = results;
+    }
+
+    fn search_blocks(&mut self, q: &str, cx: &mut Context<Self>) {
+        if q.trim().is_empty() {
+            return;
+        }
+        let groups = self
+            .app
+            .read(cx)
+            .store
+            .search_groups(q, 30)
+            .unwrap_or_default();
+        for (gi, g) in groups.iter().enumerate() {
+            self.rows.push(Row::Group { group: gi });
+            for hi in 0..g.hits.len() {
+                self.rows.push(Row::Block { group: gi, hit: hi });
+            }
+        }
+        self.groups = groups;
     }
 
     fn step(&mut self, d: isize, cx: &mut Context<Self>) {
-        let n = self.results.len() as isize;
-        if n > 0 {
-            self.selected = ((self.selected as isize + d).rem_euclid(n)) as usize;
-            cx.notify();
+        let n = self.rows.len();
+        if n == 0 {
+            return;
+        }
+        let mut i = self.selected;
+        for _ in 0..n {
+            i = (i as isize + d).rem_euclid(n as isize) as usize;
+            if self.rows[i].selectable() {
+                self.selected = i;
+                cx.notify();
+                return;
+            }
         }
     }
 
@@ -203,7 +283,7 @@ impl JumpPalette {
             }
             return;
         }
-        let Some(item) = self.results.get(ix).cloned() else {
+        let Some(row) = self.rows.get(ix).cloned() else {
             if self.mode == PaletteMode::Search {
                 return;
             }
@@ -214,18 +294,24 @@ impl JumpPalette {
             }
             return self.create(&q, sidebar, cx);
         };
-        match item {
-            QjItem::Page(h) => cx.emit(QuickJumpEvent::Chosen {
+        match row {
+            Row::Page(h) => cx.emit(QuickJumpEvent::Chosen {
                 page: h.page,
                 sidebar,
                 focus: None,
             }),
-            QjItem::Block(b) => cx.emit(QuickJumpEvent::Chosen {
-                page: b.page,
-                sidebar,
-                focus: Some(b.block),
-            }),
-            QjItem::Create(t) => self.create(&t, sidebar, cx),
+            Row::Block { group, hit } => {
+                let Some(b) = self.groups.get(group).and_then(|g| g.hits.get(hit)) else {
+                    return;
+                };
+                cx.emit(QuickJumpEvent::Chosen {
+                    page: b.page.clone(),
+                    sidebar,
+                    focus: Some(b.block.clone()),
+                });
+            }
+            Row::Create(t) => self.create(&t, sidebar, cx),
+            Row::Group { .. } => {}
         }
     }
 
@@ -253,49 +339,86 @@ impl JumpPalette {
 impl Render for JumpPalette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
-        let rows = self.results.iter().enumerate().map(|(i, r)| {
-            let (label, detail) = match r {
-                QjItem::Page(h) => (
-                    h.title.clone(),
-                    match (&h.alias, h.daily) {
-                        (Some(a), _) => format!("alias: {a}"),
-                        (None, true) => "journal".to_string(),
-                        _ => String::new(),
-                    },
-                ),
-                QjItem::Create(t) => (format!("Create page \"{t}\""), String::new()),
-                QjItem::Block(b) => (
-                    utopia_core::inline::plain_text(&b.text),
-                    b.page_title.clone(),
-                ),
-            };
-            let label: StyledText = match r {
-                QjItem::Block(b) => marked(&label, &b.anchors, &th),
-                _ => StyledText::new(label),
-            };
-            div()
+        let selected = self.selected;
+        let rows = self.rows.iter().enumerate().map(|(i, r)| match r {
+            Row::Group { group } => group_header(*group, &self.groups[*group], &th),
+            Row::Page(h) => {
+                let detail = match (&h.alias, h.daily) {
+                    (Some(a), _) => format!("alias: {a}"),
+                    (None, true) => "journal".to_string(),
+                    _ => String::new(),
+                };
+                div()
+                    .id(("qj", i))
+                    .flex()
+                    .justify_between()
+                    .px_3()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(th.hover))
+                    .when(i == selected, |d| d.bg(th.hover))
+                    .child(div().text_color(th.text).child(h.title.clone()))
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(detail),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                            this.choose(i, e.modifiers.shift, w, cx)
+                        }),
+                    )
+            }
+            Row::Create(t) => div()
                 .id(("qj", i))
-                .flex()
-                .justify_between()
                 .px_3()
                 .py_1()
                 .rounded_sm()
                 .cursor_pointer()
                 .hover(|d| d.bg(th.hover))
-                .when(i == self.selected, |d| d.bg(th.hover))
-                .child(div().text_color(th.text).line_clamp(2).child(label))
+                .when(i == selected, |d| d.bg(th.hover))
                 .child(
                     div()
-                        .text_size(px(crate::theme::CAPTION_SIZE))
-                        .text_color(th.muted)
-                        .child(detail),
+                        .text_color(th.accent)
+                        .child(format!("Create page \"{t}\"")),
                 )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, e: &MouseDownEvent, w, cx| {
                         this.choose(i, e.modifiers.shift, w, cx)
                     }),
-                )
+                ),
+            Row::Block { group, hit } => {
+                let b = &self.groups[*group].hits[*hit];
+                let text = utopia_core::inline::plain_text(&b.text);
+                let (group, hit) = (*group, *hit);
+                div()
+                    .id(("qj", i))
+                    .debug_selector(move || format!("search-hit-{group}-{hit}"))
+                    .px_3()
+                    .py_1()
+                    .pl(px(46.))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(th.hover))
+                    .when(i == selected, |d| d.bg(th.hover))
+                    .child(
+                        div()
+                            .debug_selector(move || format!("search-hit-text-{group}-{hit}"))
+                            .text_color(th.text)
+                            .line_clamp(2)
+                            .child(marked(&text, &b.anchors, &th)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                            this.choose(i, e.modifiers.shift, w, cx)
+                        }),
+                    )
+            }
         });
         div()
             .debug_selector(|| "jump-palette".into())
@@ -326,6 +449,12 @@ impl Render for JumpPalette {
                     .rounded_md()
                     .child(self.input.clone()),
             )
-            .child(div().flex().flex_col().overflow_hidden().children(rows))
+            .child(
+                div()
+                    .id("jump-results")
+                    .max_h(px(340.))
+                    .overflow_y_scroll()
+                    .child(div().flex().flex_col().children(rows)),
+            )
     }
 }

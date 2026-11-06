@@ -205,6 +205,15 @@ pub struct BlockHit {
     pub anchors: Vec<(usize, usize)>,
 }
 
+/// Search results for one page or day (SR-2): the header's name and count, then its blocks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockGroup {
+    pub page: PageId,
+    pub title: String,
+    pub daily: bool,
+    pub hits: Vec<BlockHit>,
+}
+
 /// Byte ranges in `plain` matched by `query`'s terms, for search highlighting (SR-1).
 ///
 /// FTS5 picks *which* blocks match; this locates the same prefix terms in the plain text
@@ -536,6 +545,30 @@ impl Store {
         rows.sort_by_key(|h| !h.text.to_lowercase().contains(&needle));
         rows.truncate(limit);
         Ok(rows)
+    }
+
+    /// Block search grouped under the page or day each hit lives on (SR-2). Groups keep
+    /// the order of their best hit, so the newest page stays first; hits inside a group
+    /// keep the flat search order.
+    pub fn search_groups(&self, query: &str, limit: usize) -> Result<Vec<BlockGroup>> {
+        let hits = self.search_blocks(query, limit)?;
+        let mut groups: Vec<BlockGroup> = Vec::new();
+        let mut index: HashMap<PageId, usize> = HashMap::new();
+        for hit in hits {
+            if let Some(&i) = index.get(&hit.page) {
+                groups[i].hits.push(hit);
+                continue;
+            }
+            index.insert(hit.page.clone(), groups.len());
+            let daily = self.page_row(&hit.page)?.is_some_and(|p| p.is_daily());
+            groups.push(BlockGroup {
+                page: hit.page.clone(),
+                title: hit.page_title.clone(),
+                daily,
+                hits: vec![hit],
+            });
+        }
+        Ok(groups)
     }
 
     /// Status of a `((uid))` target, including tombstones (§10.3.1).

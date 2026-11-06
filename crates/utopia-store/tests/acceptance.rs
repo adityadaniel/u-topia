@@ -898,3 +898,25 @@ fn sr_1_search_marks_the_matched_terms() {
     let both = utopia_store::match_anchors("zebra crossing", "zeb cross");
     assert_eq!(both, vec![(0, 5), (6, 14)], "the whole word is washed");
 }
+
+/// SR-2: results sit under a header per page, with that page's blocks in one group and
+/// the page's title/daily flag from the index.
+#[test]
+fn sr_2_search_groups_results_by_page() {
+    let mut s = store();
+    let a = s.create_page("Atlas").unwrap();
+    write(&mut s, &a, "atlas launch plan");
+    write(&mut s, &a, "atlas risks");
+    let b = s.create_page("Notes").unwrap();
+    write(&mut s, &b, "the atlas is late");
+    let groups = s.search_groups("atlas", 30).unwrap();
+    assert_eq!(groups.len(), 2, "{groups:?}");
+    assert!(!groups[0].daily && !groups[1].daily);
+    let atlas = groups.iter().find(|g| g.title == "Atlas").unwrap();
+    assert_eq!(atlas.page, a);
+    assert_eq!(atlas.hits.len(), 2);
+    assert!(atlas.hits.iter().all(|h| h.page == a));
+    let notes = groups.iter().find(|g| g.title == "Notes").unwrap();
+    assert_eq!(notes.page, b);
+    assert_eq!(notes.hits.len(), 1);
+}
