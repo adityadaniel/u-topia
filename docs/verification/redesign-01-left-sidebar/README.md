@@ -40,6 +40,7 @@ the same way and run
 | `after-page-menu-unpin.png` | SB-3: the same menu on a pinned page says "Unpin from sidebar"; the Pinned group above shows the page active. |
 | `after-compact.png` | ALL-5 in the sidebar: the same content with `settings.json` `"density": "compact"` — Recent Days, Pinned and Pages rows are all tighter. |
 | `after-settings-pinned.png` | SB-3: Settings → Appearance names the new preference — "Pinned pages", "2 pinned pages" and a Clear control. It is kept in `settings.json`, not `keymap.json` or the graph. |
+| `after-pinned-daily.png` | SB-3 (review fix): a daily page can be pinned too. "November 6th, 2026" sits in the Pinned group above Pages; pins resolve against every live page, not only the Pages list. The scratch config put the id there directly because scripted AppKit clicks inside the deferred page menu do not fire in this build (see below). |
 
 ## What the screenshots do not show
 
@@ -53,3 +54,9 @@ the same way and run
   have sync off (grey). A relay was not started for the shots.
 - **Drag to pin.** Pinning is offered from the page menu; dragging a page into the Pinned
   group was not implemented (the idea allows either).
+- **Scripted clicks on the deferred page menu do not fire.** `click` on "Rename", "Delete
+  page" or "Pin to sidebar" leaves the menu open (the row shows its hover fill, so the pointer
+  is over it). This is pre-existing from ALL-3 and affects all three rows, not only the pin;
+  the same listeners work through the test platform (`pinned_daily_pages_show_above_pages`,
+  `pinned_pages_sit_above_pages_and_are_local`). It was not fixed here (out of this screen's
+  scope) and is the reason the shot above seeds the pin directly.
