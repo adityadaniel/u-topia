@@ -157,7 +157,7 @@ impl Store {
         for (src_page, blocks) in steps {
             let mut cmds = Vec::new();
             for (block, mut ranges) in blocks {
-                ranges.sort_by(|a, b| b.start.cmp(&a.start));
+                ranges.sort_by_key(|r| std::cmp::Reverse(r.start));
                 for range in ranges {
                     cmds.push(Command::SetBlockText {
                         id: block.clone(),

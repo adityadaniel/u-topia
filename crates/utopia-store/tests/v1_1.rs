@@ -342,36 +342,40 @@ fn reference_children_come_from_the_index_in_order() {
     s.sync_index().unwrap();
 
     let folded = s.ref_children(std::slice::from_ref(&parent), 2).unwrap();
-    let (shown, total) = folded.get(&parent).unwrap();
-    assert_eq!(total, &4, "the chip's count is the whole truth");
+    let folded = folded.get(&parent).unwrap();
+    assert_eq!(folded.total, 4, "the chip's count is the whole truth");
     assert_eq!(
-        shown.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+        folded
+            .shown
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>(),
         ["Reason 1", "Reason 2"]
     );
-    assert_eq!(shown[0].0, kids[0], "in outline order");
+    assert_eq!(folded.shown[0].0, kids[0], "in outline order");
 
     // 0 asks for the count alone; usize::MAX asks for every child (the chip was opened).
-    let (none, total) = s
+    let none = s
         .ref_children(std::slice::from_ref(&parent), 0)
         .unwrap()
         .remove(&parent)
         .unwrap();
-    assert!(none.is_empty());
-    assert_eq!(total, 4);
-    let (all, _) = s
+    assert!(none.shown.is_empty());
+    assert_eq!(none.total, 4);
+    let all = s
         .ref_children(std::slice::from_ref(&parent), usize::MAX)
         .unwrap()
         .remove(&parent)
         .unwrap();
-    assert_eq!(all.len(), 4);
+    assert_eq!(all.shown.len(), 4);
     // A block with no children is just a count of zero, never a missing entry.
-    let (empty, total) = s
+    let empty = s
         .ref_children(std::slice::from_ref(&kids[0]), 2)
         .unwrap()
         .remove(&kids[0])
         .unwrap();
-    assert!(empty.is_empty());
-    assert_eq!(total, 0);
+    assert!(empty.shown.is_empty());
+    assert_eq!(empty.total, 0);
 }
 
 /// LR-5: "Link all" rewrites every unlinked mention, two in one block included, as one undo

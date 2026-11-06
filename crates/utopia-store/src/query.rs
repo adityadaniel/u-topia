@@ -151,6 +151,14 @@ pub struct LinkedRefs {
     pub groups: Vec<RefGroup>,
 }
 
+/// A referencing block's children for an inline preview (LR-4): the ones shown and how many
+/// the block has in total, so the view can fold the rest behind its chip.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefChildren {
+    pub shown: Vec<(BlockId, String)>,
+    pub total: usize,
+}
+
 impl LinkedRefs {
     pub fn shown(&self) -> usize {
         self.groups.iter().map(|g| g.hits.len()).sum()
@@ -683,7 +691,7 @@ impl Store {
         &self,
         parents: &[BlockId],
         limit: usize,
-    ) -> Result<HashMap<BlockId, (Vec<(BlockId, String)>, usize)>> {
+    ) -> Result<HashMap<BlockId, RefChildren>> {
         self.read_barrier()?;
         let mut out = HashMap::with_capacity(parents.len());
         let mut count = self.conn.prepare_cached(
@@ -709,7 +717,13 @@ impl Store {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
             };
-            out.insert(parent.clone(), (shown, total as usize));
+            out.insert(
+                parent.clone(),
+                RefChildren {
+                    shown,
+                    total: total as usize,
+                },
+            );
         }
         Ok(out)
     }

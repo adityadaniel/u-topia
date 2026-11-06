@@ -931,12 +931,12 @@ impl PageView {
             });
             let limit = shown(g);
             for h in g.hits.iter().take(limit) {
-                let (kids, total) = children.get(&h.block).cloned().unwrap_or_default();
-                let hidden = total.saturating_sub(kids.len());
+                let kids = children.get(&h.block).cloned().unwrap_or_default();
+                let hidden = kids.total.saturating_sub(kids.shown.len());
                 items.push(Item::Hit {
                     hit: h.clone(),
                     page_title: g.page.title.clone().into(),
-                    children: kids,
+                    children: kids.shown,
                     hidden,
                 });
             }
