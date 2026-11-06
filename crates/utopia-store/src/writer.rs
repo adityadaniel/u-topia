@@ -5,6 +5,7 @@
 //! In-memory graphs cannot share a database between connections, so they write inline
 //! on the caller's thread with the same code path.
 
+use std::collections::HashSet;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -107,6 +108,24 @@ struct Progress {
 pub(crate) struct Shared {
     progress: Mutex<Progress>,
     cv: Condvar,
+    /// The tag-page classification as of the last committed job (SB-2). Published here,
+    /// off the UI thread, so an index update never runs the whole-graph query.
+    tag_pages: Mutex<Option<HashSet<PageId>>>,
+}
+
+impl Shared {
+    /// Classify the committed index and publish it. Only meaningful after a commit, which
+    /// is the only thing that can change the answer; a failure leaves the previous set.
+    fn publish_tag_pages(&self, conn: &Connection) {
+        match crate::query::hashtag_only_pages(conn) {
+            Ok(pages) => {
+                if let Ok(mut slot) = self.tag_pages.lock() {
+                    *slot = Some(pages);
+                }
+            }
+            Err(e) => eprintln!("utopia: tag pages: {e}"),
+        }
+    }
 }
 
 pub(crate) enum Msg {
@@ -148,7 +167,9 @@ impl WriteTicket {
 }
 
 pub(crate) enum Persister {
-    Inline,
+    Inline {
+        shared: Arc<Shared>,
+    },
     Thread {
         tx: Sender<Msg>,
         shared: Arc<Shared>,
@@ -158,6 +179,13 @@ pub(crate) enum Persister {
 }
 
 impl Persister {
+    /// Writes on the caller's thread (in-memory graphs, tests, the CLI).
+    pub fn inline() -> Self {
+        Persister::Inline {
+            shared: Arc::new(Shared::default()),
+        }
+    }
+
     /// Spawn a writer thread with its own connection to `path`.
     pub fn spawn(path: &std::path::Path, key: Option<&str>) -> Result<Self> {
         let mut conn = crate::crypt::open_keyed(path, key)?;
@@ -173,6 +201,9 @@ impl Persister {
                     match msg {
                         Msg::Job(seq, job) => {
                             let r = write_job(&mut conn, &job);
+                            if r.is_ok() {
+                                s2.publish_tag_pages(&conn);
+                            }
                             if let Ok(mut p) = s2.progress.lock() {
                                 p.completed = seq;
                                 if let Err(e) = r {
@@ -196,7 +227,11 @@ impl Persister {
 
     pub fn submit(&mut self, conn: &mut Connection, job: Job) -> Result<()> {
         match self {
-            Persister::Inline => write_job(conn, &job),
+            Persister::Inline { shared } => {
+                write_job(conn, &job)?;
+                shared.publish_tag_pages(conn);
+                Ok(())
+            }
             Persister::Thread {
                 tx,
                 submitted,
@@ -219,7 +254,7 @@ impl Persister {
 
     pub fn ticket(&self) -> WriteTicket {
         match self {
-            Persister::Inline => WriteTicket {
+            Persister::Inline { .. } => WriteTicket {
                 shared: None,
                 target: 0,
             },
@@ -230,6 +265,15 @@ impl Persister {
                 target: *submitted,
             },
         }
+    }
+
+    /// The tag-page classification published by the last commit, if any (SB-2).
+    pub fn tag_pages(&self) -> Option<HashSet<PageId>> {
+        let shared = match self {
+            Persister::Inline { shared } => shared,
+            Persister::Thread { shared, .. } => shared,
+        };
+        shared.tag_pages.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// Wait for every submitted job; report (and clear) the first failure.

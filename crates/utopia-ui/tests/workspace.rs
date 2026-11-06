@@ -1211,6 +1211,37 @@ fn feed_blank_day_is_written_by_typing(cx: &mut TestAppContext) {
     assert_eq!(day_texts(&app, written[0], cx), ["filled in later"]);
 }
 
+/// DN-1: an empty day after today and yesterday is one row; clicking it starts writing
+/// there, and the day opens (with its heading) once it has a block. Clicking alone writes
+/// nothing (FR-1.2).
+#[gpui::test]
+fn folded_empty_day_opens_on_a_click(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.open_journal_days(cx)),
+        2,
+        "today and yesterday stay open"
+    );
+    let day = today() - chrono::Duration::days(4);
+    let selector: &'static str =
+        Box::leak(format!("day-folded-{}", utopia_core::date::iso(day)).into_boxed_str());
+    let row = cx.debug_bounds(selector).expect("a folded empty day");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(daily_count(&app, cx), 0, "clicking is not writing");
+    cx.simulate_input("picked up later");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(day_texts(&app, day, cx), ["picked up later"]);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.open_journal_days(cx)),
+        3,
+        "the day now shows its date and its block"
+    );
+}
+
 #[gpui::test]
 fn shortcuts_work_after_scrolling_the_caret_away(cx: &mut TestAppContext) {
     let (_app, ws, cx) = setup(cx);
@@ -1864,4 +1895,160 @@ fn auto_closed_relative_date_accepts_with_tab(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(day_texts(&app, today(), cx), [want]);
     assert_tomorrow_linked(&app, cx);
+}
+
+/// SB-2, rule 10: the tag mark comes from a classification cached off the render path; a
+/// store change the app was never told about must not be discovered while drawing a frame.
+#[gpui::test]
+fn tag_marks_come_from_the_index_feed_not_from_render(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        let (p, b) = app.store.open_daily(today()).unwrap();
+        app.store
+            .set_block_text(&p, &b, "#atlas", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    // Make the sidebar re-query its list, without running the index feed: rendering must
+    // still use the cached classification.
+    app.update(cx, |app, cx| {
+        app.refs_version += 1;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("tag-glyph-atlas").is_none(),
+        "render must not call hashtag_only_pages (rule 10)"
+    );
+    // Once the app is told the index moved, the cache refreshes and the mark appears.
+    app.update(cx, |app, cx| app.flush_now(cx));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("tag-glyph-atlas").is_some(),
+        "the index feed refreshed the tag cache"
+    );
+}
+
+/// SB-4: when a new exchange starts, the footer's dot must repaint as "syncing" at once.
+/// Without a notification the window keeps showing the green dot from the previous round
+/// for the whole network exchange.
+#[gpui::test]
+fn sync_dot_turns_amber_when_an_exchange_starts(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use utopia_ui::sync_runner::{BoxTransport, SyncDot};
+
+    let (_app, ws, cx) = setup(cx);
+    let nudge = Arc::new(AtomicBool::new(false));
+    let transport: BoxTransport = Box::new(utopia_sync::relay::RelayTransport::new(
+        utopia_sync::relay::Relay::new(),
+        "graph",
+    ));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(transport, Some(nudge.clone()), cx)
+    });
+    // The first round finishes quickly: the dot is green and painted.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(10));
+    cx.run_until_parked();
+    cx.update(|_, _| {});
+    assert_eq!(ws.update(cx, |w, _| w.sync_dot()), SyncDot::Synced);
+    assert_eq!(
+        ws.update(cx, |w, _| w.rendered_sync_dot()),
+        Some(SyncDot::Synced)
+    );
+
+    // Ask for the next round now and stop at the moment the exchange is in flight.
+    nudge.store(true, Ordering::SeqCst);
+    let mut started = false;
+    for _ in 0..500 {
+        if ws.update(cx, |w, _| w.sync_dot()) == SyncDot::Syncing {
+            started = true;
+            break;
+        }
+        // Move the test clock to the loop's next 250 ms poll (if it registered one), then
+        // run exactly one queued task. The exchange is only queued after the loop takes
+        // the transport, so it cannot run before the state is observed.
+        cx.dispatcher.advance_clock_to_next_delayed();
+        if !cx.background_executor.tick() {
+            break;
+        }
+    }
+    assert!(started, "the second exchange never started");
+    // Flushing effects paints the window only if the state change requested a frame.
+    cx.update(|_, _| {});
+    assert_eq!(
+        ws.update(cx, |w, _| w.rendered_sync_dot()),
+        Some(SyncDot::Syncing),
+        "the in-flight dot was never painted"
+    );
+}
+
+/// SB-2 under the §15.1 budget: the tag-page classification is published by the commit
+/// that changes the index, so an edit (and the index update after its flush) never runs the
+/// whole-graph query on the UI thread.
+#[gpui::test]
+fn an_edit_does_not_classify_tag_pages_on_the_ui_thread(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("tags.utopia")).unwrap();
+    store.set_today(Some(today()));
+    // "atlas" has no blocks of its own and is reached only through a hashtag.
+    store.create_page("atlas").unwrap();
+    let notes = store.create_page("Notes").unwrap();
+    let block = store.ensure_first_block(&notes).unwrap();
+    store
+        .set_block_text(&notes, &block, "Wrote about #atlas", None, None)
+        .unwrap();
+    store.commit_block(&notes, &block).unwrap();
+    store.sync_index().unwrap();
+
+    let app = cx.new(|_| AppState::new(store));
+    assert_eq!(
+        app.update(cx, |app, _| app.tag_pages.len()),
+        1,
+        "atlas is a tag page at startup"
+    );
+    // AppState classifies once at startup; after that the commit publishes the answer.
+    let scans = app.update(cx, |app, _| app.store.tag_page_scans());
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app.clone(), window, cx));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(notes.clone(), None, Some(block.clone()), false, window, cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_input("!");
+    cx.run_until_parked();
+    app.update(cx, |app, cx| app.flush_now(cx));
+    app.update(cx, |app, _| app.store.sync_index().unwrap());
+    cx.run_until_parked();
+    assert_eq!(
+        app.update(cx, |app, _| app.store.tag_page_scans()),
+        scans,
+        "typing and the index update did not re-classify on this thread"
+    );
+    assert_eq!(
+        app.update(cx, |app, _| app.tag_pages.len()),
+        1,
+        "the set published by the commit is current"
+    );
+
+    // A change that drops the hashtag is published as well.
+    app.update(cx, |app, cx| {
+        app.store
+            .set_block_text(&notes, &block, "Wrote about [[atlas]]", None, None)
+            .unwrap();
+        app.store.commit_block(&notes, &block).unwrap();
+        app.flush_now(cx);
+    });
+    app.update(cx, |app, _| app.store.sync_index().unwrap());
+    cx.run_until_parked();
+    assert!(
+        app.update(cx, |app, _| app.tag_pages.is_empty()),
+        "a plain link is not a hashtag-only page"
+    );
+    assert_eq!(app.update(cx, |app, _| app.store.tag_page_scans()), scans);
 }
