@@ -784,6 +784,112 @@ fn folding_an_edited_card_gives_the_keyboard_back(cx: &mut TestAppContext) {
     );
 }
 
+/// RS-3: the Outline lists every heading of the page, so clicking one has to reach it even
+/// when it sits under a folded block or outside the zoom the page is showing — otherwise
+/// the row is a dead control.
+#[gpui::test]
+fn outline_reaches_headings_that_are_folded_away(cx: &mut TestAppContext) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    let (app, ws, cx) = setup(cx);
+    let (page, fold, hidden, shown) = app.update(cx, |app, _| {
+        let page = app.store.create_page("Plan").unwrap();
+        let insert = |app: &mut AppState,
+                      id: &BlockId,
+                      parent: Option<BlockId>,
+                      after: Option<BlockId>,
+                      text: &str,
+                      kind: BlockKind| {
+            app.store
+                .execute(
+                    &page,
+                    vec![Command::InsertBlock {
+                        id: id.clone(),
+                        parent,
+                        after,
+                        text: text.to_string(),
+                        kind,
+                    }],
+                    Default::default(),
+                )
+                .unwrap();
+        };
+        let fold = BlockId::new();
+        insert(app, &fold, None, None, "Fold", BlockKind::Bullet);
+        let hidden = BlockId::new();
+        insert(
+            app,
+            &hidden,
+            Some(fold.clone()),
+            None,
+            "Hidden heading",
+            BlockKind::Heading(2),
+        );
+        let shown = BlockId::new();
+        insert(
+            app,
+            &shown,
+            None,
+            Some(fold.clone()),
+            "Shown heading",
+            BlockKind::Heading(2),
+        );
+        app.store.set_collapsed(&fold, true).unwrap();
+        app.store.sync_index().unwrap();
+        (page, fold, hidden, shown)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let outline = cx.debug_bounds("panel-outline").expect("the Outline tab");
+    cx.simulate_click(outline.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // The folded heading is listed and clickable; before the fix the click did nothing.
+    let first = cx.debug_bounds("outline-0").expect("the first heading");
+    cx.simulate_click(first.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.block.clone())),
+        Some(hidden.clone()),
+        "clicking the folded heading put the caret there"
+    );
+    assert!(
+        !app.read_with(cx, |app, _| app.store.is_collapsed(&fold)),
+        "its ancestor was unfolded so the row could be shown"
+    );
+
+    // A heading outside the zoom is reachable too: the page leaves the zoom to show it.
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page, Some(shown), None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let first = cx.debug_bounds("outline-0").expect("the first heading");
+    cx.simulate_click(first.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.block.clone())),
+        Some(hidden),
+        "clicking a heading outside the zoom left the zoom and focused it"
+    );
+    assert!(
+        ws.update(cx, |w, cx| w.main_zoom(cx)).is_none(),
+        "the zoom was cleared"
+    );
+}
+
 #[gpui::test]
 fn keystrokes_are_debounced_then_committed(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);

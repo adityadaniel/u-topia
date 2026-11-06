@@ -1909,7 +1909,7 @@ impl Workspace {
                     .child(div().flex_1().min_w_0().child(e.text.clone()))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.main
-                            .update(cx, |m, cx| m.focus_block(&block, None, window, cx));
+                            .update(cx, |m, cx| m.reveal_block(&block, window, cx));
                     })),
             );
         }

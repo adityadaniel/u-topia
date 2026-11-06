@@ -450,6 +450,42 @@ impl PageView {
         self.edit(page, block, Some(0), None, window, cx);
     }
 
+    /// Show `block` and put the caret in it: unfold collapsed ancestors and leave a zoom
+    /// that does not contain it first. The Outline tab lists every heading of the page
+    /// (RS-3), including ones folded away or outside the zoom, so a click there must reach
+    /// them — `focus_block` only sees the rows currently built.
+    pub fn reveal_block(&mut self, block: &BlockId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(page) = self.page.clone() else {
+            return;
+        };
+        let zoom = self.zoom.clone();
+        let mut unfolded = false;
+        let reachable = self.app.update(cx, |app, _| {
+            let Ok(st) = app.store.page_state(&page) else {
+                return true;
+            };
+            // A zoomed page only builds rows below its root; the root itself is the header.
+            let inside = match &zoom {
+                None => true,
+                Some(z) => z != block && st.ancestors(block).contains(z),
+            };
+            for a in st.ancestors(block) {
+                if app.store.is_collapsed(&a) {
+                    let _ = app.store.set_collapsed(&a, false);
+                    unfolded = true;
+                }
+            }
+            inside
+        });
+        if !reachable {
+            self.zoom = None;
+            self.dirty = true;
+        } else if unfolded {
+            self.dirty = true;
+        }
+        self.focus_block(block, None, window, cx);
+    }
+
     pub fn focus_block(
         &mut self,
         block: &BlockId,
