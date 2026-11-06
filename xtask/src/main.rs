@@ -1111,6 +1111,79 @@ fn seed_daily_feed(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The demo graph for the Linked References verification shots: the Help graph plus a
+/// reference block with more children than the inline limit, and unlinked mentions of
+/// "Ana Lovelace", so the shots exercise LR-4 and LR-5 on real content.
+fn seed_refs_graph(path: &Path) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    seed_help_graph(path)?;
+    let mut s = Store::open(path)?;
+    let today = chrono::Local::now().date_naive();
+    let day = PageId::for_date(today);
+    let st = s.page_state(&day)?.clone();
+    let host = st
+        .live_preorder()
+        .into_iter()
+        .find(|(id, _)| {
+            st.block(id)
+                .is_some_and(|b| b.text.contains("Met [[Ana Lovelace]]"))
+        })
+        .map(|(id, _)| id)
+        .context("today's mention of Ana Lovelace")?;
+    let after = st.last_child(Some(&host), true);
+    let id = BlockId::new();
+    s.execute(
+        &day,
+        vec![Command::InsertBlock {
+            id,
+            parent: Some(host),
+            after,
+            text: "She asked for the import plan first".into(),
+            kind: BlockKind::Bullet,
+        }],
+        EditOpts {
+            no_undo: true,
+            ..Default::default()
+        },
+    )?;
+    // Link yesterday, so the feed shows a day with a Linked References section of its own.
+    let yesterday = today - chrono::Duration::days(1);
+    let link = s.date_format().format(yesterday);
+    let plan = outline::append_block(s.page_state(&day)?, None);
+    let id = s
+        .execute_plan(&day, plan, None)?
+        .context("new block")?
+        .block;
+    s.set_block_text(
+        &day,
+        &id,
+        &format!("Plan follows on from [[{link}]]"),
+        None,
+        None,
+    )?;
+    s.commit_block(&day, &id)?;
+
+    let reading = s
+        .find_page("Reading")?
+        .context("the Help graph has a Reading page")?;
+    for text in [
+        "Remember: Ana Lovelace keeps the migration notes",
+        "Ana Lovelace likes a written summary first",
+    ] {
+        let plan = outline::append_block(s.page_state(&reading)?, None);
+        let id = s
+            .execute_plan(&reading, plan, None)?
+            .context("new block")?
+            .block;
+        s.set_block_text(&reading, &id, text, None, None)?;
+        s.commit_block(&reading, &id)?;
+    }
+    s.sync_index()?;
+    Ok(())
+}
+
 /// Regenerate the screenshots embedded in Settings → Help.
 ///
 /// Builds the app, seeds a mock graph, then drives the real window with
@@ -1250,13 +1323,18 @@ fn main() -> Result<()> {
         Some("bundle") => bundle(args.iter().any(|a| a == "--debug")),
         Some("mobile") => mobile(args.iter().any(|a| a == "--ios")),
         Some("help-shots") => help_shots(),
+        Some("seed-refs") => {
+            seed_refs_graph(Path::new(args.get(1).context("graph path")?))?;
+            println!("seeded {}", args[1]);
+            Ok(())
+        }
         Some("seed-page-view") => {
             seed_page_view(Path::new(args.get(1).context("graph path to seed")?))
         }
         Some("seed-daily") => seed_daily_feed(Path::new(args.get(1).context("graph path")?)),
         _ => {
             println!(
-                "usage: cargo run -p xtask --release -- bench [--ui]\n       cargo run -p xtask -- bundle [--debug]   (target/Utopia.app, registers utopia://)\n       cargo run -p xtask -- mobile [--ios]     (Swift bindings, checks, iOS shell)\n       cargo run -p xtask -- help-shots         (regenerate Settings -> Help screenshots)\n       cargo run -p xtask -- seed-daily <graph>  (a scratch graph for the Daily Notes shots)\n       cargo run -p xtask -- seed-page-view <file.utopia>   (scratch graph for page-view shots)\n       cargo run -p xtask --release -- profile-merge   (loop for sampling with `sample`)"
+                "usage: cargo run -p xtask --release -- bench [--ui]\n       cargo run -p xtask -- bundle [--debug]   (target/Utopia.app, registers utopia://)\n       cargo run -p xtask -- mobile [--ios]     (Swift bindings, checks, iOS shell)\n       cargo run -p xtask -- help-shots         (regenerate Settings -> Help screenshots)\n       cargo run -p xtask -- seed-refs <graph>  (demo graph for the reference screenshots)\n       cargo run -p xtask -- seed-daily <graph>  (a scratch graph for the Daily Notes shots)\n       cargo run -p xtask -- seed-page-view <file.utopia>   (scratch graph for page-view shots)\n       cargo run -p xtask --release -- profile-merge   (loop for sampling with `sample`)"
             );
             Ok(())
         }

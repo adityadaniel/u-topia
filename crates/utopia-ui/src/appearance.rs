@@ -11,14 +11,17 @@
 //!   "version": 1,
 //!   "font": "system",
 //!   "density": "comfortable",
+//!   "ref_children": 2,
 //!   "pinned": [],
 //!   "attribute-blocks": "compact"
 //! }
 //! ```
 //!
 //! `font` is `"system"` (the default) or `"ibm-plex-sans"`; `density` is
-//! `"comfortable"` (the default) or `"compact"` (ALL-5); `pinned` is the list of page ids
-//! the sidebar keeps in its Pinned group, in the order they were pinned (SB-3);
+//! `"comfortable"` (the default) or `"compact"` (ALL-5); `ref_children` is how many
+//! children a Linked Reference shows inline, 0 to `REF_CHILDREN_MAX` (LR-4, default 2,
+//! 0 folds every child behind the "+N more" chip); `pinned` is the list of page ids the
+//! sidebar keeps in its Pinned group, in the order they were pinned (SB-3);
 //! `attribute-blocks` is `"compact"` (the default) or `"blocks"` (PG-1). A missing file
 //! means defaults; an
 //! unreadable file, an unknown value or a newer version is logged and read as far as it can
@@ -35,6 +38,10 @@ use crate::theme::{BODY_SIZE, LINE_HEIGHT};
 
 pub const FILE: &str = "settings.json";
 pub const VERSION: u64 = 1;
+/// How many children a Linked Reference shows inline by default (LR-4).
+pub const DEFAULT_REF_CHILDREN: usize = 2;
+/// The largest "Children shown in references" the Appearance tab offers.
+pub const REF_CHILDREN_MAX: usize = 3;
 
 /// The font the UI and notes are set in. Code blocks stay in Menlo either way.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -175,10 +182,12 @@ impl AttributeBlocks {
 }
 
 /// What `settings.json` holds.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
     pub font: UiFont,
     pub density: Density,
+    /// Children shown inline under a referencing block (LR-4); 0 folds them all.
+    pub ref_children: usize,
     /// How a page draws its `key:: value` blocks (PG-1).
     pub attribute_blocks: AttributeBlocks,
     /// Page ids kept at the top of the sidebar, in the order they were pinned (SB-3).
@@ -187,6 +196,19 @@ pub struct Prefs {
     pub pinned: Vec<PageId>,
     /// Keys this version does not understand, written back untouched.
     rest: Map<String, Value>,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            font: UiFont::default(),
+            density: Density::default(),
+            ref_children: DEFAULT_REF_CHILDREN,
+            attribute_blocks: AttributeBlocks::default(),
+            pinned: Vec::new(),
+            rest: Map::new(),
+        }
+    }
 }
 
 impl Prefs {
@@ -236,6 +258,26 @@ impl Prefs {
                 Density::default()
             }
         };
+        let ref_children = match rest.remove("ref_children") {
+            None => DEFAULT_REF_CHILDREN,
+            Some(Value::Number(n)) => match n.as_u64() {
+                Some(n) if n <= REF_CHILDREN_MAX as u64 => n as usize,
+                _ => {
+                    warnings.push(format!(
+                        "{FILE}: ref_children should be 0 to {REF_CHILDREN_MAX}, not {n}; \
+                         using {DEFAULT_REF_CHILDREN}"
+                    ));
+                    DEFAULT_REF_CHILDREN
+                }
+            },
+            Some(v) => {
+                warnings.push(format!(
+                    "{FILE}: ref_children should be a number, not {v}; \
+                     using {DEFAULT_REF_CHILDREN}"
+                ));
+                DEFAULT_REF_CHILDREN
+            }
+        };
         let attribute_blocks = match rest.remove("attribute-blocks") {
             None => AttributeBlocks::default(),
             Some(Value::String(s)) => AttributeBlocks::from_key(&s).unwrap_or_else(|| {
@@ -281,6 +323,7 @@ impl Prefs {
             Self {
                 font,
                 density,
+                ref_children,
                 attribute_blocks,
                 pinned,
                 rest,
@@ -294,6 +337,7 @@ impl Prefs {
         m.insert("version".into(), VERSION.into());
         m.insert("font".into(), self.font.key().into());
         m.insert("density".into(), self.density.key().into());
+        m.insert("ref_children".into(), self.ref_children.into());
         m.insert(
             "attribute-blocks".into(),
             self.attribute_blocks.key().into(),
@@ -379,6 +423,13 @@ pub fn density(cx: &App) -> Density {
         .map_or(Density::default(), |a| a.prefs.density)
 }
 
+/// How many children a Linked Reference shows inline (LR-4), clamped to the offered range.
+pub fn ref_children(cx: &App) -> usize {
+    cx.try_global::<Appearance>()
+        .map_or(DEFAULT_REF_CHILDREN, |a| a.prefs.ref_children)
+        .min(REF_CHILDREN_MAX)
+}
+
 /// How pages draw their attribute blocks (PG-1). Compact rows when nothing was installed.
 pub fn attribute_blocks(cx: &App) -> AttributeBlocks {
     cx.try_global::<Appearance>()
@@ -449,6 +500,14 @@ pub fn set_density(cx: &mut App, density: Density, config_dir: &Path) -> std::io
     cx.global::<Appearance>().prefs.save(config_dir)
 }
 
+/// Change how many children a reference shows inline (LR-4) and remember it. Open reference
+/// panels notice the change on their next render and rebuild their rows.
+pub fn set_ref_children(cx: &mut App, count: usize, config_dir: &Path) -> std::io::Result<()> {
+    cx.default_global::<Appearance>().prefs.ref_children = count.min(REF_CHILDREN_MAX);
+    cx.refresh_windows();
+    cx.global::<Appearance>().prefs.save(config_dir)
+}
+
 /// Switch attribute blocks in every open window now and remember it (PG-1). Unlike the font
 /// and density this can be set from the page itself, so the save goes through the config
 /// dir `install` recorded; a test that never installed one stays in memory.
@@ -485,6 +544,7 @@ mod tests {
         let p = Prefs {
             font: UiFont::IbmPlexSans,
             density: Density::Compact,
+            ref_children: 0,
             attribute_blocks: AttributeBlocks::Blocks,
             pinned: vec![PageId("page-a".into()), PageId("page-b".into())],
             ..Default::default()
@@ -497,6 +557,7 @@ mod tests {
                 "version": 1,
                 "font": "ibm-plex-sans",
                 "density": "compact",
+                "ref_children": 0,
                 "attribute-blocks": "blocks",
                 "pinned": ["page-a", "page-b"],
             })
@@ -561,6 +622,29 @@ mod tests {
     fn missing_keys_are_defaults_without_complaint() {
         assert_eq!(Prefs::from_json("{}"), (Prefs::default(), vec![]));
         assert_eq!(Prefs::default().density, Density::Comfortable);
+        assert_eq!(
+            Prefs::default().ref_children,
+            DEFAULT_REF_CHILDREN,
+            "LR-4: two children inline unless the user says otherwise"
+        );
+        assert_eq!(DEFAULT_REF_CHILDREN, 2);
+    }
+
+    /// LR-4: a bad "Children shown in references" value falls back to 2 and says so; 0 is a
+    /// real choice (fold every child behind the chip), not a missing value.
+    #[test]
+    fn ref_children_is_read_and_bounded() {
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "ref_children": 0}"#);
+        assert_eq!(p.ref_children, 0);
+        assert!(warnings.is_empty());
+        let (p, _) = Prefs::from_json(r#"{"version": 1, "ref_children": 3}"#);
+        assert_eq!(p.ref_children, 3);
+        for bad in ["12", "-1", "\"two\"", "true"] {
+            let (p, warnings) =
+                Prefs::from_json(&format!(r#"{{"version": 1, "ref_children": {bad}}}"#));
+            assert_eq!(p.ref_children, DEFAULT_REF_CHILDREN, "{bad}");
+            assert_eq!(warnings.len(), 1, "{bad}: {warnings:?}");
+        }
     }
 
     /// An unknown density is the comfortable one, said out loud, never a panic (rule 11).

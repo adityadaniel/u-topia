@@ -34,6 +34,10 @@ const GROUP_PREVIEW: usize = 3;
 const JOURNAL_BATCH: usize = 10;
 /// Widest the page column gets (about 95 characters of body text per line).
 const READABLE_WIDTH: f32 = 760.;
+/// The reference filter field's preferred width (LR-1); it no longer stretches the column.
+const REF_FILTER_WIDTH: f32 = 240.;
+/// The narrowest the field gets before the pane is too small to show the controls at all.
+const REF_FILTER_MIN_WIDTH: f32 = 90.;
 /// Height of the pinned day heading (DN-3), fixed so that revealing a row can leave room
 /// for it: its padding, the caption line, the date line and the hairline.
 const STICKY_HEIGHT: f32 = 4. + 20. + 34. + 4. + 1.;
@@ -141,7 +145,16 @@ enum Item {
         count: usize,
         scheduled: bool,
     },
-    Hit(RefHit),
+    /// A referencing block (LR-3, LR-4): the group's page title and the block's first
+    /// children travel with it, so paint never reads the store (rule 3).
+    Hit {
+        hit: RefHit,
+        page_title: SharedString,
+        /// The children shown inline, in outline order.
+        children: Vec<(BlockId, String)>,
+        /// Live children past the inline limit, behind the "+N more" chip.
+        hidden: usize,
+    },
     More {
         page: PageId,
         hidden: usize,
@@ -152,6 +165,8 @@ enum Item {
         open: bool,
     },
     Mention(Mention),
+    /// The unlinked section is open and there is nothing left to link (LR-5).
+    NoMentions,
     /// A day's title in the Daily Notes feed (`page` is None for a blank day).
     DayHeader {
         date: NaiveDate,
@@ -228,6 +243,23 @@ struct Header {
     attributes: Vec<(String, String)>,
 }
 
+/// Which of the reference controls has its menu open (LR-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlMenu {
+    Date,
+    Sort,
+}
+
+/// One choice in a reference control's menu (LR-1).
+struct ControlChoice {
+    selector: &'static str,
+    label: &'static str,
+    /// "Last N days" for the date menu; `None` is any time.
+    days: Option<u64>,
+    sort: Option<RefSort>,
+    selected: bool,
+}
+
 #[derive(Clone)]
 struct DraggedBlock {
     page: PageId,
@@ -264,9 +296,17 @@ pub struct PageView {
     refs: LinkedRefs,
     refs_key: Option<(PageId, Option<BlockId>, u64)>,
     query: RefQuery,
-    suggestions: Vec<(PageId, String)>,
+    /// Co-reference chips offered under the controls: page, title, hit count (LR-1).
+    suggestions: Vec<(PageId, String, usize)>,
     filter_titles: BTreeMap<PageId, String>,
     expanded_groups: HashSet<PageId>,
+    /// Referencing blocks whose "+N more" chip was opened (LR-4). Local view state.
+    expanded_children: HashSet<BlockId>,
+    /// Children per reference in force when `items` was built (LR-4); the setting can change
+    /// while a page is open, which rebuilds once.
+    ref_children_limit: usize,
+    /// A reference control's menu is open (LR-1). Local view state, never persisted.
+    controls_menu: Option<ControlMenu>,
     open_embeds: HashSet<(BlockId, String)>,
     rename: Option<Entity<LineInput>>,
     filter: Entity<LineInput>,
@@ -344,6 +384,9 @@ impl PageView {
             suggestions: Vec::new(),
             filter_titles: BTreeMap::new(),
             expanded_groups: HashSet::new(),
+            expanded_children: HashSet::new(),
+            ref_children_limit: crate::appearance::ref_children(cx),
+            controls_menu: None,
             open_embeds: HashSet::new(),
             rename: None,
             filter,
@@ -457,8 +500,10 @@ impl PageView {
                 .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
                 .unwrap_or_default();
             self.expanded_groups = saved.into_iter().map(PageId).collect();
+            self.expanded_children.clear();
         }
         self.page_menu = false;
+        self.controls_menu = None;
         self.refs_key = None;
         self.dirty = true;
         self.rebuild(cx);
@@ -711,6 +756,7 @@ impl PageView {
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.dirty = false;
+        self.ref_children_limit = crate::appearance::ref_children(cx);
         if self.journal.is_none() {
             // Only the feed pins a day heading (DN-3).
             self.day_headings.clear();
@@ -746,9 +792,9 @@ impl PageView {
                 .live_roots()
                 .iter()
                 .filter_map(|r| {
-                    let t = &st.block(r)?.text;
-                    utopia_core::inline::attribute(t)
-                        .map(|(k, v)| (k, utopia_core::inline::plain_text(&t[v])))
+                    let b = st.block(r)?;
+                    page_attribute(b.kind, &b.text)
+                        .map(|(k, v)| (k, utopia_core::inline::plain_text(&b.text[v])))
                 })
                 .collect();
             header.date = st.meta.daily_date;
@@ -830,32 +876,39 @@ impl PageView {
         for r in rows {
             items.push(r);
         }
-        self.push_refs(&page, &mut items);
+        self.push_refs(&page, &mut items, cx);
         if self.zoom.is_none() {
-            // Unlinked References (FR-3.9): computed only when expanded, like Roam.
-            if self.unlinked_open
-                && self
-                    .unlinked
-                    .as_ref()
-                    .is_none_or(|(v, _)| *v != refs_version)
-            {
+            // Unlinked References (FR-3.9, LR-5): the header always carries the count, so the
+            // search runs once per page and index version rather than only when opened. It
+            // reads the index without flushing or waiting for the writer, so it is safe in a
+            // render (rule 10); it catches up when the index does.
+            let stale = self
+                .unlinked
+                .as_ref()
+                .is_none_or(|(v, _)| *v != refs_version);
+            if stale {
                 let found = self.app.update(cx, |app, _| {
-                    let r = app.store.unlinked_references(&page);
+                    let r = app.store.unlinked_references_now(&page);
                     app.report(r).unwrap_or_default()
                 });
                 self.unlinked = Some((refs_version, found));
             }
+            let count = self.unlinked.as_ref().map(|(_, m)| m.len());
             let mentions = self
                 .unlinked
                 .as_ref()
                 .map(|(_, m)| m.clone())
                 .filter(|_| self.unlinked_open);
             items.push(Item::UnlinkedHeader {
-                count: mentions.as_ref().map(Vec::len),
+                count,
                 open: self.unlinked_open,
             });
-            for m in mentions.unwrap_or_default() {
-                items.push(Item::Mention(m));
+            if self.unlinked_open {
+                match mentions {
+                    Some(m) if !m.is_empty() => items.extend(m.into_iter().map(Item::Mention)),
+                    Some(_) => items.push(Item::NoMentions),
+                    None => {}
+                }
             }
         }
         self.replace_items(items, cx);
@@ -985,12 +1038,14 @@ impl PageView {
             }
             items.extend(day.rows);
             if let Some(page) = day.page {
+                // Like Roam's feed: Linked References under the day when it has any, and no
+                // Unlinked References (those stay on the day's own page).
                 if let Some(refs) = refs {
                     items.push(Item::RefsHeader {
                         title: "Linked References".into(),
                         count: refs.shown(),
                     });
-                    self.push_ref_groups(&page, refs, true, &mut items);
+                    self.push_ref_groups(&page, refs, true, &mut items, cx);
                 }
                 ids.push(page);
             }
@@ -1072,7 +1127,7 @@ impl PageView {
         }
     }
 
-    fn push_refs(&self, page: &PageId, items: &mut Vec<Item>) {
+    fn push_refs(&self, page: &PageId, items: &mut Vec<Item>, cx: &mut Context<Self>) {
         let shown = self.refs.shown();
         let title = if self.zoom.is_some() {
             "Referenced by"
@@ -1091,17 +1146,52 @@ impl PageView {
             return;
         }
         let daily = self.header.kind == PageKind::Daily;
-        self.push_ref_groups(page, &self.refs, daily, items);
+        self.push_ref_groups(page, &self.refs, daily, items, cx);
     }
 
-    /// One header per referencing page, then its hits (folded past `GROUP_PREVIEW`).
+    /// One header per referencing page, then its hits (folded past `GROUP_PREVIEW`), each
+    /// with its first children inline (LR-4).
     fn push_ref_groups(
         &self,
         page: &PageId,
         refs: &LinkedRefs,
         daily: bool,
         items: &mut Vec<Item>,
+        cx: &mut Context<Self>,
     ) {
+        // Only the hits that become rows need their children; an opened "+N more" wants all.
+        let shown = |g: &utopia_store::RefGroup| {
+            if self.expanded_groups.contains(&g.page.id) {
+                usize::MAX
+            } else {
+                GROUP_PREVIEW
+            }
+        };
+        let mut folded: Vec<BlockId> = Vec::new();
+        let mut opened: Vec<BlockId> = Vec::new();
+        for g in &refs.groups {
+            for h in g.hits.iter().take(shown(g)) {
+                if self.expanded_children.contains(&h.block) {
+                    opened.push(h.block.clone());
+                } else {
+                    folded.push(h.block.clone());
+                }
+            }
+        }
+        let mut children = HashMap::new();
+        {
+            let store = &self.app.read(cx).store;
+            if !folded.is_empty() {
+                if let Ok(m) = store.ref_children(&folded, self.ref_children_limit) {
+                    children.extend(m);
+                }
+            }
+            if !opened.is_empty() {
+                if let Ok(m) = store.ref_children(&opened, usize::MAX) {
+                    children.extend(m);
+                }
+            }
+        }
         for g in &refs.groups {
             let scheduled = daily && g.page.id != *page;
             items.push(Item::GroupHeader {
@@ -1109,13 +1199,16 @@ impl PageView {
                 count: g.hits.len(),
                 scheduled,
             });
-            let limit = if self.expanded_groups.contains(&g.page.id) {
-                usize::MAX
-            } else {
-                GROUP_PREVIEW
-            };
+            let limit = shown(g);
             for h in g.hits.iter().take(limit) {
-                items.push(Item::Hit(h.clone()));
+                let kids = children.get(&h.block).cloned().unwrap_or_default();
+                let hidden = kids.total.saturating_sub(kids.shown.len());
+                items.push(Item::Hit {
+                    hit: h.clone(),
+                    page_title: g.page.title.clone().into(),
+                    children: kids.shown,
+                    hidden,
+                });
             }
             if g.hits.len() > limit {
                 items.push(Item::More {
@@ -1126,41 +1219,28 @@ impl PageView {
         }
     }
 
-    /// Pages co-referenced by the current results, for "+ filter" chips (FR-3.10).
-    fn compute_suggestions(&self, page: &PageId, cx: &mut Context<Self>) -> Vec<(PageId, String)> {
-        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for g in &self.refs.groups {
-            for h in &g.hits {
-                for r in extract_refs(&h.text) {
-                    if r.is_page_like() {
-                        *counts.entry(r.target.clone()).or_default() += 1;
-                    }
-                }
-            }
-        }
-        let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        let store = &self.app.read(cx).store;
-        let mut out: Vec<(PageId, String)> = Vec::new();
-        for (target, _) in ranked {
-            if let Ok(Some(id)) = store.find_page(&target) {
-                if id != *page
-                    && !self.query.also.contains(&id)
-                    && !out.iter().any(|(p, _)| *p == id)
-                {
-                    let title = store
-                        .page_row(&id)
-                        .ok()
-                        .flatten()
-                        .map_or(target.clone(), |r| r.title);
-                    out.push((id, title));
-                }
-            }
-            if out.len() >= 6 {
-                break;
-            }
-        }
-        out
+    /// Pages co-referenced by the current results, for the co-reference chips (FR-3.10,
+    /// LR-1). The store resolves them from the index and counts the hits each would keep
+    /// with the same predicate the filter applies, so the chip's number is what it selects.
+    fn compute_suggestions(
+        &self,
+        page: &PageId,
+        cx: &mut Context<Self>,
+    ) -> Vec<(PageId, String, usize)> {
+        let hits: Vec<RefHit> = self
+            .refs
+            .groups
+            .iter()
+            .flat_map(|g| g.hits.iter().cloned())
+            .collect();
+        self.app
+            .read(cx)
+            .store
+            .co_references(&hits, page, &self.query.also)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| (c.page, c.title, c.hits))
+            .collect()
     }
 
     // ---------------------------------------------------------------- editor events
@@ -1772,6 +1852,10 @@ impl PageView {
 
     /// "Export" in the page menu (PG-2): write Markdown, `graph.json` and `graph.opml` to a
     /// folder the user picks, exactly what `utopia export <graph> <dir>` writes (G4).
+    ///
+    /// Only the snapshot is taken here, on the UI thread; serializing three formats and
+    /// copying the files (attachments included) runs on a worker, so a large graph does not
+    /// freeze every window while it is written (rule 10).
     fn export_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: false,
@@ -1786,16 +1870,35 @@ impl PageView {
             let Some(dir) = paths.into_iter().next() else {
                 return;
             };
+            let snapshot = match this
+                .update_in(cx, |this, _, cx| {
+                    this.app.update(cx, |app, _| app.store.export_snapshot())
+                })
+                .ok()
+            {
+                Some(Ok(snapshot)) => snapshot,
+                Some(Err(e)) => {
+                    let _ = this.update_in(cx, |this, _, cx| {
+                        this.app.update(cx, |app, cx| {
+                            app.last_error = Some(e.to_string());
+                            cx.notify();
+                        });
+                    });
+                    return;
+                }
+                None => return,
+            };
+            let exported = cx
+                .background_executor()
+                .spawn(async move { utopia_store::write_export(&snapshot, &dir).map(|n| (n, dir)) })
+                .await;
             let _ = this.update_in(cx, |this, _, cx| {
                 this.app.update(cx, |app, cx| {
-                    let r = (|| {
-                        let n = app.store.export_markdown(&dir)?;
-                        app.store.export_json(&dir.join("graph.json"))?;
-                        app.store.export_opml(&dir.join("graph.opml"))?;
-                        Ok::<_, utopia_store::StoreError>(n)
-                    })();
-                    if let Some(n) = app.report(r) {
-                        app.notice = Some(format!("Exported {n} pages to {}", dir.display()));
+                    let dir = exported.as_ref().ok().map(|(_, d)| d.clone());
+                    if let Some(n) = app.report(exported.map(|(n, _)| n)) {
+                        if let Some(dir) = dir {
+                            app.notice = Some(format!("Exported {n} pages to {}", dir.display()));
+                        }
                     }
                     app.changed(Vec::new(), false, cx);
                 });
@@ -2219,6 +2322,9 @@ impl PageView {
         div()
             .id("page-menu-popup")
             .debug_selector(|| "page-menu-popup".into())
+            // Without `occlude` the menu is drawn over the page but clicks pass through it
+            // to whatever is underneath, so its items never fire (found by test).
+            .occlude()
             .w(px(180.))
             .p_1()
             .flex()
@@ -2482,8 +2588,10 @@ impl PageView {
                 .py_1()
                 .text_size(px(crate::theme::BODY_SIZE));
             for (k, v) in &h.attributes {
+                let key = k.clone();
                 grid = grid.child(
                     div()
+                        .debug_selector(move || format!("meta-{key}"))
                         .flex()
                         .gap_2()
                         .child(div().w(px(110.)).text_color(th.muted).child(k.clone()))
@@ -2594,6 +2702,24 @@ impl PageView {
         cx.notify();
     }
 
+    /// "Link all" in the Unlinked References header (LR-5): one undo step for every mention.
+    fn promote_all(&mut self, cx: &mut Context<Self>) {
+        let Some(page) = self.page.clone() else {
+            return;
+        };
+        if self.unlinked.as_ref().is_none_or(|(_, m)| m.is_empty()) {
+            return;
+        }
+        self.app.update(cx, |app, cx| {
+            let linked = app.store.promote_all_mentions(&page);
+            app.report(linked);
+            app.changed(vec![page.clone()], true, cx);
+        });
+        self.unlinked = None;
+        self.dirty = true;
+        cx.notify();
+    }
+
     fn toggle_checked(&mut self, r: &RowItem, cx: &mut Context<Self>) {
         let (page, block, checked) = (r.page.clone(), r.block.clone(), !r.checked);
         self.app.update(cx, |app, cx| {
@@ -2607,13 +2733,21 @@ impl PageView {
         cx.notify();
     }
 
+    /// LR-1: one control row (filter field, then the date and sort menu buttons) and the
+    /// co-reference chips on the line below it. Menus float over the page, so opening one
+    /// never moves the references (ALL-3).
     fn render_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         let th = theme(cx).clone();
         let sort_label = match self.query.sort {
-            RefSort::Title => "Sort: title",
-            RefSort::Recency => "Sort: recent",
+            RefSort::Title => "Title",
+            RefSort::Recency => "Recent",
         };
-        let mut chips = div().flex().flex_wrap().gap_1().items_center();
+        let mut chips = div()
+            .debug_selector(|| "refs-chips".into())
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .items_center();
         for (i, f) in self.query.also.iter().enumerate() {
             let id = f.clone();
             let title = self
@@ -2624,6 +2758,7 @@ impl PageView {
             chips = chips.child(
                 div()
                     .id(("filter", i))
+                    .debug_selector(move || format!("filter-chip-{i}"))
                     .px_2()
                     .rounded_md()
                     .text_size(px(crate::theme::CAPTION_SIZE))
@@ -2639,12 +2774,18 @@ impl PageView {
                     })),
             );
         }
-        for (i, (id, title)) in self.suggestions.iter().enumerate() {
+        for (i, (id, title, count)) in self.suggestions.iter().enumerate() {
             let id = id.clone();
             let t = title.clone();
+            // The chip carries its own count ("Ana Lovelace 3"), so a co-reference can be
+            // judged before it narrows the results.
             chips = chips.child(
                 div()
                     .id(("suggest", i))
+                    .debug_selector(move || format!("suggest-chip-{i}"))
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .px_2()
                     .rounded_md()
                     .text_size(px(crate::theme::CAPTION_SIZE))
@@ -2653,7 +2794,14 @@ impl PageView {
                     .border_color(th.line)
                     .cursor_pointer()
                     .hover(|s| s.bg(th.hover))
-                    .child(format!("+ {title}"))
+                    .child(title.clone())
+                    .child(
+                        div()
+                            .debug_selector(move || format!("suggest-count-{i}-{count}"))
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.faint)
+                            .child(count.to_string()),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.query.also.push(id.clone());
                         this.filter_titles.insert(id.clone(), t.clone());
@@ -2663,7 +2811,28 @@ impl PageView {
                     })),
             );
         }
+        let (date_label, date_key) = match self.query.since {
+            None => ("Any time".to_string(), "any-time"),
+            Some(d) => {
+                let today = self.app.read(cx).store.today();
+                (
+                    format!("Last {} days", (today - d).num_days() + 1),
+                    match (today - d).num_days() + 1 {
+                        7 => "last-7-days",
+                        30 => "last-30-days",
+                        _ => "custom",
+                    },
+                )
+            }
+        };
+        let sort_key = match self.query.sort {
+            RefSort::Title => "title",
+            RefSort::Recency => "recent",
+        };
+        let date_open = self.controls_menu == Some(ControlMenu::Date);
+        let sort_open = self.controls_menu == Some(ControlMenu::Sort);
         div()
+            .debug_selector(|| "refs-controls".into())
             .flex()
             .flex_col()
             .gap_1()
@@ -2671,12 +2840,19 @@ impl PageView {
             .pb_2()
             .child(
                 div()
+                    .debug_selector(|| "refs-control-row".into())
                     .flex()
                     .items_center()
                     .gap_2()
                     .child(
                         div()
-                            .flex_1()
+                            .debug_selector(|| "refs-filter".into())
+                            // 240 px is the preferred width; in the 380 px sidebar or a
+                            // narrow split the field gives way so the menu buttons stay
+                            // reachable instead of being clipped (LR-1).
+                            .w(px(REF_FILTER_WIDTH))
+                            .min_w(px(REF_FILTER_MIN_WIDTH))
+                            .whitespace_nowrap()
                             .px_2()
                             .border_1()
                             .border_color(th.line)
@@ -2684,44 +2860,175 @@ impl PageView {
                             .text_size(px(crate::theme::BODY_SIZE))
                             .child(self.filter.clone()),
                     )
-                    .child({
-                        let label = match self.query.since {
-                            None => "Any time".to_string(),
-                            Some(d) => {
-                                let today = self.app.read(cx).store.today();
-                                format!("Last {} days", (today - d).num_days() + 1)
-                            }
-                        };
-                        quiet_menu("date-filter", label, &th).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                // Any time → last 7 days → last 30 days → any time.
-                                let today = this.app.read(cx).store.today();
-                                let span = this.query.since.map(|d| (today - d).num_days() + 1);
-                                this.query.since = match span {
-                                    None => today.checked_sub_days(chrono::Days::new(6)),
-                                    Some(7) => today.checked_sub_days(chrono::Days::new(29)),
-                                    _ => None,
-                                };
-                                this.refs_key = None;
-                                this.dirty = true;
-                                cx.notify();
-                            },
-                        ))
-                    })
-                    .child(quiet_menu("sort", sort_label, &th).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.query.sort = match this.query.sort {
-                                RefSort::Title => RefSort::Recency,
-                                RefSort::Recency => RefSort::Title,
-                            };
-                            this.refs_key = None;
-                            this.dirty = true;
-                            cx.notify();
-                        },
-                    ))),
+                    .child(
+                        div()
+                            .relative()
+                            .flex_none()
+                            .child(
+                                quiet_menu("date-filter", date_label, &th)
+                                    .debug_selector(move || format!("refs-date-menu-{date_key}"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.controls_menu = if date_open {
+                                            None
+                                        } else {
+                                            Some(ControlMenu::Date)
+                                        };
+                                        cx.notify();
+                                    })),
+                            )
+                            .children(date_open.then(|| {
+                                deferred(
+                                    anchored()
+                                        .anchor(Corner::TopLeft)
+                                        .offset(point(px(0.), px(6.)))
+                                        .child(self.controls_menu_popup(ControlMenu::Date, cx)),
+                                )
+                                .with_priority(1)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .flex_none()
+                            .child(
+                                quiet_menu("sort", sort_label, &th)
+                                    .debug_selector(move || format!("refs-sort-menu-{sort_key}"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.controls_menu = if sort_open {
+                                            None
+                                        } else {
+                                            Some(ControlMenu::Sort)
+                                        };
+                                        cx.notify();
+                                    })),
+                            )
+                            .children(sort_open.then(|| {
+                                deferred(
+                                    anchored()
+                                        .anchor(Corner::TopLeft)
+                                        .offset(point(px(0.), px(6.)))
+                                        .child(self.controls_menu_popup(ControlMenu::Sort, cx)),
+                                )
+                                .with_priority(1)
+                            })),
+                    ),
             )
             .child(chips)
             .into_any_element()
+    }
+
+    /// The menu behind a reference control (LR-1): plain choices, the current one marked.
+    fn controls_menu_popup(
+        &self,
+        menu: ControlMenu,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let th = theme(cx).clone();
+        let today = self.app.read(cx).store.today();
+        let date_span = self.query.since.map(|d| (today - d).num_days() + 1);
+        let items = match menu {
+            ControlMenu::Date => vec![
+                ControlChoice {
+                    selector: "refs-date-option-any-time",
+                    label: "Any time",
+                    days: None,
+                    sort: None,
+                    selected: date_span.is_none(),
+                },
+                ControlChoice {
+                    selector: "refs-date-option-last-7-days",
+                    label: "Last 7 days",
+                    days: Some(7),
+                    sort: None,
+                    selected: date_span == Some(7),
+                },
+                ControlChoice {
+                    selector: "refs-date-option-last-30-days",
+                    label: "Last 30 days",
+                    days: Some(30),
+                    sort: None,
+                    selected: date_span == Some(30),
+                },
+            ],
+            ControlMenu::Sort => vec![
+                ControlChoice {
+                    selector: "refs-sort-option-title",
+                    label: "Title",
+                    days: None,
+                    sort: Some(RefSort::Title),
+                    selected: self.query.sort == RefSort::Title,
+                },
+                ControlChoice {
+                    selector: "refs-sort-option-recent",
+                    label: "Recent",
+                    days: None,
+                    sort: Some(RefSort::Recency),
+                    selected: self.query.sort == RefSort::Recency,
+                },
+            ],
+        };
+        let rows = items.into_iter().map(|choice| {
+            let ControlChoice {
+                selector,
+                label,
+                days,
+                sort,
+                selected,
+            } = choice;
+            div()
+                .id(selector)
+                .debug_selector(|| selector.into())
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .text_size(px(crate::theme::CONTROL_SIZE))
+                .text_color(th.text)
+                .cursor_pointer()
+                .hover(|s| s.bg(th.hover))
+                .child(label)
+                .child(if selected {
+                    div().text_color(th.accent).child("✓")
+                } else {
+                    div()
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(days) = days {
+                        this.query.since = this
+                            .app
+                            .read(cx)
+                            .store
+                            .today()
+                            .checked_sub_days(chrono::Days::new(days - 1));
+                    } else if let Some(sort) = sort {
+                        this.query.sort = sort;
+                    } else {
+                        this.query.since = None;
+                    }
+                    this.controls_menu = None;
+                    this.refs_key = None;
+                    this.dirty = true;
+                    cx.notify();
+                }))
+        });
+        div()
+            .id("refs-menu-popup")
+            .debug_selector(|| "refs-menu-popup".into())
+            .occlude()
+            .w(px(160.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .bg(th.surface)
+            .border_1()
+            .border_color(th.line)
+            .rounded_md()
+            .shadow_md()
+            .children(rows)
     }
 
     fn render_item(
@@ -3056,11 +3363,15 @@ impl PageView {
                 .border_t_1()
                 .border_color(th.line)
                 .flex()
-                .justify_between()
+                .items_center()
+                .gap_2()
                 .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.muted)
-                .child(title)
-                .child(count.to_string())
+                .child(div().debug_selector(|| "refs-title".into()).child(title))
+                .child(
+                    crate::theme::count_chip(count, &th)
+                        .debug_selector(move || format!("refs-count-{count}")),
+                )
                 .into_any_element(),
             Item::RefsControls => self.render_controls(cx),
             Item::GroupHeader {
@@ -3072,18 +3383,31 @@ impl PageView {
                 div()
                     .id(("group", ix))
                     .flex()
-                    .justify_between()
+                    .items_center()
                     .mx_2()
                     .px_2()
                     .pt_2()
                     .rounded_sm()
                     .cursor_pointer()
                     .hover(|s| s.bg(th.hover))
+                    // The count follows the name as a chip (LR-2), and there are no icons in
+                    // the header: the title and its count are enough.
                     .child(
                         div()
                             .flex()
                             .gap_2()
-                            .items_baseline()
+                            .items_center()
+                            .child(
+                                div()
+                                    .debug_selector(|| format!("group-title-{ix}"))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(th.accent)
+                                    .child(page.title.clone()),
+                            )
+                            .child(
+                                crate::theme::count_chip(count, &th)
+                                    .debug_selector(|| format!("group-count-{ix}-{count}")),
+                            )
                             .when(scheduled, |d| {
                                 d.child(
                                     div()
@@ -3091,19 +3415,7 @@ impl PageView {
                                         .text_color(th.tag)
                                         .child("Scheduled for this day"),
                                 )
-                            })
-                            .child(
-                                div()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(th.accent)
-                                    .child(page.title.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.muted)
-                            .child(count.to_string()),
+                            }),
                     )
                     .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                         this.editor.update(cx, |ed, cx| ed.end(cx));
@@ -3116,13 +3428,12 @@ impl PageView {
                     }))
                     .into_any_element()
             }
-            Item::Hit(hit) => {
-                let crumbs = hit
-                    .breadcrumb
-                    .iter()
-                    .map(|(_, t)| t.chars().take(30).collect::<String>())
-                    .collect::<Vec<_>>()
-                    .join(" › ");
+            Item::Hit {
+                hit,
+                page_title,
+                children,
+                hidden,
+            } => {
                 let page = hit.page.clone();
                 let block = hit.block.clone();
                 let text = self.render_rich(
@@ -3133,6 +3444,112 @@ impl PageView {
                     0,
                     cx,
                 );
+                // LR-3: the full path above the block, page first, each part clickable. A
+                // block that sits directly on its page has no ancestors, and the group header
+                // right above already names that page, so it gets no path line.
+                let path = (!hit.breadcrumb.is_empty()).then(|| {
+                    let mut line = div()
+                        .debug_selector(|| format!("hit-path-{ix}"))
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_1()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.faint);
+                    let target = page.clone();
+                    line = line.child(
+                        div()
+                            .id(SharedString::from(format!("path-page-{ix}")))
+                            .debug_selector(|| format!("hit-path-part-{ix}-0"))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(th.accent))
+                            .child(page_title.clone())
+                            .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                                // The hit row under the path opens the block; the page part
+                                // opens the page itself.
+                                cx.stop_propagation();
+                                this.editor.update(cx, |ed, cx| ed.end(cx));
+                                cx.emit(PageViewEvent::Open {
+                                    page: target.clone(),
+                                    zoom: None,
+                                    focus: None,
+                                    sidebar: e.modifiers().shift,
+                                });
+                            })),
+                    );
+                    for (i, (ancestor, caption)) in hit.breadcrumb.iter().enumerate() {
+                        let label: String = caption.chars().take(40).collect();
+                        let label = if label.is_empty() {
+                            "(empty)".to_string()
+                        } else {
+                            label
+                        };
+                        let target = page.clone();
+                        let ancestor = ancestor.clone();
+                        line = line.child(div().child("›")).child(
+                            div()
+                                .id(SharedString::from(format!("path-part-{ix}-{i}")))
+                                .debug_selector(|| format!("hit-path-part-{ix}-{}", i + 1))
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(th.accent))
+                                .child(label)
+                                .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.editor.update(cx, |ed, cx| ed.end(cx));
+                                    cx.emit(PageViewEvent::Open {
+                                        page: target.clone(),
+                                        zoom: None,
+                                        focus: Some(ancestor.clone()),
+                                        sidebar: e.modifiers().shift,
+                                    });
+                                })),
+                        );
+                    }
+                    line.into_any_element()
+                });
+                // LR-4: the first children inline, then a chip that opens the rest. The
+                // list is built in `rebuild`, so this only lays out what the index returned.
+                let mut kids = div().flex().flex_col();
+                for (i, (child, child_text)) in children.iter().enumerate() {
+                    let rendered = self.render_rich(
+                        child_text,
+                        child,
+                        None,
+                        crate::appearance::density(cx).line_height(),
+                        0,
+                        cx,
+                    );
+                    kids = kids.child(
+                        div()
+                            .debug_selector(|| format!("hit-child-{ix}-{i}"))
+                            .flex()
+                            .ml(px(14.))
+                            .child(div().w(px(14.)).text_color(th.bullet).child("•"))
+                            .child(div().flex_1().min_w_0().child(rendered)),
+                    );
+                }
+                let more = (hidden > 0).then(|| {
+                    let block = block.clone();
+                    div()
+                        .id(SharedString::from(format!("hit-more-{ix}")))
+                        .debug_selector(|| format!("hit-more-{ix}-{hidden}"))
+                        .ml(px(28.))
+                        .px_2()
+                        .rounded_md()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.accent)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(th.hover))
+                        .child(format!("+{hidden} more"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // The chip is inside the hit row, whose click opens the block.
+                            cx.stop_propagation();
+                            this.expanded_children.insert(block.clone());
+                            this.dirty = true;
+                            cx.notify();
+                        }))
+                });
+
                 div()
                     .id(("hit", ix))
                     .px_6()
@@ -3140,14 +3557,7 @@ impl PageView {
                     .flex()
                     .flex_col()
                     .cursor_pointer()
-                    .when(!crumbs.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .text_size(px(crate::theme::CAPTION_SIZE))
-                                .text_color(th.faint)
-                                .child(format!("› {crumbs}")),
-                        )
-                    })
+                    .children(path)
                     .child(
                         div()
                             .flex()
@@ -3162,6 +3572,8 @@ impl PageView {
                                     .child(text),
                             ),
                     )
+                    .when(!children.is_empty(), |d| d.child(kids))
+                    .children(more)
                     .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                         this.editor.update(cx, |ed, cx| ed.end(cx));
                         cx.emit(PageViewEvent::Open {
@@ -3199,21 +3611,45 @@ impl PageView {
                 .border_t_1()
                 .border_color(th.line)
                 .flex()
-                .justify_between()
+                .items_center()
+                .gap_2()
                 .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.muted)
                 .cursor_pointer()
                 .hover(|s| s.text_color(th.text))
-                .child(format!(
-                    "{} Unlinked References",
-                    if open { "▾" } else { "▸" }
-                ))
-                .child(count.map(|c| c.to_string()).unwrap_or_default())
+                .child(
+                    div()
+                        .debug_selector(move || format!("unlinked-arrow-{open}"))
+                        .child(if open { "▾" } else { "▸" }),
+                )
+                .child(div().child("Unlinked References"))
+                .children(count.map(|c| {
+                    crate::theme::count_chip(c, &th)
+                        .debug_selector(move || format!("unlinked-count-{c}"))
+                }))
+                .child(div().flex_1())
+                .children(count.filter(|c| *c > 0).map(|_| {
+                    quiet_control("link-all", "Link all", &th)
+                        .debug_selector(|| "link-all".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            // The header itself toggles the section.
+                            cx.stop_propagation();
+                            this.promote_all(cx);
+                        }))
+                }))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.unlinked_open = !this.unlinked_open;
                     this.dirty = true;
                     cx.notify();
                 }))
+                .into_any_element(),
+            Item::NoMentions => div()
+                .debug_selector(|| "unlinked-empty".into())
+                .px_6()
+                .py_0p5()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.faint)
+                .child("No unlinked mentions")
                 .into_any_element(),
             Item::Mention(m) => {
                 let th2 = th.clone();
@@ -3290,6 +3726,11 @@ fn start_note(
     if let Some(block) = reuse {
         return Ok(block);
     }
+    if store.is_draft(page) {
+        // A journal template already gave the draft blocks: adding the row the caret goes
+        // to must not write the day, so it lives in the draft's memory until a keystroke.
+        return store.draft_append_block(page);
+    }
     if !has_roots {
         return store.ensure_first_block(page);
     }
@@ -3313,6 +3754,16 @@ fn start_note(
     Ok(id)
 }
 
+/// PG-1's one classification of page metadata: a root `key:: value` block is an attribute,
+/// except a code block — the index never records code as an attribute (`attr_row` is skipped
+/// for `BlockKind::Code`), so `std::cout << …` stays a code block and not a `std` key.
+fn page_attribute(kind: BlockKind, text: &str) -> Option<(String, std::ops::Range<usize>)> {
+    if kind == BlockKind::Code {
+        return None;
+    }
+    utopia_core::inline::attribute(text)
+}
+
 /// PG-1 folds a root `key:: value` block into one compact row and hides its children, so
 /// its subtree is not drawn. The subtree holding `editing` stays open: the row that holds
 /// the editor — and its focus handle — must always be rendered, or every keystroke after
@@ -3332,7 +3783,7 @@ fn is_folded_attribute(
     let Some(block) = st.block(id) else {
         return false;
     };
-    if utopia_core::inline::attribute(&block.text).is_none() {
+    if page_attribute(block.kind, &block.text).is_none() {
         return false;
     }
     match editing {
@@ -3364,7 +3815,7 @@ fn push_page_rows(
         folded = None;
         let Some(b) = st.block(&id) else { continue };
         if compact_attributes && is_folded_attribute(st, true, editing, &id) {
-            if let Some((key, value)) = utopia_core::inline::attribute(&b.text) {
+            if let Some((key, value)) = page_attribute(b.kind, &b.text) {
                 let children = st.live_children(Some(&id)).len();
                 out.push(Item::Attribute {
                     depth,
@@ -3676,6 +4127,13 @@ fn push_with_embeds(
 
 impl Render for PageView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Settings -> Appearance can change this while a page is open. The rows carry the
+        // children, so a change means one rebuild (LR-4).
+        let limit = crate::appearance::ref_children(cx);
+        if limit != self.ref_children_limit {
+            self.ref_children_limit = limit;
+            self.dirty = true;
+        }
         self.rebuild_if_dirty(cx);
         let th = theme(cx).clone();
         let view = cx.entity();

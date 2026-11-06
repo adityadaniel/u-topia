@@ -51,8 +51,22 @@ impl Store {
 
     /// Plain-text mentions of the page's title or aliases outside any reference, in
     /// other pages' live blocks (FR-3.9). Found through FTS, confirmed by the parser.
+    /// This form makes pending edits durable first, so it must not run in a render path:
+    /// use [`Store::unlinked_references_now`] for that.
     pub fn unlinked_references(&mut self, page: &PageId) -> Result<Vec<Mention>> {
         self.sync_index()?;
+        self.unlinked_mentions(page)
+    }
+
+    /// The same mentions, read from the index as it stands: no flush and no wait for the
+    /// writer (LR-5, rule 10). The answer can lag one commit; the caller runs it again when
+    /// the index reports it is durable.
+    pub fn unlinked_references_now(&mut self, page: &PageId) -> Result<Vec<Mention>> {
+        self.read_barrier()?;
+        self.unlinked_mentions(page)
+    }
+
+    fn unlinked_mentions(&mut self, page: &PageId) -> Result<Vec<Mention>> {
         let st = self.page_state(page)?.clone();
         let mut names = vec![display_title(&st, &self.date_format)];
         names.extend(st.meta.aliases.iter().cloned());
@@ -127,6 +141,64 @@ impl Store {
         )?;
         self.seal_undo();
         Ok(())
+    }
+
+    /// "Link all" (LR-5): rewrite every unlinked mention of `page` as a link, in one undo
+    /// step and one transaction. Mentions inside one block are rewritten from the end back,
+    /// so the byte offsets of earlier ones stay valid.
+    pub fn promote_all_mentions(&mut self, page: &PageId) -> Result<usize> {
+        self.sync_index()?;
+        let target = self.page_state(page)?.clone();
+        let title = display_title(&target, &self.date_format);
+        let insert = page_link_text(&title, false);
+        let mentions = self.unlinked_references(page)?;
+        if mentions.is_empty() {
+            return Ok(0);
+        }
+        let mut steps: std::collections::BTreeMap<
+            PageId,
+            std::collections::BTreeMap<BlockId, Vec<Range<usize>>>,
+        > = std::collections::BTreeMap::new();
+        for m in &mentions {
+            steps
+                .entry(m.page.clone())
+                .or_default()
+                .entry(m.block.clone())
+                .or_default()
+                .push(m.range.clone());
+        }
+        let mut page_steps = Vec::with_capacity(steps.len());
+        let mut linked = 0;
+        for (src_page, blocks) in steps {
+            let mut cmds = Vec::new();
+            for (block, mut ranges) in blocks {
+                // A title and one of its aliases can match the same words ("New York" and
+                // "York"), so the list holds overlapping ranges. Keep the earliest, longest
+                // span and drop anything that overlaps it: two edits over the same bytes
+                // would rewrite each other's replacements.
+                ranges.sort_by_key(|r| (r.start, std::cmp::Reverse(r.end)));
+                let mut kept: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+                for range in ranges {
+                    if kept.last().is_none_or(|last| range.start >= last.end) {
+                        kept.push(range);
+                    }
+                }
+                // Apply from the end back so earlier byte offsets stay valid.
+                for range in kept.into_iter().rev() {
+                    linked += 1;
+                    cmds.push(Command::SetBlockText {
+                        id: block.clone(),
+                        edit: utopia_core::TextEdit {
+                            range,
+                            insert: insert.clone(),
+                        },
+                    });
+                }
+            }
+            page_steps.push((src_page, cmds));
+        }
+        self.execute_multi(page_steps, EditOpts::default())?;
+        Ok(linked)
     }
 
     // ---------------------------------------------------------------- aliases UI
@@ -591,19 +663,7 @@ impl Store {
 
     /// OPML export of every live page (v1.1).
     pub fn export_opml(&mut self, path: &Path) -> Result<()> {
-        self.sync_index()?;
-        let mut pages = Vec::new();
-        for row in self.list_pages(true)? {
-            let st = self.page_state(&row.id)?.clone();
-            pages.push((row.title, st));
-        }
-        let refs: Vec<(String, &PageState)> = pages.iter().map(|(t, s)| (t.clone(), s)).collect();
-        if let Some(dir) = path.parent() {
-            if !dir.as_os_str().is_empty() {
-                std::fs::create_dir_all(dir)?;
-            }
-        }
-        std::fs::write(path, utopia_core::markdown::pages_to_opml(&refs))?;
-        Ok(())
+        let snapshot = self.export_snapshot()?;
+        crate::export::write_opml(&snapshot, path)
     }
 }

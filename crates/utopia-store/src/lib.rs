@@ -15,6 +15,7 @@ mod blockquery;
 mod crypt;
 mod doctor;
 mod export;
+pub use export::{write_export, ExportSnapshot};
 mod extras;
 mod pagegraph;
 mod pages;
@@ -228,6 +229,12 @@ impl Store {
     /// the first commit; [`Store::hashtag_only_pages`] computes and returns it directly.
     pub fn tag_pages(&self) -> Option<HashSet<PageId>> {
         self.persister.tag_pages()
+    }
+
+    /// How many whole-graph tag classifications the commit path has run (tests, SB-2). One
+    /// is enough: later commits update only the pages they can affect.
+    pub fn tag_page_full_scans(&self) -> u64 {
+        self.persister.tag_scans()
     }
 
     /// How many full tag-page classifications this store's own connection has run. The

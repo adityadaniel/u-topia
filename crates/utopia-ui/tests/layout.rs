@@ -568,6 +568,17 @@ fn setup_refs(
     (cx, ws, target)
 }
 
+/// The list index of the first Linked References hit drawn.
+fn first_hit_ix(cx: &mut VisualTestContext) -> usize {
+    cx.run_until_parked();
+    (0..40)
+        .find(|ix| {
+            let sel: &'static str = Box::leak(format!("hit-{ix}").into_boxed_str());
+            cx.debug_bounds(sel).is_some()
+        })
+        .expect("a linked reference was rendered")
+}
+
 /// The first Linked References hit drawn (its list index depends on what sits above it).
 /// Each test opens a fresh window, so no stale bounds from an earlier frame can match.
 fn first_hit(cx: &mut VisualTestContext) -> Bounds<Pixels> {
@@ -2047,4 +2058,582 @@ fn starting_a_note_on_an_attribute_only_day_appends_a_block(cx: &mut TestAppCont
             .collect();
         assert_eq!(texts, vec!["status:: x".to_string(), "note".to_string()]);
     });
+}
+
+/// A graph whose "Target" page has two referencing blocks, one of them also mentioning "Ana
+/// Lovelace", so the reference controls offer a co-reference chip with a count (LR-1).
+fn setup_ref_controls(
+    cx: &mut TestAppContext,
+) -> (&mut VisualTestContext, Entity<Workspace>, PageId) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let target = store.create_page("Target").unwrap();
+    store.create_page("Ana Lovelace").unwrap();
+    let src = store.create_page("Source").unwrap();
+    let b = store.ensure_first_block(&src).unwrap();
+    store
+        .set_block_text(
+            &src,
+            &b,
+            "A note about [[Target]] with [[Ana Lovelace]]",
+            None,
+            None,
+        )
+        .unwrap();
+    store.commit_block(&src, &b).unwrap();
+    let plan = utopia_core::outline::append_block(store.page_state(&src).unwrap(), None);
+    let b2 = store.execute_plan(&src, plan, None).unwrap().unwrap().block;
+    store
+        .set_block_text(&src, &b2, "Another note about [[Target]] alone", None, None)
+        .unwrap();
+    store.commit_block(&src, &b2).unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    (cx, ws, target)
+}
+
+/// LR-1: one control row — a 240 px filter field, then the date and sort menus as buttons —
+/// and the co-reference chips (with their counts) wrapping on the line below it.
+#[gpui::test]
+fn reference_controls_are_one_row_with_chips_below(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_controls(cx);
+    let filter = bounds(cx, "refs-filter");
+    let row = bounds(cx, "refs-control-row");
+    let date = bounds(cx, "refs-date-menu-any-time");
+    let sort = bounds(cx, "refs-sort-menu-title");
+    assert!(
+        approx(filter.size.width, 240.),
+        "a 240 px field: {filter:?}"
+    );
+    assert!(
+        approx(
+            date.origin.y + date.size.height / 2.,
+            f32::from(row.origin.y) + f32::from(row.size.height) / 2.
+        ),
+        "the date menu sits on the same row as the field: {date:?} {row:?}"
+    );
+    assert!(
+        date.origin.x >= filter.origin.x + filter.size.width,
+        "after the field: {date:?} {filter:?}"
+    );
+    assert!(sort.origin.x >= date.origin.x + date.size.width, "{sort:?}");
+    // Both are quiet control buttons (ALL-3): the same compact height, not a form field.
+    assert!(
+        approx(sort.size.height, f32::from(date.size.height)) && sort.size.height <= px(34.),
+        "compact menu buttons: {sort:?} {date:?}"
+    );
+    let chips = bounds(cx, "refs-chips");
+    let chip = bounds(cx, "suggest-chip-0");
+    assert!(
+        chips.origin.y >= row.origin.y + row.size.height - px(0.5),
+        "co-reference chips wrap onto the next line: {chips:?} {row:?}"
+    );
+    assert!(
+        chip.origin.y >= row.origin.y + row.size.height - px(0.5),
+        "a chip is below the control row: {chip:?}"
+    );
+}
+
+/// ALL-3/LR-1: the filter menus float over the page. Opening one must not move the controls
+/// or the references under them.
+#[gpui::test]
+fn a_reference_menu_floats_without_moving_the_layout(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_controls(cx);
+    let row_before = bounds(cx, "refs-control-row");
+    let hit_before = first_hit(cx);
+    assert!(
+        cx.debug_bounds("refs-menu-popup").is_none(),
+        "no menu until the control is clicked"
+    );
+    let date = bounds(cx, "refs-date-menu-any-time");
+    cx.simulate_click(date.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let popup = bounds(cx, "refs-menu-popup");
+    assert!(
+        popup.origin.y >= date.origin.y + date.size.height - px(1.),
+        "the menu opens below its control: {popup:?} {date:?}"
+    );
+    assert!(
+        approx(
+            row_before.origin.y,
+            f32::from(bounds(cx, "refs-control-row").origin.y)
+        ) && approx(hit_before.origin.y, f32::from(first_hit(cx).origin.y)),
+        "opening the menu takes no space in the column"
+    );
+    // Picking a choice applies it (the label and its state change) and closes the menu.
+    let option = bounds(cx, "refs-date-option-last-7-days");
+    cx.simulate_click(option.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    bounds(cx, "refs-date-menu-last-7-days");
+    let sort = bounds(cx, "refs-sort-menu-title");
+    cx.simulate_click(sort.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let recent = bounds(cx, "refs-sort-option-recent");
+    cx.simulate_click(recent.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    bounds(cx, "refs-sort-menu-recent");
+}
+/// ALL-3 follow-up: the page menu is drawn over the page, so it must also take the clicks
+/// meant for it. Without `occlude` the "Delete page" item is visible but never fires (found
+/// while building the reference menus).
+#[gpui::test]
+fn page_menu_items_take_their_clicks(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_refs(cx, false);
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let delete = bounds(cx, "page-menu-delete");
+    cx.simulate_click(delete.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let app = ws.update(cx, |w, _| w.app().clone());
+    let deleted = app.update(cx, |app, _| {
+        app.store
+            .page_row(&target)
+            .unwrap()
+            .is_some_and(|r| r.deleted_at.is_some())
+    });
+    assert!(deleted, "the danger item deleted the page it belongs to");
+}
+
+/// The first `group-title-{ix}` and its count chip, by trying list indices.
+fn first_group(cx: &mut VisualTestContext) -> (Bounds<Pixels>, Bounds<Pixels>) {
+    cx.run_until_parked();
+    (0..40)
+        .find_map(|ix| {
+            let title: &'static str = Box::leak(format!("group-title-{ix}").into_boxed_str());
+            let title = cx.debug_bounds(title)?;
+            // The count is in the selector, so try the counts a small graph can have.
+            (1..=9).find_map(|n| {
+                let count: &'static str =
+                    Box::leak(format!("group-count-{ix}-{n}").into_boxed_str());
+                Some((title, cx.debug_bounds(count)?))
+            })
+        })
+        .expect("a referencing group was rendered")
+}
+
+/// LR-2: the count is a small chip right after the page or day name, not a number pushed to
+/// the far edge of the row.
+#[gpui::test]
+fn reference_counts_sit_next_to_the_name(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_controls(cx);
+    let title = bounds(cx, "refs-title");
+    let count = bounds(cx, "refs-count-2");
+    let header = bounds(cx, "refs-header");
+    assert!(
+        count.origin.x >= title.origin.x + title.size.width - px(1.),
+        "the count follows the title: {count:?} {title:?}"
+    );
+    assert!(
+        count.origin.x - (title.origin.x + title.size.width) < px(16.),
+        "and sits right next to it: {count:?} {title:?}"
+    );
+    assert!(
+        approx(
+            count.origin.y + count.size.height / 2.,
+            f32::from(title.origin.y) + f32::from(title.size.height) / 2.
+        ),
+        "on the same line: {count:?} {title:?}"
+    );
+    assert!(
+        count.origin.x + count.size.width < header.origin.x + header.size.width - px(200.),
+        "not at the far edge: {count:?} {header:?}"
+    );
+
+    let (group, group_count) = first_group(cx);
+    assert!(
+        group_count.origin.x >= group.origin.x + group.size.width - px(1.),
+        "the group's count follows its name: {group_count:?} {group:?}"
+    );
+    assert!(
+        group_count.origin.x - (group.origin.x + group.size.width) < px(16.),
+        "right next to it: {group_count:?} {group:?}"
+    );
+}
+
+/// "Atlas Launch" → heading "Risks" → a block that links to "Target", so the reference has a
+/// path above it.
+fn setup_nested_refs(
+    cx: &mut TestAppContext,
+) -> (
+    &mut VisualTestContext,
+    Entity<Workspace>,
+    PageId,
+    Vec<utopia_core::BlockId>,
+) {
+    use utopia_core::{BlockKind, Command};
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let target = store.create_page("Target").unwrap();
+    let atlas = store.create_page("Atlas Launch").unwrap();
+    let risks = utopia_core::BlockId::new();
+    let risky = utopia_core::BlockId::new();
+    let mut cmds = vec![
+        Command::InsertBlock {
+            id: risks.clone(),
+            parent: None,
+            after: None,
+            text: "Risks".into(),
+            kind: BlockKind::Heading(2),
+        },
+        Command::InsertBlock {
+            id: risky.clone(),
+            parent: Some(risks.clone()),
+            after: None,
+            text: "The beta date depends on [[Target]]".into(),
+            kind: BlockKind::Bullet,
+        },
+    ];
+    // Four children under the referencing block, for the inline-children limit (LR-4).
+    let mut after = None;
+    for n in 1..=4 {
+        let id = utopia_core::BlockId::new();
+        cmds.push(Command::InsertBlock {
+            id: id.clone(),
+            parent: Some(risky.clone()),
+            after: after.clone(),
+            text: format!("Reason {n}"),
+            kind: BlockKind::Bullet,
+        });
+        after = Some(id);
+    }
+    store.execute(&atlas, cmds, Default::default()).unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    (cx, ws, target, vec![risks, risky])
+}
+
+/// LR-3: a referencing block nested under "Risks" shows "Atlas Launch › Risks" as one caption
+/// line above it, and each part is its own click target.
+#[gpui::test]
+fn reference_shows_the_full_path_above_the_block(cx: &mut TestAppContext) {
+    let (cx, _, _, _) = setup_nested_refs(cx);
+    let hit = first_hit(cx);
+    cx.run_until_parked();
+    let (page, ancestor) = (0..40)
+        .find_map(|ix| {
+            let page: &'static str = Box::leak(format!("hit-path-part-{ix}-0").into_boxed_str());
+            let ancestor: &'static str =
+                Box::leak(format!("hit-path-part-{ix}-1").into_boxed_str());
+            Some((cx.debug_bounds(page)?, cx.debug_bounds(ancestor)?))
+        })
+        .expect("a path above the reference");
+    let path = cx
+        .debug_bounds("hit-path-7")
+        .or_else(|| {
+            (0..40).find_map(|ix| {
+                let sel: &'static str = Box::leak(format!("hit-path-{ix}").into_boxed_str());
+                cx.debug_bounds(sel)
+            })
+        })
+        .expect("a path line was rendered");
+    assert!(
+        path.origin.y + path.size.height <= hit.origin.y + px(0.5),
+        "the path sits above the block: {path:?} {hit:?}"
+    );
+    assert!(
+        path.size.height <= px(24.),
+        "one 12.5 px line, not a stacked crumb list: {path:?}"
+    );
+    assert!(
+        ancestor.origin.x >= page.origin.x + page.size.width - px(1.),
+        "the ancestor follows the page name: {ancestor:?} {page:?}"
+    );
+    assert!(
+        approx(page.origin.y, f32::from(ancestor.origin.y)),
+        "both parts on the same line: {page:?} {ancestor:?}"
+    );
+    let (left, right) = column(cx);
+    assert!(
+        f32::from(page.origin.x) >= left
+            && f32::from(ancestor.origin.x + ancestor.size.width) <= right + 0.5,
+        "the path stays inside the column: {path:?} ({left}, {right})"
+    );
+}
+
+/// LR-4: a reference shows the first two children inline and folds the rest behind a
+/// "+N more" chip, which opens them. The numbers come from the index, not the paint.
+#[gpui::test]
+fn reference_children_are_inline_up_to_the_limit(cx: &mut TestAppContext) {
+    let (cx, _, _, _) = setup_nested_refs(cx);
+    let ix = first_hit_ix(cx);
+    let first: &'static str = Box::leak(format!("hit-child-{ix}-0").into_boxed_str());
+    let second: &'static str = Box::leak(format!("hit-child-{ix}-1").into_boxed_str());
+    let third: &'static str = Box::leak(format!("hit-child-{ix}-2").into_boxed_str());
+    let hit = first_hit(cx);
+    let first = bounds(cx, first);
+    let second = bounds(cx, second);
+    assert!(
+        first.origin.y >= hit.origin.y + hit.size.height - px(0.5),
+        "children sit under their block: {first:?} {hit:?}"
+    );
+    assert!(
+        second.origin.y > first.origin.y,
+        "and stack in outline order: {first:?} {second:?}"
+    );
+    assert!(
+        first.origin.x >= hit.origin.x - px(0.5) && first.origin.x <= hit.origin.x + px(20.),
+        "children line up under the block's text, not its bullet: {first:?} {hit:?}"
+    );
+    assert!(
+        cx.debug_bounds(third).is_none(),
+        "only two are shown by default"
+    );
+    let more: &'static str = Box::leak(format!("hit-more-{ix}-2").into_boxed_str());
+    let chip = bounds(cx, more);
+    assert!(
+        chip.origin.y >= second.origin.y + second.size.height - px(0.5),
+        "the chip follows the shown children: {chip:?} {second:?}"
+    );
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let third = bounds(cx, third);
+    assert!(
+        third.origin.y >= second.origin.y + second.size.height - px(0.5),
+        "the chip opened the rest, in order: {third:?} {second:?}"
+    );
+}
+
+/// LR-1: clicking a co-reference chip narrows the references and the choice becomes a filled
+/// chip on the same line; clicking it again widens them back.
+#[gpui::test]
+fn selecting_a_co_reference_chip_filters_and_fills(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_controls(cx);
+    assert!(
+        cx.debug_bounds("filter-chip-0").is_none(),
+        "nothing is selected yet"
+    );
+    let chip = bounds(cx, "suggest-chip-0");
+    let chips = bounds(cx, "refs-chips");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let selected = bounds(cx, "filter-chip-0");
+    assert!(
+        selected.origin.y >= chips.origin.y - px(0.5),
+        "the selected chip joins the chips line: {selected:?} {chips:?}"
+    );
+    // One of the two references also mentions Ana, so the list narrowed to one.
+    bounds(cx, "refs-count-1");
+    let selected = bounds(cx, "filter-chip-0");
+    cx.simulate_click(selected.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    bounds(cx, "refs-count-2");
+}
+
+/// LR-1 review fix: the reference controls also render in the 380 px right sidebar. The
+/// filter field keeps 240 px as its preferred width but must give way instead of pushing
+/// the menu buttons past the pane.
+#[gpui::test]
+fn reference_controls_fit_the_sidebar_pane(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_ref_controls(cx);
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, None, true, window, cx)
+    });
+    let side = bounds(cx, "right-sidebar");
+    let row = bounds(cx, "refs-control-row");
+    assert!(
+        row.origin.x >= side.origin.x && row.origin.x + row.size.width <= side.right() + px(0.5),
+        "the control row stays inside the sidebar: {row:?} {side:?}"
+    );
+    let sort = bounds(cx, "refs-sort-menu-title");
+    assert!(
+        sort.origin.x + sort.size.width <= side.right() + px(0.5),
+        "the sort menu is still reachable: {sort:?} {side:?}"
+    );
+    assert!(
+        approx(
+            row.size.height,
+            f32::from(bounds(cx, "refs-date-menu-any-time").size.height)
+        ),
+        "the controls stay on one line instead of wrapping: {row:?}"
+    );
+}
+
+/// LR-1 review fix: a split pane can be narrower than the sidebar. The row must fit there
+/// too, with all three controls still on it.
+#[gpui::test]
+fn reference_controls_fit_a_narrow_split_pane(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_ref_controls(cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    ws.update_in(cx, |w, window, cx| w.open_split(target, window, cx));
+    cx.simulate_resize(size(px(900.), px(700.)));
+    cx.run_until_parked();
+    let split = bounds(cx, "split-0");
+    let row = bounds(cx, "refs-control-row");
+    assert!(
+        row.origin.x >= split.origin.x && row.origin.x + row.size.width <= split.right() + px(0.5),
+        "the control row stays inside the split: {row:?} {split:?}"
+    );
+    let filter = bounds(cx, "refs-filter");
+    assert!(
+        filter.size.width < px(240.),
+        "the field shrank to make room: {filter:?} {split:?}"
+    );
+    let sort = bounds(cx, "refs-sort-menu-title");
+    assert!(
+        sort.origin.x + sort.size.width <= split.right() + px(0.5),
+        "{sort:?} {split:?}"
+    );
+}
+
+/// A graph where one hit mentions "Ana Lovelace" twice and another once: the co-reference
+/// chip must count the two hits it selects, not the three occurrences of the link (LR-1).
+fn setup_ref_token_counts(
+    cx: &mut TestAppContext,
+) -> (&mut VisualTestContext, Entity<Workspace>, PageId) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let target = store.create_page("Target").unwrap();
+    store.create_page("Ana Lovelace").unwrap();
+    let src = store.create_page("Source").unwrap();
+    let b = store.ensure_first_block(&src).unwrap();
+    store
+        .set_block_text(
+            &src,
+            &b,
+            "[[Target]] with [[Ana Lovelace]] and [[Ana Lovelace]] again",
+            None,
+            None,
+        )
+        .unwrap();
+    store.commit_block(&src, &b).unwrap();
+    let plan = utopia_core::outline::append_block(store.page_state(&src).unwrap(), None);
+    let b2 = store.execute_plan(&src, plan, None).unwrap().unwrap().block;
+    store
+        .set_block_text(
+            &src,
+            &b2,
+            "another [[Target]] with [[Ana Lovelace]]",
+            None,
+            None,
+        )
+        .unwrap();
+    store.commit_block(&src, &b2).unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    (cx, ws, target)
+}
+
+/// LR-1 review fix: a co-reference chip counts the distinct hits it would leave, exactly
+/// like the filter it applies, instead of every occurrence of the link in the text.
+#[gpui::test]
+fn co_reference_counts_match_the_hits_they_select(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_token_counts(cx);
+    // Two hits mention Ana; one of them mentions her twice. The chip says 2, not 3.
+    bounds(cx, "suggest-count-0-2");
+    let chip = bounds(cx, "suggest-chip-0");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    bounds(cx, "refs-count-2");
+}
+
+/// PG-1 review fix: a root code block that happens to contain `::` (C++'s `std::cout`) is a
+/// code block, not page metadata. The projector never indexes code as an attribute, so the
+/// outline and the metadata header must not either.
+#[gpui::test]
+fn code_blocks_are_not_folded_as_attributes(cx: &mut TestAppContext) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    use utopia_store::EditOpts;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+        utopia_ui::appearance::install(cx, &path);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(today()));
+    let page = store.create_page("Cxx").unwrap();
+    let mut prev: Option<BlockId> = None;
+    let mut cmds = Vec::new();
+    for (kind, text) in [
+        (BlockKind::Bullet, "status:: dogfooding"),
+        (BlockKind::Code, "std::cout << \"hello\";"),
+        (BlockKind::Bullet, "An ordinary note"),
+    ] {
+        let id = BlockId::new();
+        cmds.push(Command::InsertBlock {
+            id: id.clone(),
+            parent: None,
+            after: prev.clone(),
+            text: text.to_string(),
+            kind,
+        });
+        prev = Some(id);
+    }
+    store
+        .execute(
+            &page,
+            cmds,
+            EditOpts {
+                no_undo: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    // The real attribute still folds; the code block keeps its own row right after it.
+    bounds(cx, "attr-1");
+    assert!(
+        cx.debug_bounds("content-1").is_none(),
+        "the attribute block is folded away"
+    );
+    bounds(cx, "content-2");
+    assert!(
+        cx.debug_bounds("attr-2").is_none(),
+        "the code block is not an attribute row"
+    );
+    // And the metadata header does not list `std` as a key either.
+    bounds(cx, "meta-status");
+    assert!(
+        cx.debug_bounds("meta-std").is_none(),
+        "a code block is not page metadata"
+    );
 }
