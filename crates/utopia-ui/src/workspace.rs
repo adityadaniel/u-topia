@@ -24,7 +24,7 @@ use crate::page_view::{PageView, PageViewEvent};
 use crate::pdf_view::{PdfEvent, PdfView};
 use crate::quick_jump::{JumpPalette, PaletteMode, QuickJumpEvent};
 use crate::sync_runner::{exchange_owned, status_line, BoxTransport, SyncRunner};
-use crate::theme::theme;
+use crate::theme::{quiet_control, theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InspectorTab {
@@ -1043,7 +1043,7 @@ impl Workspace {
             .py_0p5()
             .rounded_sm()
             .cursor_pointer()
-            .text_sm()
+            .text_size(px(crate::theme::BODY_SIZE))
             .text_color(if active { th.accent } else { th.text })
             .when(active, |d| d.bg(th.hover))
             .hover(|s| s.bg(th.hover))
@@ -1065,7 +1065,7 @@ impl Workspace {
             div()
                 .mt_3()
                 .px_2()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(th.muted)
                 .child(title)
@@ -1092,7 +1092,7 @@ impl Workspace {
             .flex_col()
             .bg(th.sidebar_bg)
             .border_r_1()
-            .border_color(th.border)
+            .border_color(th.line)
             .p_2()
             .child(
                 div()
@@ -1105,31 +1105,12 @@ impl Workspace {
                         div()
                             .flex()
                             .gap_1()
+                            .child(quiet_control("open-jump", "⌘K", &th).on_click(cx.listener(
+                                |this, _, window, cx| this.start_jump(JumpMode::Open, window, cx),
+                            )))
                             .child(
-                                div()
-                                    .id("open-jump")
-                                    .px_1()
-                                    .rounded_sm()
-                                    .text_xs()
-                                    .text_color(th.muted)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(th.hover))
-                                    .child("⌘K")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.start_jump(JumpMode::Open, window, cx)
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("collapse-left")
+                                quiet_control("collapse-left", "«", &th)
                                     .debug_selector(|| "collapse-left".into())
-                                    .px_1()
-                                    .rounded_sm()
-                                    .text_xs()
-                                    .text_color(th.muted)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(th.hover))
-                                    .child("«")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.toggle_left(&ToggleLeftSidebar, window, cx)
                                     })),
@@ -1209,7 +1190,7 @@ impl Workspace {
                 div()
                     .flex()
                     .flex_col()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.muted)
                     .children(
                         preview
@@ -1231,7 +1212,7 @@ impl Workspace {
             scroll = scroll.child(
                 div()
                     .px_2()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.faint)
                     .child("Type [[ or # to make a page."),
             );
@@ -1257,8 +1238,8 @@ impl Workspace {
                 .pt_2()
                 .px_2()
                 .border_t_1()
-                .border_color(th.border)
-                .text_xs()
+                .border_color(th.line)
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.muted)
                 .child(format!("Local · {file}"))
                 .child(match &self.sync {
@@ -1266,15 +1247,11 @@ impl Workspace {
                     Some(runner) => {
                         let (line, warn) =
                             status_line(runner.status.as_ref(), self.app.read(cx).store.now());
-                        div()
-                            .when(warn, |d| d.text_color(gpui::rgb(0xd97706)))
-                            .child(line)
+                        div().when(warn, |d| d.text_color(th.warning)).child(line)
                     }
                 })
                 .when_some(notice, |d, n| d.child(div().text_color(th.text).child(n)))
-                .when_some(err, |d, e| {
-                    d.child(div().text_color(th.missing_text).child(e))
-                }),
+                .when_some(err, |d, e| d.child(div().text_color(th.danger).child(e))),
         )
         .into_any_element()
     }
@@ -1289,7 +1266,7 @@ impl Workspace {
             div()
                 .id(id)
                 .px_2()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .rounded_sm()
                 .cursor_pointer()
                 .text_color(if this.tab == t { th.accent } else { th.muted })
@@ -1385,7 +1362,7 @@ impl Workspace {
                     body = body.child(
                         div()
                             .px_2()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.faint)
                             .child("Every reference resolves."),
                     );
@@ -1394,8 +1371,8 @@ impl Workspace {
                     let block = o.from_block.clone();
                     let mut row = div().flex().flex_col().px_2().py_1().child(
                         div()
-                            .text_sm()
-                            .text_color(th.missing_text)
+                            .text_size(px(crate::theme::BODY_SIZE))
+                            .text_color(th.danger)
                             .child(label.clone()),
                     );
                     if let RefTarget::UnresolvedPage { key } = &o.target {
@@ -1406,7 +1383,7 @@ impl Workspace {
                             div()
                                 .id(id)
                                 .px_1()
-                                .text_xs()
+                                .text_size(px(crate::theme::CAPTION_SIZE))
                                 .rounded_sm()
                                 .text_color(th.accent)
                                 .cursor_pointer()
@@ -1462,10 +1439,10 @@ impl Workspace {
             .gap_1()
             .p_2()
             .border_t_1()
-            .border_color(th.border)
+            .border_color(th.line)
             .child(
                 div()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(th.muted)
                     .child("REFERENCES"),
@@ -1480,6 +1457,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh(cx);
         let th = theme(cx).clone();
+        let density = crate::appearance::density(cx);
         let left = if self.left_open {
             self.render_left(cx)
         } else {
@@ -1495,13 +1473,13 @@ impl Render for Workspace {
                 .pt_2()
                 .bg(th.sidebar_bg)
                 .border_r_1()
-                .border_color(th.border)
+                .border_color(th.line)
                 .child(
                     div()
                         .id("expand-left")
                         .px_1()
                         .rounded_sm()
-                        .text_xs()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
                         .text_color(th.muted)
                         .cursor_pointer()
                         .hover(|s| s.bg(th.hover))
@@ -1521,7 +1499,7 @@ impl Render for Workspace {
                     .justify_center()
                     .py_1()
                     .bg(th.banner_bg)
-                    .text_sm()
+                    .text_size(px(crate::theme::BODY_SIZE))
                     .cursor_pointer()
                     .child("It's a new day → open today")
                     .on_click(cx.listener(|this, _, window, cx| this.open_journal(window, cx))),
@@ -1537,22 +1515,28 @@ impl Render for Workspace {
                         .justify_center()
                         .py_1()
                         .bg(th.banner_bg)
-                        .text_sm()
+                        .text_size(px(crate::theme::BODY_SIZE))
                         .child(text),
                 );
             }
         }
-        let mut panes_row = div().flex_1().min_h_0().flex().flex_row().child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .map(|d| match (&self.graph, &self.pdf) {
-                    (Some(g), _) => d.child(g.clone()),
-                    (None, Some(p)) => d.child(p.clone()),
-                    (None, None) => d.child(self.main.clone()),
-                }),
-        );
+        let mut panes_row = div()
+            .debug_selector(move || format!("ui-density-{}", density.key()))
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_row()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .map(|d| match (&self.graph, &self.pdf) {
+                        (Some(g), _) => d.child(g.clone()),
+                        (None, Some(p)) => d.child(p.clone()),
+                        (None, None) => d.child(self.main.clone()),
+                    }),
+            );
         for (i, sp) in self.splits.iter().enumerate() {
             panes_row = panes_row.child(
                 div()
@@ -1561,7 +1545,7 @@ impl Render for Workspace {
                     .min_w_0()
                     .h_full()
                     .border_l_1()
-                    .border_color(th.border)
+                    .border_color(th.line)
                     .child(sp.clone()),
             );
         }
@@ -1575,14 +1559,14 @@ impl Render for Workspace {
                 .flex_none()
                 .flex()
                 .flex_col()
-                .bg(th.panel_bg)
+                .bg(th.surface)
                 .border_l_1()
-                .border_color(th.border);
+                .border_color(th.line);
             if self.panes.is_empty() && !self.inspector_open {
                 col = col.child(
                     div()
                         .p_4()
-                        .text_sm()
+                        .text_size(px(crate::theme::BODY_SIZE))
                         .text_color(th.faint)
                         .child("Shift-click a link to open it here."),
                 );
@@ -1593,7 +1577,7 @@ impl Render for Workspace {
                         .flex_1()
                         .min_h(px(140.))
                         .border_b_1()
-                        .border_color(th.border)
+                        .border_color(th.line)
                         .child(p.clone()),
                 );
             }
@@ -1610,7 +1594,7 @@ impl Render for Workspace {
                 .flex()
                 .justify_center()
                 .pt(px(90.))
-                .bg(gpui::hsla(0., 0., 0., 0.18))
+                .bg(th.scrim)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| {
@@ -1658,8 +1642,8 @@ impl Render for Workspace {
             .flex_row()
             .bg(th.bg)
             .text_color(th.text)
-            .text_size(px(crate::theme::TEXT_SIZE))
-            .line_height(px(crate::theme::LINE_HEIGHT))
+            .text_size(px(density.text_size()))
+            .line_height(px(density.line_height()))
             .font_family(font.family())
             .child(left)
             .child(main_col)

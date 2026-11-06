@@ -41,7 +41,7 @@ pub fn render<V: 'static>(
         .flex()
         .justify_between()
         .items_center()
-        .text_sm()
+        .text_size(px(crate::theme::BODY_SIZE))
         .child(
             div()
                 .id("cal-prev")
@@ -68,7 +68,7 @@ pub fn render<V: 'static>(
         .children(["M", "T", "W", "T", "F", "S", "S"].iter().map(|n| {
             div()
                 .w(px(26.))
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.faint)
                 .flex()
                 .justify_center()
@@ -84,7 +84,7 @@ pub fn render<V: 'static>(
             .flex()
             .justify_center()
             .items_center()
-            .text_xs()
+            .text_size(px(crate::theme::CAPTION_SIZE))
             .rounded_sm()
             .cursor_pointer()
             .text_color(if in_month { th.text } else { th.faint })

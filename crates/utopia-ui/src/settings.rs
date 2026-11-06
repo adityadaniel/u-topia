@@ -6,8 +6,9 @@
 //! - **Shortcuts** — the cheat sheet of everything currently bound, which is also what the
 //!   Help menu's "Keyboard Shortcuts" opens.
 //! - **Appearance** — the font notes and the interface are set in (System or the bundled
-//!   IBM Plex Sans). Applies to every window at once; kept in `settings.json`
-//!   ([`crate::appearance`]), not in `keymap.json`.
+//!   IBM Plex Sans) and how densely blocks are set (Comfortable or Compact). Applies to
+//!   every window at once; kept in `settings.json` ([`crate::appearance`]), not in
+//!   `keymap.json`.
 //! - **Help** — a tour of the app's features, with screenshots taken from the app itself.
 //!
 //! Capture uses a gpui *keystroke interceptor* rather than a key-down handler on purpose:
@@ -24,9 +25,9 @@ use std::path::PathBuf;
 use crate::actions::{
     by_category, canonical_keys, doc, pretty_keys, reinstall, ActionDoc, Category, Overrides,
 };
-use crate::appearance::{self, UiFont};
+use crate::appearance::{self, Density, UiFont};
 use crate::help::{shot_image, TOPICS};
-use crate::theme::theme;
+use crate::theme::{quiet_control, theme};
 
 /// Help prose stops at a readable line length, like the page column does.
 const HELP_WIDTH: f32 = 720.;
@@ -281,6 +282,26 @@ impl SettingsView {
         });
         cx.notify();
     }
+
+    /// Settings → Appearance: switch density in every window and remember it (ALL-5).
+    pub fn choose_density(&mut self, density: Density, cx: &mut Context<Self>) {
+        let before = appearance::density(cx);
+        self.status = Some(
+            match appearance::set_density(cx, density, &self.config_dir) {
+                Err(e) => format!(
+                    "{} applies now, but could not save {}: {e}",
+                    density.label(),
+                    appearance::FILE
+                )
+                .into(),
+                Ok(()) if before == density => {
+                    format!("The density is already {}.", density.label()).into()
+                }
+                Ok(()) => format!("The density is now {}.", density.label()).into(),
+            },
+        );
+        cx.notify();
+    }
 }
 
 /// gpui sends modifier presses through as keystrokes with no real key on some layouts.
@@ -299,6 +320,7 @@ fn has_modifier(ks: &Keystroke) -> bool {
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
+        let density = appearance::density(cx);
         let tabs = Tab::all().iter().map(|&t| {
             let on = t == self.tab;
             div()
@@ -308,7 +330,7 @@ impl Render for SettingsView {
                 .py_1()
                 .rounded_md()
                 .cursor_pointer()
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
                 .when(!on, |d| d.text_color(th.muted))
                 .child(t.label())
@@ -323,6 +345,17 @@ impl Render for SettingsView {
             Tab::Appearance => self.render_appearance(cx).into_any_element(),
             Tab::Help => self.render_help(cx).into_any_element(),
         };
+        // One debug selector per element: the body names the font, the header the density.
+        let body = div()
+            .debug_selector(move || format!("settings-ui-font-{}", font.key()))
+            .flex()
+            .flex_col()
+            .flex_1()
+            // A flex child's automatic minimum is its content height. Without this the
+            // scrolling list would grow the column past the window instead of scrolling
+            // inside it, pushing the status line out of reach.
+            .min_h_0()
+            .child(body);
 
         div()
             .debug_selector(|| "settings".into())
@@ -333,19 +366,21 @@ impl Render for SettingsView {
             .flex_col()
             .bg(th.bg)
             .text_color(th.text)
-            .text_size(px(crate::theme::TEXT_SIZE))
+            .text_size(px(density.text_size()))
+            .line_height(px(density.line_height()))
             .font_family(appearance::font_family(cx))
             .child(
                 div()
-                    // Names the font in force, for tests (the root already has a selector).
-                    .debug_selector(move || format!("settings-ui-font-{}", font.key()))
+                    // Names the density in force, for tests (the root names the font; an
+                    // element carries only one debug selector).
+                    .debug_selector(move || format!("settings-ui-density-{}", density.key()))
                     .flex()
                     .items_center()
                     .gap_2()
                     .px_4()
                     .py_3()
                     .border_b_1()
-                    .border_color(th.border)
+                    .border_color(th.line)
                     .child(div().font_weight(FontWeight::BOLD).mr_2().child("Settings"))
                     .children(tabs),
             )
@@ -356,9 +391,9 @@ impl Render for SettingsView {
                     .px_4()
                     .py_2()
                     .border_t_1()
-                    .border_color(th.border)
-                    .bg(th.panel_bg)
-                    .text_xs()
+                    .border_color(th.line)
+                    .bg(th.surface)
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.muted)
                     .child(s)
             }))
@@ -388,28 +423,22 @@ impl SettingsView {
                 .items_center()
                 .justify_between()
                 .pb_2()
-                .child(div().text_xs().text_color(th.muted).child(if changed == 0 {
-                    "Pick Change, then press the keys you want.".to_string()
-                } else {
-                    format!(
-                        "Pick Change, then press the keys you want. {changed} changed \
-                                 from the default."
-                    )
-                }))
                 .child(
                     div()
-                        .id("reset-all")
-                        .debug_selector(|| "settings-reset-all".into())
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(th.border)
-                        .text_xs()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
                         .text_color(th.muted)
-                        .cursor_pointer()
-                        .hover(|d| d.bg(th.hover))
-                        .child("Reset All")
+                        .child(if changed == 0 {
+                            "Pick Change, then press the keys you want.".to_string()
+                        } else {
+                            format!(
+                                "Pick Change, then press the keys you want. {changed} changed \
+                                 from the default."
+                            )
+                        }),
+                )
+                .child(
+                    quiet_control("reset-all", "Reset All", &th)
+                        .debug_selector(|| "settings-reset-all".into())
                         .on_click(cx.listener(|this, _, _, cx| this.reset_all(cx))),
                 ),
         );
@@ -420,9 +449,9 @@ impl SettingsView {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(th.missing_bg)
-                    .text_xs()
-                    .text_color(th.missing_text)
+                    .bg(th.danger_bg)
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.danger)
                     .child(format!(
                         "{} and {} are both on {}.",
                         a.label,
@@ -438,7 +467,7 @@ impl SettingsView {
             section = section.child(
                 div()
                     .pb_1()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.faint)
                     .font_weight(FontWeight::MEDIUM)
                     .child(c.label()),
@@ -466,7 +495,7 @@ impl SettingsView {
                 .rounded_md()
                 .bg(th.banner_bg)
                 .text_color(th.accent)
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .child("Press keys… (esc to keep)")
         } else {
             div()
@@ -474,7 +503,7 @@ impl SettingsView {
                 .py_0p5()
                 .rounded_md()
                 .bg(th.chip_bg)
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.text)
                 .child(pretty_keys(&keys))
         };
@@ -494,7 +523,12 @@ impl SettingsView {
                     .flex_col()
                     .flex_1()
                     .child(div().child(d.label))
-                    .child(div().text_xs().text_color(th.muted).child(d.help)),
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(d.help),
+                    ),
             )
             .child(
                 div()
@@ -503,27 +537,22 @@ impl SettingsView {
                     .gap_2()
                     .child(chip)
                     .child(
-                        div()
-                            .id(SharedString::from(format!("change-{}", d.action)))
-                            .debug_selector(move || format!("settings-change-{}", d.action))
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(th.border)
-                            .text_xs()
-                            .text_color(th.muted)
-                            .cursor_pointer()
-                            .hover(|x| x.bg(th.hover))
-                            .child(if capturing { "Cancel" } else { "Change" })
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                        quiet_control(
+                            SharedString::from(format!("change-{}", d.action)),
+                            if capturing { "Cancel" } else { "Change" },
+                            &th,
+                        )
+                        .debug_selector(move || format!("settings-change-{}", d.action))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
                                 if this.capturing.map(|c| c.action) == Some(d.action) {
                                     this.cancel_capture();
                                     cx.notify();
                                 } else {
                                     this.start_capture(d, window, cx);
                                 }
-                            })),
+                            },
+                        )),
                     )
                     .children(changed.then(|| {
                         div()
@@ -532,7 +561,7 @@ impl SettingsView {
                             .px_2()
                             .py_0p5()
                             .rounded_md()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.accent)
                             .cursor_pointer()
                             .hover(|x| x.bg(th.hover))
@@ -557,7 +586,7 @@ impl SettingsView {
         list = list.child(
             div()
                 .pb_2()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.muted)
                 .child("Every shortcut in the app, as it is bound now."),
         );
@@ -569,10 +598,10 @@ impl SettingsView {
                     .justify_between()
                     .gap_4()
                     .py_0p5()
-                    .child(div().text_sm().child(d.label))
+                    .child(div().text_size(px(crate::theme::BODY_SIZE)).child(d.label))
                     .child(
                         div()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.muted)
                             .child(pretty_keys(&self.overrides.keys_for(d))),
                     )
@@ -585,7 +614,7 @@ impl SettingsView {
                     .child(
                         div()
                             .pb_1()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.faint)
                             .font_weight(FontWeight::MEDIUM)
                             .child(c.label()),
@@ -611,7 +640,7 @@ impl SettingsView {
                 .py_2()
                 .rounded_md()
                 .border_1()
-                .border_color(if on { th.accent } else { th.border })
+                .border_color(if on { th.accent } else { th.line })
                 .when(on, |d| d.bg(th.chip_bg))
                 .cursor_pointer()
                 .hover(|x| x.bg(th.hover))
@@ -648,6 +677,61 @@ impl SettingsView {
                 .on_click(cx.listener(move |this, _, _, cx| this.choose_font(f, cx)))
         });
         let options: Vec<_> = options.collect();
+        let current_density = appearance::density(cx);
+        let densities: Vec<_> = Density::ALL
+            .iter()
+            .map(|&d| {
+                let on = d == current_density;
+                let th = th.clone();
+                div()
+                    .id(SharedString::from(format!("density-{}", d.key())))
+                    .debug_selector(move || format!("settings-density-{}", d.key()))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if on { th.accent } else { th.line })
+                    .when(on, |x| x.bg(th.chip_bg))
+                    .cursor_pointer()
+                    .hover(|x| x.bg(th.hover))
+                    .child(
+                        div()
+                            .size(px(14.))
+                            .flex_none()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(if on { th.accent } else { th.faint })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(on, |x| {
+                                x.child(div().size(px(8.)).rounded_full().bg(th.accent))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .child(div().child(d.label()))
+                            .child(
+                                div()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
+                                    .text_color(th.muted)
+                                    .child(match d {
+                                        Density::Comfortable => {
+                                            "15 px body on 24 px lines, as before."
+                                        }
+                                        Density::Compact => "13.5 px body and 4 px between blocks.",
+                                    }),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_density(d, cx)))
+            })
+            .collect();
         div()
             .id("settings-appearance")
             .debug_selector(|| "settings-appearance".into())
@@ -669,16 +753,35 @@ impl SettingsView {
                         div()
                             .pt_3()
                             .pb_1()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.faint)
                             .font_weight(FontWeight::MEDIUM)
                             .child("Font"),
                     )
-                    .child(div().text_xs().text_color(th.muted).child(
+                    .child(div().text_size(px(crate::theme::CAPTION_SIZE)).text_color(th.muted).child(
                         "Used for your notes and the interface, in every window, as soon as \
                          you pick it. Code blocks stay in Menlo.",
                     ))
-                    .children(options),
+                    .children(options)
+                    .child(
+                        div()
+                            .pt_4()
+                            .pb_1()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.faint)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Density"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(
+                                "How much space your notes take. Local to this machine, \
+                                 kept in settings.json, never synced.",
+                            ),
+                    )
+                    .children(densities),
             )
     }
 
@@ -694,7 +797,7 @@ impl SettingsView {
                 .py_1p5()
                 .rounded_md()
                 .cursor_pointer()
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
                 .when(!on, |d| d.text_color(th.text).hover(|x| x.bg(th.hover)))
                 .child(t.title)
@@ -721,10 +824,15 @@ impl SettingsView {
                             .py_0p5()
                             .rounded_md()
                             .bg(th.chip_bg)
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .child(pretty_keys(&self.overrides.keys_for(d))),
                     )
-                    .child(div().text_xs().text_color(th.muted).child(d.label))
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(d.label),
+                    )
             })
             .collect();
 
@@ -738,13 +846,13 @@ impl SettingsView {
             .gap_3()
             .child(
                 div()
-                    .text_size(px(22.))
+                    .text_size(px(crate::theme::H1_SIZE))
                     .font_weight(FontWeight::BOLD)
                     .child(t.title),
             )
             .child(div().text_color(th.muted).child(t.summary));
         for p in t.body {
-            column = column.child(div().text_sm().child(*p));
+            column = column.child(div().text_size(px(crate::theme::BODY_SIZE)).child(*p));
         }
         if !shortcuts.is_empty() {
             column = column.child(div().flex().flex_wrap().gap_3().pt_1().children(shortcuts));
@@ -757,7 +865,7 @@ impl SettingsView {
                         .h(px(HELP_SHOT_HEIGHT))
                         .rounded_md()
                         .border_1()
-                        .border_color(th.border),
+                        .border_color(th.line),
                 ),
             );
         }
@@ -787,7 +895,7 @@ impl SettingsView {
                     .flex_none()
                     .overflow_y_scroll()
                     .border_r_1()
-                    .border_color(th.border)
+                    .border_color(th.line)
                     .bg(th.sidebar_bg)
                     .px_2()
                     .py_3()

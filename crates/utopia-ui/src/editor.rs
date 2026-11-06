@@ -1321,7 +1321,12 @@ impl BlockEditor {
                 .when(i == ac.selected, |d| d.bg(th.hover))
                 .child(div().text_color(th.text).child(label))
                 .when_some(detail, |d, s| {
-                    d.child(div().text_xs().text_color(th.muted).child(s))
+                    d.child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(s),
+                    )
                 })
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1339,9 +1344,9 @@ impl BlockEditor {
                         .mt_1()
                         .w(px(340.))
                         .p_1()
-                        .bg(th.panel_bg)
+                        .bg(th.surface)
                         .border_1()
-                        .border_color(th.border)
+                        .border_color(th.line)
                         .rounded_md()
                         .shadow_md()
                         .children(rows),
@@ -1397,7 +1402,7 @@ impl Render for BlockEditor {
             .debug_selector(|| "block-editor".into())
             .track_focus(&self.focus)
             .w_full()
-            .min_h(px(crate::theme::LINE_HEIGHT))
+            .min_h(px(crate::appearance::density(cx).line_height()))
             .cursor_text()
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::insert_above))

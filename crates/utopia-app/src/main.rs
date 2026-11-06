@@ -463,12 +463,13 @@ impl Root {
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
+        let density = utopia_ui::appearance::density(cx);
         let shell = div()
             .size_full()
             .bg(th.bg)
             .text_color(th.text)
-            .text_size(px(utopia_ui::theme::TEXT_SIZE))
-            .line_height(px(utopia_ui::theme::LINE_HEIGHT))
+            .text_size(px(density.text_size()))
+            .line_height(px(density.line_height()))
             .font_family(utopia_ui::appearance::font_family(cx));
         match &self.state {
             RootState::Ready(ws) => shell.child(ws.clone()),
@@ -481,7 +482,7 @@ impl Render for Root {
                         .gap_2()
                         .child(
                             div()
-                                .text_size(px(24.))
+                                .text_size(px(utopia_ui::theme::H1_SIZE))
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .child("Welcome to Utopia"),
                         )
@@ -499,14 +500,14 @@ impl Render for Root {
                                 .rounded_md()
                                 .child(input.clone()),
                         )
-                        .child(div().text_xs().text_color(th.faint).child(format!(
+                        .child(div().text_size(px(utopia_ui::theme::CAPTION_SIZE)).text_color(th.faint).child(format!(
                             "Creates {}/<name>.utopia",
                             paths::graphs_dir().display()
                         )))
                         .children(
                             error
                                 .clone()
-                                .map(|e| div().text_color(th.missing_text).child(e)),
+                                .map(|e| div().text_color(th.danger).child(e)),
                         ),
                 )
             }
@@ -521,7 +522,7 @@ impl Render for Root {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(24.))
+                            .text_size(px(utopia_ui::theme::H1_SIZE))
                             .font_weight(gpui::FontWeight::BOLD)
                             .child("This graph is locked"),
                     )
@@ -540,20 +541,20 @@ impl Render for Root {
                             .rounded_md()
                             .child(input.clone()),
                     )
-                    .child(div().text_xs().text_color(th.faint).child(
+                    .child(div().text_size(px(utopia_ui::theme::CAPTION_SIZE)).text_color(th.faint).child(
                         "Tip: store it in the keychain (service utopia-db) to unlock automatically.",
                     ))
                     .children(
                         error
                             .clone()
-                            .map(|e| div().text_color(th.missing_text).child(e)),
+                            .map(|e| div().text_color(th.danger).child(e)),
                     ),
             ),
             RootState::Failed(msg) => shell
                 .flex()
                 .justify_center()
                 .items_center()
-                .child(div().text_color(th.missing_text).child(msg.clone())),
+                .child(div().text_color(th.danger).child(msg.clone())),
         }
     }
 }

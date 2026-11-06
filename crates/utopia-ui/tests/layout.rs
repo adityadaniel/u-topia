@@ -390,3 +390,175 @@ fn left_sidebar_collapses_to_a_rail(cx: &mut TestAppContext) {
     let cal = bounds(cx, "left-calendar");
     assert!(cal.origin.y > toggle.origin.y);
 }
+
+/// ALL-3: "Delete page" is a danger item inside the page header's menu, not loose text.
+#[gpui::test]
+fn page_menu_holds_the_danger_delete(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    // An empty day is a draft until its first write (FR-1.2); write one so it has a page
+    // with actions to offer.
+    cx.simulate_input("note");
+    cx.simulate_keystrokes("escape");
+    assert!(
+        cx.debug_bounds("page-menu-delete").is_none(),
+        "the menu starts closed"
+    );
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    let popup = bounds(cx, "page-menu-popup");
+    let delete = bounds(cx, "page-menu-delete");
+    assert!(
+        popup.origin.y >= menu.origin.y + menu.size.height - px(1.),
+        "the menu opens below its control: {popup:?} {menu:?}"
+    );
+    assert!(
+        delete.origin.x >= popup.origin.x && delete.origin.x + delete.size.width <= popup.right(),
+        "the danger item stays inside the menu: {delete:?} {popup:?}"
+    );
+}
+
+/// Rule 6: a daily page's title is display-only, so its menu must not offer Rename (which
+/// `start_rename` turns into the calendar on daily pages).
+#[gpui::test]
+fn daily_page_menu_does_not_offer_rename(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    cx.simulate_input("note");
+    cx.simulate_keystrokes("escape");
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("page-menu-delete").is_some(),
+        "the daily page still offers Delete page"
+    );
+    assert!(
+        cx.debug_bounds("page-menu-rename").is_none(),
+        "daily titles are display-only: no Rename action"
+    );
+}
+
+/// ALL-1: page title 28, H1 20, body 15 — measured as line boxes, since the heading used to
+/// draw at 24 px (larger than H1 and close to the title).
+#[gpui::test]
+fn type_scale_caps_outline_headings_at_h1(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    cx.simulate_input("body");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("Heading /head");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_input(" one");
+    cx.simulate_keystrokes("escape");
+    let title = bounds(cx, "page-title");
+    let body = bounds(cx, "content-1");
+    let h1 = bounds(cx, "content-2");
+    assert!(
+        title.size.height > h1.size.height,
+        "the title outranks H1: {title:?} {h1:?}"
+    );
+    assert!(
+        h1.size.height > body.size.height,
+        "H1 outranks body: {h1:?} {body:?}"
+    );
+    assert!(
+        h1.size.height <= px(utopia_ui::theme::H1_SIZE + 8.),
+        "H1 is 20 px on a 28 px line, never the old 24 px: {h1:?}"
+    );
+}
+
+/// ALL-4: the block being edited carries a 2 px accent bar at its left edge.
+#[gpui::test]
+fn focused_block_has_an_accent_bar(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    cx.simulate_input("focused");
+    let bar = bounds(cx, "focus-bar-1");
+    let content = bounds(cx, "content-1");
+    assert!(approx(bar.size.width, 2.), "2 px wide: {bar:?}");
+    assert!(
+        bar.origin.x < content.origin.x,
+        "the bar sits left of the block text: {bar:?} {content:?}"
+    );
+}
+
+/// ALL-5: Compact shrinks the body and adds 4 px between blocks; both are measurable, and
+/// the setting applies to the open window without a restart.
+#[gpui::test]
+fn compact_density_is_tighter(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_input("one");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("two");
+    cx.simulate_keystrokes("escape");
+    let body_before = bounds(cx, "content-1").size.height;
+    let row_before = bounds(cx, "row-1").size.height;
+
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|_window, cx| {
+        utopia_ui::appearance::set_density(cx, utopia_ui::appearance::Density::Compact, dir.path())
+            .unwrap();
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("ui-density-compact").is_some(),
+        "the open window re-rendered at the new density"
+    );
+    let body_after = bounds(cx, "content-1").size.height;
+    let row_after = bounds(cx, "row-1").size.height;
+    assert!(
+        approx(body_after, 18.),
+        "Compact body is 13.5 px on an 18 px line: {body_after:?}"
+    );
+    assert!(
+        body_after < body_before && row_after < row_before,
+        "Compact is tighter: body {body_before:?} -> {body_after:?}, \
+         row {row_before:?} -> {row_after:?}"
+    );
+    assert!(
+        approx(row_after - body_after, 4.),
+        "4 px of block spacing: row {row_after:?}, body {body_after:?}"
+    );
+}
+
+/// A fresh page window for one menu state, so no debug bounds from the other state linger.
+fn page_title_with_menu(cx: &mut TestAppContext, menu_open: bool) -> Bounds<Pixels> {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = store.create_page("Menu Target").unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    if menu_open {
+        let menu = cx
+            .debug_bounds("page-menu")
+            .expect("the page menu button is rendered");
+        cx.simulate_click(menu.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("page-menu-popup").is_some(),
+            "the menu opened"
+        );
+    }
+    cx.debug_bounds("page-title")
+        .expect("the page title is rendered")
+}
+
+/// ALL-3: the page menu floats over the page. Opening it must not push the title down.
+#[gpui::test]
+fn opening_the_page_menu_does_not_move_the_title(cx: &mut TestAppContext) {
+    let closed = page_title_with_menu(cx, false);
+    let open = page_title_with_menu(cx, true);
+    assert_eq!(
+        closed, open,
+        "the title keeps its bounds when the menu opens"
+    );
+}

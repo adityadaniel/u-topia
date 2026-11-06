@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::NaiveDate;
 use gpui::{
-    div, list, prelude::*, px, AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    ListAlignment, ListState, MouseButton, MouseDownEvent, SharedString, StyledText, Subscription,
-    Window,
+    anchored, deferred, div, list, point, prelude::*, px, AnyElement, Context, Corner, Entity,
+    EventEmitter, FocusHandle, Focusable, ListAlignment, ListState, MouseButton, MouseDownEvent,
+    SharedString, StyledText, Subscription, Window,
 };
 use utopia_core::inline::{extract_refs, plain_text};
 use utopia_core::outline::{self, Focus, Plan};
@@ -20,7 +20,7 @@ use crate::editor::{BlockEditor, EditTarget, EditorEvent};
 use crate::field::Goal;
 use crate::line_input::{LineInput, LineInputEvent};
 use crate::rich::{self, ChipState, LinkTarget};
-use crate::theme::{theme, INDENT, LINE_HEIGHT, MAX_VISUAL_DEPTH};
+use crate::theme::{quiet_control, quiet_danger, quiet_menu, theme, INDENT, MAX_VISUAL_DEPTH};
 
 /// Transclusions stop expanding at this depth (FR-4.5).
 const MAX_EMBED_DEPTH: u8 = 3;
@@ -194,9 +194,9 @@ impl Render for DragPreview {
         div()
             .px_2()
             .py_1()
-            .bg(th.panel_bg)
+            .bg(th.surface)
             .border_1()
-            .border_color(th.border)
+            .border_color(th.line)
             .rounded_md()
             .text_color(th.text)
             .child(self.0.clone())
@@ -228,6 +228,8 @@ pub struct PageView {
     calendar_month: NaiveDate,
     /// Set while showing the Daily Notes feed; `page` is then today's page.
     journal: Option<Journal>,
+    /// The page header's "···" menu is open (ALL-3).
+    page_menu: bool,
     dirty: bool,
     _subs: Vec<Subscription>,
 }
@@ -294,6 +296,7 @@ impl PageView {
             alias_input: None,
             calendar_month: today,
             journal: None,
+            page_menu: false,
             dirty: true,
             _subs: subs,
         }
@@ -363,6 +366,7 @@ impl PageView {
                 .unwrap_or_default();
             self.expanded_groups = saved.into_iter().map(PageId).collect();
         }
+        self.page_menu = false;
         self.refs_key = None;
         self.dirty = true;
         self.rebuild(cx);
@@ -1522,6 +1526,7 @@ impl PageView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let th = theme(cx).clone();
+        let lh = crate::appearance::density(cx).line_height();
         let rendered = {
             let store = &self.app.read(cx).store;
             rich::render(text, &th, &mut |uid| {
@@ -1537,7 +1542,7 @@ impl PageView {
         let links = rendered.links.iter().map(|(r, _)| r.clone()).collect();
         div()
             .flex_1()
-            .min_h(px(LINE_HEIGHT))
+            .min_h(px(lh))
             // An editable row shows the I-beam between its links; a read-only one (a query
             // or search hit) is itself clickable, so it keeps its container's pointer.
             .when(row.is_some(), |d| d.cursor_text())
@@ -1575,6 +1580,9 @@ impl PageView {
 
     fn render_row(&self, ix: usize, r: &RowItem, cx: &mut Context<Self>) -> AnyElement {
         let th = theme(cx).clone();
+        let density = crate::appearance::density(cx);
+        let lh = density.line_height();
+        let vpad = density.block_spacing() / 2.;
         let host = cx.entity_id();
         let editing = self.editor.read(cx).is_editing(host, &r.page, &r.block);
         let indent = r.depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT;
@@ -1589,11 +1597,11 @@ impl PageView {
             div()
                 .id(("arrow", ix))
                 .w(px(14.))
-                .h(px(LINE_HEIGHT))
+                .h(px(lh))
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.faint)
                 .when(r.has_children, |d| {
                     d.cursor_pointer()
@@ -1614,13 +1622,13 @@ impl PageView {
             div()
                 .id(("bullet", ix))
                 .w(px(18.))
-                .h(px(LINE_HEIGHT))
+                .h(px(lh))
                 .flex()
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
                 .when(r.kind == BlockKind::Numbered, |d| {
-                    d.text_sm()
+                    d.text_size(px(crate::theme::BODY_SIZE))
                         .text_color(th.muted)
                         .child(format!("{}.", r.number))
                 })
@@ -1661,13 +1669,31 @@ impl PageView {
         let target = r.clone();
         div()
             .id(("row", ix))
+            .debug_selector(move || format!("row-{ix}"))
+            .relative()
             .flex()
             .flex_row()
             .items_start()
             .pl(px(indent))
             .pr_2()
+            .py(px(vpad))
+            // ALL-4: the focused block is marked by a 2 px accent bar, not by a heavier
+            // text colour (the caret already moves). Absolutely placed so it costs no
+            // layout shift when editing starts.
+            .when(editing, |d| {
+                d.child(
+                    div()
+                        .debug_selector(move || format!("focus-bar-{ix}"))
+                        .absolute()
+                        .left(px(indent))
+                        .top(px(0.))
+                        .w(px(2.))
+                        .h(px(lh))
+                        .bg(th.accent),
+                )
+            })
             .when(r.embed > 0, |d| {
-                d.bg(th.panel_bg).border_l_2().border_color(th.chip_bg)
+                d.bg(th.surface).border_l_2().border_color(th.chip_bg)
             })
             .drag_over::<DraggedBlock>(move |s, _, _, _| s.border_b_2().border_color(th.accent))
             .on_drop(
@@ -1682,7 +1708,7 @@ impl PageView {
                         .id(("todo", ix))
                         .debug_selector(|| format!("todo-{ix}"))
                         .w(px(20.))
-                        .h(px(LINE_HEIGHT))
+                        .h(px(lh))
                         .flex()
                         .items_center()
                         .cursor_pointer()
@@ -1700,14 +1726,14 @@ impl PageView {
                 c = match r.kind {
                     BlockKind::Heading(l) => c
                         .text_size(px(match l {
-                            1 => 24.,
-                            2 => 20.,
-                            _ => 17.,
+                            1 => crate::theme::H1_SIZE,
+                            2 => crate::theme::H2_SIZE,
+                            _ => crate::theme::H3_SIZE,
                         }))
                         .line_height(px(match l {
-                            1 => 34.,
-                            2 => 30.,
-                            _ => 26.,
+                            1 => 28.,
+                            2 => 24.,
+                            _ => 22.,
                         }))
                         .font_weight(gpui::FontWeight::BOLD),
                     BlockKind::Quote => c
@@ -1732,7 +1758,7 @@ impl PageView {
                     div()
                         .ml_1()
                         .px_1()
-                        .text_xs()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
                         .text_color(th.muted)
                         .bg(th.chip_bg)
                         .rounded_sm()
@@ -1749,16 +1775,44 @@ impl PageView {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let th = theme(cx).clone();
+        quiet_control(id, label, &th)
+    }
+
+    /// The page actions menu. It is drawn deferred and anchored, so opening it floats over
+    /// the page instead of taking a row in the column (ALL-3).
+    fn page_menu_popup(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let th = theme(cx).clone();
+        // Daily titles are display-only (rule 6): `start_rename` would open the calendar
+        // for them, so Rename is only offered on ordinary pages.
+        let rename = (self.header.kind != PageKind::Daily).then(|| {
+            quiet_control("page-menu-rename", "Rename", &th)
+                .debug_selector(|| "page-menu-rename".into())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.page_menu = false;
+                    this.start_rename(window, cx);
+                }))
+        });
+        let delete = quiet_danger("page-menu-delete", "Delete page", &th)
+            .debug_selector(|| "page-menu-delete".into())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.page_menu = false;
+                this.page_action("delete", cx);
+            }));
         div()
-            .id(id)
-            .px_2()
-            .py_0p5()
-            .rounded_sm()
-            .text_xs()
-            .text_color(th.muted)
-            .cursor_pointer()
-            .hover(|s| s.bg(th.hover))
-            .child(label.into())
+            .id("page-menu-popup")
+            .debug_selector(|| "page-menu-popup".into())
+            .w(px(180.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .bg(th.surface)
+            .border_1()
+            .border_color(th.line)
+            .rounded_md()
+            .shadow_md()
+            .children(rename.map(|r| r.w_full().justify_start()))
+            .child(delete.w_full().justify_start())
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1785,34 +1839,30 @@ impl PageView {
                 )
             })
             .when(h.kind == PageKind::Daily, |d| {
-                d.child(
-                    self.button("prev-day", "‹", cx)
-                        .text_base()
-                        .on_click(cx.listener(|this, e: &gpui::ClickEvent, w, cx| {
-                            if let Some(date) = this.header.date {
-                                this.pick_date(
-                                    date.pred_opt().unwrap_or(date),
-                                    e.modifiers().shift,
-                                    w,
-                                    cx,
-                                );
-                            }
-                        })),
-                )
-                .child(
-                    self.button("next-day", "›", cx)
-                        .text_base()
-                        .on_click(cx.listener(|this, e: &gpui::ClickEvent, w, cx| {
-                            if let Some(date) = this.header.date {
-                                this.pick_date(
-                                    date.succ_opt().unwrap_or(date),
-                                    e.modifiers().shift,
-                                    w,
-                                    cx,
-                                );
-                            }
-                        })),
-                )
+                d.child(self.button("prev-day", "‹", cx).on_click(cx.listener(
+                    |this, e: &gpui::ClickEvent, w, cx| {
+                        if let Some(date) = this.header.date {
+                            this.pick_date(
+                                date.pred_opt().unwrap_or(date),
+                                e.modifiers().shift,
+                                w,
+                                cx,
+                            );
+                        }
+                    },
+                )))
+                .child(self.button("next-day", "›", cx).on_click(cx.listener(
+                    |this, e: &gpui::ClickEvent, w, cx| {
+                        if let Some(date) = this.header.date {
+                            this.pick_date(
+                                date.succ_opt().unwrap_or(date),
+                                e.modifiers().shift,
+                                w,
+                                cx,
+                            );
+                        }
+                    },
+                )))
             })
             .child(div().flex_1())
             .when(h.deleted, |d| {
@@ -1823,8 +1873,25 @@ impl PageView {
             })
             .when(!h.deleted && !h.draft && self.zoom.is_none(), |d| {
                 d.child(
-                    self.button("delete", "Delete page", cx)
-                        .on_click(cx.listener(|this, _, _, cx| this.page_action("delete", cx))),
+                    div()
+                        .relative()
+                        .child(
+                            self.button("page-menu", "···", cx)
+                                .debug_selector(|| "page-menu".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.page_menu = !this.page_menu;
+                                    cx.notify();
+                                })),
+                        )
+                        .children(self.page_menu.then(|| {
+                            deferred(
+                                anchored()
+                                    .anchor(Corner::TopRight)
+                                    .offset(point(px(0.), px(6.)))
+                                    .child(self.page_menu_popup(cx)),
+                            )
+                            .with_priority(1)
+                        })),
                 )
             });
         col = col.child(top);
@@ -1833,7 +1900,7 @@ impl PageView {
                 .flex()
                 .flex_wrap()
                 .gap_1()
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.muted);
             crumbs = crumbs.child(
                 div()
@@ -1883,7 +1950,8 @@ impl PageView {
         };
         let title_el: AnyElement = match &self.rename {
             Some(input) => div()
-                .text_size(px(26.))
+                .text_size(px(crate::theme::TITLE_SIZE))
+                .line_height(px(34.))
                 .border_b_1()
                 .border_color(th.accent)
                 .child(input.clone())
@@ -1891,7 +1959,8 @@ impl PageView {
             None => div()
                 .id("title")
                 .debug_selector(|| "page-title".into())
-                .text_size(px(if self.compact { 20. } else { 28. }))
+                .text_size(px(crate::theme::TITLE_SIZE))
+                .line_height(px(34.))
                 .font_weight(gpui::FontWeight::BOLD)
                 .text_color(if h.deleted { th.muted } else { th.text })
                 .cursor_pointer()
@@ -1912,7 +1981,7 @@ impl PageView {
                     .w(px(200.))
                     .p_2()
                     .border_1()
-                    .border_color(th.border)
+                    .border_color(th.line)
                     .rounded_md()
                     .child(crate::calendar::render(
                         cx,
@@ -1926,7 +1995,12 @@ impl PageView {
         }
         if self.zoom.is_none() && !h.attributes.is_empty() {
             // Page metadata header (P1, W7): the page's `Key:: value` blocks at a glance.
-            let mut grid = div().flex().flex_col().gap_0p5().py_1().text_sm();
+            let mut grid = div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .py_1()
+                .text_size(px(crate::theme::BODY_SIZE));
             for (k, v) in &h.attributes {
                 grid = grid.child(
                     div()
@@ -1944,7 +2018,7 @@ impl PageView {
                 .flex_wrap()
                 .items_center()
                 .gap_1()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.muted);
             if !h.aliases.is_empty() {
                 row = row.child("Also known as:");
@@ -2086,7 +2160,7 @@ impl PageView {
                     .id(("filter", i))
                     .px_2()
                     .rounded_md()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .bg(th.chip_bg)
                     .text_color(th.accent)
                     .cursor_pointer()
@@ -2107,10 +2181,10 @@ impl PageView {
                     .id(("suggest", i))
                     .px_2()
                     .rounded_md()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.muted)
                     .border_1()
-                    .border_color(th.border)
+                    .border_color(th.line)
                     .cursor_pointer()
                     .hover(|s| s.bg(th.hover))
                     .child(format!("+ {title}"))
@@ -2139,9 +2213,9 @@ impl PageView {
                             .flex_1()
                             .px_2()
                             .border_1()
-                            .border_color(th.border)
+                            .border_color(th.line)
                             .rounded_md()
-                            .text_sm()
+                            .text_size(px(crate::theme::BODY_SIZE))
                             .child(self.filter.clone()),
                     )
                     .child({
@@ -2152,7 +2226,7 @@ impl PageView {
                                 format!("Last {} days", (today - d).num_days() + 1)
                             }
                         };
-                        self.button("date-filter", label, cx).on_click(cx.listener(
+                        quiet_menu("date-filter", label, &th).on_click(cx.listener(
                             |this, _, _, cx| {
                                 // Any time → last 7 days → last 30 days → any time.
                                 let today = this.app.read(cx).store.today();
@@ -2168,7 +2242,7 @@ impl PageView {
                             },
                         ))
                     })
-                    .child(self.button("sort", sort_label, cx).on_click(cx.listener(
+                    .child(quiet_menu("sort", sort_label, &th).on_click(cx.listener(
                         |this, _, _, cx| {
                             this.query.sort = match this.query.sort {
                                 RefSort::Title => RefSort::Recency,
@@ -2199,7 +2273,7 @@ impl PageView {
             Item::Row(r) => self.render_row(ix, &r, cx),
             Item::Notice { depth, text } => div()
                 .pl(px(depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT + 32.))
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.muted)
                 .child(text)
                 .into_any_element(),
@@ -2207,7 +2281,7 @@ impl PageView {
                 .debug_selector(|| "query-header".into())
                 .pl(px(depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT + 32.))
                 .pt_1()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.muted)
                 .child(label)
                 .into_any_element(),
@@ -2229,7 +2303,7 @@ impl PageView {
                             .flex_none()
                             .w(px(160.))
                             .overflow_hidden()
-                            .text_sm()
+                            .text_size(px(crate::theme::BODY_SIZE))
                             .text_color(th.accent)
                             .child(hit.page_title.clone()),
                     )
@@ -2305,13 +2379,18 @@ impl PageView {
                                     .py_0p5()
                                     .rounded_md()
                                     .bg(th.chip_bg)
-                                    .text_sm()
+                                    .text_size(px(crate::theme::BODY_SIZE))
                                     .when(path.is_some(), |d| {
                                         d.cursor_pointer().hover(|s| s.bg(th.hover))
                                     })
                                     .child(icon)
                                     .child(blob.name.clone())
-                                    .child(div().text_xs().text_color(th.faint).child(detail)),
+                                    .child(
+                                        div()
+                                            .text_size(px(crate::theme::CAPTION_SIZE))
+                                            .text_color(th.faint)
+                                            .child(detail),
+                                    ),
                             )
                             .on_click(cx.listener(move |_, _, _, cx| match (kind, &open_path) {
                                 (BlobKind::Pdf, Some(_)) => cx.emit(PageViewEvent::OpenPdf {
@@ -2344,14 +2423,15 @@ impl PageView {
                 first,
             } => div()
                 .debug_selector(move || if first { "today-title" } else { "day-title" }.into())
-                .when(!first, |d| d.mt_8().border_t_1().border_color(th.border))
+                .when(!first, |d| d.mt_8().border_t_1().border_color(th.line))
                 .px_4()
                 .pt_4()
                 .pb_2()
                 .child(
                     div()
                         .id(("day-title", ix))
-                        .text_size(px(if self.compact { 20. } else { 28. }))
+                        .text_size(px(crate::theme::TITLE_SIZE))
+                        .line_height(px(34.))
                         .font_weight(gpui::FontWeight::BOLD)
                         .cursor_pointer()
                         .hover(|s| s.text_color(th.accent))
@@ -2398,7 +2478,7 @@ impl PageView {
                     .px_4()
                     .pt_8()
                     .pb(px(120.))
-                    .text_sm()
+                    .text_size(px(crate::theme::BODY_SIZE))
                     .text_color(th.faint)
                     .child("Loading older days…")
                     .into_any_element()
@@ -2410,10 +2490,10 @@ impl PageView {
                 .pt_2()
                 .pb_1()
                 .border_t_1()
-                .border_color(th.border)
+                .border_color(th.line)
                 .flex()
                 .justify_between()
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.muted)
                 .child(title)
                 .child(count.to_string())
@@ -2429,9 +2509,12 @@ impl PageView {
                     .id(("group", ix))
                     .flex()
                     .justify_between()
-                    .px_4()
+                    .mx_2()
+                    .px_2()
                     .pt_2()
+                    .rounded_sm()
                     .cursor_pointer()
+                    .hover(|s| s.bg(th.hover))
                     .child(
                         div()
                             .flex()
@@ -2440,7 +2523,7 @@ impl PageView {
                             .when(scheduled, |d| {
                                 d.child(
                                     div()
-                                        .text_xs()
+                                        .text_size(px(crate::theme::CAPTION_SIZE))
                                         .text_color(th.tag)
                                         .child("Scheduled for this day"),
                                 )
@@ -2454,7 +2537,7 @@ impl PageView {
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.muted)
                             .child(count.to_string()),
                     )
@@ -2489,7 +2572,7 @@ impl PageView {
                     .when(!crumbs.is_empty(), |d| {
                         d.child(
                             div()
-                                .text_xs()
+                                .text_size(px(crate::theme::CAPTION_SIZE))
                                 .text_color(th.faint)
                                 .child(format!("› {crumbs}")),
                         )
@@ -2522,7 +2605,7 @@ impl PageView {
             Item::More { page, hidden } => div()
                 .id(("more", ix))
                 .px_6()
-                .text_xs()
+                .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.accent)
                 .cursor_pointer()
                 .child(format!("+{hidden} more"))
@@ -2531,7 +2614,7 @@ impl PageView {
             Item::NoRefs => div()
                 .px_4()
                 .pb_6()
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.faint)
                 .child("No linked references yet.")
                 .into_any_element(),
@@ -2543,12 +2626,13 @@ impl PageView {
                 .pt_2()
                 .pb_1()
                 .border_t_1()
-                .border_color(th.border)
+                .border_color(th.line)
                 .flex()
                 .justify_between()
-                .text_sm()
+                .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.muted)
                 .cursor_pointer()
+                .hover(|s| s.text_color(th.text))
                 .child(format!(
                     "{} Unlinked References",
                     if open { "▾" } else { "▸" }
@@ -2587,7 +2671,7 @@ impl PageView {
                             .flex_col()
                             .child(
                                 div()
-                                    .text_xs()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
                                     .text_color(th.accent)
                                     .child(m.page_title.clone()),
                             )
@@ -2599,10 +2683,10 @@ impl PageView {
                             .debug_selector(|| format!("link-{ix}"))
                             .px_2()
                             .rounded_sm()
-                            .text_xs()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.accent)
                             .border_1()
-                            .border_color(th.border)
+                            .border_color(th.line)
                             .cursor_pointer()
                             .hover(|s| s.bg(th2.hover))
                             .child("Link")

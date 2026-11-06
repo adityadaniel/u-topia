@@ -19,7 +19,7 @@ use utopia_store::PdfHighlight;
 
 use crate::app_state::AppState;
 use crate::pdf::{page_cache_path, PAGE_WIDTH};
-use crate::theme::theme;
+use crate::theme::{quiet_control, theme};
 
 pub enum PdfEvent {
     Close,
@@ -281,7 +281,7 @@ impl PdfView {
             .h(px(height))
             .bg(gpui::white())
             .border_1()
-            .border_color(th.border)
+            .border_color(th.line)
             .cursor_crosshair()
             .child(
                 canvas(
@@ -326,7 +326,7 @@ impl PdfView {
                 MouseButton::Left,
                 cx.listener(|this, e: &MouseUpEvent, _, cx| this.finish_drag(e.position, cx)),
             );
-        let yellow = gpui::hsla(0.14, 0.95, 0.55, 0.35);
+        let yellow = th.pdf_highlight;
         for (k, hl) in self
             .highlights
             .iter()
@@ -369,7 +369,7 @@ impl PdfView {
                         .top(px(r[1] * height))
                         .w(px(r[2] * PAGE_WIDTH))
                         .h(px(r[3] * height))
-                        .bg(gpui::hsla(0.6, 0.9, 0.55, 0.25)),
+                        .bg(th.pdf_selection),
                 );
             }
         }
@@ -413,38 +413,31 @@ impl Render for PdfView {
             .px_4()
             .py_2()
             .border_b_1()
-            .border_color(th.border)
+            .border_color(th.line)
             .child(
                 div()
                     .font_weight(gpui::FontWeight::BOLD)
                     .child(self.name.clone()),
             )
-            .child(div().text_xs().text_color(th.faint).child(format!(
-                "{count} pages · {} highlights · drag over a page to highlight",
-                self.highlights.len()
-            )))
+            .child(
+                div()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.faint)
+                    .child(format!(
+                        "{count} pages · {} highlights · drag over a page to highlight",
+                        self.highlights.len()
+                    )),
+            )
             .child(div().flex_1())
             .when_some(self.path.clone(), |d, p| {
                 d.child(
-                    div()
-                        .id("pdf-external")
-                        .px_2()
-                        .text_sm()
-                        .text_color(th.muted)
-                        .cursor_pointer()
-                        .hover(|s| s.text_color(th.accent))
-                        .child("Open in Preview")
+                    quiet_control("pdf-external", "Open in Preview", &th)
                         .on_click(move |_, _, cx| cx.open_with_system(&p)),
                 )
             })
             .child(
-                div()
-                    .id("pdf-close")
-                    .px_2()
-                    .text_sm()
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(th.accent))
-                    .child("Close")
+                quiet_control("pdf-close", "Close", &th)
+                    .debug_selector(|| "pdf-close".into())
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(PdfEvent::Close))),
             );
         let view = cx.entity();
@@ -479,7 +472,7 @@ impl Render for PdfView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(th.panel_bg)
+            .bg(th.surface)
             .child(header)
             .child(body)
     }

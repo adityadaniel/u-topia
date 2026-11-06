@@ -303,7 +303,7 @@ impl Render for LineInput {
             .key_context(INPUT_CONTEXT)
             .track_focus(&self.focus)
             .w_full()
-            .min_h(px(crate::theme::LINE_HEIGHT))
+            .min_h(px(crate::appearance::density(cx).line_height()))
             .overflow_hidden()
             .cursor_text()
             .on_action(cx.listener(Self::backspace))

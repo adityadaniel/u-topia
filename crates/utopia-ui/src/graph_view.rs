@@ -15,7 +15,7 @@ use utopia_core::PageId;
 use utopia_store::{GraphOptions, PageGraph};
 
 use crate::app_state::AppState;
-use crate::theme::theme;
+use crate::theme::{quiet_control, theme};
 
 const LAYOUT_ITERATIONS: usize = 160;
 const MARGIN: f32 = 48.;
@@ -233,16 +233,9 @@ impl GraphView {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let th = theme(cx).clone();
-        div()
-            .id(id)
-            .px_2()
-            .py_0p5()
-            .rounded_md()
-            .text_sm()
-            .cursor_pointer()
+        quiet_control(id, label, &th)
             .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
-            .when(!on, |d| d.text_color(th.muted).hover(|s| s.bg(th.hover)))
-            .child(label.into())
+            .when(!on, |d| d.text_color(th.muted))
     }
 }
 
@@ -265,7 +258,7 @@ impl Render for GraphView {
             .px_4()
             .py_2()
             .border_b_1()
-            .border_color(th.border)
+            .border_color(th.line)
             .child(div().font_weight(gpui::FontWeight::BOLD).child("Graph"))
             .child(
                 self.chip("graph-all", "All pages", !self.local, cx)
@@ -285,11 +278,16 @@ impl Render for GraphView {
                     })),
             )
             .child(div().flex_1())
-            .child(div().text_xs().text_color(th.faint).child(format!(
-                "{} pages · {} links",
-                self.graph.nodes.len(),
-                self.graph.edges.len()
-            )))
+            .child(
+                div()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.faint)
+                    .child(format!(
+                        "{} pages · {} links",
+                        self.graph.nodes.len(),
+                        self.graph.edges.len()
+                    )),
+            )
             .child(
                 self.chip("graph-close", "Close", false, cx)
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(GraphEvent::Close))),
@@ -347,7 +345,7 @@ impl Render for GraphView {
                         }
                         if any_faint {
                             if let Ok(p) = faint.build() {
-                                window.paint_path(p, th.border);
+                                window.paint_path(p, th.line);
                             }
                         }
                         if any_strong {

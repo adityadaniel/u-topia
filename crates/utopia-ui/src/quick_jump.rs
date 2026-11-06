@@ -259,9 +259,15 @@ impl Render for JumpPalette {
                 .py_1()
                 .rounded_sm()
                 .cursor_pointer()
+                .hover(|d| d.bg(th.hover))
                 .when(i == self.selected, |d| d.bg(th.hover))
                 .child(div().text_color(th.text).child(label))
-                .child(div().text_xs().text_color(th.muted).child(detail))
+                .child(
+                    div()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.muted)
+                        .child(detail),
+                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, e: &MouseDownEvent, w, cx| {
@@ -275,9 +281,9 @@ impl Render for JumpPalette {
             .max_h(px(440.))
             .flex()
             .flex_col()
-            .bg(th.panel_bg)
+            .bg(th.surface)
             .border_1()
-            .border_color(th.border)
+            .border_color(th.line)
             .rounded_lg()
             .shadow_lg()
             .p_2()
@@ -285,7 +291,7 @@ impl Render for JumpPalette {
             .child(
                 div()
                     .px_1()
-                    .text_xs()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.muted)
                     .child(self.title),
             )
@@ -294,7 +300,7 @@ impl Render for JumpPalette {
                     .px_2()
                     .py_1()
                     .border_1()
-                    .border_color(th.border)
+                    .border_color(th.line)
                     .rounded_md()
                     .child(self.input.clone()),
             )
