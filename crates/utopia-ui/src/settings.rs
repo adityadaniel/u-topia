@@ -283,6 +283,25 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Settings → Appearance: how many children a reference shows inline (LR-4).
+    pub fn choose_ref_children(&mut self, count: usize, cx: &mut Context<Self>) {
+        let before = appearance::ref_children(cx);
+        self.status = Some(
+            match appearance::set_ref_children(cx, count, &self.config_dir) {
+                Err(e) => format!(
+                    "{count} applies now, but could not save {}: {e}",
+                    appearance::FILE
+                )
+                .into(),
+                Ok(()) if before == count => {
+                    format!("References already show {count} children.").into()
+                }
+                Ok(()) => format!("References now show {count} children.").into(),
+            },
+        );
+        cx.notify();
+    }
+
     /// Settings → Appearance: switch density in every window and remember it (ALL-5).
     pub fn choose_density(&mut self, density: Density, cx: &mut Context<Self>) {
         let before = appearance::density(cx);
@@ -732,6 +751,29 @@ impl SettingsView {
                     .on_click(cx.listener(move |this, _, _, cx| this.choose_density(d, cx)))
             })
             .collect();
+        let current_children = appearance::ref_children(cx);
+        let children: Vec<_> = (0..=appearance::REF_CHILDREN_MAX)
+            .map(|n| {
+                let on = n == current_children;
+                let th = th.clone();
+                div()
+                    .id(SharedString::from(format!("ref-children-{n}")))
+                    .debug_selector(move || format!("settings-ref-children-{n}"))
+                    .w(px(56.))
+                    .py_1()
+                    .flex()
+                    .justify_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if on { th.accent } else { th.line })
+                    .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
+                    .when(!on, |d| d.text_color(th.muted))
+                    .cursor_pointer()
+                    .hover(|x| x.bg(th.hover))
+                    .child(n.to_string())
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_ref_children(n, cx)))
+            })
+            .collect();
         div()
             .id("settings-appearance")
             .debug_selector(|| "settings-appearance".into())
@@ -781,7 +823,26 @@ impl SettingsView {
                                  kept in settings.json, never synced.",
                             ),
                     )
-                    .children(densities),
+                    .children(densities)
+                    .child(
+                        div()
+                            .pt_4()
+                            .pb_1()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.faint)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Children shown in references"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(
+                                "How many children a Linked Reference shows inline. 0 keeps \
+                                 them all behind its \"+N more\" chip.",
+                            ),
+                    )
+                    .child(div().flex().gap_2().children(children)),
             )
     }
 

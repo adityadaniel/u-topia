@@ -120,11 +120,15 @@ enum Item {
         count: usize,
         scheduled: bool,
     },
-    /// A referencing block (LR-3): the group's page title travels with it so the path above
-    /// the block can be drawn without a store read at paint time.
+    /// A referencing block (LR-3, LR-4): the group's page title and the block's first
+    /// children travel with it, so paint never reads the store (rule 3).
     Hit {
         hit: RefHit,
         page_title: SharedString,
+        /// The children shown inline, in outline order.
+        children: Vec<(BlockId, String)>,
+        /// Live children past the inline limit, behind the "+N more" chip.
+        hidden: usize,
     },
     More {
         page: PageId,
@@ -233,6 +237,11 @@ pub struct PageView {
     suggestions: Vec<(PageId, String, usize)>,
     filter_titles: BTreeMap<PageId, String>,
     expanded_groups: HashSet<PageId>,
+    /// Referencing blocks whose "+N more" chip was opened (LR-4). Local view state.
+    expanded_children: HashSet<BlockId>,
+    /// Children per reference in force when `items` was built (LR-4); the setting can change
+    /// while a page is open, which rebuilds once.
+    ref_children_limit: usize,
     /// A reference control's menu is open (LR-1). Local view state, never persisted.
     controls_menu: Option<ControlMenu>,
     open_embeds: HashSet<(BlockId, String)>,
@@ -304,6 +313,8 @@ impl PageView {
             suggestions: Vec::new(),
             filter_titles: BTreeMap::new(),
             expanded_groups: HashSet::new(),
+            expanded_children: HashSet::new(),
+            ref_children_limit: crate::appearance::ref_children(cx),
             controls_menu: None,
             open_embeds: HashSet::new(),
             rename: None,
@@ -383,6 +394,7 @@ impl PageView {
                 .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
                 .unwrap_or_default();
             self.expanded_groups = saved.into_iter().map(PageId).collect();
+            self.expanded_children.clear();
         }
         self.page_menu = false;
         self.controls_menu = None;
@@ -532,6 +544,7 @@ impl PageView {
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.dirty = false;
+        self.ref_children_limit = crate::appearance::ref_children(cx);
         let Some(page) = self.page.clone() else {
             self.replace_items(Vec::new(), cx);
             return;
@@ -653,7 +666,7 @@ impl PageView {
         for r in rows {
             items.push(r);
         }
-        self.push_refs(&page, &mut items);
+        self.push_refs(&page, &mut items, cx);
         if self.zoom.is_none() {
             // Unlinked References (FR-3.9): computed only when expanded, like Roam.
             if self.unlinked_open
@@ -786,7 +799,7 @@ impl PageView {
                     title: "Linked References".into(),
                     count: refs.shown(),
                 });
-                self.push_ref_groups(&page, refs, true, &mut items);
+                self.push_ref_groups(&page, refs, true, &mut items, cx);
             }
             ids.push(page);
         }
@@ -834,7 +847,7 @@ impl PageView {
         }
     }
 
-    fn push_refs(&self, page: &PageId, items: &mut Vec<Item>) {
+    fn push_refs(&self, page: &PageId, items: &mut Vec<Item>, cx: &mut Context<Self>) {
         let shown = self.refs.shown();
         let title = if self.zoom.is_some() {
             "Referenced by"
@@ -853,17 +866,52 @@ impl PageView {
             return;
         }
         let daily = self.header.kind == PageKind::Daily;
-        self.push_ref_groups(page, &self.refs, daily, items);
+        self.push_ref_groups(page, &self.refs, daily, items, cx);
     }
 
-    /// One header per referencing page, then its hits (folded past `GROUP_PREVIEW`).
+    /// One header per referencing page, then its hits (folded past `GROUP_PREVIEW`), each
+    /// with its first children inline (LR-4).
     fn push_ref_groups(
         &self,
         page: &PageId,
         refs: &LinkedRefs,
         daily: bool,
         items: &mut Vec<Item>,
+        cx: &mut Context<Self>,
     ) {
+        // Only the hits that become rows need their children; an opened "+N more" wants all.
+        let shown = |g: &utopia_store::RefGroup| {
+            if self.expanded_groups.contains(&g.page.id) {
+                usize::MAX
+            } else {
+                GROUP_PREVIEW
+            }
+        };
+        let mut folded: Vec<BlockId> = Vec::new();
+        let mut opened: Vec<BlockId> = Vec::new();
+        for g in &refs.groups {
+            for h in g.hits.iter().take(shown(g)) {
+                if self.expanded_children.contains(&h.block) {
+                    opened.push(h.block.clone());
+                } else {
+                    folded.push(h.block.clone());
+                }
+            }
+        }
+        let mut children = HashMap::new();
+        {
+            let store = &self.app.read(cx).store;
+            if !folded.is_empty() {
+                if let Ok(m) = store.ref_children(&folded, self.ref_children_limit) {
+                    children.extend(m);
+                }
+            }
+            if !opened.is_empty() {
+                if let Ok(m) = store.ref_children(&opened, usize::MAX) {
+                    children.extend(m);
+                }
+            }
+        }
         for g in &refs.groups {
             let scheduled = daily && g.page.id != *page;
             items.push(Item::GroupHeader {
@@ -871,15 +919,15 @@ impl PageView {
                 count: g.hits.len(),
                 scheduled,
             });
-            let limit = if self.expanded_groups.contains(&g.page.id) {
-                usize::MAX
-            } else {
-                GROUP_PREVIEW
-            };
+            let limit = shown(g);
             for h in g.hits.iter().take(limit) {
+                let (kids, total) = children.get(&h.block).cloned().unwrap_or_default();
+                let hidden = total.saturating_sub(kids.len());
                 items.push(Item::Hit {
                     hit: h.clone(),
                     page_title: g.page.title.clone().into(),
+                    children: kids,
+                    hidden,
                 });
             }
             if g.hits.len() > limit {
@@ -2765,7 +2813,12 @@ impl PageView {
                     }))
                     .into_any_element()
             }
-            Item::Hit { hit, page_title } => {
+            Item::Hit {
+                hit,
+                page_title,
+                children,
+                hidden,
+            } => {
                 let page = hit.page.clone();
                 let block = hit.block.clone();
                 let text = self.render_rich(&hit.text, &hit.block, None, cx);
@@ -2832,6 +2885,41 @@ impl PageView {
                     }
                     line.into_any_element()
                 });
+                // LR-4: the first children inline, then a chip that opens the rest. The
+                // list is built in `rebuild`, so this only lays out what the index returned.
+                let mut kids = div().flex().flex_col();
+                for (i, (child, child_text)) in children.iter().enumerate() {
+                    let rendered = self.render_rich(child_text, child, None, cx);
+                    kids = kids.child(
+                        div()
+                            .debug_selector(|| format!("hit-child-{ix}-{i}"))
+                            .flex()
+                            .ml(px(14.))
+                            .child(div().w(px(14.)).text_color(th.bullet).child("•"))
+                            .child(div().flex_1().min_w_0().child(rendered)),
+                    );
+                }
+                let more = (hidden > 0).then(|| {
+                    let block = block.clone();
+                    div()
+                        .id(SharedString::from(format!("hit-more-{ix}")))
+                        .debug_selector(|| format!("hit-more-{ix}-{hidden}"))
+                        .ml(px(28.))
+                        .px_2()
+                        .rounded_md()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.accent)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(th.hover))
+                        .child(format!("+{hidden} more"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // The chip is inside the hit row, whose click opens the block.
+                            cx.stop_propagation();
+                            this.expanded_children.insert(block.clone());
+                            this.dirty = true;
+                            cx.notify();
+                        }))
+                });
                 div()
                     .id(("hit", ix))
                     .px_6()
@@ -2854,6 +2942,8 @@ impl PageView {
                                     .child(text),
                             ),
                     )
+                    .when(!children.is_empty(), |d| d.child(kids))
+                    .children(more)
                     .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                         this.editor.update(cx, |ed, cx| ed.end(cx));
                         cx.emit(PageViewEvent::Open {
@@ -3109,6 +3199,13 @@ fn push_with_embeds(
 
 impl Render for PageView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Settings -> Appearance can change this while a page is open. The rows carry the
+        // children, so a change means one rebuild (LR-4).
+        let limit = crate::appearance::ref_children(cx);
+        if limit != self.ref_children_limit {
+            self.ref_children_limit = limit;
+            self.dirty = true;
+        }
         self.rebuild_if_dirty(cx);
         let th = theme(cx).clone();
         let view = cx.entity();

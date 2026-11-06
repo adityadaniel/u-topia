@@ -7,11 +7,13 @@
 //! versioned object meant to grow more general preferences:
 //!
 //! ```json
-//! { "version": 1, "font": "system", "density": "comfortable" }
+//! { "version": 1, "font": "system", "density": "comfortable", "ref_children": 2 }
 //! ```
 //!
 //! `font` is `"system"` (the default) or `"ibm-plex-sans"`; `density` is
-//! `"comfortable"` (the default) or `"compact"` (ALL-5). A missing file means defaults; an
+//! `"comfortable"` (the default) or `"compact"` (ALL-5); `ref_children` is how many
+//! children a Linked Reference shows inline, 0 to `REF_CHILDREN_MAX` (LR-4, default 2,
+//! 0 folds every child behind the "+N more" chip). A missing file means defaults; an
 //! unreadable file, an unknown value or a newer version is logged and read as far as it can
 //! be, never a panic (rule 11). Keys this version does not know are kept when the file is
 //! rewritten, so a newer release's preferences survive a round trip through an older one.
@@ -25,6 +27,10 @@ use crate::theme::{BODY_SIZE, LINE_HEIGHT};
 
 pub const FILE: &str = "settings.json";
 pub const VERSION: u64 = 1;
+/// How many children a Linked Reference shows inline by default (LR-4).
+pub const DEFAULT_REF_CHILDREN: usize = 2;
+/// The largest "Children shown in references" the Appearance tab offers.
+pub const REF_CHILDREN_MAX: usize = 3;
 
 /// The font the UI and notes are set in. Code blocks stay in Menlo either way.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -122,12 +128,25 @@ impl Density {
 }
 
 /// What `settings.json` holds.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
     pub font: UiFont,
     pub density: Density,
+    /// Children shown inline under a referencing block (LR-4); 0 folds them all.
+    pub ref_children: usize,
     /// Keys this version does not understand, written back untouched.
     rest: Map<String, Value>,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            font: UiFont::default(),
+            density: Density::default(),
+            ref_children: DEFAULT_REF_CHILDREN,
+            rest: Map::new(),
+        }
+    }
 }
 
 impl Prefs {
@@ -177,10 +196,31 @@ impl Prefs {
                 Density::default()
             }
         };
+        let ref_children = match rest.remove("ref_children") {
+            None => DEFAULT_REF_CHILDREN,
+            Some(Value::Number(n)) => match n.as_u64() {
+                Some(n) if n <= REF_CHILDREN_MAX as u64 => n as usize,
+                _ => {
+                    warnings.push(format!(
+                        "{FILE}: ref_children should be 0 to {REF_CHILDREN_MAX}, not {n}; \
+                         using {DEFAULT_REF_CHILDREN}"
+                    ));
+                    DEFAULT_REF_CHILDREN
+                }
+            },
+            Some(v) => {
+                warnings.push(format!(
+                    "{FILE}: ref_children should be a number, not {v}; \
+                     using {DEFAULT_REF_CHILDREN}"
+                ));
+                DEFAULT_REF_CHILDREN
+            }
+        };
         (
             Self {
                 font,
                 density,
+                ref_children,
                 rest,
             },
             warnings,
@@ -192,6 +232,7 @@ impl Prefs {
         m.insert("version".into(), VERSION.into());
         m.insert("font".into(), self.font.key().into());
         m.insert("density".into(), self.density.key().into());
+        m.insert("ref_children".into(), self.ref_children.into());
         for (k, v) in &self.rest {
             m.insert(k.clone(), v.clone());
         }
@@ -260,6 +301,13 @@ pub fn density(cx: &App) -> Density {
         .map_or(Density::default(), |a| a.prefs.density)
 }
 
+/// How many children a Linked Reference shows inline (LR-4), clamped to the offered range.
+pub fn ref_children(cx: &App) -> usize {
+    cx.try_global::<Appearance>()
+        .map_or(DEFAULT_REF_CHILDREN, |a| a.prefs.ref_children)
+        .min(REF_CHILDREN_MAX)
+}
+
 /// Switch font in every open window now, and remember it in `config_dir/settings.json`.
 /// A failed write is returned, not fatal: the font still applies for this session.
 pub fn set_font(cx: &mut App, font: UiFont, config_dir: &Path) -> std::io::Result<()> {
@@ -270,6 +318,14 @@ pub fn set_font(cx: &mut App, font: UiFont, config_dir: &Path) -> std::io::Resul
 /// Switch density in every open window now and remember it (rule 9: local UI state).
 pub fn set_density(cx: &mut App, density: Density, config_dir: &Path) -> std::io::Result<()> {
     cx.default_global::<Appearance>().prefs.density = density;
+    cx.refresh_windows();
+    cx.global::<Appearance>().prefs.save(config_dir)
+}
+
+/// Change how many children a reference shows inline (LR-4) and remember it. Open reference
+/// panels notice the change on their next render and rebuild their rows.
+pub fn set_ref_children(cx: &mut App, count: usize, config_dir: &Path) -> std::io::Result<()> {
+    cx.default_global::<Appearance>().prefs.ref_children = count.min(REF_CHILDREN_MAX);
     cx.refresh_windows();
     cx.global::<Appearance>().prefs.save(config_dir)
 }
@@ -300,6 +356,7 @@ mod tests {
         let p = Prefs {
             font: UiFont::IbmPlexSans,
             density: Density::Compact,
+            ref_children: 0,
             ..Default::default()
         };
         let json = p.to_json();
@@ -310,6 +367,7 @@ mod tests {
                 "version": 1,
                 "font": "ibm-plex-sans",
                 "density": "compact",
+                "ref_children": 0,
             })
         );
         assert_eq!(Prefs::from_json(&json), (p, vec![]));
@@ -335,6 +393,29 @@ mod tests {
     fn missing_keys_are_defaults_without_complaint() {
         assert_eq!(Prefs::from_json("{}"), (Prefs::default(), vec![]));
         assert_eq!(Prefs::default().density, Density::Comfortable);
+        assert_eq!(
+            Prefs::default().ref_children,
+            DEFAULT_REF_CHILDREN,
+            "LR-4: two children inline unless the user says otherwise"
+        );
+        assert_eq!(DEFAULT_REF_CHILDREN, 2);
+    }
+
+    /// LR-4: a bad "Children shown in references" value falls back to 2 and says so; 0 is a
+    /// real choice (fold every child behind the chip), not a missing value.
+    #[test]
+    fn ref_children_is_read_and_bounded() {
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "ref_children": 0}"#);
+        assert_eq!(p.ref_children, 0);
+        assert!(warnings.is_empty());
+        let (p, _) = Prefs::from_json(r#"{"version": 1, "ref_children": 3}"#);
+        assert_eq!(p.ref_children, 3);
+        for bad in ["12", "-1", "\"two\"", "true"] {
+            let (p, warnings) =
+                Prefs::from_json(&format!(r#"{{"version": 1, "ref_children": {bad}}}"#));
+            assert_eq!(p.ref_children, DEFAULT_REF_CHILDREN, "{bad}");
+            assert_eq!(warnings.len(), 1, "{bad}: {warnings:?}");
+        }
     }
 
     /// An unknown density is the comfortable one, said out loud, never a panic (rule 11).

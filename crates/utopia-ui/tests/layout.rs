@@ -262,6 +262,17 @@ fn setup_refs(
     (cx, ws, target)
 }
 
+/// The list index of the first Linked References hit drawn.
+fn first_hit_ix(cx: &mut VisualTestContext) -> usize {
+    cx.run_until_parked();
+    (0..40)
+        .find(|ix| {
+            let sel: &'static str = Box::leak(format!("hit-{ix}").into_boxed_str());
+            cx.debug_bounds(sel).is_some()
+        })
+        .expect("a linked reference was rendered")
+}
+
 /// The first Linked References hit drawn (its list index depends on what sits above it).
 /// Each test opens a fresh window, so no stale bounds from an earlier frame can match.
 fn first_hit(cx: &mut VisualTestContext) -> Bounds<Pixels> {
@@ -780,28 +791,36 @@ fn setup_nested_refs(
     let atlas = store.create_page("Atlas Launch").unwrap();
     let risks = utopia_core::BlockId::new();
     let risky = utopia_core::BlockId::new();
-    store
-        .execute(
-            &atlas,
-            vec![
-                Command::InsertBlock {
-                    id: risks.clone(),
-                    parent: None,
-                    after: None,
-                    text: "Risks".into(),
-                    kind: BlockKind::Heading(2),
-                },
-                Command::InsertBlock {
-                    id: risky.clone(),
-                    parent: Some(risks.clone()),
-                    after: None,
-                    text: "The beta date depends on [[Target]]".into(),
-                    kind: BlockKind::Bullet,
-                },
-            ],
-            Default::default(),
-        )
-        .unwrap();
+    let mut cmds = vec![
+        Command::InsertBlock {
+            id: risks.clone(),
+            parent: None,
+            after: None,
+            text: "Risks".into(),
+            kind: BlockKind::Heading(2),
+        },
+        Command::InsertBlock {
+            id: risky.clone(),
+            parent: Some(risks.clone()),
+            after: None,
+            text: "The beta date depends on [[Target]]".into(),
+            kind: BlockKind::Bullet,
+        },
+    ];
+    // Four children under the referencing block, for the inline-children limit (LR-4).
+    let mut after = None;
+    for n in 1..=4 {
+        let id = utopia_core::BlockId::new();
+        cmds.push(Command::InsertBlock {
+            id: id.clone(),
+            parent: Some(risky.clone()),
+            after: after.clone(),
+            text: format!("Reason {n}"),
+            kind: BlockKind::Bullet,
+        });
+        after = Some(id);
+    }
+    store.execute(&atlas, cmds, Default::default()).unwrap();
     store.sync_index().unwrap();
     let app = cx.new(|_| AppState::new(store));
     let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
@@ -860,5 +879,48 @@ fn reference_shows_the_full_path_above_the_block(cx: &mut TestAppContext) {
         f32::from(page.origin.x) >= left
             && f32::from(ancestor.origin.x + ancestor.size.width) <= right + 0.5,
         "the path stays inside the column: {path:?} ({left}, {right})"
+    );
+}
+
+/// LR-4: a reference shows the first two children inline and folds the rest behind a
+/// "+N more" chip, which opens them. The numbers come from the index, not the paint.
+#[gpui::test]
+fn reference_children_are_inline_up_to_the_limit(cx: &mut TestAppContext) {
+    let (cx, _, _, _) = setup_nested_refs(cx);
+    let ix = first_hit_ix(cx);
+    let first: &'static str = Box::leak(format!("hit-child-{ix}-0").into_boxed_str());
+    let second: &'static str = Box::leak(format!("hit-child-{ix}-1").into_boxed_str());
+    let third: &'static str = Box::leak(format!("hit-child-{ix}-2").into_boxed_str());
+    let hit = first_hit(cx);
+    let first = bounds(cx, first);
+    let second = bounds(cx, second);
+    assert!(
+        first.origin.y >= hit.origin.y + hit.size.height - px(0.5),
+        "children sit under their block: {first:?} {hit:?}"
+    );
+    assert!(
+        second.origin.y > first.origin.y,
+        "and stack in outline order: {first:?} {second:?}"
+    );
+    assert!(
+        first.origin.x >= hit.origin.x - px(0.5) && first.origin.x <= hit.origin.x + px(20.),
+        "children line up under the block's text, not its bullet: {first:?} {hit:?}"
+    );
+    assert!(
+        cx.debug_bounds(third).is_none(),
+        "only two are shown by default"
+    );
+    let more: &'static str = Box::leak(format!("hit-more-{ix}-2").into_boxed_str());
+    let chip = bounds(cx, more);
+    assert!(
+        chip.origin.y >= second.origin.y + second.size.height - px(0.5),
+        "the chip follows the shown children: {chip:?} {second:?}"
+    );
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let third = bounds(cx, third);
+    assert!(
+        third.origin.y >= second.origin.y + second.size.height - px(0.5),
+        "the chip opened the rest, in order: {third:?} {second:?}"
     );
 }

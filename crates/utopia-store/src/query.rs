@@ -675,6 +675,45 @@ impl Store {
         Ok(LinkedRefs { total, groups: out })
     }
 
+    /// The first `limit` live children of each referencing block, in outline order, and how
+    /// many live children it has in total (LR-4). Read from the `block` projection, so a
+    /// reference panel can show them without doing the work at paint time (rule 3).
+    /// `usize::MAX` means every child (the "+N more" chip was opened).
+    pub fn ref_children(
+        &self,
+        parents: &[BlockId],
+        limit: usize,
+    ) -> Result<HashMap<BlockId, (Vec<(BlockId, String)>, usize)>> {
+        self.read_barrier()?;
+        let mut out = HashMap::with_capacity(parents.len());
+        let mut count = self.conn.prepare_cached(
+            "SELECT count(*) FROM block WHERE parent_id=?1 AND deleted_at IS NULL",
+        )?;
+        let mut rows = self.conn.prepare_cached(
+            "SELECT id, text FROM block WHERE parent_id=?1 AND deleted_at IS NULL
+             ORDER BY position LIMIT ?2",
+        )?;
+        // SQLite reads a negative LIMIT as "no limit".
+        let sql_limit: i64 = if limit == usize::MAX {
+            -1
+        } else {
+            limit as i64
+        };
+        for parent in parents {
+            let total: i64 = count.query_row([parent.as_str()], |r| r.get(0))?;
+            let shown: Vec<(BlockId, String)> = if limit == 0 {
+                Vec::new()
+            } else {
+                rows.query_map(rusqlite::params![parent.as_str(), sql_limit], |r| {
+                    Ok((BlockId(r.get(0)?), r.get(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            out.insert(parent.clone(), (shown, total as usize));
+        }
+        Ok(out)
+    }
+
     /// Number of live blocks referencing a page.
     pub fn backlink_count(&self, page: &PageId) -> Result<usize> {
         self.read_barrier()?;

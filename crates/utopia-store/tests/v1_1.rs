@@ -321,3 +321,55 @@ fn date_filter_on_linked_references() {
     };
     assert_eq!(s.linked_references(&topic, &q).unwrap().shown(), 2);
 }
+
+/// LR-4: a reference's inline children come from the `block` projection, in outline order,
+/// with the total count so the view can fold the rest behind its chip.
+#[test]
+fn reference_children_come_from_the_index_in_order() {
+    let (mut s, _d) = store();
+    let target = s.create_page("Target").unwrap();
+    let src = s.create_page("Source").unwrap();
+    let parent = write(&mut s, &src, "the plan depends on [[Target]]");
+    let mut kids = Vec::new();
+    for n in 1..=4 {
+        let plan = outline::append_block(s.page_state(&src).unwrap(), Some(&parent));
+        let id = s.execute_plan(&src, plan, None).unwrap().unwrap().block;
+        s.set_block_text(&src, &id, &format!("Reason {n}"), None, None)
+            .unwrap();
+        s.commit_block(&src, &id).unwrap();
+        kids.push(id);
+    }
+    s.sync_index().unwrap();
+
+    let folded = s.ref_children(std::slice::from_ref(&parent), 2).unwrap();
+    let (shown, total) = folded.get(&parent).unwrap();
+    assert_eq!(total, &4, "the chip's count is the whole truth");
+    assert_eq!(
+        shown.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+        ["Reason 1", "Reason 2"]
+    );
+    assert_eq!(shown[0].0, kids[0], "in outline order");
+
+    // 0 asks for the count alone; usize::MAX asks for every child (the chip was opened).
+    let (none, total) = s
+        .ref_children(std::slice::from_ref(&parent), 0)
+        .unwrap()
+        .remove(&parent)
+        .unwrap();
+    assert!(none.is_empty());
+    assert_eq!(total, 4);
+    let (all, _) = s
+        .ref_children(std::slice::from_ref(&parent), usize::MAX)
+        .unwrap()
+        .remove(&parent)
+        .unwrap();
+    assert_eq!(all.len(), 4);
+    // A block with no children is just a count of zero, never a missing entry.
+    let (empty, total) = s
+        .ref_children(std::slice::from_ref(&kids[0]), 2)
+        .unwrap()
+        .remove(&kids[0])
+        .unwrap();
+    assert!(empty.is_empty());
+    assert_eq!(total, 0);
+}
