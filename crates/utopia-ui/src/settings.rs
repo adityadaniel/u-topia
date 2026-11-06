@@ -1,14 +1,18 @@
-//! The Settings window (§9.1, `OpenSettings` / Cmd+,). Four tabs:
+//! The Settings window (§9.1, `OpenSettings` / Cmd+,). Five tabs, in a list down the left
+//! side as System Settings has it (ST-5):
 //!
+//! - **Appearance** — the font notes and the interface are set in (System or the bundled
+//!   IBM Plex Sans) and how densely blocks are set (Comfortable or Compact). Applies to
+//!   every window at once; kept in `settings.json` ([`crate::appearance`]), not in
+//!   `keymap.json`.
 //! - **Keybindings** — every action in [`crate::actions::CATALOG`] with the keys in force,
 //!   rebindable by pressing the combination you want. Changes apply at once and are written
 //!   to `keymap.json`; only the actions you changed are stored.
 //! - **Shortcuts** — the cheat sheet of everything currently bound, which is also what the
 //!   Help menu's "Keyboard Shortcuts" opens.
-//! - **Appearance** — the font notes and the interface are set in (System or the bundled
-//!   IBM Plex Sans) and how densely blocks are set (Comfortable or Compact). Applies to
-//!   every window at once; kept in `settings.json` ([`crate::appearance`]), not in
-//!   `keymap.json`.
+//! - **Sync** — where this graph syncs to and whether its pages are encrypted on the way
+//!   (§12). Read only: the transport is resolved from the environment and the keychain at
+//!   launch, and no secret is shown.
 //! - **Help** — a tour of the app's features, with screenshots taken from the app itself.
 //!
 //! Capture uses a gpui *keystroke interceptor* rather than a key-down handler on purpose:
@@ -27,12 +31,13 @@ use crate::actions::{
 };
 use crate::appearance::{self, Density, UiFont};
 use crate::help::{shot_image, TOPICS};
+use crate::sync_runner;
 use crate::theme::{quiet_control, theme, Theme};
 
 /// Every pane is set in one readable column (ST-1), like the page column does.
 const CONTENT_WIDTH: f32 = 720.;
-/// Help prose stops at the same readable line length.
-const HELP_WIDTH: f32 = CONTENT_WIDTH;
+/// The tab list down the left side, as System Settings has it (ST-5).
+const RAIL_WIDTH: f32 = 220.;
 /// Screenshots are shown at a fixed size. gpui derives an image's aspect ratio from the
 /// decoded bytes, but that lands a frame after layout, so a width alone leaves the element
 /// at its intrinsic height; giving both keeps the box the right shape from the first frame.
@@ -42,24 +47,79 @@ const HELP_SHOT_HEIGHT: f32 = HELP_SHOT_WIDTH * 798. / 1200.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
+    Appearance,
     Keybindings,
     Shortcuts,
-    Appearance,
+    Sync,
     Help,
 }
 
 impl Tab {
     fn label(self) -> &'static str {
         match self {
+            Tab::Appearance => "Appearance",
             Tab::Keybindings => "Keybindings",
             Tab::Shortcuts => "Shortcuts",
-            Tab::Appearance => "Appearance",
+            Tab::Sync => "Sync",
             Tab::Help => "Help",
         }
     }
 
+    /// The glyph at the left of the tab: a letter or a symbol, drawn in the tab's colour.
+    /// Text rather than an image because the app ships no icons and a glyph inherits the
+    /// type size, the density and the font the user picked.
+    fn icon(self) -> &'static str {
+        match self {
+            Tab::Appearance => "Aa",
+            Tab::Keybindings => "⌘",
+            Tab::Shortcuts => "⌨",
+            Tab::Sync => "↻",
+            Tab::Help => "?",
+        }
+    }
+
+    /// One line under the pane title, so a tab explains itself.
+    fn summary(self) -> &'static str {
+        match self {
+            Tab::Appearance => {
+                "The font your notes and the interface are set in, and how \
+                                tightly blocks are set."
+            }
+            Tab::Keybindings => {
+                "Every action in the app and the keys it answers to. Click a \
+                                 key to change it."
+            }
+            Tab::Shortcuts => "Everything bound right now, as a cheat sheet.",
+            Tab::Sync => {
+                "Where this graph syncs to, and whether its pages are encrypted on \
+                          the way."
+            }
+            Tab::Help => {
+                "A short tour of what the app can do, with pictures of the real \
+                          thing."
+            }
+        }
+    }
+
+    /// How a debug selector names the tab.
+    fn key(self) -> &'static str {
+        match self {
+            Tab::Appearance => "appearance",
+            Tab::Keybindings => "keybindings",
+            Tab::Shortcuts => "shortcuts",
+            Tab::Sync => "sync",
+            Tab::Help => "help",
+        }
+    }
+
     fn all() -> &'static [Tab] {
-        &[Tab::Keybindings, Tab::Shortcuts, Tab::Appearance, Tab::Help]
+        &[
+            Tab::Appearance,
+            Tab::Keybindings,
+            Tab::Shortcuts,
+            Tab::Sync,
+            Tab::Help,
+        ]
     }
 }
 
@@ -323,31 +383,16 @@ impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let density = appearance::density(cx);
-        let tabs = Tab::all().iter().map(|&t| {
-            let on = t == self.tab;
-            div()
-                .id(SharedString::from(format!("tab-{}", t.label())))
-                .debug_selector(move || format!("settings-tab-{}", t.label()))
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .text_size(px(crate::theme::BODY_SIZE))
-                .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
-                .when(!on, |d| d.text_color(th.muted))
-                .child(t.label())
-                .on_click(cx.listener(move |this, _, _, cx| this.set_tab(t, cx)))
-        });
-        let tabs: Vec<_> = tabs.collect();
         let font = appearance::ui_font(cx);
 
         let body = match self.tab {
             Tab::Keybindings => self.render_keybindings(cx).into_any_element(),
             Tab::Shortcuts => self.render_shortcuts(cx).into_any_element(),
             Tab::Appearance => self.render_appearance(cx).into_any_element(),
+            Tab::Sync => self.render_sync(cx).into_any_element(),
             Tab::Help => self.render_help(cx).into_any_element(),
         };
-        // One debug selector per element: the body names the font, the header the density.
+        // One debug selector per element: the body names the font, the rail the density.
         let body = div()
             .debug_selector(move || format!("settings-ui-font-{}", font.key()))
             .flex()
@@ -358,6 +403,82 @@ impl Render for SettingsView {
             // inside it, pushing the status line out of reach.
             .min_h_0()
             .child(body);
+
+        // ST-5: the tabs are a list down the left side, as System Settings has it, each
+        // with a glyph so the list reads at a glance.
+        let tabs: Vec<_> = Tab::all()
+            .iter()
+            .map(|&t| {
+                let on = t == self.tab;
+                div()
+                    .id(SharedString::from(format!("nav-{}", t.key())))
+                    .debug_selector(move || format!("settings-nav-{}", t.key()))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py(px(if density == Density::Compact { 5. } else { 8. }))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(crate::theme::CONTROL_SIZE))
+                    .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
+                    .when(!on, |d| d.text_color(th.text).hover(|x| x.bg(th.hover)))
+                    .child(
+                        div()
+                            .w(px(18.))
+                            .flex_none()
+                            .text_color(if on { th.accent } else { th.muted })
+                            .child(t.icon()),
+                    )
+                    .child(t.label())
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_tab(t, cx)))
+            })
+            .collect();
+        let rail = div()
+            // Names the density in force, for tests (the root names the font; an element
+            // carries only one debug selector).
+            .debug_selector(move || format!("settings-ui-density-{}", density.key()))
+            .w(px(RAIL_WIDTH))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .px_3()
+            .py_4()
+            .border_r_1()
+            .border_color(th.line)
+            .bg(th.sidebar_bg)
+            .child(
+                div()
+                    .px_2()
+                    .pb_3()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.faint)
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("Settings"),
+            )
+            .children(tabs);
+
+        // The pane title sits in the same column as its cards, not at the window's edge.
+        let header = div().px_6().pt_6().pb_1().child(
+            column()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(crate::theme::H1_SIZE))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(self.tab.label()),
+                )
+                .child(
+                    div()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.muted)
+                        .child(self.tab.summary()),
+                ),
+        );
 
         div()
             .debug_selector(|| "settings".into())
@@ -373,24 +494,26 @@ impl Render for SettingsView {
             .font_family(appearance::font_family(cx))
             .child(
                 div()
-                    // Names the density in force, for tests (the root names the font; an
-                    // element carries only one debug selector).
-                    .debug_selector(move || format!("settings-ui-density-{}", density.key()))
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_4()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(th.line)
-                    .child(div().font_weight(FontWeight::BOLD).mr_2().child("Settings"))
-                    .children(tabs),
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .child(rail)
+                    .child(
+                        div()
+                            .debug_selector(|| "settings-pane".into())
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(header)
+                            .child(body),
+                    ),
             )
-            .child(body)
             .children(self.status.clone().map(|s| {
                 div()
                     .debug_selector(|| "settings-status".into())
-                    .px_4()
+                    .px_6()
                     .py_2()
                     .border_t_1()
                     .border_color(th.line)
@@ -427,6 +550,25 @@ fn card_title(th: &Theme, label: &str) -> Div {
         .text_color(th.faint)
         .font_weight(FontWeight::MEDIUM)
         .child(label.to_string())
+}
+
+/// One fact on a card: a label and its value, the value free to wrap.
+fn fact_row(label: &'static str, value: String, th: &Theme) -> Div {
+    div()
+        .flex()
+        .items_baseline()
+        .justify_between()
+        .gap_4()
+        .child(div().text_size(px(crate::theme::BODY_SIZE)).child(label))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted)
+                .text_right()
+                .child(value),
+        )
 }
 
 /// One row inside a card: the hairline between rows is the point of ST-1.
@@ -794,28 +936,37 @@ impl SettingsView {
             .child(densities)
     }
 
+    /// The tour: one readable column of prose, with the topics as chips above it. The old
+    /// second column of topics is gone now that the tabs themselves are a list at the left
+    /// (ST-5); the screenshots get the full 720 px column instead of a clipped half.
     fn render_help(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let selected = self.topic.min(TOPICS.len().saturating_sub(1));
-        let nav = TOPICS.iter().enumerate().map(|(i, t)| {
-            let on = i == selected;
-            div()
-                .id(SharedString::from(format!("help-nav-{i}")))
-                .debug_selector(move || format!("help-nav-{i}"))
-                .px_3()
-                .py_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .text_size(px(crate::theme::BODY_SIZE))
-                .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
-                .when(!on, |d| d.text_color(th.text).hover(|x| x.bg(th.hover)))
-                .child(t.title)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.topic = i;
-                    cx.notify();
-                }))
-        });
-        let nav: Vec<_> = nav.collect();
+        let nav: Vec<_> = TOPICS
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let on = i == selected;
+                div()
+                    .id(SharedString::from(format!("help-nav-{i}")))
+                    .debug_selector(move || format!("help-nav-{i}"))
+                    .px_2()
+                    .py_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(crate::theme::CONTROL_SIZE))
+                    .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
+                    .when(!on, |d| {
+                        d.text_color(th.muted)
+                            .hover(|x| x.bg(th.hover).text_color(th.text))
+                    })
+                    .child(t.title)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.topic = i;
+                        cx.notify();
+                    }))
+            })
+            .collect();
 
         let t = &TOPICS[selected];
         let shortcuts: Vec<_> = t
@@ -847,70 +998,154 @@ impl SettingsView {
 
         // `w_full` first, then `max_w`: a flex child's width is only definite once it is
         // told to fill its parent, and without a definite width the prose does not wrap.
-        let mut column = div()
-            .w_full()
-            .max_w(px(HELP_WIDTH))
+        let mut body = column()
             .flex()
             .flex_col()
             .gap_3()
+            .child(div().flex().flex_wrap().gap_1().children(nav))
             .child(
                 div()
+                    .pt_3()
                     .text_size(px(crate::theme::H1_SIZE))
                     .font_weight(FontWeight::BOLD)
                     .child(t.title),
             )
             .child(div().text_color(th.muted).child(t.summary));
         for p in t.body {
-            column = column.child(div().text_size(px(crate::theme::BODY_SIZE)).child(*p));
+            body = body.child(div().text_size(px(crate::theme::BODY_SIZE)).child(*p));
         }
         if !shortcuts.is_empty() {
-            column = column.child(div().flex().flex_wrap().gap_3().pt_1().children(shortcuts));
+            body = body.child(div().flex().flex_wrap().gap_3().pt_1().children(shortcuts));
         }
         if let Some(image) = shot_image(t) {
-            column = column.child(
-                div().debug_selector(|| "help-shot".into()).pt_2().child(
-                    img(image)
-                        .w(px(HELP_SHOT_WIDTH))
-                        .h(px(HELP_SHOT_HEIGHT))
-                        .rounded_md()
-                        .border_1()
-                        .border_color(th.line),
-                ),
+            body = body.child(
+                div()
+                    .debug_selector(|| "help-shot".into())
+                    .w(px(HELP_SHOT_WIDTH))
+                    .flex_none()
+                    .pt_2()
+                    .child(
+                        img(image)
+                            .w(px(HELP_SHOT_WIDTH))
+                            .h(px(HELP_SHOT_HEIGHT))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(th.line),
+                    ),
             );
         }
-        let detail = div()
-            .id("help-detail")
-            .debug_selector(|| "help-detail".into())
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w(px(0.))
-            .overflow_y_scroll()
-            .px_6()
-            .py_4()
-            .child(column);
+        pane("help-detail", "help-detail").child(body)
+    }
 
-        div()
-            .flex()
-            .flex_row()
-            .flex_1()
-            .overflow_hidden()
-            .child(
+    /// Settings → Sync (ST-5): what the transport in force is, and how it is set up. Read
+    /// only on purpose: the relay URL, token and passphrase are resolved from the
+    /// environment and the keychain at launch (§12), and secrets are never echoed here or
+    /// written to `settings.json` (§15.6, rule 9).
+    fn render_sync(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let th = theme(cx).clone();
+        let density = appearance::density(cx);
+        let facts = sync_runner::facts(cx);
+        let (status, status_help) = if facts.is_on() {
+            (
+                "Sync is on for this graph.",
+                "Page changes are exchanged in the background; the sidebar of the main \
+                 window shows the latest round.",
+            )
+        } else {
+            (
+                "Sync is off for this graph.",
+                "Utopia is local-only: nothing leaves this machine unless you start it with \
+                 a sync target.",
+            )
+        };
+        let transport = facts
+            .target
+            .clone()
+            .unwrap_or_else(|| "Local only (no relay, no shared folder)".to_string());
+        let encryption = if facts.encrypted {
+            "End-to-end encrypted: the relay only sees ciphertext"
+        } else {
+            "Not encrypted: a relay can read page payloads"
+        };
+
+        let mut this_graph = card(&th)
+            .debug_selector(|| "settings-sync".into())
+            .child(card_title(&th, "This graph"))
+            .child(card_row(
                 div()
-                    .id("help-nav")
                     .flex()
                     .flex_col()
-                    .w(px(260.))
-                    .flex_none()
-                    .overflow_y_scroll()
-                    .border_r_1()
-                    .border_color(th.line)
-                    .bg(th.sidebar_bg)
-                    .px_2()
-                    .py_3()
                     .gap_0p5()
-                    .children(nav),
-            )
-            .child(detail)
+                    .child(div().text_size(px(crate::theme::BODY_SIZE)).child(status))
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(status_help),
+                    ),
+                0,
+                &th,
+                density,
+            ))
+            .child(card_row(
+                fact_row("Transport", transport, &th)
+                    .debug_selector(|| "settings-sync-transport".into()),
+                1,
+                &th,
+                density,
+            ))
+            .child(card_row(
+                fact_row(
+                    "Graph id",
+                    facts.graph.clone().unwrap_or_else(|| "unknown".to_string()),
+                    &th,
+                ),
+                2,
+                &th,
+                density,
+            ))
+            .child(card_row(
+                fact_row("Encryption", encryption.to_string(), &th),
+                3,
+                &th,
+                density,
+            ));
+
+        this_graph = this_graph.child(card_row(
+            div()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted)
+                .child(
+                    "Sync is configured when Utopia starts, not in this window: \
+                     UTOPIA_SYNC_URL (or `lan`) for a relay, UTOPIA_SYNC_FOLDER for a shared \
+                     folder. The relay token and the end-to-end passphrase come from the \
+                     environment or the macOS keychain (services utopia-sync and \
+                     utopia-sync-passphrase), never from the graph.",
+                ),
+            4,
+            &th,
+            density,
+        ));
+
+        let how = card(&th)
+            .debug_selector(|| "settings-sync-how".into())
+            .child(card_title(&th, "How it is set up"))
+            .child(card_row(
+                div()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(
+                        "Nothing on this pane is written down: settings.json holds only \
+                         local preferences, and the graph holds no token. Restart Utopia \
+                         with different variables to point it somewhere else.",
+                    ),
+                0,
+                &th,
+                density,
+            ));
+
+        pane("settings-sync-pane", "settings-sync-pane")
+            .child(this_graph)
+            .child(how)
     }
 }

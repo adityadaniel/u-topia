@@ -213,17 +213,19 @@ fn keybindings_are_a_readable_column_of_cards(cx: &mut TestAppContext) {
         .expect("the Navigation card is drawn");
     let width = f32::from(nav.size.width);
     assert!((width - 720.).abs() < 1.5, "the column is 720 px: {nav:?}");
-    let left = f32::from(nav.origin.x);
-    let right = 1100. - left - width;
+    // Centred in the pane beside the tab rail, not in the whole window (ST-5).
+    let pane = cx.debug_bounds("settings-pane").unwrap();
+    let left = f32::from(nav.origin.x) - f32::from(pane.origin.x);
+    let right = f32::from(pane.size.width) - left - width;
     assert!(
         (left - right).abs() < 2.,
-        "the column is centred: {left} left, {right} right"
+        "the column is centred in the pane: {left} left, {right} right"
     );
     let app = cx
         .debug_bounds("settings-card-Application")
         .expect("the Application card is drawn");
     assert!(
-        (f32::from(app.origin.x) - left).abs() < 1.5
+        (f32::from(app.origin.x) - f32::from(nav.origin.x)).abs() < 1.5
             && (f32::from(app.size.width) - width).abs() < 1.5,
         "every category card shares the column: {app:?}"
     );
@@ -234,6 +236,130 @@ fn keybindings_are_a_readable_column_of_cards(cx: &mut TestAppContext) {
     assert!(
         (f32::from(yesterday.origin.y) - f32::from(today.origin.y + today.size.height)).abs() < 1.,
         "rows touch: {today:?} then {yesterday:?}"
+    );
+}
+
+/// ST-5: the tabs are a list down the left, each with an icon, and picking one swaps the
+/// pane without moving the rail.
+#[gpui::test]
+fn side_tabs_switch_panes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+
+    for key in ["appearance", "keybindings", "shortcuts", "sync", "help"] {
+        assert!(
+            cx.debug_bounds(match key {
+                "appearance" => "settings-nav-appearance",
+                "keybindings" => "settings-nav-keybindings",
+                "shortcuts" => "settings-nav-shortcuts",
+                "sync" => "settings-nav-sync",
+                _ => "settings-nav-help",
+            })
+            .is_some(),
+            "the {key} tab is in the list"
+        );
+    }
+    // The rail fills the left edge and the pane starts where it ends.
+    let first = cx.debug_bounds("settings-nav-appearance").unwrap();
+    assert!(f32::from(first.origin.x) < 30., "{first:?}");
+    let pane = cx.debug_bounds("settings-pane").unwrap();
+    assert!(f32::from(pane.origin.x) < 221., "{pane:?}");
+    assert!(
+        f32::from(pane.size.width) > 800.,
+        "the pane takes the rest of the window: {pane:?}"
+    );
+    // The top tab row is gone (never drawn, so a bounds check is sound).
+    assert!(cx.debug_bounds("settings-tab-Keybindings").is_none());
+
+    let appearance = cx.debug_bounds("settings-nav-appearance").unwrap();
+    cx.simulate_click(appearance.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.tab()), Tab::Appearance);
+    assert!(
+        cx.debug_bounds("settings-card-Font").is_some(),
+        "the Appearance pane is drawn after the click"
+    );
+
+    let sync = cx.debug_bounds("settings-nav-sync").unwrap();
+    cx.simulate_click(sync.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.tab()), Tab::Sync);
+    assert!(
+        cx.debug_bounds("settings-sync").is_some(),
+        "the Sync pane is drawn after the click"
+    );
+}
+
+/// ST-5: the Sync tab reports the transport in force and never a secret. The facts are
+/// built from the config the app resolved at launch, which holds the token and passphrase.
+#[gpui::test]
+fn the_sync_tab_shows_the_transport(cx: &mut TestAppContext) {
+    use utopia_ui::sync_runner::{SyncConfig, SyncFacts, SyncTarget};
+    let cfg = SyncConfig {
+        target: SyncTarget::Relay {
+            url: "https://relay.example".into(),
+            token: Some("s3cret-token".into()),
+        },
+        graph: "graph-123".into(),
+        passphrase: Some("hunter2".into()),
+    };
+    let facts = SyncFacts::from_config(&cfg);
+    // The token and the passphrase are never carried into the view.
+    let shown = format!("{facts:?}");
+    assert!(facts.encrypted);
+    assert!(shown.contains("https://relay.example"), "{shown}");
+    assert!(!shown.contains("s3cret-token") && !shown.contains("hunter2"));
+
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+        cx.set_global(facts.clone());
+    });
+    let path = dir.path().to_path_buf();
+    let (_view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Sync, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("settings-sync").is_some());
+    assert!(
+        cx.debug_bounds("settings-sync-transport").is_some(),
+        "the transport has a row of its own"
+    );
+}
+
+/// ST-5: Help is one readable column now that the topics sit above it instead of in a
+/// second sidebar; the 640 px screenshots fit in the 720 px column.
+#[gpui::test]
+fn help_screenshots_fit_the_column(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (_view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Help, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+    let pane = cx.debug_bounds("settings-pane").unwrap();
+    let shot = cx
+        .debug_bounds("help-shot")
+        .expect("the topic has a screenshot");
+    assert!((f32::from(shot.size.width) - 640.).abs() < 1.5, "{shot:?}");
+    assert!(
+        f32::from(shot.origin.x) >= f32::from(pane.origin.x)
+            && f32::from(shot.origin.x + shot.size.width)
+                <= f32::from(pane.origin.x + pane.size.width),
+        "the screenshot is inside the pane: {shot:?} in {pane:?}"
     );
 }
 
