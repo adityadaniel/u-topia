@@ -2052,3 +2052,41 @@ fn an_edit_does_not_classify_tag_pages_on_the_ui_thread(cx: &mut TestAppContext)
     );
     assert_eq!(app.update(cx, |app, _| app.store.tag_page_scans()), scans);
 }
+
+/// FR-1.2: a journal template gives a draft day blocks before it is written. Clicking that
+/// day must still write nothing; the row the caret goes to is added to the draft in memory
+/// and only becomes a page on the first keystroke, together with the template.
+#[gpui::test]
+fn template_backed_day_is_not_written_by_a_click(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        let t = app.store.create_page("templates/journal").unwrap();
+        let b = app.store.ensure_first_block(&t).unwrap();
+        app.store
+            .set_block_text(&t, &b, "Intention for today", None, None)
+            .unwrap();
+        app.store.commit_block(&t, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let day = today() - chrono::Duration::days(4);
+    let selector: &'static str =
+        Box::leak(format!("day-folded-{}", utopia_core::date::iso(day)).into_boxed_str());
+    let row = cx.debug_bounds(selector).expect("a folded empty day");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        daily_count(&app, cx),
+        0,
+        "clicking a template-backed day is not writing it"
+    );
+    // The template's block and the new note are written together on the first keystroke.
+    cx.simulate_input("filled in later");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        day_texts(&app, day, cx),
+        ["Intention for today", "filled in later"]
+    );
+}

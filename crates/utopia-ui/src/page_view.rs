@@ -3701,6 +3701,11 @@ fn start_note(
     if let Some(block) = reuse {
         return Ok(block);
     }
+    if store.is_draft(page) {
+        // A journal template already gave the draft blocks: adding the row the caret goes
+        // to must not write the day, so it lives in the draft's memory until a keystroke.
+        return store.draft_append_block(page);
+    }
     if !has_roots {
         return store.ensure_first_block(page);
     }
