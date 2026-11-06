@@ -6,22 +6,23 @@
 //! identity, references and the index. Nodes grow from 6 px to 18 px with their distinct
 //! link count, the page the graph was opened from keeps a 2 px accent ring (GR-1); hovering
 //! fades everything but the page and its neighbours to 25 % and floats a card with the
-//! first block (GR-2).
+//! first block (GR-2); the count and colour key sit at the bottom left and the zoom controls
+//! at the bottom right (GR-3).
 
 use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
     anchored, canvas, deferred, div, point, prelude::*, px, size, transparent_black, Bounds,
-    Context, EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathBuilder, Pixels, Point, ScrollWheelEvent, SharedString, Task, TextRun,
-    Window,
+    Context, EventEmitter, FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, ScrollWheelEvent, SharedString, Task,
+    TextRun, Window,
 };
 use utopia_core::PageId;
 use utopia_store::{GraphOptions, PageGraph};
 
 use crate::app_state::AppState;
-use crate::theme::{quiet_control, theme, CAPTION_SIZE, CONTROL_SIZE};
+use crate::theme::{quiet_control, theme, Theme, CAPTION_SIZE, CONTROL_SIZE};
 
 const LAYOUT_ITERATIONS: usize = 160;
 const MARGIN: f32 = 48.;
@@ -125,6 +126,10 @@ impl GraphView {
 
     pub fn is_laid_out(&self) -> bool {
         self.laid_out
+    }
+
+    pub fn zoom(&self) -> f32 {
+        self.zoom
     }
 
     pub fn hovered(&self) -> Option<usize> {
@@ -318,6 +323,22 @@ impl GraphView {
         cx.notify();
     }
 
+    /// GR-3: the "−" and "+" controls. Zoom about the middle of the canvas.
+    fn zoom_by(&mut self, factor: f32, cx: &mut Context<Self>) {
+        let old = self.zoom;
+        self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+        let k = self.zoom / old;
+        self.pan = point(self.pan.x * k, self.pan.y * k);
+        cx.notify();
+    }
+
+    /// GR-3: "Fit" returns to the layout's own frame, which always spans the canvas.
+    fn fit(&mut self, cx: &mut Context<Self>) {
+        self.zoom = 1.0;
+        self.pan = point(px(0.), px(0.));
+        cx.notify();
+    }
+
     fn chip(
         &self,
         id: &'static str,
@@ -330,6 +351,82 @@ impl GraphView {
             .debug_selector(move || id.into())
             .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
             .when(!on, |d| d.text_color(th.muted))
+    }
+
+    fn legend(&self, th: &Theme) -> gpui::Stateful<gpui::Div> {
+        let key = |color: Hsla, label: &'static str| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .w(px(7.))
+                        .h(px(7.))
+                        .rounded_full()
+                        .bg(color)
+                        .flex_none(),
+                )
+                .child(label)
+        };
+        let ring = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .w(px(9.))
+                    .h(px(9.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(th.accent)
+                    .flex_none(),
+            )
+            .child("Current page");
+        div()
+            .id("graph-legend")
+            .debug_selector(|| "graph-legend".into())
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .text_size(px(CAPTION_SIZE))
+            .text_color(th.muted)
+            .child(key(th.bullet, "Pages"))
+            .child(key(th.tag, "Journal pages"))
+            .child(ring)
+            .child(
+                div()
+                    .debug_selector(|| "graph-legend-count".into())
+                    .pt_0p5()
+                    .text_color(th.faint)
+                    .child(format!(
+                        "{} pages · {} links",
+                        self.graph.nodes.len(),
+                        self.graph.edges.len()
+                    )),
+            )
+    }
+
+    fn zoom_controls(&self, th: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                quiet_control("graph-zoom-out", "−", th)
+                    .debug_selector(|| "graph-zoom-out".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1. / 1.25, cx))),
+            )
+            .child(
+                quiet_control("graph-zoom-in", "+", th)
+                    .debug_selector(|| "graph-zoom-in".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1.25, cx))),
+            )
+            .child(
+                quiet_control("graph-zoom-fit", "Fit", th)
+                    .debug_selector(|| "graph-zoom-fit".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.fit(cx))),
+            )
     }
 }
 
@@ -371,7 +468,7 @@ impl Render for GraphView {
                 .map(|r| r.title)
         });
 
-        // The filters, the count and Close sit in the top bar.
+        // GR-3: the filters and Close stay in the top bar; the count moves into the legend.
         let header = div()
             .flex()
             .items_center()
@@ -399,16 +496,6 @@ impl Render for GraphView {
                     })),
             )
             .child(div().flex_1())
-            .child(
-                div()
-                    .text_size(px(CAPTION_SIZE))
-                    .text_color(th.faint)
-                    .child(format!(
-                        "{} pages · {} links",
-                        self.graph.nodes.len(),
-                        self.graph.edges.len()
-                    )),
-            )
             .child(
                 self.chip("graph-close", "Close", false, cx)
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(GraphEvent::Close))),
@@ -617,6 +704,11 @@ impl Render for GraphView {
                 )
             });
 
+        // GR-3: the legend and controls float over the canvas, so they never take space
+        // from the picture.
+        let body = body
+            .child(self.legend(&th).absolute().left_3().bottom_3())
+            .child(self.zoom_controls(&th, cx).absolute().right_3().bottom_3());
         div()
             .debug_selector(|| "graph-view".into())
             .key_context("GraphView")

@@ -562,3 +562,51 @@ fn opening_the_page_menu_does_not_move_the_title(cx: &mut TestAppContext) {
         "the title keeps its bounds when the menu opens"
     );
 }
+
+/// GR-3: the legend and the count sit at the bottom left, the zoom controls at the bottom
+/// right, and the top bar no longer spends a row on the count.
+#[gpui::test]
+fn graph_legend_and_zoom_controls_sit_at_the_edges(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape cmd-shift-g");
+    cx.run_until_parked();
+    let canvas = bounds(cx, "graph-canvas");
+    let legend = bounds(cx, "graph-legend");
+    let zoom_in = bounds(cx, "graph-zoom-in");
+    let zoom_out = bounds(cx, "graph-zoom-out");
+    let fit = bounds(cx, "graph-zoom-fit");
+    let right = canvas.origin.x + canvas.size.width;
+    let bottom = canvas.origin.y + canvas.size.height;
+    assert!(
+        legend.origin.x > canvas.origin.x && legend.origin.x < canvas.center().x,
+        "legend on the left: {legend:?}"
+    );
+    assert!(
+        legend.origin.y + legend.size.height <= bottom + px(1.)
+            && legend.origin.y > canvas.center().y,
+        "legend at the bottom: {legend:?}"
+    );
+    assert!(
+        zoom_out.origin.x > canvas.center().x && fit.origin.x + fit.size.width <= right + px(1.),
+        "zoom controls on the right: {zoom_out:?} {fit:?}"
+    );
+    assert!(
+        zoom_in.origin.y + zoom_in.size.height <= bottom + px(1.),
+        "zoom controls at the bottom: {zoom_in:?}"
+    );
+
+    // The controls change the scale, and Fit returns to the layout's frame.
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let graph = ws.update(cx, |w, _| w.graph_view()).expect("graph shown");
+    let at = zoom_in.center();
+    cx.simulate_click(at, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(graph.update(cx, |g, _| g.zoom()) > 1.);
+    let at = fit.center();
+    cx.simulate_click(at, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(graph.update(cx, |g, _| g.zoom()), 1.);
+}
