@@ -171,6 +171,19 @@ pub fn quiet_menu(
 /// Label size for controls, between body and caption.
 pub const CONTROL_SIZE: f32 = 13.;
 
+/// The small count that follows a name (LR-2): a quiet chip right after the page or day
+/// name, not a number pushed to the far edge of the row.
+pub fn count_chip(count: usize, th: &Theme) -> Div {
+    div()
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .bg(th.chip_bg)
+        .text_size(px(CAPTION_SIZE))
+        .text_color(th.muted)
+        .child(count.to_string())
+}
+
 /// The one type scale (ALL-1): titles, outline headings, body and captions. Page titles
 /// and day headings share `TITLE_SIZE`; an outline heading never draws larger than H1.
 pub const TITLE_SIZE: f32 = 28.;

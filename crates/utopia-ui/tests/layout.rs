@@ -707,3 +707,54 @@ fn page_menu_items_take_their_clicks(cx: &mut TestAppContext) {
     });
     assert!(deleted, "the danger item deleted the page it belongs to");
 }
+
+/// The first `group-title-{ix}` and its count chip, by trying list indices.
+fn first_group(cx: &mut VisualTestContext) -> (Bounds<Pixels>, Bounds<Pixels>) {
+    cx.run_until_parked();
+    (0..40)
+        .find_map(|ix| {
+            let title: &'static str = Box::leak(format!("group-title-{ix}").into_boxed_str());
+            let count: &'static str = Box::leak(format!("group-count-{ix}-1").into_boxed_str());
+            Some((cx.debug_bounds(title)?, cx.debug_bounds(count)?))
+        })
+        .expect("a referencing group with one hit was rendered")
+}
+
+/// LR-2: the count is a small chip right after the page or day name, not a number pushed to
+/// the far edge of the row.
+#[gpui::test]
+fn reference_counts_sit_next_to_the_name(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_controls(cx);
+    let title = bounds(cx, "refs-title");
+    let count = bounds(cx, "refs-count-1");
+    let header = bounds(cx, "refs-header");
+    assert!(
+        count.origin.x >= title.origin.x + title.size.width - px(1.),
+        "the count follows the title: {count:?} {title:?}"
+    );
+    assert!(
+        count.origin.x - (title.origin.x + title.size.width) < px(16.),
+        "and sits right next to it: {count:?} {title:?}"
+    );
+    assert!(
+        approx(
+            count.origin.y + count.size.height / 2.,
+            f32::from(title.origin.y) + f32::from(title.size.height) / 2.
+        ),
+        "on the same line: {count:?} {title:?}"
+    );
+    assert!(
+        count.origin.x + count.size.width < header.origin.x + header.size.width - px(200.),
+        "not at the far edge: {count:?} {header:?}"
+    );
+
+    let (group, group_count) = first_group(cx);
+    assert!(
+        group_count.origin.x >= group.origin.x + group.size.width - px(1.),
+        "the group's count follows its name: {group_count:?} {group:?}"
+    );
+    assert!(
+        group_count.origin.x - (group.origin.x + group.size.width) < px(16.),
+        "right next to it: {group_count:?} {group:?}"
+    );
+}

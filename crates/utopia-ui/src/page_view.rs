@@ -2692,11 +2692,15 @@ impl PageView {
                 .border_t_1()
                 .border_color(th.line)
                 .flex()
-                .justify_between()
+                .items_center()
+                .gap_2()
                 .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.muted)
-                .child(title)
-                .child(count.to_string())
+                .child(div().debug_selector(|| "refs-title".into()).child(title))
+                .child(
+                    crate::theme::count_chip(count, &th)
+                        .debug_selector(move || format!("refs-count-{count}")),
+                )
                 .into_any_element(),
             Item::RefsControls => self.render_controls(cx),
             Item::GroupHeader {
@@ -2708,18 +2712,31 @@ impl PageView {
                 div()
                     .id(("group", ix))
                     .flex()
-                    .justify_between()
+                    .items_center()
                     .mx_2()
                     .px_2()
                     .pt_2()
                     .rounded_sm()
                     .cursor_pointer()
                     .hover(|s| s.bg(th.hover))
+                    // The count follows the name as a chip (LR-2), and there are no icons in
+                    // the header: the title and its count are enough.
                     .child(
                         div()
                             .flex()
                             .gap_2()
-                            .items_baseline()
+                            .items_center()
+                            .child(
+                                div()
+                                    .debug_selector(|| format!("group-title-{ix}"))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(th.accent)
+                                    .child(page.title.clone()),
+                            )
+                            .child(
+                                crate::theme::count_chip(count, &th)
+                                    .debug_selector(|| format!("group-count-{ix}-{count}")),
+                            )
                             .when(scheduled, |d| {
                                 d.child(
                                     div()
@@ -2727,19 +2744,7 @@ impl PageView {
                                         .text_color(th.tag)
                                         .child("Scheduled for this day"),
                                 )
-                            })
-                            .child(
-                                div()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(th.accent)
-                                    .child(page.title.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.muted)
-                            .child(count.to_string()),
+                            }),
                     )
                     .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                         this.editor.update(cx, |ed, cx| ed.end(cx));
