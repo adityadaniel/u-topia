@@ -675,3 +675,85 @@ fn opening_the_page_menu_does_not_move_the_title(cx: &mut TestAppContext) {
         "the title keeps its bounds when the menu opens"
     );
 }
+
+/// PG-4: the bullet reads as a drag handle only under the pointer, and a parent's collapse
+/// arrow appears with it — but only for the row being hovered.
+#[gpui::test]
+fn block_affordances_appear_on_hover(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    cx.simulate_input("parent");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("child");
+    cx.simulate_keystrokes("tab escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("grip-1").is_none(),
+        "a row shows no drag handle until the pointer is over it"
+    );
+    assert!(
+        cx.debug_bounds("arrow-1").is_none(),
+        "an expanded parent's arrow is quiet at rest"
+    );
+
+    let child = bounds(cx, "row-2");
+    cx.simulate_mouse_move(child.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("grip-2").is_some(),
+        "the hovered row shows its drag handle"
+    );
+    assert!(
+        cx.debug_bounds("arrow-1").is_none(),
+        "hovering one row does not reveal another row's arrow"
+    );
+
+    let parent = bounds(cx, "row-1");
+    cx.simulate_mouse_move(parent.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let grip = bounds(cx, "grip-1");
+    let arrow = bounds(cx, "arrow-1");
+    let content = bounds(cx, "content-1");
+    assert!(
+        arrow.origin.x < grip.origin.x && grip.origin.x < content.origin.x,
+        "arrow, then the handle, then the text: {arrow:?} {grip:?} {content:?}"
+    );
+    assert!(
+        grip.size.height > px(4.) && grip.size.height < px(14.),
+        "the grip is a small drawn handle: {grip:?}"
+    );
+}
+
+/// PG-4: the to-do box is a drawn 3 px-cornered control, and clicking it checks the to-do
+/// (the box, not the font's ☐ glyph, is the target).
+#[gpui::test]
+fn todo_box_is_a_drawn_control(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    cx.simulate_input("milk");
+    cx.simulate_keystrokes("alt-enter escape");
+    cx.run_until_parked();
+    let boxed = bounds(cx, "todo-1");
+    let content = bounds(cx, "content-1");
+    assert!(
+        approx(boxed.size.width, 13.) && approx(boxed.size.height, 13.),
+        "a 13 px box: {boxed:?}"
+    );
+    assert!(
+        boxed.origin.x < content.origin.x,
+        "the box sits left of the text: {boxed:?} {content:?}"
+    );
+    cx.simulate_click(boxed.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let app = ws.update(cx, |w, _| w.app().clone());
+    let page = ws.update(cx, |w, cx| w.main_page(cx)).expect("a page");
+    app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).expect("page state");
+        let first = st.live_roots().first().cloned().expect("one block");
+        let b = st.block(&first).expect("the block");
+        assert_eq!(b.kind, utopia_core::BlockKind::Todo, "still a to-do");
+        assert!(b.checked, "clicking the box checked it");
+    });
+}

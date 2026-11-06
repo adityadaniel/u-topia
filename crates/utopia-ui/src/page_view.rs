@@ -230,6 +230,9 @@ pub struct PageView {
     journal: Option<Journal>,
     /// The page header's "···" menu is open (ALL-3).
     page_menu: bool,
+    /// The row the pointer is over, so its bullet can read as a drag handle and its
+    /// collapse arrow can appear (PG-4). Local UI state, never persisted (rule 9).
+    hovered_row: Option<BlockId>,
     dirty: bool,
     _subs: Vec<Subscription>,
 }
@@ -297,6 +300,7 @@ impl PageView {
             calendar_month: today,
             journal: None,
             page_menu: false,
+            hovered_row: None,
             dirty: true,
             _subs: subs,
         }
@@ -1612,8 +1616,13 @@ impl PageView {
         } else {
             self.render_rich(shown, &r.block, Some(row.clone()), line, prefix, cx)
         };
+        // PG-4: the collapse arrow belongs to the row the pointer is over. A collapsed
+        // block keeps its arrow (it is the only sign that content is hidden); an expanded
+        // one shows it only on hover, which leaves the outline quiet to read.
+        let hovered = self.hovered_row.as_ref() == Some(&r.block);
         let arrow = {
             let block = r.block.clone();
+            let shown = r.has_children && (r.collapsed || hovered);
             div()
                 .id(("arrow", ix))
                 .w(px(14.))
@@ -1624,11 +1633,16 @@ impl PageView {
                 .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.faint)
                 .when(r.has_children, |d| {
-                    d.cursor_pointer()
-                        .child(if r.collapsed { "▸" } else { "▾" })
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.toggle_collapse(&block, cx)),
-                        )
+                    d.cursor_pointer().on_click(
+                        cx.listener(move |this, _, _, cx| this.toggle_collapse(&block, cx)),
+                    )
+                })
+                .when(shown, |d| {
+                    d.child(
+                        div()
+                            .debug_selector(move || format!("arrow-{ix}"))
+                            .child(if r.collapsed { "▸" } else { "▾" }),
+                    )
                 })
         };
         let bullet = {
@@ -1653,15 +1667,10 @@ impl PageView {
                         .child(format!("{}.", r.number))
                 })
                 .when(r.kind != BlockKind::Numbered, |d| {
-                    d.child(
-                        div()
-                            .size(px(6.))
-                            .rounded_full()
-                            .bg(th.bullet)
-                            .when(r.collapsed && r.has_children, |d| {
-                                d.size(px(8.)).border_2().border_color(th.chip_bg)
-                            }),
-                    )
+                    // PG-4: the bullet is the drag handle. At rest it is the ink dot; under
+                    // the pointer it opens into a two-by-three grip, the one affordance in
+                    // the row that says "you can move this".
+                    d.child(drag_handle(ix, hovered, r, &th, lh))
                 })
                 .on_drag(
                     DraggedBlock {
@@ -1719,21 +1728,53 @@ impl PageView {
             .on_drop(
                 cx.listener(move |this, d: &DraggedBlock, _, cx| this.drop_block(d, &target, cx)),
             )
+            .on_hover(cx.listener({
+                let id = r.block.clone();
+                move |this, hovered: &bool, _, cx| {
+                    // Leaving a row for the next one can deliver the old row's `false`
+                    // after the new row's `true`; only clear our own id.
+                    let next = if *hovered {
+                        Some(id.clone())
+                    } else if this.hovered_row.as_ref() == Some(&id) {
+                        None
+                    } else {
+                        this.hovered_row.clone()
+                    };
+                    if this.hovered_row != next {
+                        this.hovered_row = next;
+                        cx.notify();
+                    }
+                }
+            }))
             .child(arrow)
             .child(bullet)
             .when(r.kind == BlockKind::Todo, |d| {
                 let row = r.clone();
+                // PG-4: a drawn box, not a ☐ glyph from whichever font is in force, with
+                // 3 px corners. A done to-do is a filled accent box with a check cut out of
+                // it (the page colour), so its state reads at a glance.
                 d.child(
                     div()
                         .id(("todo", ix))
-                        .debug_selector(|| format!("todo-{ix}"))
                         .w(px(20.))
                         .h(px(lh))
                         .flex()
                         .items_center()
                         .cursor_pointer()
-                        .text_color(if r.checked { th.accent } else { th.muted })
-                        .child(if r.checked { "☑" } else { "☐" })
+                        .child(
+                            div()
+                                .debug_selector(|| format!("todo-{ix}"))
+                                .size(px(13.))
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(if r.checked { th.accent } else { th.muted })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .font_family(crate::theme::MONO)
+                                .text_size(px(9.))
+                                .when(r.checked, |d| d.bg(th.accent).text_color(th.bg).child("✓")),
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| this.toggle_checked(&row, cx))),
                 )
             })
@@ -1784,7 +1825,9 @@ impl PageView {
                             None => card,
                         }
                     }
-                    BlockKind::Todo if r.checked => c.text_color(th.faint).line_through(),
+                    // PG-4: struck through in the muted colour, which still reads (the audit
+                    // measured `faint` under 3:1 on white).
+                    BlockKind::Todo if r.checked => c.text_color(th.muted).line_through(),
                     _ => c,
                 };
                 c.child(content)
@@ -2746,6 +2789,53 @@ impl PageView {
             }
         }
     }
+}
+
+/// The bullet, which is also the row's drag handle (PG-4). At rest it is the ink dot (an
+/// 8 px ring when the block is collapsed); while the pointer is over the row it opens into
+/// a two-by-three grip, so the one control that moves a block announces itself.
+fn drag_handle(
+    ix: usize,
+    hovered: bool,
+    r: &RowItem,
+    th: &crate::theme::Theme,
+    lh: f32,
+) -> AnyElement {
+    let cell = div()
+        .w(px(18.))
+        .h(px(lh))
+        .flex()
+        .items_center()
+        .justify_center();
+    if hovered {
+        // A "grip" of six 2 px dots, drawn rather than typed: no font has to carry it.
+        let mut grip = div()
+            .debug_selector(move || format!("grip-{ix}"))
+            .flex()
+            .flex_col()
+            .gap(px(2.));
+        for _ in 0..3 {
+            grip = grip.child(
+                div()
+                    .flex()
+                    .gap(px(2.))
+                    .child(div().size(px(2.)).rounded_full().bg(th.faint))
+                    .child(div().size(px(2.)).rounded_full().bg(th.faint)),
+            );
+        }
+        return cell.child(grip).into_any_element();
+    }
+    cell.child(
+        div()
+            .debug_selector(move || format!("dot-{ix}"))
+            .size(px(6.))
+            .rounded_full()
+            .bg(th.bullet)
+            .when(r.collapsed && r.has_children, |d| {
+                d.size(px(8.)).border_2().border_color(th.chip_bg)
+            }),
+    )
+    .into_any_element()
 }
 
 /// Language names a code block may announce on its first line (PG-5). A Roam/Markdown
