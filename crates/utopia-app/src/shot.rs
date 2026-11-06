@@ -12,7 +12,7 @@
 //!   from its top left (a Retina capture is twice that and includes the 28 pt title bar),
 //!   for controls with no shortcut
 //! - `hover <x> <y>` moves the pointer there without pressing, for states that only show
-//!   on hover
+//!   on hover (a block's drag handle, PG-4)
 //! - `shot <path.png>` captures the window
 //! - `drop <file>` drops a file on the window, as from Finder
 //! - `ws <command> [args…]` runs a workspace command the app exposes for scripts
@@ -496,6 +496,11 @@ mod tests {
         );
         assert!(parse("click 12").is_err());
         assert!(parse("click a b").is_err());
+        assert_eq!(
+            parse("hover 12 40.5").unwrap(),
+            vec![Step::Hover(12., 40.5)]
+        );
+        assert!(parse("hover 12").is_err());
         assert_eq!(
             parse("ws open-pdf").unwrap(),
             vec![Step::Ws(vec!["open-pdf".into()])]

@@ -56,6 +56,10 @@ pub enum PageViewEvent {
         page: PageId,
         block: BlockId,
     },
+    /// "Open in graph" in the page menu (PG-2): show the graph with this page focused.
+    OpenGraph {
+        page: PageId,
+    },
     /// Pin or unpin this page in the left sidebar (SB-3). The workspace owns the local
     /// preference; the page itself is untouched (rule 9).
     TogglePin {
@@ -91,6 +95,17 @@ pub struct RowItem {
 enum Item {
     Header,
     Row(RowItem),
+    /// A page attribute (`key:: value`) drawn as one compact muted row (PG-1). View only:
+    /// the block stays the source, and "Show as blocks" draws it in full again.
+    Attribute {
+        depth: usize,
+        key: String,
+        value: String,
+        block: BlockId,
+        /// Children folded away with the block, marked with "…" so nothing vanishes
+        /// silently; "Show as blocks" brings them back.
+        children: usize,
+    },
     Notice {
         depth: usize,
         text: SharedString,
@@ -266,6 +281,12 @@ pub struct PageView {
     day_headings: Vec<DayHeading>,
     /// The page header's "···" menu is open (ALL-3).
     page_menu: bool,
+    /// The row the pointer is over, so its bullet can read as a drag handle and its
+    /// collapse arrow can appear (PG-4). Local UI state, never persisted (rule 9).
+    hovered_row: Option<BlockId>,
+    /// How attribute blocks are drawn (PG-1), mirrored from `settings.json` so a change
+    /// made in Settings rebuilds this page's rows.
+    attribute_blocks: crate::appearance::AttributeBlocks,
     dirty: bool,
     _subs: Vec<Subscription>,
 }
@@ -334,6 +355,8 @@ impl PageView {
             journal: None,
             day_headings: Vec::new(),
             page_menu: false,
+            hovered_row: None,
+            attribute_blocks: crate::appearance::attribute_blocks(cx),
             dirty: true,
             _subs: subs,
         }
@@ -467,7 +490,7 @@ impl PageView {
                             plan.and_then(|p| app.store.execute_plan(&page, p, None))
                                 .map(|f| f.map(|f| f.block))
                         }
-                        None => app.store.ensure_first_block(&page).map(Some),
+                        None => start_note(&mut app.store, &page).map(Some),
                     };
                     let b = app.report(r).flatten();
                     app.changed(vec![page.clone()], true, cx);
@@ -491,11 +514,31 @@ impl PageView {
         cx: &mut Context<Self>,
     ) {
         self.rebuild_if_dirty(cx);
-        let row = self.items.iter().find_map(|i| match i {
-            Item::Row(r) if r.block == *block => Some(r.page.clone()),
-            _ => None,
-        });
-        if let Some(page) = row {
+        let page = self
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Row(r) if r.block == *block => Some(r.page.clone()),
+                _ => None,
+            })
+            .or_else(|| {
+                // PG-1: a compact attribute row — or a block hidden under one — has no Row
+                // until it is the editor's target. Find the page that holds it so `edit` can
+                // open the attribute's path around it (search results, backlinks, undo).
+                let pages: Vec<PageId> = match &self.journal {
+                    Some(j) => j.days.clone(),
+                    None => self.page.iter().cloned().collect(),
+                };
+                pages.into_iter().find(|p| {
+                    self.app.update(cx, |app, _| {
+                        app.store
+                            .page_state(p)
+                            .ok()
+                            .is_some_and(|st| st.is_live(block))
+                    })
+                })
+            });
+        if let Some(page) = page {
             self.edit(page, block.clone(), offset, None, window, cx);
         }
     }
@@ -509,12 +552,31 @@ impl PageView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // DN-3: the row may be drawn under the pinned day heading. Asked of the frame the
+        // user is looking at, before the rebuild below re-measures every row.
+        let line = crate::appearance::density(cx).line_height();
+        let under_heading = self
+            .row_index(&block)
+            .is_some_and(|ix| self.row_overlaps_pinned_day(ix, line));
         self.rebuild_if_dirty(cx);
-        if self.row_index(&block).is_none() {
-            // Not editable here (e.g. the zoom root shown as the header): stop editing
-            // rather than focus an editor no row renders.
-            self.editor.update(cx, |e, cx| e.end(cx));
-            return;
+        let drawn = self.row_index(&block).is_some();
+        if !drawn {
+            // Not drawn right now: a compact attribute row or a block hidden under one
+            // (PG-1). Start the edit anyway and rebuild below, which opens the attribute's
+            // path around the editor. A block this view cannot draw at all — the zoom root,
+            // which the header shows instead, or one that is not on this page — still ends
+            // the edit, so focus is never stranded on an element nothing renders.
+            let zoom_root = self.zoom.as_ref() == Some(&block);
+            let live_here = self.app.update(cx, |app, _| {
+                app.store
+                    .page_state(&page)
+                    .ok()
+                    .is_some_and(|st| st.is_live(&block))
+            });
+            if zoom_root || !live_here {
+                self.editor.update(cx, |e, cx| e.end(cx));
+                return;
+            }
         }
         let host = cx.entity_id();
         self.editor.update(cx, |e, cx| {
@@ -530,17 +592,62 @@ impl PageView {
                 cx,
             )
         });
+        if !drawn {
+            // Rebuild with the edit target set, so the folded attribute opens and this
+            // block gets a row that can hold the editor (a focused element that is not
+            // rendered gets no keystrokes).
+            self.rebuild(cx);
+        }
+        let ix = self.row_index(&block);
         self.splice_items(self.items.len(), cx);
-        if let Some(ix) = self.row_index(&block) {
-            self.list.scroll_to_reveal_item(ix);
-            self.leave_room_for_the_pinned_day(ix);
+        match ix {
+            // DN-3: the row was under the pinned heading: put its top below it.
+            Some(ix) if under_heading => self.list.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: -px(STICKY_HEIGHT),
+            }),
+            Some(ix) => {
+                self.list.scroll_to_reveal_item(ix);
+                // The row the list just put at its top edge is under the heading too.
+                self.leave_room_for_the_pinned_day(ix);
+            }
+            // Still no row (an ordinary collapsed ancestor hides it): stop rather than keep
+            // an editor whose focus handle is not drawn.
+            None => self.editor.update(cx, |e, cx| e.end(cx)),
         }
         cx.notify();
     }
 
-    /// DN-3: an edit target above the viewport is revealed at the list's top edge, where
-    /// the pinned day heading would cover it and its caret. Put the row one heading-height
-    /// down instead, so the caret shows below the pin (the strip above it is the pin).
+    /// DN-3: the pinned day heading is drawn *over* the top of the list, so a row the list
+    /// counts as visible can still be hidden behind it. True when the row's own top sits
+    /// above the heading's bottom edge — the row revealed at the list's top edge, or the
+    /// next short row scrolled up under the 63 px heading. Measured against bounds when the
+    /// list has them, so a tall row that merely *follows* the top one does not trigger a
+    /// scroll it does not need.
+    fn row_overlaps_pinned_day(&self, ix: usize, line_height: f32) -> bool {
+        if self.sticky_heading().is_none() {
+            return false;
+        }
+        let viewport = self.list.viewport_bounds();
+        if viewport.size.height > px(0.) {
+            if let Some(row) = self.list.bounds_for_item(ix) {
+                return row.top() < viewport.top() + px(STICKY_HEIGHT);
+            }
+        }
+        // A splice (an edit starts by re-registering the rows so the editor can keep the
+        // keystrokes) leaves the list with no measured rows until the next layout. Estimate
+        // from the offset instead: the heading covers `STICKY_HEIGHT`, and a row is at
+        // least one line tall, so only the first few rows can hide under it.
+        if -self.list.logical_scroll_top().offset_in_item >= px(STICKY_HEIGHT) {
+            return false;
+        }
+        let rows = (STICKY_HEIGHT / line_height.max(1.)).ceil() as usize;
+        ix <= self.list.logical_scroll_top().item_ix + rows
+    }
+
+    /// DN-3: a row the list reveals at its top edge is under the pinned heading. The rows
+    /// re-measured by a splice have no bounds yet, so this index check stays as the
+    /// fallback for that case.
     fn leave_room_for_the_pinned_day(&self, ix: usize) {
         let top = self.list.logical_scroll_top();
         if top.item_ix != ix || top.offset_in_item > px(0.) {
@@ -561,6 +668,11 @@ impl PageView {
     }
 
     fn rebuild_if_dirty(&mut self, cx: &mut Context<Self>) {
+        let preference = crate::appearance::attribute_blocks(cx);
+        if self.attribute_blocks != preference {
+            self.attribute_blocks = preference;
+            self.dirty = true;
+        }
         if self.dirty {
             self.rebuild(cx);
         }
@@ -613,6 +725,8 @@ impl PageView {
         }
         let zoom = self.zoom.clone();
         let open_embeds = self.open_embeds.clone();
+        let compact_attributes = self.zoom.is_none() && self.attributes_are_compact();
+        let editing = self.editing_block(cx.entity_id(), cx);
         let refs_version = self.app.read(cx).refs_version;
         let need_refs = self.refs_key != Some((page.clone(), zoom.clone(), refs_version));
         let query = self.query.clone();
@@ -653,29 +767,19 @@ impl PageView {
                 }
             }
             let mut rows = Vec::new();
-            for (id, depth) in st.visible_rows(zoom.as_ref(), &|b| collapsed.contains(b)) {
-                let b = st.block(&id).expect("visible row exists");
-                let item = RowItem {
-                    page: page.clone(),
-                    block: id.clone(),
-                    text: b.text.clone(),
-                    depth,
-                    has_children: st.has_live_children(&id),
-                    collapsed: collapsed.contains(&id),
-                    embed: 0,
-                    kind: b.kind,
-                    checked: b.checked,
-                    number: st.index_in_parent(&id, true).map_or(1, |i| i + 1),
-                };
-                push_with_embeds(
-                    app,
-                    item,
-                    &open_embeds,
-                    &collapsed,
-                    &mut vec![id.clone()],
-                    &mut rows,
-                );
-            }
+            // The header only exists on a whole page, so only there do we fold attributes
+            // into compact rows (PG-1); a zoomed view keeps its blocks as they are.
+            push_page_rows(
+                app,
+                &st,
+                &page,
+                zoom.as_ref(),
+                &collapsed,
+                &open_embeds,
+                compact_attributes,
+                editing.as_ref(),
+                &mut rows,
+            );
             let refs = if need_refs {
                 Some(match &zoom {
                     Some(z) => {
@@ -718,7 +822,9 @@ impl PageView {
             self.replace_items(items, cx);
             return;
         }
-        if rows.is_empty() {
+        // A page whose only root blocks are folded attributes (PG-1) still needs somewhere
+        // to click to start writing.
+        if !rows.iter().any(|i| matches!(i, Item::Row(_))) {
             items.push(Item::Empty);
         }
         for r in rows {
@@ -757,6 +863,8 @@ impl PageView {
 
     fn rebuild_journal(&mut self, today: PageId, limit: usize, cx: &mut Context<Self>) {
         let open_embeds = self.open_embeds.clone();
+        let compact_attributes = self.attributes_are_compact();
+        let editing = self.editing_block(cx.entity_id(), cx);
         let refs_version = self.app.read(cx).refs_version;
         let mut refs_cache = match &mut self.journal {
             Some(j) if j.refs_version == refs_version => std::mem::take(&mut j.refs),
@@ -792,29 +900,17 @@ impl PageView {
                     .filter(|(_, st)| st.meta.deleted_at.is_none());
                 if let Some((page, st)) = st {
                     day.title = utopia_store::display_title(&st, &fmt);
-                    for (id, depth) in st.visible_rows(None, &|b| collapsed.contains(b)) {
-                        let b = st.block(&id).expect("visible row exists");
-                        let item = RowItem {
-                            page: page.clone(),
-                            block: id.clone(),
-                            text: b.text.clone(),
-                            depth,
-                            has_children: st.has_live_children(&id),
-                            collapsed: collapsed.contains(&id),
-                            embed: 0,
-                            kind: b.kind,
-                            checked: b.checked,
-                            number: st.index_in_parent(&id, true).map_or(1, |i| i + 1),
-                        };
-                        push_with_embeds(
-                            app,
-                            item,
-                            &open_embeds,
-                            &collapsed,
-                            &mut vec![id.clone()],
-                            &mut day.rows,
-                        );
-                    }
+                    push_page_rows(
+                        app,
+                        &st,
+                        &page,
+                        None,
+                        &collapsed,
+                        &open_embeds,
+                        compact_attributes,
+                        editing.as_ref(),
+                        &mut day.rows,
+                    );
                     if !refs_cache.contains_key(&page) {
                         let refs = app
                             .store
@@ -852,6 +948,8 @@ impl PageView {
             // DN-1: a day with nothing on it folds to one 36 px row. Today and yesterday
             // always stay open, so the day the caret starts in always shows its heading;
             // folding is a view change only, the day is still written on its first key.
+            // PG-1: rows can exist and still not be visible — a root attribute block folds
+            // to one muted row, so the day keeps its heading but still offers the prompt.
             let open =
                 !day.rows.is_empty() || refs.is_some() || i == 0 || Some(day.date) == yesterday;
             // The day's heading, for the sticky header, when the day is open.
@@ -875,7 +973,7 @@ impl PageView {
                     today: day.date == today_date,
                     first: i == 0,
                 });
-                if day.rows.is_empty() {
+                if !day.rows.iter().any(|i| matches!(i, Item::Row(_))) {
                     items.push(Item::DayEmpty { date: day.date });
                 }
             } else {
@@ -911,6 +1009,39 @@ impl PageView {
         self.replace_items(items, cx);
     }
 
+    /// The block this view is editing, if any: its row must be drawn as a row (PG-1).
+    fn editing_block(&self, host: gpui::EntityId, cx: &gpui::App) -> Option<BlockId> {
+        self.editor
+            .read(cx)
+            .target
+            .as_ref()
+            .filter(|t| t.host == host)
+            .map(|t| t.block.clone())
+    }
+
+    /// PG-1: an attribute block is drawn as one compact row unless the preference says to
+    /// show the blocks.
+    fn attributes_are_compact(&self) -> bool {
+        self.attribute_blocks == crate::appearance::AttributeBlocks::Compact
+    }
+
+    /// The header's "Show as blocks" toggle, and a click on a compact row: set the
+    /// preference, remember it, and rebuild the outline (PG-1).
+    fn set_attribute_blocks(
+        &mut self,
+        blocks: crate::appearance::AttributeBlocks,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = crate::appearance::set_attribute_blocks(cx, blocks) {
+            self.app.update(cx, |app, _| {
+                app.last_error = Some(format!("could not save settings.json: {e}"))
+            });
+        }
+        self.attribute_blocks = blocks;
+        self.dirty = true;
+        cx.notify();
+    }
+
     /// Load the next batch of older days into the feed (once per batch).
     fn load_older_days(&mut self, cx: &mut Context<Self>) {
         if let Some(j) = &mut self.journal {
@@ -928,11 +1059,7 @@ impl PageView {
     fn start_day(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
         let target = self.app.update(cx, |app, cx| {
             let r = app.store.draft_daily(date).and_then(|page| {
-                let first = app.store.page_state(&page)?.live_roots().first().cloned();
-                let block = match first {
-                    Some(b) => b,
-                    None => app.store.ensure_first_block(&page)?,
-                };
+                let block = start_note(&mut app.store, &page)?;
                 Ok((page, block))
             });
             let t = app.report(r);
@@ -1099,6 +1226,11 @@ impl PageView {
                     None
                 };
                 let collapsed = self.app.read(cx).store.collapsed_set().clone();
+                // PG-1 hides the children of a compact attribute row, so Backspace must merge
+                // into the previous row the user can *see*, not into a hidden descendant
+                // (FR-2.5). Visibility here is the renderer's, not the store's alone.
+                let compact = self.zoom.is_none() && self.attributes_are_compact();
+                let editing = t.block.clone();
                 let now = self.app.read(cx).store.now();
                 self.run_plan(
                     &t.page,
@@ -1107,7 +1239,10 @@ impl PageView {
                             st,
                             &t.block,
                             zoom.as_ref(),
-                            &|b| collapsed.contains(b),
+                            &|b| {
+                                collapsed.contains(b)
+                                    || is_folded_attribute(st, compact, Some(&editing), b)
+                            },
                             now,
                         )
                     },
@@ -1238,19 +1373,19 @@ impl PageView {
         }
     }
 
-    /// Put the caret back where an undo/redo says, if that block is shown here.
+    /// Put the caret back where an undo/redo says, if that block can be shown here.
     pub fn restore_caret(&mut self, caret: &Caret, window: &mut Window, cx: &mut Context<Self>) {
         self.rebuild(cx);
-        if self.row_index(&caret.block).is_some() {
-            self.edit(
-                caret.page.clone(),
-                caret.block.clone(),
-                Some(caret.offset),
-                None,
-                window,
-                cx,
-            );
-        }
+        // `edit` opens a folded attribute's path when needed, and declines a block this view
+        // cannot draw.
+        self.edit(
+            caret.page.clone(),
+            caret.block.clone(),
+            Some(caret.offset),
+            None,
+            window,
+            cx,
+        );
     }
 
     fn apply_plan(&mut self, page: &PageId, plan: Plan, cx: &mut Context<Self>) -> Option<Focus> {
@@ -1635,6 +1770,40 @@ impl PageView {
         cx.notify();
     }
 
+    /// "Export" in the page menu (PG-2): write Markdown, `graph.json` and `graph.opml` to a
+    /// folder the user picks, exactly what `utopia export <graph> <dir>` writes (G4).
+    fn export_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Export".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            let Some(dir) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.app.update(cx, |app, cx| {
+                    let r = (|| {
+                        let n = app.store.export_markdown(&dir)?;
+                        app.store.export_json(&dir.join("graph.json"))?;
+                        app.store.export_opml(&dir.join("graph.opml"))?;
+                        Ok::<_, utopia_store::StoreError>(n)
+                    })();
+                    if let Some(n) = app.report(r) {
+                        app.notice = Some(format!("Exported {n} pages to {}", dir.display()));
+                    }
+                    app.changed(Vec::new(), false, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
     // ---------------------------------------------------------------- rendering
 
     fn chip_state(store: &utopia_store::Store, uid: &str, row_block: &BlockId) -> ChipState {
@@ -1648,15 +1817,18 @@ impl PageView {
         }
     }
 
+    /// `prefix` is how many bytes of the block's text `text` starts after (a code block's
+    /// language line, PG-5), so a click still puts the caret at the right offset.
     fn render_rich(
         &self,
         text: &str,
         row_block: &BlockId,
         row: Option<RowItem>,
+        min_h: f32,
+        prefix: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let th = theme(cx).clone();
-        let lh = crate::appearance::density(cx).line_height();
         let rendered = {
             let store = &self.app.read(cx).store;
             rich::render(text, &th, &mut |uid| {
@@ -1667,12 +1839,14 @@ impl PageView {
             StyledText::new(rendered.text.clone()).with_highlights(rendered.highlights.clone());
         let layout = styled.layout().clone();
         let same = rendered.text.as_ref() == text;
-        let source_len = text.len();
+        let end = prefix + text.len();
         let row2 = row.clone();
         let links = rendered.links.iter().map(|(r, _)| r.clone()).collect();
+        let text_sel = format!("text-{}", row_block.0);
         div()
             .flex_1()
-            .min_h(px(lh))
+            .min_h(px(min_h))
+            .debug_selector(move || text_sel.clone())
             // An editable row shows the I-beam between its links; a read-only one (a query
             // or search hit) is itself clickable, so it keeps its container's pointer.
             .when(row.is_some(), |d| d.cursor_text())
@@ -1690,8 +1864,8 @@ impl PageView {
                     }
                     if let Some(r) = &row2 {
                         let caret = match ix {
-                            Ok(i) | Err(i) if same => i.min(source_len),
-                            _ => source_len,
+                            Ok(i) | Err(i) if same => (prefix + i).min(end),
+                            _ => end,
                         };
                         cx.stop_propagation();
                         this.edit(
@@ -1716,14 +1890,34 @@ impl PageView {
         let host = cx.entity_id();
         let editing = self.editor.read(cx).is_editing(host, &r.page, &r.block);
         let indent = r.depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT;
+        // PG-3: a heading's own line box, so H3 is not padded out to the body's 24 px.
+        let line = match r.kind {
+            BlockKind::Heading(level) => crate::theme::heading_metrics(level).1,
+            _ => lh,
+        };
+        // PG-5: a code block whose first line is a language name shows it as the card's
+        // label instead of drawing it as the first line of code. View only: the block's
+        // text is unchanged, and while editing the raw text (label line included) is shown.
+        let code = (r.kind == BlockKind::Code && !editing)
+            .then(|| code_language(&r.text))
+            .flatten();
+        let (shown, prefix) = match &code {
+            Some((_, body, skip)) => (*body, *skip),
+            None => (r.text.as_str(), 0),
+        };
         let row = r.clone();
         let content: AnyElement = if editing {
             self.editor.clone().into_any_element()
         } else {
-            self.render_rich(&r.text, &r.block, Some(row.clone()), cx)
+            self.render_rich(shown, &r.block, Some(row.clone()), line, prefix, cx)
         };
+        // PG-4: the collapse arrow belongs to the row the pointer is over. A collapsed
+        // block keeps its arrow (it is the only sign that content is hidden); an expanded
+        // one shows it only on hover, which leaves the outline quiet to read.
+        let hovered = self.hovered_row.as_ref() == Some(&r.block);
         let arrow = {
             let block = r.block.clone();
+            let shown = r.has_children && (r.collapsed || hovered);
             div()
                 .id(("arrow", ix))
                 .w(px(14.))
@@ -1734,11 +1928,16 @@ impl PageView {
                 .text_size(px(crate::theme::CAPTION_SIZE))
                 .text_color(th.faint)
                 .when(r.has_children, |d| {
-                    d.cursor_pointer()
-                        .child(if r.collapsed { "▸" } else { "▾" })
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.toggle_collapse(&block, cx)),
-                        )
+                    d.cursor_pointer().on_click(
+                        cx.listener(move |this, _, _, cx| this.toggle_collapse(&block, cx)),
+                    )
+                })
+                .when(shown, |d| {
+                    d.child(
+                        div()
+                            .debug_selector(move || format!("arrow-{ix}"))
+                            .child(if r.collapsed { "▸" } else { "▾" }),
+                    )
                 })
         };
         let bullet = {
@@ -1763,15 +1962,10 @@ impl PageView {
                         .child(format!("{}.", r.number))
                 })
                 .when(r.kind != BlockKind::Numbered, |d| {
-                    d.child(
-                        div()
-                            .size(px(6.))
-                            .rounded_full()
-                            .bg(th.bullet)
-                            .when(r.collapsed && r.has_children, |d| {
-                                d.size(px(8.)).border_2().border_color(th.chip_bg)
-                            }),
-                    )
+                    // PG-4: the bullet is the drag handle. At rest it is the ink dot; under
+                    // the pointer it opens into a two-by-three grip, the one affordance in
+                    // the row that says "you can move this".
+                    d.child(drag_handle(ix, hovered, r, &th, lh))
                 })
                 .on_drag(
                     DraggedBlock {
@@ -1829,21 +2023,53 @@ impl PageView {
             .on_drop(
                 cx.listener(move |this, d: &DraggedBlock, _, cx| this.drop_block(d, &target, cx)),
             )
+            .on_hover(cx.listener({
+                let id = r.block.clone();
+                move |this, hovered: &bool, _, cx| {
+                    // Leaving a row for the next one can deliver the old row's `false`
+                    // after the new row's `true`; only clear our own id.
+                    let next = if *hovered {
+                        Some(id.clone())
+                    } else if this.hovered_row.as_ref() == Some(&id) {
+                        None
+                    } else {
+                        this.hovered_row.clone()
+                    };
+                    if this.hovered_row != next {
+                        this.hovered_row = next;
+                        cx.notify();
+                    }
+                }
+            }))
             .child(arrow)
             .child(bullet)
             .when(r.kind == BlockKind::Todo, |d| {
                 let row = r.clone();
+                // PG-4: a drawn box, not a ☐ glyph from whichever font is in force, with
+                // 3 px corners. A done to-do is a filled accent box with a check cut out of
+                // it (the page colour), so its state reads at a glance.
                 d.child(
                     div()
                         .id(("todo", ix))
-                        .debug_selector(|| format!("todo-{ix}"))
                         .w(px(20.))
                         .h(px(lh))
                         .flex()
                         .items_center()
                         .cursor_pointer()
-                        .text_color(if r.checked { th.accent } else { th.muted })
-                        .child(if r.checked { "☑" } else { "☐" })
+                        .child(
+                            div()
+                                .debug_selector(|| format!("todo-{ix}"))
+                                .size(px(13.))
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(if r.checked { th.accent } else { th.muted })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .font_family(crate::theme::MONO)
+                                .text_size(px(9.))
+                                .when(r.checked, |d| d.bg(th.accent).text_color(th.bg).child("✓")),
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| this.toggle_checked(&row, cx))),
                 )
             })
@@ -1855,30 +2081,48 @@ impl PageView {
                     .debug_selector(|| format!("content-{ix}"));
                 c = match r.kind {
                     BlockKind::Heading(l) => c
-                        .text_size(px(match l {
-                            1 => crate::theme::H1_SIZE,
-                            2 => crate::theme::H2_SIZE,
-                            _ => crate::theme::H3_SIZE,
-                        }))
-                        .line_height(px(match l {
-                            1 => 28.,
-                            2 => 24.,
-                            _ => 22.,
-                        }))
-                        .font_weight(gpui::FontWeight::BOLD),
+                        .text_size(px(crate::theme::heading_metrics(l).0))
+                        .line_height(px(crate::theme::heading_metrics(l).1))
+                        // PG-3: semibold, not bold. The title stays 28 px, so an outline
+                        // heading never competes with it (ALL-1).
+                        .font_weight(gpui::FontWeight::SEMIBOLD),
+                    // PG-5: a 2 px accent bar and a warm grey italic, not the interface
+                    // muted grey.
                     BlockKind::Quote => c
                         .border_l_2()
-                        .border_color(th.faint)
+                        .border_color(th.accent)
                         .pl_2()
-                        .text_color(th.muted)
+                        .text_color(th.quote)
                         .italic(),
-                    BlockKind::Code => c
-                        .font_family("Menlo")
-                        .text_size(px(13.))
-                        .bg(th.code_bg)
-                        .px_1()
-                        .rounded_sm(),
-                    BlockKind::Todo if r.checked => c.text_color(th.faint).line_through(),
+                    // PG-5: a surface card in Menlo, 6 px corners, with the language (when
+                    // the block names one) at the top right.
+                    BlockKind::Code => {
+                        let card = c
+                            .bg(th.surface)
+                            .border_1()
+                            .border_color(th.line)
+                            .rounded_md()
+                            .px_2()
+                            .py_1()
+                            .font_family(crate::theme::MONO)
+                            .text_size(px(13.));
+                        match &code {
+                            Some((lang, _, _)) => card.child(
+                                div()
+                                    .debug_selector(|| format!("code-language-{ix}"))
+                                    .flex()
+                                    .justify_end()
+                                    .pb_0p5()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
+                                    .text_color(th.muted)
+                                    .child(lang.clone()),
+                            ),
+                            None => card,
+                        }
+                    }
+                    // PG-4: struck through in the muted colour, which still reads (the audit
+                    // measured `faint` under 3:1 on white).
+                    BlockKind::Todo if r.checked => c.text_color(th.muted).line_through(),
                     _ => c,
                 };
                 c.child(content)
@@ -1909,9 +2153,25 @@ impl PageView {
     }
 
     /// The page actions menu. It is drawn deferred and anchored, so opening it floats over
-    /// the page instead of taking a row in the column (ALL-3).
+    /// the page instead of taking a row in the column (ALL-3). Order per PG-2: the two
+    /// navigation/export actions, then the two that change the page, then the danger item.
     fn page_menu_popup(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let th = theme(cx).clone();
+        let graph = quiet_control("page-menu-graph", "Open in graph", &th)
+            .debug_selector(|| "page-menu-graph".into())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.page_menu = false;
+                if let Some(page) = this.page.clone() {
+                    this.editor.update(cx, |e, cx| e.end(cx));
+                    cx.emit(PageViewEvent::OpenGraph { page });
+                }
+            }));
+        let export = quiet_control("page-menu-export", "Export", &th)
+            .debug_selector(|| "page-menu-export".into())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.page_menu = false;
+                this.export_graph(window, cx);
+            }));
         // Daily titles are display-only (rule 6): `start_rename` would open the calendar
         // for them, so Rename is only offered on ordinary pages.
         let rename = (self.header.kind != PageKind::Daily).then(|| {
@@ -1922,6 +2182,17 @@ impl PageView {
                     this.start_rename(window, cx);
                 }))
         });
+        // FR-3.6: after a rename the old title stays an alias, and this rewrites every
+        // reference to it. It only applies when there is an alias to rewrite.
+        let rewrite =
+            (!self.header.aliases.is_empty() && self.header.kind == PageKind::Page).then(|| {
+                quiet_control("page-menu-rewrite", "Rewrite references", &th)
+                    .debug_selector(|| "page-menu-rewrite".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.page_menu = false;
+                        this.page_action("rewrite", cx);
+                    }))
+            });
         let pin = self.page.clone().map(|page| {
             let pinned = crate::appearance::is_pinned(cx, &page);
             quiet_control(
@@ -1958,8 +2229,13 @@ impl PageView {
             .border_color(th.line)
             .rounded_md()
             .shadow_md()
+            .child(graph.w_full().justify_start())
+            .child(export.w_full().justify_start())
             .children(rename.map(|r| r.w_full().justify_start()))
+            .children(rewrite.map(|r| r.w_full().justify_start()))
             .children(pin.map(|p| p.w_full().justify_start()))
+            // A hairline sets the destructive item apart, always last.
+            .child(div().h(px(1.)).my_1().bg(th.line))
             .child(delete.w_full().justify_start())
     }
 
@@ -2017,29 +2293,6 @@ impl PageView {
                 d.child(
                     self.button("restore", "Restore from trash", cx)
                         .on_click(cx.listener(|this, _, _, cx| this.page_action("restore", cx))),
-                )
-            })
-            .when(!h.deleted && !h.draft && self.zoom.is_none(), |d| {
-                d.child(
-                    div()
-                        .relative()
-                        .child(
-                            self.button("page-menu", "···", cx)
-                                .debug_selector(|| "page-menu".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.page_menu = !this.page_menu;
-                                    cx.notify();
-                                })),
-                        )
-                        .children(self.page_menu.then(|| {
-                            deferred(
-                                anchored()
-                                    .anchor(Corner::TopRight)
-                                    .offset(point(px(0.), px(6.)))
-                                    .child(self.page_menu_popup(cx)),
-                            )
-                            .with_priority(1)
-                        })),
                 )
             });
         col = col.child(top);
@@ -2121,6 +2374,81 @@ impl PageView {
                 .into_any_element(),
         };
         col = col.child(title_el);
+        // PG-2: the page's own controls in one row under the title: alias chips, "+ alias",
+        // and the "···" menu kept at the far right of the column.
+        if self.zoom.is_none() && !h.deleted {
+            let mut left = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted);
+            for (i, a) in h.aliases.iter().enumerate() {
+                let alias = a.clone();
+                left = left.child(
+                    div()
+                        .id(("alias", i))
+                        .debug_selector(move || format!("alias-{i}"))
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .bg(th.chip_bg)
+                        .text_color(th.muted)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(th.hover).text_color(th.text))
+                        .child(format!("{a} ×"))
+                        .on_click(cx.listener(move |this, _, _, cx| this.remove_alias(&alias, cx))),
+                );
+            }
+            left = match &self.alias_input {
+                Some(input) => left.child(
+                    div()
+                        .w(px(160.))
+                        .px_1()
+                        .border_1()
+                        .border_color(th.accent)
+                        .rounded_md()
+                        .child(input.clone()),
+                ),
+                None => left.child(
+                    self.button("add-alias", "+ alias", cx)
+                        .debug_selector(|| "add-alias".into())
+                        .on_click(cx.listener(|this, _, window, cx| this.start_alias(window, cx))),
+                ),
+            };
+            let menu = (!h.draft).then(|| {
+                div()
+                    .relative()
+                    .child(
+                        self.button("page-menu", "···", cx)
+                            .debug_selector(|| "page-menu".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.page_menu = !this.page_menu;
+                                cx.notify();
+                            })),
+                    )
+                    .children(self.page_menu.then(|| {
+                        deferred(
+                            anchored()
+                                .anchor(Corner::TopRight)
+                                .offset(point(px(0.), px(6.)))
+                                .child(self.page_menu_popup(cx)),
+                        )
+                        .with_priority(1)
+                    }))
+            });
+            col = col.child(
+                div()
+                    .debug_selector(|| "page-toolbar".into())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(left)
+                    .children(menu),
+            );
+        }
         if self.show_calendar {
             let today = self.app.read(cx).store.today();
             let existing: HashSet<NaiveDate> = HashSet::new();
@@ -2143,9 +2471,13 @@ impl PageView {
         }
         if self.zoom.is_none() && !h.attributes.is_empty() {
             // Page metadata header (P1, W7): the page's `Key:: value` blocks at a glance.
+            // PG-1 keeps it, and adds the toggle that decides whether the blocks are drawn
+            // in full under it or folded to one muted row each.
             let mut grid = div()
                 .flex()
                 .flex_col()
+                .flex_1()
+                .min_w_0()
                 .gap_0p5()
                 .py_1()
                 .text_size(px(crate::theme::BODY_SIZE));
@@ -2158,58 +2490,44 @@ impl PageView {
                         .child(div().text_color(th.text).child(v.clone())),
                 );
             }
-            col = col.child(grid);
-        }
-        if self.zoom.is_none() && !h.deleted {
-            let mut row = div()
+            let on = !self.attributes_are_compact();
+            let toggle = div()
+                .id("attribute-blocks-toggle")
+                .debug_selector(|| "attribute-blocks-toggle".into())
                 .flex()
-                .flex_wrap()
                 .items_center()
                 .gap_1()
+                .px_2()
+                .py_0p5()
+                .rounded_md()
                 .text_size(px(crate::theme::CAPTION_SIZE))
-                .text_color(th.muted);
-            if !h.aliases.is_empty() {
-                row = row.child("Also known as:");
-            }
-            for (i, a) in h.aliases.iter().enumerate() {
-                let alias = a.clone();
-                row = row.child(
+                .text_color(if on { th.text } else { th.muted })
+                .cursor_pointer()
+                .hover(|d| d.bg(th.hover).text_color(th.text))
+                .child(
                     div()
-                        .id(("alias", i))
-                        .px_1()
-                        .rounded_sm()
-                        .bg(th.chip_bg)
-                        .cursor_pointer()
-                        .child(format!("{a} ×"))
-                        .on_click(cx.listener(move |this, _, _, cx| this.remove_alias(&alias, cx))),
-                );
-            }
-            match &self.alias_input {
-                Some(input) => {
-                    row = row.child(
-                        div()
-                            .w(px(160.))
-                            .px_1()
-                            .border_1()
-                            .border_color(th.accent)
-                            .rounded_sm()
-                            .child(input.clone()),
-                    );
-                }
-                None => {
-                    row =
-                        row.child(self.button("add-alias", "+ alias", cx).on_click(
-                            cx.listener(|this, _, window, cx| this.start_alias(window, cx)),
-                        ));
-                }
-            }
-            if !h.aliases.is_empty() && h.kind == PageKind::Page {
-                row = row.child(
-                    self.button("rewrite", "Rewrite references to this title", cx)
-                        .on_click(cx.listener(|this, _, _, cx| this.page_action("rewrite", cx))),
-                );
-            }
-            col = col.child(row);
+                        .size(px(10.))
+                        .flex_none()
+                        .rounded(px(2.))
+                        .border_1()
+                        .border_color(if on { th.accent } else { th.faint })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .font_family(crate::theme::MONO)
+                        .text_size(px(8.))
+                        .when(on, |d| d.bg(th.accent).text_color(th.bg).child("✓")),
+                )
+                .child("Show as blocks")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let next = if on {
+                        crate::appearance::AttributeBlocks::Compact
+                    } else {
+                        crate::appearance::AttributeBlocks::Blocks
+                    };
+                    this.set_attribute_blocks(next, cx);
+                }));
+            col = col.child(div().flex().items_start().gap_2().child(grid).child(toggle));
         }
         col.into_any_element()
     }
@@ -2419,6 +2737,41 @@ impl PageView {
         match item {
             Item::Header => self.render_header(cx),
             Item::Row(r) => self.render_row(ix, &r, cx),
+            // PG-1: the attribute's block, folded to the one line the header already
+            // carries. A click shows the blocks again, which is what the row means.
+            Item::Attribute {
+                depth,
+                key,
+                value,
+                block,
+                children,
+            } => {
+                div()
+                    .id(("attr", ix))
+                    .debug_selector(|| format!("attr-{ix}"))
+                    .pl(px(depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT + 32.))
+                    .pr_2()
+                    .py_0p5()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(crate::theme::CONTROL_SIZE))
+                    .line_height(px(18.))
+                    .text_color(th.muted)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(th.text))
+                    .child(format!("{key} · {value}"))
+                    .when(children > 0, |d| {
+                        d.child(div().text_color(th.faint).child(format!("… {children}")))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        // Reveal the block and start editing it: the row is a shortcut to
+                        // the real block, not a second copy of the data.
+                        this.set_attribute_blocks(crate::appearance::AttributeBlocks::Blocks, cx);
+                        this.focus_block(&block, Some(0), window, cx);
+                    }))
+                    .into_any_element()
+            }
             Item::Notice { depth, text } => div()
                 .pl(px(depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT + 32.))
                 .text_size(px(crate::theme::BODY_SIZE))
@@ -2436,7 +2789,14 @@ impl PageView {
             Item::QueryHit { depth, hit } => {
                 let page = hit.page.clone();
                 let block = hit.block.clone();
-                let text = self.render_rich(&hit.text, &hit.block, None, cx);
+                let text = self.render_rich(
+                    &hit.text,
+                    &hit.block,
+                    None,
+                    crate::appearance::density(cx).line_height(),
+                    0,
+                    cx,
+                );
                 div()
                     .id(("query-hit", ix))
                     .pl(px(depth.min(MAX_VISUAL_DEPTH) as f32 * INDENT + 32.))
@@ -2556,6 +2916,7 @@ impl PageView {
             }
             Item::Empty => div()
                 .id("empty")
+                .debug_selector(|| "empty".into())
                 .px_4()
                 .py_1()
                 .pl(px(32.))
@@ -2764,7 +3125,14 @@ impl PageView {
                     .join(" › ");
                 let page = hit.page.clone();
                 let block = hit.block.clone();
-                let text = self.render_rich(&hit.text, &hit.block, None, cx);
+                let text = self.render_rich(
+                    &hit.text,
+                    &hit.block,
+                    None,
+                    crate::appearance::density(cx).line_height(),
+                    0,
+                    cx,
+                );
                 div()
                     .id(("hit", ix))
                     .px_6()
@@ -2899,6 +3267,265 @@ impl PageView {
             }
         }
     }
+}
+
+/// The block a "Click to start writing" prompt writes into (FR-1.2): a new root block after
+/// whatever the page already has. Not `ensure_first_block` alone — on a page whose only
+/// blocks are attributes that hands back the attribute, and typing rewrites its key (PG-1).
+fn start_note(
+    store: &mut utopia_store::Store,
+    page: &PageId,
+) -> Result<BlockId, utopia_store::StoreError> {
+    let (reuse, has_roots) = {
+        let st = store.page_state(page)?;
+        let roots = st.live_roots();
+        // A day's draft starts with one empty block (FR-1.2): write into it, so clicking a
+        // blank day stays free of writes until the first keystroke.
+        let reuse = match roots.as_slice() {
+            [only] if st.block(only).is_some_and(|b| b.text.is_empty()) => Some(only.clone()),
+            _ => None,
+        };
+        (reuse, !roots.is_empty())
+    };
+    if let Some(block) = reuse {
+        return Ok(block);
+    }
+    if !has_roots {
+        return store.ensure_first_block(page);
+    }
+    // The borrow of the shard ends here, before the write.
+    let after = store.page_state(page)?.last_child(None, false);
+    let id = BlockId::new();
+    store.execute(
+        page,
+        vec![utopia_core::Command::InsertBlock {
+            id: id.clone(),
+            parent: None,
+            after,
+            text: String::new(),
+            kind: BlockKind::Bullet,
+        }],
+        utopia_store::EditOpts {
+            no_undo: true,
+            ..Default::default()
+        },
+    )?;
+    Ok(id)
+}
+
+/// PG-1 folds a root `key:: value` block into one compact row and hides its children, so
+/// its subtree is not drawn. The subtree holding `editing` stays open: the row that holds
+/// the editor — and its focus handle — must always be rendered, or every keystroke after
+/// the fold is lost (AGENTS.md, "the list keeps rendering the row being edited").
+///
+/// This is the one answer to "is this attribute drawn folded", used by the renderer and by
+/// anything that asks which row the user can see (Backspace's merge, FR-2.5).
+fn is_folded_attribute(
+    st: &utopia_core::PageState,
+    compact: bool,
+    editing: Option<&BlockId>,
+    id: &BlockId,
+) -> bool {
+    if !compact || st.depth(id) != 0 {
+        return false;
+    }
+    let Some(block) = st.block(id) else {
+        return false;
+    };
+    if utopia_core::inline::attribute(&block.text).is_none() {
+        return false;
+    }
+    match editing {
+        Some(active) => active != id && !st.ancestors(active).contains(id),
+        None => true,
+    }
+}
+
+/// Push a page's visible rows, folding each root `key:: value` attribute block into one
+/// compact row (PG-1) when `compact_attributes`. The block and its subtree stay in the
+/// shard; folding is only what this frame draws, and the "…" says children went with it.
+#[allow(clippy::too_many_arguments)]
+fn push_page_rows(
+    app: &mut AppState,
+    st: &utopia_core::PageState,
+    page: &PageId,
+    zoom: Option<&BlockId>,
+    collapsed: &HashSet<BlockId>,
+    open_embeds: &HashSet<(BlockId, String)>,
+    compact_attributes: bool,
+    editing: Option<&BlockId>,
+    out: &mut Vec<Item>,
+) {
+    let mut folded: Option<usize> = None;
+    for (id, depth) in st.visible_rows(zoom, &|b| collapsed.contains(b)) {
+        if folded.is_some_and(|d| depth > d) {
+            continue;
+        }
+        folded = None;
+        let Some(b) = st.block(&id) else { continue };
+        if compact_attributes && is_folded_attribute(st, true, editing, &id) {
+            if let Some((key, value)) = utopia_core::inline::attribute(&b.text) {
+                let children = st.live_children(Some(&id)).len();
+                out.push(Item::Attribute {
+                    depth,
+                    key,
+                    value: plain_text(&b.text[value]),
+                    block: id.clone(),
+                    children,
+                });
+                folded = Some(depth);
+                continue;
+            }
+        }
+        let item = RowItem {
+            page: page.clone(),
+            block: id.clone(),
+            text: b.text.clone(),
+            depth,
+            has_children: st.has_live_children(&id),
+            collapsed: collapsed.contains(&id),
+            embed: 0,
+            kind: b.kind,
+            checked: b.checked,
+            number: st.index_in_parent(&id, true).map_or(1, |i| i + 1),
+        };
+        push_with_embeds(
+            app,
+            item,
+            open_embeds,
+            collapsed,
+            &mut vec![id.clone()],
+            out,
+        );
+    }
+}
+
+/// The bullet, which is also the row's drag handle (PG-4). At rest it is the ink dot (an
+/// 8 px ring when the block is collapsed); while the pointer is over the row it opens into
+/// a two-by-three grip, so the one control that moves a block announces itself.
+fn drag_handle(
+    ix: usize,
+    hovered: bool,
+    r: &RowItem,
+    th: &crate::theme::Theme,
+    lh: f32,
+) -> AnyElement {
+    let cell = div()
+        .w(px(18.))
+        .h(px(lh))
+        .flex()
+        .items_center()
+        .justify_center();
+    if hovered {
+        // A "grip" of six 2 px dots, drawn rather than typed: no font has to carry it.
+        let mut grip = div()
+            .debug_selector(move || format!("grip-{ix}"))
+            .flex()
+            .flex_col()
+            .gap(px(2.));
+        for _ in 0..3 {
+            grip = grip.child(
+                div()
+                    .flex()
+                    .gap(px(2.))
+                    .child(div().size(px(2.)).rounded_full().bg(th.faint))
+                    .child(div().size(px(2.)).rounded_full().bg(th.faint)),
+            );
+        }
+        return cell.child(grip).into_any_element();
+    }
+    cell.child(
+        div()
+            .debug_selector(move || format!("dot-{ix}"))
+            .size(px(6.))
+            .rounded_full()
+            .bg(th.bullet)
+            .when(r.collapsed && r.has_children, |d| {
+                d.size(px(8.)).border_2().border_color(th.chip_bg)
+            }),
+    )
+    .into_any_element()
+}
+
+/// Language names a code block may announce on its first line (PG-5). A Roam/Markdown
+/// fence imports as `"rust\nfn main() { … }"` (see `docs/unslop-audit.md`), so a first line
+/// that is exactly one of these names is drawn as the card's label rather than as code.
+/// The list is closed: a single word that happens to be code (`return`, `fn`) stays code.
+const CODE_LANGUAGES: &[&str] = &[
+    "bash",
+    "c",
+    "c#",
+    "c++",
+    "clojure",
+    "cpp",
+    "cs",
+    "css",
+    "dart",
+    "diff",
+    "elixir",
+    "erlang",
+    "f#",
+    "go",
+    "golang",
+    "haskell",
+    "html",
+    "ini",
+    "java",
+    "javascript",
+    "js",
+    "json",
+    "jsx",
+    "julia",
+    "kotlin",
+    "lua",
+    "makefile",
+    "markdown",
+    "md",
+    "nim",
+    "nix",
+    "objc",
+    "objective-c",
+    "ocaml",
+    "perl",
+    "php",
+    "plaintext",
+    "py",
+    "python",
+    "r",
+    "ruby",
+    "rust",
+    "scala",
+    "sh",
+    "shell",
+    "sql",
+    "swift",
+    "tex",
+    "text",
+    "toml",
+    "ts",
+    "tsx",
+    "typescript",
+    "vb",
+    "xml",
+    "yaml",
+    "yml",
+    "zig",
+    "zsh",
+];
+
+/// `(language, the rest of the block, bytes skipped)` when a code block's first line names
+/// its language (PG-5). The block keeps its text; this only decides what is drawn.
+fn code_language(text: &str) -> Option<(String, &str, usize)> {
+    let (first, rest) = text.split_once('\n')?;
+    let word = first.trim();
+    if word.is_empty()
+        || word.len() > 16
+        || !CODE_LANGUAGES.iter().any(|l| l.eq_ignore_ascii_case(word))
+    {
+        return None;
+    }
+    let skip = first.len() + 1;
+    Some((word.to_string(), rest, skip))
 }
 
 /// Uids of `{{embed: ((uid))}}` blocks, which always render expanded (P1 block embeds).
@@ -3142,6 +3769,40 @@ fn human_size(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PG-5: a fenced code block's first line is its language, shown as the card's label.
+    /// Anything else stays the first line of code, so a block of real code is never eaten.
+    #[test]
+    fn a_code_blocks_language_is_its_first_line_when_it_names_one() {
+        let (lang, body, skip) = code_language("rust\nfn main() {}").expect("rust is a language");
+        assert_eq!(lang, "rust");
+        assert_eq!(body, "fn main() {}");
+        assert_eq!(&"rust\nfn main() {}"[skip..], body);
+
+        // Case and a trailing space on the label line are tolerated.
+        let (lang, body, _) = code_language("Rust  \nfn main() {}").unwrap();
+        assert_eq!((lang.as_str(), body), ("Rust", "fn main() {}"));
+
+        // A label with no code under it still labels the (empty) card.
+        assert_eq!(
+            code_language("sql\n").map(|(l, b, _)| (l, b)),
+            Some(("sql".into(), ""))
+        );
+
+        // Ordinary code, prose and unknown words keep every line they have.
+        for text in [
+            "fn main() {}",
+            "return\n1",
+            "the quick brown fox\njumps",
+            "",
+            "rustup update\nx",
+            "python3\nx",
+            "averylongwordthatisnotalanguagename\ncode",
+        ] {
+            assert_eq!(code_language(text), None, "{text:?}");
+        }
+        assert!(!CODE_LANGUAGES.is_empty());
+    }
 
     /// DN-2: "Thursday · Today", "Wednesday · Yesterday", "Monday".
     #[test]

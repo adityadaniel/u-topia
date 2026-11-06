@@ -277,7 +277,7 @@ mod appearance {
     use utopia_store::Store;
     use utopia_ui::actions::install_keymap;
     use utopia_ui::app_state::AppState;
-    use utopia_ui::appearance::{self, Density, UiFont};
+    use utopia_ui::appearance::{self, AttributeBlocks, Density, UiFont};
     use utopia_ui::settings::{SettingsView, Tab};
     use utopia_ui::theme::Theme;
     use utopia_ui::workspace::Workspace;
@@ -352,6 +352,7 @@ mod appearance {
                 "font": "ibm-plex-sans",
                 "density": "comfortable",
                 "pinned": [],
+                "attribute-blocks": "compact",
             }))
         );
         assert!(
@@ -514,5 +515,52 @@ mod appearance {
         assert!(std::fs::read_to_string(dir.path().join("settings.json"))
             .unwrap()
             .contains("comic-sans"));
+    }
+
+    /// PG-1: how attribute blocks are drawn is a third local preference, picked in
+    /// Settings → Appearance, applied to every open window and written to settings.json.
+    #[gpui::test]
+    fn choosing_attribute_blocks_applies_everywhere_and_is_saved(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, settings) = open_both(cx, dir.path());
+        assert_eq!(
+            cx.update(|cx| appearance::attribute_blocks(cx)),
+            AttributeBlocks::Compact,
+            "compact rows are the default"
+        );
+        assert!(settings_json(dir.path()).is_none(), "nothing saved yet");
+
+        let mut s = VisualTestContext::from_window(settings, cx);
+        s.run_until_parked();
+        let option = s
+            .debug_bounds("settings-attributes-blocks")
+            .expect("the As blocks choice is shown");
+        s.simulate_click(option.center(), Modifiers::default());
+        s.run_until_parked();
+        assert_eq!(
+            s.update(|_, cx| appearance::attribute_blocks(cx)),
+            AttributeBlocks::Blocks
+        );
+        let saved = settings_json(dir.path()).expect("settings.json written");
+        assert_eq!(saved["attribute-blocks"], "blocks");
+        assert_eq!(saved["font"], "system", "the other preferences are kept");
+
+        // The main window follows, without being asked, and can be switched back here.
+        let mut w = VisualTestContext::from_window(main, cx);
+        w.run_until_parked();
+        assert!(
+            w.debug_bounds("ui-density-comfortable").is_some(),
+            "the page window still draws"
+        );
+        let option = s
+            .debug_bounds("settings-attributes-compact")
+            .expect("the Compact choice is shown");
+        s.simulate_click(option.center(), Modifiers::default());
+        s.run_until_parked();
+        assert_eq!(
+            settings_json(dir.path()).unwrap()["attribute-blocks"],
+            "compact",
+            "switching back is saved too"
+        );
     }
 }

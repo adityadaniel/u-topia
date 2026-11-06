@@ -7,13 +7,20 @@
 //! versioned object meant to grow more general preferences:
 //!
 //! ```json
-//! { "version": 1, "font": "system", "density": "comfortable", "pinned": [] }
+//! {
+//!   "version": 1,
+//!   "font": "system",
+//!   "density": "comfortable",
+//!   "pinned": [],
+//!   "attribute-blocks": "compact"
+//! }
 //! ```
 //!
 //! `font` is `"system"` (the default) or `"ibm-plex-sans"`; `density` is
 //! `"comfortable"` (the default) or `"compact"` (ALL-5); `pinned` is the list of page ids
-//! the sidebar keeps in its Pinned group, in the order they were pinned (SB-3). A missing
-//! file means defaults; an
+//! the sidebar keeps in its Pinned group, in the order they were pinned (SB-3);
+//! `attribute-blocks` is `"compact"` (the default) or `"blocks"` (PG-1). A missing file
+//! means defaults; an
 //! unreadable file, an unknown value or a newer version is logged and read as far as it can
 //! be, never a panic (rule 11). Keys this version does not know are kept when the file is
 //! rewritten, so a newer release's preferences survive a round trip through an older one.
@@ -124,11 +131,56 @@ impl Density {
     }
 }
 
+/// How a page draws its `Key:: value` root blocks (PG-1). The metadata header always keeps
+/// the projection; this only decides whether the blocks are also drawn in full.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttributeBlocks {
+    /// One compact "key · value" row per attribute, in the muted colour (the default).
+    #[default]
+    Compact,
+    /// The ordinary outline blocks, as before the setting existed.
+    Blocks,
+}
+
+impl AttributeBlocks {
+    pub const ALL: &'static [AttributeBlocks] =
+        &[AttributeBlocks::Compact, AttributeBlocks::Blocks];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            AttributeBlocks::Compact => "compact",
+            AttributeBlocks::Blocks => "blocks",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|a| a.key() == key)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AttributeBlocks::Compact => "Compact rows",
+            AttributeBlocks::Blocks => "As blocks",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            AttributeBlocks::Compact => {
+                "One muted \"key · value\" row per attribute, under the metadata header."
+            }
+            AttributeBlocks::Blocks => "The attribute blocks themselves, as before.",
+        }
+    }
+}
+
 /// What `settings.json` holds.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Prefs {
     pub font: UiFont,
     pub density: Density,
+    /// How a page draws its `key:: value` blocks (PG-1).
+    pub attribute_blocks: AttributeBlocks,
     /// Page ids kept at the top of the sidebar, in the order they were pinned (SB-3).
     /// Local state: a pin is a pointer to a page, not a property of the page, so it never
     /// goes into a CRDT shard (rule 9).
@@ -184,6 +236,21 @@ impl Prefs {
                 Density::default()
             }
         };
+        let attribute_blocks = match rest.remove("attribute-blocks") {
+            None => AttributeBlocks::default(),
+            Some(Value::String(s)) => AttributeBlocks::from_key(&s).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "{FILE}: unknown attribute-blocks {s:?}; using compact rows"
+                ));
+                AttributeBlocks::default()
+            }),
+            Some(v) => {
+                warnings.push(format!(
+                    "{FILE}: attribute-blocks should be a string, not {v}; using compact rows"
+                ));
+                AttributeBlocks::default()
+            }
+        };
         let pinned = match rest.remove("pinned") {
             None => Vec::new(),
             Some(Value::Array(items)) => {
@@ -214,6 +281,7 @@ impl Prefs {
             Self {
                 font,
                 density,
+                attribute_blocks,
                 pinned,
                 rest,
             },
@@ -226,6 +294,10 @@ impl Prefs {
         m.insert("version".into(), VERSION.into());
         m.insert("font".into(), self.font.key().into());
         m.insert("density".into(), self.density.key().into());
+        m.insert(
+            "attribute-blocks".into(),
+            self.attribute_blocks.key().into(),
+        );
         m.insert(
             "pinned".into(),
             Value::Array(
@@ -307,6 +379,12 @@ pub fn density(cx: &App) -> Density {
         .map_or(Density::default(), |a| a.prefs.density)
 }
 
+/// How pages draw their attribute blocks (PG-1). Compact rows when nothing was installed.
+pub fn attribute_blocks(cx: &App) -> AttributeBlocks {
+    cx.try_global::<Appearance>()
+        .map_or(AttributeBlocks::default(), |a| a.prefs.attribute_blocks)
+}
+
 /// Pages pinned to the top of the sidebar, in pin order (SB-3). Empty when nothing was
 /// installed (tests, early startup).
 pub fn pinned(cx: &App) -> Vec<PageId> {
@@ -371,6 +449,16 @@ pub fn set_density(cx: &mut App, density: Density, config_dir: &Path) -> std::io
     cx.global::<Appearance>().prefs.save(config_dir)
 }
 
+/// Switch attribute blocks in every open window now and remember it (PG-1). Unlike the font
+/// and density this can be set from the page itself, so the save goes through the config
+/// dir `install` recorded; a test that never installed one stays in memory.
+pub fn set_attribute_blocks(cx: &mut App, value: AttributeBlocks) -> std::io::Result<()> {
+    cx.default_global::<Appearance>().prefs.attribute_blocks = value;
+    let saved = save(cx);
+    cx.refresh_windows();
+    saved
+}
+
 /// Make `font` drawable: the bundled faces are handed to gpui the first time they are
 /// needed (the setting, or Settings showing a sample of each choice), not at every launch.
 pub fn load_font(cx: &mut App, font: UiFont) {
@@ -397,6 +485,7 @@ mod tests {
         let p = Prefs {
             font: UiFont::IbmPlexSans,
             density: Density::Compact,
+            attribute_blocks: AttributeBlocks::Blocks,
             pinned: vec![PageId("page-a".into()), PageId("page-b".into())],
             ..Default::default()
         };
@@ -408,10 +497,25 @@ mod tests {
                 "version": 1,
                 "font": "ibm-plex-sans",
                 "density": "compact",
+                "attribute-blocks": "blocks",
                 "pinned": ["page-a", "page-b"],
             })
         );
         assert_eq!(Prefs::from_json(&json), (p, vec![]));
+    }
+
+    /// PG-1: attribute blocks default to compact rows, and a value this version does not
+    /// know is the default with a warning, not a crash (rule 11).
+    #[test]
+    fn attribute_blocks_default_to_compact() {
+        let (p, warnings) = Prefs::from_json("{}");
+        assert_eq!(p.attribute_blocks, AttributeBlocks::Compact);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (p, _) = Prefs::from_json(r#"{"version": 1, "attribute-blocks": "blocks"}"#);
+        assert_eq!(p.attribute_blocks, AttributeBlocks::Blocks);
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "attribute-blocks": "hidden"}"#);
+        assert_eq!(p.attribute_blocks, AttributeBlocks::Compact);
+        assert!(warnings[0].contains("hidden"), "{warnings:?}");
     }
 
     /// SB-3: pins are page ids in `settings.json`, in pin order; a repeated id counts once

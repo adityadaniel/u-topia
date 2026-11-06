@@ -56,7 +56,8 @@ impl AppState {
         if let Err(e) = store.set_debounced(true) {
             eprintln!("utopia: {e}");
         }
-        // Classify once here, then on every index update: rendering only reads the cache.
+        // Classify once at startup; each commit publishes the new set with the job (SB-2),
+        // so neither the sidebar's render nor an index update runs the query (rule 10).
         let tag_pages = store.hashtag_only_pages().unwrap_or_default();
         Self {
             store,
@@ -131,9 +132,12 @@ impl AppState {
 
     fn index_updated(&mut self, cx: &mut Context<Self>) {
         self.refs_version += 1;
-        // Derived from the index and cached: the sidebar must not re-parse references while
-        // drawing a frame (SB-2, rule 10).
-        self.tag_pages = self.store.hashtag_only_pages().unwrap_or_default();
+        // The commit that just landed published the tag-page classification with it (SB-2):
+        // take that copy. Re-classifying here would put a whole-graph query on the UI thread
+        // after every keystroke flush (§15.1, rule 10).
+        if let Some(pages) = self.store.tag_pages() {
+            self.tag_pages = pages;
+        }
         cx.emit(IndexUpdated);
         cx.notify();
     }

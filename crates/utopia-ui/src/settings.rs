@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use crate::actions::{
     by_category, canonical_keys, doc, pretty_keys, reinstall, ActionDoc, Category, Overrides,
 };
-use crate::appearance::{self, Density, UiFont};
+use crate::appearance::{self, AttributeBlocks, Density, UiFont};
 use crate::help::{shot_image, TOPICS};
 use crate::theme::{quiet_control, theme};
 
@@ -314,6 +314,25 @@ impl SettingsView {
                 Ok(()) => format!("The density is now {}.", density.label()).into(),
             },
         );
+        cx.notify();
+    }
+
+    /// Settings → Appearance: how pages draw their attribute blocks (PG-1). The same
+    /// preference the page's "Show as blocks" toggle writes.
+    pub fn choose_attribute_blocks(&mut self, value: AttributeBlocks, cx: &mut Context<Self>) {
+        let before = appearance::attribute_blocks(cx);
+        self.status = Some(match appearance::set_attribute_blocks(cx, value) {
+            Err(e) => format!(
+                "{} applies now, but could not save {}: {e}",
+                value.label(),
+                appearance::FILE
+            )
+            .into(),
+            Ok(()) if before == value => {
+                format!("Attribute blocks are already {}.", value.label()).into()
+            }
+            Ok(()) => format!("Attribute blocks are now {}.", value.label()).into(),
+        });
         cx.notify();
     }
 }
@@ -746,6 +765,58 @@ impl SettingsView {
                     .on_click(cx.listener(move |this, _, _, cx| this.choose_density(d, cx)))
             })
             .collect();
+        let current_attributes = appearance::attribute_blocks(cx);
+        let attributes: Vec<_> = AttributeBlocks::ALL
+            .iter()
+            .map(|&a| {
+                let on = a == current_attributes;
+                let th = th.clone();
+                div()
+                    .id(SharedString::from(format!("attributes-{}", a.key())))
+                    .debug_selector(move || format!("settings-attributes-{}", a.key()))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if on { th.accent } else { th.line })
+                    .when(on, |x| x.bg(th.chip_bg))
+                    .cursor_pointer()
+                    .hover(|x| x.bg(th.hover))
+                    .child(
+                        div()
+                            .size(px(14.))
+                            .flex_none()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(if on { th.accent } else { th.faint })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(on, |x| {
+                                x.child(div().size(px(8.)).rounded_full().bg(th.accent))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .child(div().child(a.label()))
+                            .child(
+                                div()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
+                                    .text_color(th.muted)
+                                    .child(a.hint()),
+                            ),
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.choose_attribute_blocks(a, cx)),
+                    )
+            })
+            .collect();
         div()
             .id("settings-appearance")
             .debug_selector(|| "settings-appearance".into())
@@ -796,6 +867,25 @@ impl SettingsView {
                             ),
                     )
                     .children(densities)
+                    .child(
+                        div()
+                            .pt_4()
+                            .pb_1()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.faint)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Attribute blocks"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(
+                                "A page's key:: value blocks also appear in the metadata \
+                                 header. Compact rows draw them once, quietly, under it.",
+                            ),
+                    )
+                    .children(attributes)
                     .child(
                         div()
                             .pt_4()
