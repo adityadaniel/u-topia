@@ -300,9 +300,7 @@ mod appearance {
         let mut store = Store::open_in_memory().unwrap();
         store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
         let app = cx.new(|_| AppState::new(store));
-        let main: gpui::AnyWindowHandle = cx
-            .add_window(|window, cx| Workspace::new(app, window, cx))
-            .into();
+        let main = cx.add_window(|window, cx| Workspace::new(app, window, cx));
         let settings =
             cx.add_window(move |window, cx| SettingsView::new(path, Tab::Appearance, window, cx));
         cx.run_until_parked();

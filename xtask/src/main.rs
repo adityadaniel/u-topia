@@ -969,8 +969,17 @@ fn seed_refs_graph(path: &Path) -> Result<()> {
     let yesterday = today - chrono::Duration::days(1);
     let link = s.date_format().format(yesterday);
     let plan = outline::append_block(s.page_state(&day)?, None);
-    let id = s.execute_plan(&day, plan, None)?.context("new block")?.block;
-    s.set_block_text(&day, &id, &format!("Plan follows on from [[{link}]]"), None, None)?;
+    let id = s
+        .execute_plan(&day, plan, None)?
+        .context("new block")?
+        .block;
+    s.set_block_text(
+        &day,
+        &id,
+        &format!("Plan follows on from [[{link}]]"),
+        None,
+        None,
+    )?;
     s.commit_block(&day, &id)?;
 
     let reading = s

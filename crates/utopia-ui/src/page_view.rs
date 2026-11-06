@@ -199,6 +199,16 @@ enum ControlMenu {
     Sort,
 }
 
+/// One choice in a reference control's menu (LR-1).
+struct ControlChoice {
+    selector: &'static str,
+    label: &'static str,
+    /// "Last N days" for the date menu; `None` is any time.
+    days: Option<u64>,
+    sort: Option<RefSort>,
+    selected: bool,
+}
+
 #[derive(Clone)]
 struct DraggedBlock {
     page: PageId,
@@ -2374,9 +2384,7 @@ impl PageView {
                             .relative()
                             .child(
                                 quiet_menu("date-filter", date_label, &th)
-                                    .debug_selector(move || {
-                                        format!("refs-date-menu-{date_key}").into()
-                                    })
+                                    .debug_selector(move || format!("refs-date-menu-{date_key}"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.controls_menu = if date_open {
                                             None
@@ -2401,9 +2409,7 @@ impl PageView {
                             .relative()
                             .child(
                                 quiet_menu("sort", sort_label, &th)
-                                    .debug_selector(move || {
-                                        format!("refs-sort-menu-{sort_key}").into()
-                                    })
+                                    .debug_selector(move || format!("refs-sort-menu-{sort_key}"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.controls_menu = if sort_open {
                                             None
@@ -2437,59 +2443,58 @@ impl PageView {
         let th = theme(cx).clone();
         let today = self.app.read(cx).store.today();
         let date_span = self.query.since.map(|d| (today - d).num_days() + 1);
-        // (selector suffix, label, choice: days for the date menu, sort for the other,
-        // selected right now).
-        let items: Vec<(
-            &'static str,
-            &'static str,
-            Option<u64>,
-            Option<RefSort>,
-            bool,
-        )> = match menu {
+        let items = match menu {
             ControlMenu::Date => vec![
-                (
-                    "refs-date-option-any-time",
-                    "Any time",
-                    None,
-                    None,
-                    date_span.is_none(),
-                ),
-                (
-                    "refs-date-option-last-7-days",
-                    "Last 7 days",
-                    Some(7),
-                    None,
-                    date_span == Some(7),
-                ),
-                (
-                    "refs-date-option-last-30-days",
-                    "Last 30 days",
-                    Some(30),
-                    None,
-                    date_span == Some(30),
-                ),
+                ControlChoice {
+                    selector: "refs-date-option-any-time",
+                    label: "Any time",
+                    days: None,
+                    sort: None,
+                    selected: date_span.is_none(),
+                },
+                ControlChoice {
+                    selector: "refs-date-option-last-7-days",
+                    label: "Last 7 days",
+                    days: Some(7),
+                    sort: None,
+                    selected: date_span == Some(7),
+                },
+                ControlChoice {
+                    selector: "refs-date-option-last-30-days",
+                    label: "Last 30 days",
+                    days: Some(30),
+                    sort: None,
+                    selected: date_span == Some(30),
+                },
             ],
             ControlMenu::Sort => vec![
-                (
-                    "refs-sort-option-title",
-                    "Title",
-                    None,
-                    Some(RefSort::Title),
-                    self.query.sort == RefSort::Title,
-                ),
-                (
-                    "refs-sort-option-recent",
-                    "Recent",
-                    None,
-                    Some(RefSort::Recency),
-                    self.query.sort == RefSort::Recency,
-                ),
+                ControlChoice {
+                    selector: "refs-sort-option-title",
+                    label: "Title",
+                    days: None,
+                    sort: Some(RefSort::Title),
+                    selected: self.query.sort == RefSort::Title,
+                },
+                ControlChoice {
+                    selector: "refs-sort-option-recent",
+                    label: "Recent",
+                    days: None,
+                    sort: Some(RefSort::Recency),
+                    selected: self.query.sort == RefSort::Recency,
+                },
             ],
         };
-        let rows = items.into_iter().map(|(selector, label, days, sort, on)| {
+        let rows = items.into_iter().map(|choice| {
+            let ControlChoice {
+                selector,
+                label,
+                days,
+                sort,
+                selected,
+            } = choice;
             div()
                 .id(selector)
-                .debug_selector(move || selector.into())
+                .debug_selector(|| selector.into())
                 .flex()
                 .items_center()
                 .justify_between()
@@ -2502,7 +2507,7 @@ impl PageView {
                 .cursor_pointer()
                 .hover(|s| s.bg(th.hover))
                 .child(label)
-                .child(if on {
+                .child(if selected {
                     div().text_color(th.accent).child("✓")
                 } else {
                     div()
