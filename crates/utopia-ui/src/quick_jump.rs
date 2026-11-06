@@ -17,7 +17,7 @@ use std::ops::Range;
 use chrono::NaiveDate;
 use gpui::{
     div, prelude::*, px, AnyElement, App, Context, Entity, EventEmitter, FontWeight,
-    HighlightStyle, MouseButton, MouseDownEvent, StyledText, Subscription, Window,
+    HighlightStyle, MouseButton, MouseDownEvent, ScrollHandle, StyledText, Subscription, Window,
 };
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, PageId};
@@ -131,6 +131,9 @@ pub struct JumpPalette {
     /// link or extracting a block has nothing to do with the pages you just visited.
     recent: Option<Vec<PageId>>,
     selected: usize,
+    /// The result list, so ↑/↓ can bring the selected row into view: the command catalog is
+    /// longer than the palette, and Enter would otherwise run a command nobody can see.
+    scroll: ScrollHandle,
     title: &'static str,
     mode: PaletteMode,
     _sub: Subscription,
@@ -175,6 +178,7 @@ impl JumpPalette {
             tags: HashSet::new(),
             recent,
             selected: 0,
+            scroll: ScrollHandle::new(),
             title,
             mode,
             _sub: sub,
@@ -203,7 +207,7 @@ impl JumpPalette {
                 };
                 self.results = hits.into_iter().map(QjItem::Block).collect();
                 self.tags.clear();
-                self.selected = 0;
+                self.select_first();
                 cx.notify();
                 return;
             }
@@ -213,14 +217,14 @@ impl JumpPalette {
         if let Some(rest) = q.strip_prefix('>') {
             self.results = commands(rest).into_iter().map(QjItem::Command).collect();
             self.tags.clear();
-            self.selected = 0;
+            self.select_first();
             cx.notify();
             return;
         }
         // QJ-1: with nothing typed, offer today, yesterday and the pages opened last.
         if q.trim().is_empty() {
             self.results = self.empty_state(cx);
-            self.selected = 0;
+            self.select_first();
             self.rank_tags(cx);
             cx.notify();
             return;
@@ -258,7 +262,7 @@ impl JumpPalette {
             }
         }
         self.results = results;
-        self.selected = 0;
+        self.select_first();
         self.rank_tags(cx);
         cx.notify();
     }
@@ -334,10 +338,19 @@ impl JumpPalette {
         }
     }
 
+    /// A new query starts again at the top, scrolled back to it, so ↑/↓ and Enter agree
+    /// on which row is the current one.
+    fn select_first(&mut self) {
+        self.selected = 0;
+        self.scroll.scroll_to_item(0);
+    }
+
     fn step(&mut self, d: isize, cx: &mut Context<Self>) {
         let n = self.results.len() as isize;
         if n > 0 {
             self.selected = ((self.selected as isize + d).rem_euclid(n)) as usize;
+            // The catalog is taller than the palette: keep the row Enter would run visible.
+            self.scroll.scroll_to_item(self.selected);
             cx.notify();
         }
     }
@@ -658,6 +671,7 @@ impl Render for JumpPalette {
                     .flex_col()
                     .max_h(px(320.))
                     .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
                     .children(rows)
                     .children(create_row),
             )

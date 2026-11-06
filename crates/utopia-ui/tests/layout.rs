@@ -74,6 +74,12 @@ fn bounds(cx: &mut VisualTestContext, sel: &'static str) -> Bounds<Pixels> {
         .unwrap_or_else(|| panic!("{sel} was not rendered"))
 }
 
+/// [`bounds`] for a selector built at run time (debug selectors are `&'static str`).
+fn bounds_dyn(cx: &mut VisualTestContext, sel: String) -> Bounds<Pixels> {
+    let sel: &'static str = Box::leak(sel.into_boxed_str());
+    bounds(cx, sel)
+}
+
 fn approx(a: Pixels, b: f32) -> bool {
     (f32::from(a) - b).abs() < 1.5
 }
@@ -348,6 +354,35 @@ fn quick_jump_rows_line_up(cx: &mut TestAppContext) {
         ),
         "type labels are right-aligned: {detail0:?} {detail1:?}"
     );
+}
+
+/// QJ-3/QJ-5: ↑/↓ move through the whole command catalog, so the list has to follow the
+/// selection — otherwise Enter runs a command nobody can see.
+#[gpui::test]
+fn quick_jump_scrolls_the_selection_into_view(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input(">");
+    cx.run_until_parked();
+    let last = utopia_ui::actions::CATALOG.len() - 1;
+    let visible = |cx: &mut VisualTestContext, i: usize| {
+        let row = bounds_dyn(cx, format!("qj-row-{i}"));
+        let results = bounds(cx, "jump-results");
+        row.origin.y >= results.origin.y - px(1.)
+            && row.origin.y + row.size.height <= results.origin.y + results.size.height + px(1.)
+    };
+    // Up from the first row wraps to the last: the list scrolls down to show it.
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert!(visible(cx, last), "the selected last command is in view");
+    // Down from there wraps back to the top, which scrolls the list up again.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert!(visible(cx, 0), "the first command is in view again");
+    // And walking down past the viewport keeps the selection in view.
+    cx.simulate_keystrokes("down down down down down down down down down down down down");
+    cx.run_until_parked();
+    assert!(visible(cx, 12), "the selection follows the list");
 }
 
 /// QJ-1/QJ-3: ten rows (today, yesterday and eight recent pages) keep the palette under
