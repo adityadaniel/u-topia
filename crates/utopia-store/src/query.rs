@@ -5,9 +5,9 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
-use utopia_core::inline::plain_text;
+use utopia_core::inline::{extract_refs, plain_text, RefKind};
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, BlockKind, PageId, PageKind};
 
@@ -149,6 +149,26 @@ pub struct LinkedRefs {
     /// Hits before filtering.
     pub total: usize,
     pub groups: Vec<RefGroup>,
+}
+
+/// A page the current hits co-reference: the chip a reference panel offers, with the number
+/// of hits selecting it would keep (FR-3.10, LR-1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoReference {
+    pub page: PageId,
+    pub title: String,
+    pub hits: usize,
+}
+
+/// How many co-reference chips a panel offers.
+pub const CO_REFERENCE_LIMIT: usize = 6;
+
+/// A referencing block's children for an inline preview (LR-4): the ones shown and how many
+/// the block has in total, so the view can fold the rest behind its chip.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefChildren {
+    pub shown: Vec<(BlockId, String)>,
+    pub total: usize,
 }
 
 impl LinkedRefs {
@@ -393,6 +413,9 @@ pub fn match_anchors(plain: &str, query: &str) -> Vec<(usize, usize)> {
 pub struct JournalEntry {
     pub page: PageRow,
     pub preview: Vec<String>,
+    /// Live blocks with text: what the sidebar's muted count says (SB-1). A day that only
+    /// exists because a link pointed at it has 0 here.
+    pub blocks: usize,
 }
 
 /// Subsequence fuzzy score of `needle` in `hay` (both normalized); higher is better.
@@ -522,7 +545,20 @@ impl Store {
         Ok(rows.iter().map(|t| plain_text(t)).collect())
     }
 
-    /// The last `limit` journal pages up to `today`, with a 2-line preview (FR-1.3).
+    /// Pages that exist only because of a `#tag` (SB-2, FR-2.15): no blocks of their own,
+    /// and every incoming reference to them is a hashtag (`#tag` / `#[[tag]]`), never a
+    /// `[[link]]`. Display-only: the sidebar draws a `#` beside these, there is no tags
+    /// subsystem. Ref spans are re-read from the source blocks because `ref` stores the
+    /// resolved edge only; this is an index-time query, never paint-time work (rule 3).
+    pub fn hashtag_only_pages(&self) -> Result<HashSet<PageId>> {
+        self.read_barrier()?;
+        self.tag_page_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        hashtag_only_pages(&self.conn)
+    }
+
+    /// The last `limit` journal pages up to `today`, with a 2-line preview (FR-1.3) and
+    /// the number of blocks on the day (SB-1).
     pub fn journal(&self, limit: usize) -> Result<Vec<JournalEntry>> {
         self.journal_pages(limit)?
             .into_iter()
@@ -532,9 +568,26 @@ impl Store {
                     .into_iter()
                     .filter(|s| !s.trim().is_empty())
                     .collect();
-                Ok(JournalEntry { page, preview })
+                let blocks = self.page_block_count(&page.id)?;
+                Ok(JournalEntry {
+                    page,
+                    preview,
+                    blocks,
+                })
             })
             .collect()
+    }
+
+    /// Live blocks with text on a page. An empty block does not count: the sidebar's
+    /// count says how much was written, not how many blank rows the outliner holds.
+    pub fn page_block_count(&self, page: &PageId) -> Result<usize> {
+        self.read_barrier()?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT count(*) FROM block
+             WHERE page_id=?1 AND deleted_at IS NULL AND trim(text) <> ''",
+        )?;
+        let n: i64 = stmt.query_row(params![page.as_str()], |r| r.get(0))?;
+        Ok(n.max(0) as usize)
     }
 
     /// Daily pages up to today with something on them, newest first: the Daily Notes
@@ -1038,6 +1091,123 @@ impl Store {
         Ok(LinkedRefs { total, groups: out })
     }
 
+    /// The first `limit` live children of each referencing block, in outline order, and how
+    /// many live children it has in total (LR-4). Read from the `block` projection, so a
+    /// reference panel can show them without doing the work at paint time (rule 3).
+    /// `usize::MAX` means every child (the "+N more" chip was opened).
+    pub fn ref_children(
+        &self,
+        parents: &[BlockId],
+        limit: usize,
+    ) -> Result<HashMap<BlockId, RefChildren>> {
+        self.read_barrier()?;
+        let mut out = HashMap::with_capacity(parents.len());
+        let mut count = self.conn.prepare_cached(
+            "SELECT count(*) FROM block WHERE parent_id=?1 AND deleted_at IS NULL",
+        )?;
+        let mut rows = self.conn.prepare_cached(
+            "SELECT id, text FROM block WHERE parent_id=?1 AND deleted_at IS NULL
+             ORDER BY position LIMIT ?2",
+        )?;
+        // SQLite reads a negative LIMIT as "no limit".
+        let sql_limit: i64 = if limit == usize::MAX {
+            -1
+        } else {
+            limit as i64
+        };
+        for parent in parents {
+            let total: i64 = count.query_row([parent.as_str()], |r| r.get(0))?;
+            let shown: Vec<(BlockId, String)> = if limit == 0 {
+                Vec::new()
+            } else {
+                rows.query_map(rusqlite::params![parent.as_str(), sql_limit], |r| {
+                    Ok((BlockId(r.get(0)?), r.get(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            out.insert(
+                parent.clone(),
+                RefChildren {
+                    shown,
+                    total: total as usize,
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    /// The pages the current hits co-reference, each with the number of hits that selecting
+    /// it would keep (FR-3.10, LR-1). Candidates come from the index — the referencing
+    /// block, its ancestors and their aliases all resolve to pages there — and the count
+    /// uses the very predicate a co-reference filter applies, so a chip's number is exactly
+    /// the number of results it produces.
+    pub fn co_references(
+        &self,
+        hits: &[RefHit],
+        page: &PageId,
+        applied: &[PageId],
+    ) -> Result<Vec<CoReference>> {
+        self.read_barrier()?;
+        let mut candidates: HashSet<String> = HashSet::new();
+        {
+            let mut refs = self.conn.prepare_cached(
+                "SELECT DISTINCT dst_page_id FROM ref
+                 WHERE src_block_id=?1 AND dst_kind='page' AND dst_page_id IS NOT NULL",
+            )?;
+            for h in hits {
+                let blocks = std::iter::once(&h.block).chain(h.breadcrumb.iter().map(|(b, _)| b));
+                for block in blocks {
+                    let rows = refs.query_map([block.as_str()], |r| r.get::<_, String>(0))?;
+                    for id in rows {
+                        candidates.insert(id?);
+                    }
+                }
+            }
+        }
+        let mut filter = self.conn.prepare_cached(
+            "SELECT src_block_id FROM ref WHERE dst_page_id=?1 AND dst_kind='page'",
+        )?;
+        let mut out: Vec<(String, CoReference)> = Vec::new();
+        for id in candidates {
+            let candidate = PageId(id);
+            if candidate == *page || applied.contains(&candidate) {
+                continue;
+            }
+            let set: HashSet<String> = filter
+                .query_map([candidate.as_str()], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            // The `RefQuery::also` predicate: the hit's block, an ancestor, or its page.
+            let kept = hits
+                .iter()
+                .filter(|h| {
+                    h.page == candidate
+                        || set.contains(h.block.as_str())
+                        || h.breadcrumb.iter().any(|(a, _)| set.contains(a.as_str()))
+                })
+                .count();
+            if kept == 0 {
+                continue;
+            }
+            let Some(row) = self.page_row(&candidate)? else {
+                continue;
+            };
+            if row.deleted_at.is_some() {
+                continue;
+            }
+            out.push((
+                row.title_key,
+                CoReference {
+                    page: candidate,
+                    title: row.title,
+                    hits: kept,
+                },
+            ));
+        }
+        out.sort_by(|a, b| b.1.hits.cmp(&a.1.hits).then(a.0.cmp(&b.0)));
+        out.truncate(CO_REFERENCE_LIMIT);
+        Ok(out.into_iter().map(|(_, c)| c).collect())
+    }
+
     /// Number of live blocks referencing a page.
     pub fn backlink_count(&self, page: &PageId) -> Result<usize> {
         self.read_barrier()?;
@@ -1165,4 +1335,138 @@ impl Store {
             .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(rows)
     }
+}
+
+/// Whether `page` is a hashtag-only page, classified on its own (SB-2). `None` means the
+/// page cannot be one at all (it has blocks, is not a page, or is deleted); `Some(true)` is
+/// a tag page. Used by the writer to update only the entries a commit can change.
+pub(crate) fn classify_tag_page(conn: &Connection, page: &PageId) -> Result<Option<bool>> {
+    let title_key: Option<String> = conn
+        .query_row(
+            "SELECT p.title_key FROM page p
+             WHERE p.id=?1 AND p.deleted_at IS NULL AND p.kind = 'page'
+               AND NOT EXISTS (SELECT 1 FROM block b WHERE b.page_id = p.id
+                                 AND b.deleted_at IS NULL AND trim(b.text) <> '')",
+            [page.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(title_key) = title_key else {
+        return Ok(None);
+    };
+    let mut keys = HashSet::from([title_key]);
+    let mut aliases = conn.prepare_cached("SELECT alias_key FROM alias WHERE page_id=?1")?;
+    for row in aliases.query_map([page.as_str()], |r| r.get::<_, String>(0))? {
+        keys.insert(row?);
+    }
+    let mut texts = conn.prepare_cached(
+        "SELECT b.text FROM ref r JOIN block b ON b.id = r.src_block_id
+         WHERE r.dst_page_id=?1 AND b.deleted_at IS NULL",
+    )?;
+    let mut any = false;
+    let mut all_tags = true;
+    for row in texts.query_map([page.as_str()], |r| r.get::<_, String>(0))? {
+        let text = row?;
+        for r in extract_refs(&text) {
+            if r.is_page_like() && keys.contains(&normalize_title(&r.target)) {
+                any = true;
+                all_tags &= r.kind == RefKind::Tag;
+            }
+        }
+    }
+    Ok(Some(any && all_tags))
+}
+
+/// Pages referenced by any block of `sources` right now (SB-2): a commit can change the
+/// classification of these, so the writer updates just their entries.
+pub(crate) fn dst_pages_of_sources(
+    conn: &Connection,
+    sources: &[PageId],
+) -> Result<HashSet<PageId>> {
+    let mut out = HashSet::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT dst_page_id FROM ref
+         WHERE src_page_id=?1 AND dst_kind='page' AND dst_page_id IS NOT NULL",
+    )?;
+    for page in sources {
+        for row in stmt.query_map([page.as_str()], |r| r.get::<_, String>(0))? {
+            out.insert(PageId(row?));
+        }
+    }
+    Ok(out)
+}
+
+/// Whether anything references `page` at all (SB-2): a published tag page whose last
+/// reference went away is no longer one, and this is the cheap way to notice.
+pub(crate) fn has_any_ref(conn: &Connection, page: &PageId) -> Result<bool> {
+    let mut stmt =
+        conn.prepare_cached("SELECT 1 FROM ref WHERE dst_page_id=?1 AND dst_kind='page' LIMIT 1")?;
+    Ok(stmt.exists([page.as_str()])?)
+}
+
+/// The classification itself, over any connection: the writer publishes it after every
+/// commit, so the UI thread never runs it (SB-2, §15.1). The body re-reads reference spans
+/// from the source blocks because `ref` stores the resolved edge only.
+pub(crate) fn hashtag_only_pages(conn: &Connection) -> Result<HashSet<PageId>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.id, p.title_key FROM page p
+         WHERE p.deleted_at IS NULL AND p.kind = 'page'
+           AND NOT EXISTS (SELECT 1 FROM block b WHERE b.page_id = p.id
+                             AND b.deleted_at IS NULL AND trim(b.text) <> '')",
+    )?;
+    let candidates = stmt
+        .query_map([], |r| {
+            Ok((PageId(r.get::<_, String>(0)?), r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    // The source text of every reference into a blockless page, in one query rather
+    // than one per page: the sidebar re-reads this whenever the index moves.
+    let mut sources = conn.prepare(
+        "SELECT r.dst_page_id, b.text FROM ref r
+         JOIN block b ON b.id = r.src_block_id
+         JOIN page p ON p.id = r.dst_page_id
+         WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL AND p.kind = 'page'
+           AND NOT EXISTS (SELECT 1 FROM block own WHERE own.page_id = p.id
+                             AND own.deleted_at IS NULL AND trim(own.text) <> '')",
+    )?;
+    let mut texts: HashMap<PageId, Vec<String>> = HashMap::new();
+    for row in sources.query_map([], |r| {
+        Ok((PageId(r.get::<_, String>(0)?), r.get::<_, String>(1)?))
+    })? {
+        let (page, text) = row?;
+        texts.entry(page).or_default().push(text);
+    }
+    // A reference through an alias reaches the page under the alias's key.
+    let mut aliases = conn.prepare("SELECT page_id, alias_key FROM alias")?;
+    let mut alias_keys: HashMap<PageId, HashSet<String>> = HashMap::new();
+    for row in aliases.query_map([], |r| {
+        Ok((PageId(r.get::<_, String>(0)?), r.get::<_, String>(1)?))
+    })? {
+        let (page, key) = row?;
+        alias_keys.entry(page).or_default().insert(key);
+    }
+    let mut out = HashSet::new();
+    for (page, title_key) in candidates {
+        let mut keys = HashSet::from([title_key]);
+        if let Some(aliases) = alias_keys.get(&page) {
+            keys.extend(aliases.iter().cloned());
+        }
+        let mut any = false;
+        let mut all_tags = true;
+        for text in texts.get(&page).map(Vec::as_slice).unwrap_or_default() {
+            for r in extract_refs(text) {
+                if r.is_page_like() && keys.contains(&normalize_title(&r.target)) {
+                    any = true;
+                    all_tags &= r.kind == RefKind::Tag;
+                }
+            }
+        }
+        if any && all_tags {
+            out.insert(page);
+        }
+    }
+    Ok(out)
 }

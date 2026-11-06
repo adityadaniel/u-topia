@@ -321,3 +321,366 @@ fn date_filter_on_linked_references() {
     };
     assert_eq!(s.linked_references(&topic, &q).unwrap().shown(), 2);
 }
+
+/// LR-4: a reference's inline children come from the `block` projection, in outline order,
+/// with the total count so the view can fold the rest behind its chip.
+#[test]
+fn reference_children_come_from_the_index_in_order() {
+    let (mut s, _d) = store();
+    let src = s.create_page("Source").unwrap();
+    let parent = write(&mut s, &src, "the plan depends on [[Target]]");
+    let mut kids = Vec::new();
+    for n in 1..=4 {
+        let plan = outline::append_block(s.page_state(&src).unwrap(), Some(&parent));
+        let id = s.execute_plan(&src, plan, None).unwrap().unwrap().block;
+        s.set_block_text(&src, &id, &format!("Reason {n}"), None, None)
+            .unwrap();
+        s.commit_block(&src, &id).unwrap();
+        kids.push(id);
+    }
+    s.sync_index().unwrap();
+
+    let folded = s.ref_children(std::slice::from_ref(&parent), 2).unwrap();
+    let folded = folded.get(&parent).unwrap();
+    assert_eq!(folded.total, 4, "the chip's count is the whole truth");
+    assert_eq!(
+        folded
+            .shown
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>(),
+        ["Reason 1", "Reason 2"]
+    );
+    assert_eq!(folded.shown[0].0, kids[0], "in outline order");
+
+    // 0 asks for the count alone; usize::MAX asks for every child (the chip was opened).
+    let none = s
+        .ref_children(std::slice::from_ref(&parent), 0)
+        .unwrap()
+        .remove(&parent)
+        .unwrap();
+    assert!(none.shown.is_empty());
+    assert_eq!(none.total, 4);
+    let all = s
+        .ref_children(std::slice::from_ref(&parent), usize::MAX)
+        .unwrap()
+        .remove(&parent)
+        .unwrap();
+    assert_eq!(all.shown.len(), 4);
+    // A block with no children is just a count of zero, never a missing entry.
+    let empty = s
+        .ref_children(std::slice::from_ref(&kids[0]), 2)
+        .unwrap()
+        .remove(&kids[0])
+        .unwrap();
+    assert!(empty.shown.is_empty());
+    assert_eq!(empty.total, 0);
+}
+
+/// LR-5: "Link all" rewrites every unlinked mention, two in one block included, as one undo
+/// step.
+#[test]
+fn promote_all_mentions_links_every_mention_in_one_step() {
+    let (mut s, _d) = store();
+    let m = s.create_page("Mindfulness").unwrap();
+    let a = s.create_page("Reading").unwrap();
+    let b = write(
+        &mut s,
+        &a,
+        "mindfulness in the morning, mindfulness at night",
+    );
+    write(&mut s, &a, "and a mindful walk");
+    assert_eq!(s.unlinked_references(&m).unwrap().len(), 2);
+
+    assert_eq!(s.promote_all_mentions(&m).unwrap(), 2);
+    s.sync_index().unwrap();
+    let text = s.page_state(&a).unwrap().block(&b).unwrap().text.clone();
+    assert_eq!(
+        text, "[[Mindfulness]] in the morning, [[Mindfulness]] at night",
+        "both mentions, in place"
+    );
+    assert!(s.unlinked_references(&m).unwrap().is_empty());
+    assert_eq!(s.backlink_count(&m).unwrap(), 1, "one referencing block");
+
+    // One undo puts both back.
+    s.undo().unwrap();
+    s.sync_index().unwrap();
+    let text = s.page_state(&a).unwrap().block(&b).unwrap().text.clone();
+    assert_eq!(text, "mindfulness in the morning, mindfulness at night");
+    assert_eq!(s.unlinked_references(&m).unwrap().len(), 2);
+    doctor_ok(&mut s);
+
+    // Nothing to link is zero, not an error.
+    assert_eq!(s.promote_all_mentions(&m).unwrap_or(0), 2);
+}
+
+/// LR-5 review fix: a title and one of its aliases can match the same words. The mention
+/// list then holds overlapping ranges ("New York" 0..8 and "York" 4..8), and linking both
+/// would rewrite the text twice over itself.
+#[test]
+fn promote_all_mentions_keeps_overlapping_mentions_apart() {
+    let (mut s, _d) = store();
+    let ny = s.create_page("New York").unwrap();
+    s.add_alias(&ny, "York").unwrap();
+    let src = s.create_page("Travel").unwrap();
+    let b = write(&mut s, &src, "flying to New York in May");
+    let mentions = s.unlinked_references(&ny).unwrap();
+    assert_eq!(
+        mentions.len(),
+        2,
+        "the title and its alias both match: {mentions:?}"
+    );
+
+    assert_eq!(
+        s.promote_all_mentions(&ny).unwrap(),
+        1,
+        "one span, one link"
+    );
+    s.sync_index().unwrap();
+    let text = s.page_state(&src).unwrap().block(&b).unwrap().text.clone();
+    assert_eq!(text, "flying to [[New York]] in May", "no doubled rewrite");
+    assert!(s.unlinked_references(&ny).unwrap().is_empty());
+    doctor_ok(&mut s);
+}
+
+/// LR-5 review fix (rule 10): the reference panel's count is read from the index as it
+/// stands. Reading it must not flush a pending edit, and "nothing pending" is not the same
+/// as "the index is current": `flush` empties the queue long before the writer has
+/// committed.
+#[test]
+fn unlinked_count_reads_the_index_without_flushing() {
+    let (mut s, _d) = store();
+    let m = s.create_page("Mindfulness").unwrap();
+    let src = s.create_page("Reading").unwrap();
+    // From here on, edits stay in the shard until the debounced flush, as in the UI.
+    s.set_debounced(true).unwrap();
+    let b = s.ensure_first_block(&src).unwrap();
+    s.set_block_text(&src, &b, "practising mindfulness daily", None, None)
+        .unwrap();
+    assert!(s.has_pending(), "the edit waits for the debounced flush");
+
+    assert!(
+        s.unlinked_references_now(&m).unwrap().is_empty(),
+        "the index has not seen the new block yet"
+    );
+    assert!(
+        s.has_pending(),
+        "reading the count must not flush the pending edit"
+    );
+
+    // The old guard: after a flush the queue is empty while the writer may still be
+    // running, so a page drawn in that window waited on disk commits.
+    s.flush().unwrap();
+    assert!(
+        !s.has_pending(),
+        "flush empties the queue before the writer is done"
+    );
+
+    // The blocking form makes the edit durable first and then sees it; the panel uses the
+    // non-blocking form and catches up when the index reports it is durable.
+    assert_eq!(s.unlinked_references(&m).unwrap().len(), 1);
+    assert_eq!(s.unlinked_references_now(&m).unwrap().len(), 1);
+}
+
+/// LR-1 review fix: the co-reference chips and their counts use the filter's own predicate.
+/// An alias resolves to the page, an ancestor reference counts for its descendants, and two
+/// mentions of the same page in one block are still one hit.
+#[test]
+fn co_reference_counts_use_the_filter_predicate() {
+    use utopia_core::outline;
+    let (mut s, _d) = store();
+    let target = s.create_page("Target").unwrap();
+    let ana = s.create_page("Ana Lovelace").unwrap();
+    s.add_alias(&ana, "AL").unwrap();
+    let bob = s.create_page("Bob").unwrap();
+    let src = s.create_page("Source").unwrap();
+    let parent = write(&mut s, &src, "Review of [[AL]]");
+    // A child that references Target, under a parent that references Ana through her alias.
+    let plan = outline::append_block(s.page_state(&src).unwrap(), Some(&parent));
+    let child = s.execute_plan(&src, plan, None).unwrap().unwrap().block;
+    s.set_block_text(
+        &src,
+        &child,
+        "the [[Target]] plan with [[Bob]] and [[Bob]]",
+        None,
+        None,
+    )
+    .unwrap();
+    s.commit_block(&src, &child).unwrap();
+    write(&mut s, &src, "another [[Target]] note with [[Bob]]");
+    s.sync_index().unwrap();
+
+    let refs = s.linked_references(&target, &Default::default()).unwrap();
+    let hits: Vec<_> = refs.groups.iter().flat_map(|g| g.hits.clone()).collect();
+    assert_eq!(hits.len(), 2);
+
+    let co = s.co_references(&hits, &target, &[]).unwrap();
+    let by_page = |p: &PageId| co.iter().find(|c| c.page == *p).map(|c| c.hits);
+    assert_eq!(
+        by_page(&ana),
+        Some(1),
+        "the alias reference on the ancestor counts for the child hit"
+    );
+    assert_eq!(
+        by_page(&bob),
+        Some(2),
+        "two hits, although one block mentions Bob twice"
+    );
+    assert!(
+        co.iter().all(|c| c.page != target),
+        "the page itself is never a co-reference"
+    );
+    // The count is exactly what the filter leaves.
+    let q = utopia_store::RefQuery {
+        also: vec![bob.clone()],
+        ..Default::default()
+    };
+    assert_eq!(
+        s.linked_references(&target, &q).unwrap().shown(),
+        by_page(&bob).unwrap()
+    );
+    // And applied filters are not offered again.
+    let co = s
+        .co_references(&hits, &target, std::slice::from_ref(&bob))
+        .unwrap();
+    assert!(co.iter().all(|c| c.page != bob));
+}
+
+/// SB-2 review fix: the tag-page classification is published after a commit, but only the
+/// pages a commit can affect are reclassified. One whole-graph scan is enough, no matter
+/// how many refs the graph holds.
+#[test]
+fn tag_classification_is_updated_incrementally() {
+    let (mut s, _d) = store();
+    let src = s.create_page("Notes").unwrap();
+    let tag = write(&mut s, &src, "see #alpha here");
+    s.sync_index().unwrap();
+    let alpha = s.find_page("alpha").unwrap().expect("the tag made a page");
+    let note = write(&mut s, &src, "an ordinary note");
+    s.sync_index().unwrap();
+    let full = s.tag_page_full_scans();
+    assert_eq!(full, 1, "the first commit classifies once");
+    assert!(s.tag_pages().unwrap().contains(&alpha));
+
+    // Writing an unrelated block does not rescan the graph, and keeps the answer.
+    s.set_block_text(&src, &note, "an ordinary note, edited", None, None)
+        .unwrap();
+    s.commit_block(&src, &note).unwrap();
+    assert_eq!(s.tag_page_full_scans(), full, "no whole-graph scan");
+    assert!(s.tag_pages().unwrap().contains(&alpha), "still a tag page");
+
+    // The same block's tag becoming a link takes the page out of the set.
+    s.set_block_text(&src, &tag, "see [[alpha]] here", None, None)
+        .unwrap();
+    s.commit_block(&src, &tag).unwrap();
+    assert_eq!(s.tag_page_full_scans(), full);
+    assert!(
+        !s.tag_pages().unwrap().contains(&alpha),
+        "a [[link]] is not a tag"
+    );
+    assert_eq!(
+        s.tag_pages().unwrap(),
+        s.hashtag_only_pages().unwrap(),
+        "the published set matches a full classification"
+    );
+
+    // A tag again: back in, still without a scan.
+    s.set_block_text(&src, &tag, "see #alpha here", None, None)
+        .unwrap();
+    s.commit_block(&src, &tag).unwrap();
+    assert!(s.tag_pages().unwrap().contains(&alpha));
+    assert_eq!(s.tag_page_full_scans(), full);
+
+    // Removing the last reference drops it (a page that lost every ref cannot be a tag
+    // page), which the incremental path has to notice without a scan.
+    s.set_block_text(&src, &tag, "nothing to see", None, None)
+        .unwrap();
+    s.commit_block(&src, &tag).unwrap();
+    assert!(!s.tag_pages().unwrap().contains(&alpha));
+    assert!(s.tag_pages().unwrap().is_empty());
+    assert_eq!(s.tag_page_full_scans(), full);
+}
+
+/// SB-2 review fix: a page that was a plain page only because of one `[[link]]` becomes a
+/// tag page when that link goes away. The destination is no longer referenced by the page
+/// that changed, so the reclassification has to start from the references the commit
+/// *removed*, not only from the ones it left behind.
+#[test]
+fn a_link_that_goes_away_makes_its_destination_a_tag_page() {
+    let (mut s, _d) = store();
+    let notes = s.create_page("Notes").unwrap();
+    let tagged = s.create_page("Tagged").unwrap();
+    write(&mut s, &tagged, "kept as a tag: #alpha");
+    let link = write(&mut s, &notes, "a plain link: [[alpha]]");
+    s.sync_index().unwrap();
+    let alpha = s.find_page("alpha").unwrap().expect("the tag made a page");
+    let full = s.tag_page_full_scans();
+    assert!(
+        !s.tag_pages().unwrap().contains(&alpha),
+        "one [[link]] keeps the page a page, not a tag"
+    );
+
+    // The link goes away; only the hashtag still reaches the page.
+    s.set_block_text(&notes, &link, "no link any more", None, None)
+        .unwrap();
+    s.commit_block(&notes, &link).unwrap();
+    s.sync_index().unwrap();
+    assert!(
+        s.tag_pages().unwrap().contains(&alpha),
+        "reclassified from the removed reference: {:?}",
+        s.tag_pages()
+    );
+    assert_eq!(s.tag_page_full_scans(), full, "still no whole-graph scan");
+    assert_eq!(s.tag_pages().unwrap(), s.hashtag_only_pages().unwrap());
+}
+
+/// PG-2 review fix: an export copies what it needs off the store, then the serialization and
+/// the file writes take no store at all — that is what lets them run on a background worker
+/// instead of freezing every window. Both routes must write the same files.
+#[test]
+fn export_snapshot_is_written_off_the_store() {
+    let (mut s, _d) = store();
+    let src = s.create_page("Notes").unwrap();
+    write(&mut s, &src, "see #alpha and [[Beta]]");
+    let daily = s.create_page("Reading").unwrap();
+    write(&mut s, &daily, "a second page");
+    s.sync_index().unwrap();
+
+    // The snapshot is a value: the free writer runs it without borrowing the store.
+    let snapshot = s.export_snapshot().unwrap();
+    let from_snapshot = tempfile::tempdir().unwrap();
+    let pages = utopia_store::write_export(&snapshot, from_snapshot.path()).unwrap();
+    assert_eq!(pages, snapshot.pages.len());
+    for name in ["graph.json", "graph.opml"] {
+        assert!(
+            from_snapshot.path().join(name).is_file(),
+            "{name} is written"
+        );
+    }
+
+    // The store's own methods write the same files.
+    let from_store = tempfile::tempdir().unwrap();
+    assert_eq!(s.export_markdown(from_store.path()).unwrap(), pages);
+    s.export_json(&from_store.path().join("graph.json"))
+        .unwrap();
+    s.export_opml(&from_store.path().join("graph.opml"))
+        .unwrap();
+    let mut names: Vec<String> = std::fs::read_dir(from_store.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    let mut snapshot_names: Vec<String> = std::fs::read_dir(from_snapshot.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    snapshot_names.sort();
+    assert_eq!(names, snapshot_names, "the same files either way");
+    for name in names {
+        assert_eq!(
+            std::fs::read(from_snapshot.path().join(&name)).unwrap(),
+            std::fs::read(from_store.path().join(&name)).unwrap(),
+            "{name} has the same bytes"
+        );
+    }
+}
