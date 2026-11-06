@@ -732,7 +732,10 @@ fn pinned_pages_sit_above_pages_and_are_local(cx: &mut TestAppContext) {
     // A new launch reads the pin back from the file.
     cx.update(|_, cx| {
         utopia_ui::appearance::install(cx, dir.path());
-        assert_eq!(utopia_ui::appearance::pinned(cx), [alpha.clone()]);
+        assert_eq!(
+            utopia_ui::appearance::pinned(cx),
+            std::slice::from_ref(&alpha)
+        );
     });
 
     // Show another page, then unpin Alpha with the row's ✕. The click must not open Alpha.

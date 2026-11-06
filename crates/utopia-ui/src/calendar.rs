@@ -115,6 +115,23 @@ pub fn render<V: 'static>(
         .children(rows)
 }
 
+/// The callbacks the sidebar's month strip needs, bundled so the render signature stays
+/// readable (pick a day, move a month, fold the strip).
+pub struct StripActions<V> {
+    pub pick: fn(&mut V, NaiveDate, bool, &mut Window, &mut Context<V>),
+    pub shift: fn(&mut V, i32, &mut Context<V>),
+    pub toggle: fn(&mut V, &mut Context<V>),
+}
+
+// Function pointers are `Copy` whatever `V` is, so each listener can take its own copy.
+impl<V> Clone for StripActions<V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<V> Copy for StripActions<V> {}
+
 /// The left sidebar's month strip (SB-5): a quiet 7-column grid under Journal. The month
 /// name is the collapse control — one click folds the grid away; the arrows still move
 /// between months either way. Days with an entry get a small dot under the number, and
@@ -126,9 +143,7 @@ pub fn render_month_strip<V: 'static>(
     today: NaiveDate,
     existing: &HashSet<NaiveDate>,
     open: bool,
-    pick: fn(&mut V, NaiveDate, bool, &mut Window, &mut Context<V>),
-    shift: fn(&mut V, i32, &mut Context<V>),
-    toggle: fn(&mut V, &mut Context<V>),
+    actions: StripActions<V>,
 ) -> Div {
     let th = theme(cx).clone();
     let arrow = |id: &'static str, glyph: &'static str, delta: i32| {
@@ -141,7 +156,7 @@ pub fn render_month_strip<V: 'static>(
             .text_color(th.faint)
             .hover(|d| d.bg(th.hover).text_color(th.text))
             .child(glyph)
-            .on_click(cx.listener(move |v, _, _, cx| shift(v, delta, cx)))
+            .on_click(cx.listener(move |v, _, _, cx| (actions.shift)(v, delta, cx)))
     };
     let header = div()
         .flex()
@@ -164,7 +179,7 @@ pub fn render_month_strip<V: 'static>(
                 .hover(|d| d.bg(th.hover).text_color(th.text))
                 .child(if open { "▾" } else { "▸" })
                 .child(month.format("%B %Y").to_string())
-                .on_click(cx.listener(move |v, _, _, cx| toggle(v, cx))),
+                .on_click(cx.listener(move |v, _, _, cx| (actions.toggle)(v, cx))),
         )
         .child(arrow("cal-next", "›", 1));
     let mut strip = div().flex().flex_col().gap_0p5().child(header);
@@ -224,7 +239,7 @@ pub fn render_month_strip<V: 'static>(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |v, e: &MouseDownEvent, w, cx| {
-                        pick(v, d, e.modifiers.shift, w, cx)
+                        (actions.pick)(v, d, e.modifiers.shift, w, cx)
                     }),
                 )
         })

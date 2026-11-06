@@ -1365,9 +1365,11 @@ impl Workspace {
                         today,
                         &self.sidebar.days,
                         self.calendar_open,
-                        Self::pick_date,
-                        Self::shift_month,
-                        Self::toggle_calendar,
+                        crate::calendar::StripActions {
+                            pick: Self::pick_date,
+                            shift: Self::shift_month,
+                            toggle: Self::toggle_calendar,
+                        },
                     )),
             );
         let mut scroll = div()
