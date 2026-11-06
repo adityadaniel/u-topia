@@ -443,6 +443,63 @@ fn search_filters_by_name_description_and_key(cx: &mut TestAppContext) {
     );
 }
 
+/// ST-2: the key chip is the control. Clicking it records keys, a changed row shows the
+/// small ↺, and the Change button is gone.
+#[gpui::test]
+fn the_key_chip_records_and_resets(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("settings-change-GoToday").is_none(),
+        "no separate Change button (never drawn, so a bounds check is sound)"
+    );
+    assert!(
+        cx.debug_bounds("settings-reset-GoToday").is_none(),
+        "the ↺ only appears once the row changed"
+    );
+
+    let chip = cx
+        .debug_bounds("settings-chip-GoToday")
+        .expect("the key chip is the control");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let today = doc("GoToday").unwrap();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.capturing().map(|d| d.action)),
+        Some("GoToday"),
+        "clicking the chip starts recording"
+    );
+
+    cx.simulate_keystrokes("cmd-alt-t");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(v.capturing().is_none());
+        assert_eq!(v.overrides().keys_for(today), "alt-cmd-t");
+    });
+    assert!(
+        cx.debug_bounds("settings-reset-GoToday").is_some(),
+        "the changed row carries the ↺"
+    );
+
+    // Clicking the ↺ puts the catalog default back.
+    let reset = cx.debug_bounds("settings-reset-GoToday").unwrap();
+    cx.simulate_click(reset.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(v.overrides().0.is_empty());
+        assert_eq!(v.overrides().keys_for(today), platform_keys("cmd-shift-t"));
+    });
+}
+
 /// A `keymap.json` that cannot be read must not take the window down with it (rule 11).
 #[gpui::test]
 fn a_broken_keymap_is_reported_not_fatal(cx: &mut TestAppContext) {

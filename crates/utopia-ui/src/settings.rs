@@ -740,11 +740,12 @@ impl SettingsView {
 
         let hint = if self.query.trim().is_empty() {
             if changed == 0 {
-                "Pick Change, then press the keys you want.".to_string()
+                "Click a key, then press the combination you want. Esc keeps the one you had."
+                    .to_string()
             } else {
                 format!(
-                    "Pick Change, then press the keys you want. {changed} changed from the \
-                     default."
+                    "Click a key, then press the combination you want. {changed} changed from \
+                     the default."
                 )
             }
         } else {
@@ -823,25 +824,54 @@ impl SettingsView {
         let capturing = self.capturing.map(|c| c.action) == Some(d.action);
         let keys = self.overrides.keys_for(d);
         let changed = self.overrides.is_changed(d.action);
-        let chip = if capturing {
+
+        // ST-2: the key chip *is* the control. Click it and it waits for the next
+        // combination; there is no separate Change button to hunt for.
+        let chip = div()
+            .id(SharedString::from(format!("chip-{}", d.action)))
+            .debug_selector(move || format!("settings-chip-{}", d.action))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(if capturing { th.accent } else { th.line })
+            .bg(if capturing { th.banner_bg } else { th.chip_bg })
+            .text_color(if capturing { th.accent } else { th.text })
+            .text_size(px(crate::theme::CAPTION_SIZE))
+            .cursor_pointer()
+            .hover(|x| x.border_color(th.accent))
+            .child(if capturing {
+                "Press keys…".to_string()
+            } else {
+                pretty_keys(&keys)
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.capturing.map(|c| c.action) == Some(d.action) {
+                    this.cancel_capture();
+                    this.status = Some("Left unchanged.".into());
+                    cx.notify();
+                } else {
+                    this.start_capture(d, window, cx);
+                }
+            }));
+
+        // A changed row carries a small undo mark; it puts the catalog default back.
+        let reset = changed.then(|| {
             div()
-                .px_2()
+                .id(SharedString::from(format!("reset-{}", d.action)))
+                .debug_selector(move || format!("settings-reset-{}", d.action))
+                .flex_none()
+                .px_1()
                 .py_0p5()
                 .rounded_md()
-                .bg(th.banner_bg)
-                .text_color(th.accent)
                 .text_size(px(crate::theme::CAPTION_SIZE))
-                .child("Press keys… (esc to keep)")
-        } else {
-            div()
-                .px_2()
-                .py_0p5()
-                .rounded_md()
-                .bg(th.chip_bg)
-                .text_size(px(crate::theme::CAPTION_SIZE))
-                .text_color(th.text)
-                .child(pretty_keys(&keys))
-        };
+                .text_color(th.muted)
+                .cursor_pointer()
+                .hover(|x| x.bg(th.hover).text_color(th.text))
+                .child("↺")
+                .on_click(cx.listener(move |this, _, _, cx| this.reset_one(d, cx)))
+        });
+
         div()
             .debug_selector(move || format!("settings-row-{}", d.action))
             .flex()
@@ -871,41 +901,8 @@ impl SettingsView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(chip)
-                            .child(
-                                quiet_control(
-                                    SharedString::from(format!("change-{}", d.action)),
-                                    if capturing { "Cancel" } else { "Change" },
-                                    &th,
-                                )
-                                .debug_selector(move || format!("settings-change-{}", d.action))
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        if this.capturing.map(|c| c.action) == Some(d.action) {
-                                            this.cancel_capture();
-                                            cx.notify();
-                                        } else {
-                                            this.start_capture(d, window, cx);
-                                        }
-                                    },
-                                )),
-                            )
-                            .children(changed.then(|| {
-                                div()
-                                    .id(SharedString::from(format!("reset-{}", d.action)))
-                                    .debug_selector(move || format!("settings-reset-{}", d.action))
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_md()
-                                    .text_size(px(crate::theme::CAPTION_SIZE))
-                                    .text_color(th.accent)
-                                    .cursor_pointer()
-                                    .hover(|x| x.bg(th.hover))
-                                    .child("Reset")
-                                    .on_click(
-                                        cx.listener(move |this, _, _, cx| this.reset_one(d, cx)),
-                                    )
-                            })),
+                            .children(reset)
+                            .child(chip),
                     ),
             )
     }
