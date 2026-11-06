@@ -201,6 +201,62 @@ pub struct BlockHit {
     pub page: PageId,
     pub page_title: String,
     pub text: String,
+    /// Byte ranges of the matched terms in the plain text the UI draws (SR-1).
+    pub anchors: Vec<(usize, usize)>,
+}
+
+/// Byte ranges in `plain` matched by `query`'s terms, for search highlighting (SR-1).
+///
+/// FTS5 picks *which* blocks match; this locates the same prefix terms in the plain text
+/// the result row shows. Matching the drawn text rather than the source markup means a
+/// range can never point into `[[brackets]]` the renderer drops. Terms start at a word
+/// boundary and match case-insensitively, like the index's `unicode61` tokenizer; a term
+/// longer than the word it starts in does not match. The range covers the whole word, not
+/// just the typed prefix, because the wash marks matched words (SR-1). Diacritics are not
+/// folded here.
+pub fn match_anchors(plain: &str, query: &str) -> Vec<(usize, usize)> {
+    let terms: Vec<Vec<char>> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.chars().collect())
+        .collect();
+    let chars: Vec<(usize, char)> = plain.char_indices().collect();
+    let fold = |a: char, b: char| a.to_lowercase().eq(b.to_lowercase());
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for term in &terms {
+        for (i, &(start, first)) in chars.iter().enumerate() {
+            if i > 0 && chars[i - 1].1.is_alphanumeric() {
+                continue; // must start a word, as the tokenizer does
+            }
+            if !fold(first, term[0]) {
+                continue;
+            }
+            let fits = term
+                .iter()
+                .enumerate()
+                .all(|(k, &c)| chars.get(i + k).is_some_and(|&(_, h)| fold(h, c)));
+            if !fits {
+                continue;
+            }
+            let end = {
+                let mut k = i + term.len();
+                while chars.get(k).is_some_and(|&(_, c)| c.is_alphanumeric()) {
+                    k += 1;
+                }
+                chars.get(k).map_or(plain.len(), |&(off, _)| off)
+            };
+            out.push((start, end));
+        }
+    }
+    out.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in out {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -449,11 +505,13 @@ impl Store {
             "SELECT b.id, b.page_id, p.title, b.text FROM block b JOIN page p ON p.id=b.page_id
              WHERE b.deleted_at IS NULL AND b.text <> '' ORDER BY b.updated_at DESC LIMIT ?1";
         let map = |r: &Row<'_>| {
+            let text: String = r.get(3)?;
             Ok(BlockHit {
                 block: BlockId(r.get(0)?),
                 page: PageId(r.get(1)?),
                 page_title: r.get(2)?,
-                text: r.get(3)?,
+                anchors: match_anchors(&plain_text(&text), query),
+                text,
             })
         };
         if terms.is_empty() {

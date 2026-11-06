@@ -869,3 +869,32 @@ fn reopening_mid_session_sees_writer_commits() {
         vec![("from the writer thread".to_string(), 0)]
     );
 }
+
+/// SR-1: each hit carries the byte ranges of the matched terms in the plain text the
+/// palette draws, so the view never has to scan for them (and never marks a bracket the
+/// renderer hides). Prefixes match at a word start, as the FTS tokenizer does.
+#[test]
+fn sr_1_search_marks_the_matched_terms() {
+    let mut s = store();
+    let p = s.create_page("Notes").unwrap();
+    write(
+        &mut s,
+        &p,
+        "The **zebra** crossing and [[Zebra Crossing]] again",
+    );
+    write(&mut s, &p, "bathes in the sun");
+    let hits = s.search_blocks("zeb", 5).unwrap();
+    assert_eq!(hits.len(), 1);
+    let plain = utopia_core::inline::plain_text(&hits[0].text);
+    let marked: Vec<&str> = hits[0].anchors.iter().map(|&(a, b)| &plain[a..b]).collect();
+    assert_eq!(marked, vec!["zebra", "Zebra"], "{plain:?}");
+    // The ranges are the ones gpui's StyledText requires: sorted and non-overlapping.
+    assert!(hits[0].anchors.windows(2).all(|w| w[0].1 <= w[1].0));
+    assert!(
+        s.search_blocks("thes", 5).unwrap().is_empty(),
+        "a match inside a word is not the index's match either"
+    );
+    // Two terms merge into one painted run rather than a nested highlight.
+    let both = utopia_store::match_anchors("zebra crossing", "zeb cross");
+    assert_eq!(both, vec![(0, 5), (6, 14)], "the whole word is washed");
+}

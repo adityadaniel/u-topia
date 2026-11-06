@@ -2,8 +2,8 @@
 //! in the sidebar, and a novel title offers "Create". Dates resolve to daily pages.
 
 use gpui::{
-    div, prelude::*, px, Context, Entity, EventEmitter, MouseButton, MouseDownEvent, Subscription,
-    Window,
+    div, prelude::*, px, Context, Entity, EventEmitter, HighlightStyle, MouseButton,
+    MouseDownEvent, StyledText, Subscription, Window,
 };
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, PageId};
@@ -12,6 +12,27 @@ use utopia_store::{BlockHit, TitleHit};
 use crate::app_state::AppState;
 use crate::line_input::{LineInput, LineInputEvent};
 use crate::theme::theme;
+
+/// A result row's text with the matched terms on a soft accent wash (SR-1). The anchors
+/// come from the store, which computed them against this same plain text.
+fn marked(text: &str, anchors: &[(usize, usize)], th: &crate::theme::Theme) -> StyledText {
+    let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = anchors
+        .iter()
+        .filter(|(a, b)| {
+            a < b && *b <= text.len() && text.is_char_boundary(*a) && text.is_char_boundary(*b)
+        })
+        .map(|&(a, b)| {
+            (
+                a..b,
+                HighlightStyle {
+                    background_color: Some(th.accent.opacity(0.16)),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    StyledText::new(text.to_string()).with_highlights(highlights)
+}
 
 #[derive(Debug, Clone)]
 pub enum QjItem {
@@ -244,12 +265,13 @@ impl Render for JumpPalette {
                 ),
                 QjItem::Create(t) => (format!("Create page \"{t}\""), String::new()),
                 QjItem::Block(b) => (
-                    utopia_core::inline::plain_text(&b.text)
-                        .chars()
-                        .take(80)
-                        .collect(),
+                    utopia_core::inline::plain_text(&b.text),
                     b.page_title.clone(),
                 ),
+            };
+            let label: StyledText = match r {
+                QjItem::Block(b) => marked(&label, &b.anchors, &th),
+                _ => StyledText::new(label),
             };
             div()
                 .id(("qj", i))
@@ -261,7 +283,7 @@ impl Render for JumpPalette {
                 .cursor_pointer()
                 .hover(|d| d.bg(th.hover))
                 .when(i == self.selected, |d| d.bg(th.hover))
-                .child(div().text_color(th.text).child(label))
+                .child(div().text_color(th.text).line_clamp(2).child(label))
                 .child(
                     div()
                         .text_size(px(crate::theme::CAPTION_SIZE))
