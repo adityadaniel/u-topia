@@ -283,6 +283,20 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Settings → Appearance: remove every pinned page (SB-3). The pages are untouched;
+    /// only the sidebar's local order changes.
+    pub fn clear_pins(&mut self, cx: &mut Context<Self>) {
+        self.status = Some(match appearance::clear_pinned(cx) {
+            Ok(()) => "Unpinned every page.".into(),
+            Err(e) => format!(
+                "The pins are gone for this session, but could not save {}: {e}",
+                appearance::FILE
+            )
+            .into(),
+        });
+        cx.notify();
+    }
+
     /// Settings → Appearance: switch density in every window and remember it (ALL-5).
     pub fn choose_density(&mut self, density: Density, cx: &mut Context<Self>) {
         let before = appearance::density(cx);
@@ -871,7 +885,57 @@ impl SettingsView {
                                  header. Compact rows draw them once, quietly, under it.",
                             ),
                     )
-                    .children(attributes),
+                    .children(attributes)
+                    .child(
+                        div()
+                            .pt_4()
+                            .pb_1()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.faint)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Pinned pages"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(
+                                "Pages pinned to the top of the sidebar (SB-3). Local to this \
+                                 machine, kept in settings.json, never synced.",
+                            ),
+                    )
+                    .child({
+                        let pinned = appearance::pinned(cx).len();
+                        div()
+                            .debug_selector(|| "settings-pinned".into())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_4()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(th.line)
+                            .child(div().text_color(if pinned == 0 {
+                                th.muted
+                            } else {
+                                th.text
+                            }).child(match pinned {
+                                0 => "No pinned pages".to_string(),
+                                1 => "1 pinned page".to_string(),
+                                n => format!("{n} pinned pages"),
+                            }))
+                            .when(pinned > 0, |d| {
+                                d.child(
+                                    quiet_control("settings-clear-pinned", "Clear", &th)
+                                        .debug_selector(|| "settings-clear-pinned".into())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.clear_pins(cx)
+                                        })),
+                                )
+                            })
+                    }),
             )
     }
 

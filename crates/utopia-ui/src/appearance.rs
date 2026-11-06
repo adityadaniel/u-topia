@@ -7,12 +7,20 @@
 //! versioned object meant to grow more general preferences:
 //!
 //! ```json
-//! { "version": 1, "font": "system", "density": "comfortable", "attribute-blocks": "compact" }
+//! {
+//!   "version": 1,
+//!   "font": "system",
+//!   "density": "comfortable",
+//!   "pinned": [],
+//!   "attribute-blocks": "compact"
+//! }
 //! ```
 //!
 //! `font` is `"system"` (the default) or `"ibm-plex-sans"`; `density` is
-//! `"comfortable"` (the default) or `"compact"` (ALL-5); `attribute-blocks` is
-//! `"compact"` (the default) or `"blocks"` (PG-1). A missing file means defaults; an
+//! `"comfortable"` (the default) or `"compact"` (ALL-5); `pinned` is the list of page ids
+//! the sidebar keeps in its Pinned group, in the order they were pinned (SB-3);
+//! `attribute-blocks` is `"compact"` (the default) or `"blocks"` (PG-1). A missing file
+//! means defaults; an
 //! unreadable file, an unknown value or a newer version is logged and read as far as it can
 //! be, never a panic (rule 11). Keys this version does not know are kept when the file is
 //! rewritten, so a newer release's preferences survive a round trip through an older one.
@@ -20,6 +28,7 @@
 use gpui::{App, Global, SharedString};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
+use utopia_core::PageId;
 
 use crate::fonts::{register_ibm_plex_sans, IBM_PLEX_SANS};
 use crate::theme::{BODY_SIZE, LINE_HEIGHT};
@@ -170,7 +179,12 @@ impl AttributeBlocks {
 pub struct Prefs {
     pub font: UiFont,
     pub density: Density,
+    /// How a page draws its `key:: value` blocks (PG-1).
     pub attribute_blocks: AttributeBlocks,
+    /// Page ids kept at the top of the sidebar, in the order they were pinned (SB-3).
+    /// Local state: a pin is a pointer to a page, not a property of the page, so it never
+    /// goes into a CRDT shard (rule 9).
+    pub pinned: Vec<PageId>,
     /// Keys this version does not understand, written back untouched.
     rest: Map<String, Value>,
 }
@@ -237,11 +251,38 @@ impl Prefs {
                 AttributeBlocks::default()
             }
         };
+        let pinned = match rest.remove("pinned") {
+            None => Vec::new(),
+            Some(Value::Array(items)) => {
+                let mut pinned: Vec<PageId> = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::String(id) if !id.is_empty() => {
+                            let id = PageId(id);
+                            if !pinned.contains(&id) {
+                                pinned.push(id);
+                            }
+                        }
+                        other => warnings.push(format!(
+                            "{FILE}: ignoring pinned page {other}; page ids are strings"
+                        )),
+                    }
+                }
+                pinned
+            }
+            Some(v) => {
+                warnings.push(format!(
+                    "{FILE}: pinned should be a list of page ids, not {v}; using none"
+                ));
+                Vec::new()
+            }
+        };
         (
             Self {
                 font,
                 density,
                 attribute_blocks,
+                pinned,
                 rest,
             },
             warnings,
@@ -256,6 +297,15 @@ impl Prefs {
         m.insert(
             "attribute-blocks".into(),
             self.attribute_blocks.key().into(),
+        );
+        m.insert(
+            "pinned".into(),
+            Value::Array(
+                self.pinned
+                    .iter()
+                    .map(|p| Value::String(p.as_str().to_string()))
+                    .collect(),
+            ),
         );
         for (k, v) in &self.rest {
             m.insert(k.clone(), v.clone());
@@ -288,10 +338,10 @@ impl Prefs {
 #[derive(Default)]
 pub struct Appearance {
     pub prefs: Prefs,
+    /// Where `settings.json` lives (set by [`install`]); empty in tests that never install
+    /// one, where preferences still apply for the session but are not written.
+    config_dir: PathBuf,
     plex_registered: bool,
-    /// Where `settings.json` lives, so a view can save a preference it owns without being
-    /// handed the path (the page's "Show as blocks" toggle, PG-1). None until installed.
-    config_dir: Option<PathBuf>,
 }
 
 impl Global for Appearance {}
@@ -305,8 +355,8 @@ pub fn install(cx: &mut App, config_dir: &Path) -> Vec<String> {
     let font = prefs.font;
     cx.set_global(Appearance {
         prefs,
+        config_dir: config_dir.to_path_buf(),
         plex_registered: false,
-        config_dir: Some(config_dir.to_path_buf()),
     });
     apply(cx, font);
     warnings
@@ -335,6 +385,56 @@ pub fn attribute_blocks(cx: &App) -> AttributeBlocks {
         .map_or(AttributeBlocks::default(), |a| a.prefs.attribute_blocks)
 }
 
+/// Pages pinned to the top of the sidebar, in pin order (SB-3). Empty when nothing was
+/// installed (tests, early startup).
+pub fn pinned(cx: &App) -> Vec<PageId> {
+    cx.try_global::<Appearance>()
+        .map_or_else(Vec::new, |a| a.prefs.pinned.clone())
+}
+
+pub fn is_pinned(cx: &App, page: &PageId) -> bool {
+    cx.try_global::<Appearance>()
+        .is_some_and(|a| a.prefs.pinned.contains(page))
+}
+
+/// Pin or unpin `page` (SB-3) and remember it in `settings.json`. Returns the new state.
+/// A failed write is returned, not fatal: the pin still applies for this session (rule 11).
+pub fn toggle_pinned(cx: &mut App, page: &PageId) -> std::io::Result<bool> {
+    let a = cx.default_global::<Appearance>();
+    let on = match a.prefs.pinned.iter().position(|p| p == page) {
+        Some(i) => {
+            a.prefs.pinned.remove(i);
+            false
+        }
+        None => {
+            a.prefs.pinned.push(page.clone());
+            true
+        }
+    };
+    let saved = save(cx);
+    // The sidebar and an open page menu both show the pin state.
+    cx.refresh_windows();
+    saved.map(|()| on)
+}
+
+/// Unpin every page (Settings → Appearance). Returns whether a write failed.
+pub fn clear_pinned(cx: &mut App) -> std::io::Result<()> {
+    cx.default_global::<Appearance>().prefs.pinned.clear();
+    let saved = save(cx);
+    cx.refresh_windows();
+    saved
+}
+
+/// Write `settings.json` beside the running app; nothing to do for a test that never
+/// installed a config dir.
+fn save(cx: &mut App) -> std::io::Result<()> {
+    let a = cx.default_global::<Appearance>();
+    if a.config_dir.as_os_str().is_empty() {
+        return Ok(());
+    }
+    a.prefs.save(&a.config_dir)
+}
+
 /// Switch font in every open window now, and remember it in `config_dir/settings.json`.
 /// A failed write is returned, not fatal: the font still applies for this session.
 pub fn set_font(cx: &mut App, font: UiFont, config_dir: &Path) -> std::io::Result<()> {
@@ -350,19 +450,13 @@ pub fn set_density(cx: &mut App, density: Density, config_dir: &Path) -> std::io
 }
 
 /// Switch attribute blocks in every open window now and remember it (PG-1). Unlike the font
-/// and density this is set from the page itself, so the save uses the config dir `install`
-/// recorded; without one (tests that never installed) it applies to the session only.
+/// and density this can be set from the page itself, so the save goes through the config
+/// dir `install` recorded; a test that never installed one stays in memory.
 pub fn set_attribute_blocks(cx: &mut App, value: AttributeBlocks) -> std::io::Result<()> {
-    let dir = {
-        let a = cx.default_global::<Appearance>();
-        a.prefs.attribute_blocks = value;
-        a.config_dir.clone()
-    };
+    cx.default_global::<Appearance>().prefs.attribute_blocks = value;
+    let saved = save(cx);
     cx.refresh_windows();
-    match dir {
-        Some(d) => cx.global::<Appearance>().prefs.save(&d),
-        None => Ok(()),
-    }
+    saved
 }
 
 /// Make `font` drawable: the bundled faces are handed to gpui the first time they are
@@ -392,6 +486,7 @@ mod tests {
             font: UiFont::IbmPlexSans,
             density: Density::Compact,
             attribute_blocks: AttributeBlocks::Blocks,
+            pinned: vec![PageId("page-a".into()), PageId("page-b".into())],
             ..Default::default()
         };
         let json = p.to_json();
@@ -403,9 +498,47 @@ mod tests {
                 "font": "ibm-plex-sans",
                 "density": "compact",
                 "attribute-blocks": "blocks",
+                "pinned": ["page-a", "page-b"],
             })
         );
         assert_eq!(Prefs::from_json(&json), (p, vec![]));
+    }
+
+    /// PG-1: attribute blocks default to compact rows, and a value this version does not
+    /// know is the default with a warning, not a crash (rule 11).
+    #[test]
+    fn attribute_blocks_default_to_compact() {
+        let (p, warnings) = Prefs::from_json("{}");
+        assert_eq!(p.attribute_blocks, AttributeBlocks::Compact);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (p, _) = Prefs::from_json(r#"{"version": 1, "attribute-blocks": "blocks"}"#);
+        assert_eq!(p.attribute_blocks, AttributeBlocks::Blocks);
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "attribute-blocks": "hidden"}"#);
+        assert_eq!(p.attribute_blocks, AttributeBlocks::Compact);
+        assert!(warnings[0].contains("hidden"), "{warnings:?}");
+    }
+
+    /// SB-3: pins are page ids in `settings.json`, in pin order; a repeated id counts once
+    /// and anything that is not a page id is skipped with a warning, never a panic.
+    #[test]
+    fn pinned_pages_round_trip_and_degrade() {
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned": ["a", "a", "b"]}"#);
+        assert!(
+            warnings.is_empty(),
+            "a repeated id is not an error: {warnings:?}"
+        );
+        assert_eq!(p.pinned, [PageId("a".into()), PageId("b".into())]);
+        let v: Value = serde_json::from_str(&p.to_json()).unwrap();
+        assert_eq!(v["pinned"], serde_json::json!(["a", "b"]));
+
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned": ["a", 3, ""]}"#);
+        assert_eq!(p.pinned, [PageId("a".into())], "only page ids survive");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned": "a"}"#);
+        assert!(p.pinned.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(Prefs::default().pinned, Vec::<PageId>::new());
     }
 
     /// Rule 11: whatever is in the file, the app comes up, on System, and says why.
@@ -437,20 +570,6 @@ mod tests {
         assert_eq!(p.density, Density::Comfortable);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("tiny"), "{warnings:?}");
-    }
-
-    /// PG-1: attribute blocks default to compact rows, and a value this version does not
-    /// know is the default with a warning, not a crash (rule 11).
-    #[test]
-    fn attribute_blocks_default_to_compact() {
-        let (p, warnings) = Prefs::from_json("{}");
-        assert_eq!(p.attribute_blocks, AttributeBlocks::Compact);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        let (p, _) = Prefs::from_json(r#"{"version": 1, "attribute-blocks": "blocks"}"#);
-        assert_eq!(p.attribute_blocks, AttributeBlocks::Blocks);
-        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "attribute-blocks": "hidden"}"#);
-        assert_eq!(p.attribute_blocks, AttributeBlocks::Compact);
-        assert!(warnings[0].contains("hidden"), "{warnings:?}");
     }
 
     /// A newer release's file: what we know is read, the rest is kept for it.

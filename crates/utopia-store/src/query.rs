@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::NaiveDate;
 use rusqlite::{params, OptionalExtension, Row};
 use serde::Serialize;
-use utopia_core::inline::plain_text;
+use utopia_core::inline::{extract_refs, plain_text, RefKind};
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, BlockKind, PageId, PageKind};
 
@@ -207,6 +207,9 @@ pub struct BlockHit {
 pub struct JournalEntry {
     pub page: PageRow,
     pub preview: Vec<String>,
+    /// Live blocks with text: what the sidebar's muted count says (SB-1). A day that only
+    /// exists because a link pointed at it has 0 here.
+    pub blocks: usize,
 }
 
 /// Subsequence fuzzy score of `needle` in `hay` (both normalized); higher is better.
@@ -326,7 +329,78 @@ impl Store {
         Ok(rows.iter().map(|t| plain_text(t)).collect())
     }
 
-    /// The last `limit` journal pages up to `today`, with a 2-line preview (FR-1.3).
+    /// Pages that exist only because of a `#tag` (SB-2, FR-2.15): no blocks of their own,
+    /// and every incoming reference to them is a hashtag (`#tag` / `#[[tag]]`), never a
+    /// `[[link]]`. Display-only: the sidebar draws a `#` beside these, there is no tags
+    /// subsystem. Ref spans are re-read from the source blocks because `ref` stores the
+    /// resolved edge only; this is an index-time query, never paint-time work (rule 3).
+    pub fn hashtag_only_pages(&self) -> Result<HashSet<PageId>> {
+        self.read_barrier()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.title_key FROM page p
+             WHERE p.deleted_at IS NULL AND p.kind = 'page'
+               AND NOT EXISTS (SELECT 1 FROM block b WHERE b.page_id = p.id
+                                 AND b.deleted_at IS NULL AND trim(b.text) <> '')",
+        )?;
+        let candidates = stmt
+            .query_map([], |r| {
+                Ok((PageId(r.get::<_, String>(0)?), r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
+        }
+        // The source text of every reference into a blockless page, in one query rather
+        // than one per page: the sidebar re-reads this whenever the index moves.
+        let mut sources = self.conn.prepare(
+            "SELECT r.dst_page_id, b.text FROM ref r
+             JOIN block b ON b.id = r.src_block_id
+             JOIN page p ON p.id = r.dst_page_id
+             WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL AND p.kind = 'page'
+               AND NOT EXISTS (SELECT 1 FROM block own WHERE own.page_id = p.id
+                                 AND own.deleted_at IS NULL AND trim(own.text) <> '')",
+        )?;
+        let mut texts: HashMap<PageId, Vec<String>> = HashMap::new();
+        for row in sources.query_map([], |r| {
+            Ok((PageId(r.get::<_, String>(0)?), r.get::<_, String>(1)?))
+        })? {
+            let (page, text) = row?;
+            texts.entry(page).or_default().push(text);
+        }
+        // A reference through an alias reaches the page under the alias's key.
+        let mut aliases = self.conn.prepare("SELECT page_id, alias_key FROM alias")?;
+        let mut alias_keys: HashMap<PageId, HashSet<String>> = HashMap::new();
+        for row in aliases.query_map([], |r| {
+            Ok((PageId(r.get::<_, String>(0)?), r.get::<_, String>(1)?))
+        })? {
+            let (page, key) = row?;
+            alias_keys.entry(page).or_default().insert(key);
+        }
+        let mut out = HashSet::new();
+        for (page, title_key) in candidates {
+            let mut keys = HashSet::from([title_key]);
+            if let Some(aliases) = alias_keys.get(&page) {
+                keys.extend(aliases.iter().cloned());
+            }
+            let mut any = false;
+            let mut all_tags = true;
+            for text in texts.get(&page).map(Vec::as_slice).unwrap_or_default() {
+                for r in extract_refs(text) {
+                    if r.is_page_like() && keys.contains(&normalize_title(&r.target)) {
+                        any = true;
+                        all_tags &= r.kind == RefKind::Tag;
+                    }
+                }
+            }
+            if any && all_tags {
+                out.insert(page);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The last `limit` journal pages up to `today`, with a 2-line preview (FR-1.3) and
+    /// the number of blocks on the day (SB-1).
     pub fn journal(&self, limit: usize) -> Result<Vec<JournalEntry>> {
         self.journal_pages(limit)?
             .into_iter()
@@ -336,9 +410,26 @@ impl Store {
                     .into_iter()
                     .filter(|s| !s.trim().is_empty())
                     .collect();
-                Ok(JournalEntry { page, preview })
+                let blocks = self.page_block_count(&page.id)?;
+                Ok(JournalEntry {
+                    page,
+                    preview,
+                    blocks,
+                })
             })
             .collect()
+    }
+
+    /// Live blocks with text on a page. An empty block does not count: the sidebar's
+    /// count says how much was written, not how many blank rows the outliner holds.
+    pub fn page_block_count(&self, page: &PageId) -> Result<usize> {
+        self.read_barrier()?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT count(*) FROM block
+             WHERE page_id=?1 AND deleted_at IS NULL AND trim(text) <> ''",
+        )?;
+        let n: i64 = stmt.query_row(params![page.as_str()], |r| r.get(0))?;
+        Ok(n.max(0) as usize)
     }
 
     /// Daily pages up to today with something on them, newest first: the Daily Notes

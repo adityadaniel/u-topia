@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::NaiveDate;
 use gpui::{
     anchored, deferred, div, list, point, prelude::*, px, AnyElement, Context, Corner, Entity,
-    EventEmitter, FocusHandle, Focusable, ListAlignment, ListState, MouseButton, MouseDownEvent,
-    SharedString, StyledText, Subscription, Window,
+    EventEmitter, FocusHandle, Focusable, ListAlignment, ListOffset, ListState, MouseButton,
+    MouseDownEvent, SharedString, StyledText, Subscription, Window,
 };
 use utopia_core::inline::{extract_refs, plain_text};
 use utopia_core::outline::{self, Focus, Plan};
@@ -34,6 +34,9 @@ const GROUP_PREVIEW: usize = 3;
 const JOURNAL_BATCH: usize = 10;
 /// Widest the page column gets (about 95 characters of body text per line).
 const READABLE_WIDTH: f32 = 760.;
+/// Height of the pinned day heading (DN-3), fixed so that revealing a row can leave room
+/// for it: its padding, the caption line, the date line and the hairline.
+const STICKY_HEIGHT: f32 = 4. + 20. + 34. + 4. + 1.;
 
 #[derive(Debug, Clone)]
 pub enum PageViewEvent {
@@ -55,6 +58,11 @@ pub enum PageViewEvent {
     },
     /// "Open in graph" in the page menu (PG-2): show the graph with this page focused.
     OpenGraph {
+        page: PageId,
+    },
+    /// Pin or unpin this page in the left sidebar (SB-3). The workspace owns the local
+    /// preference; the page itself is untouched (rule 9).
+    TogglePin {
         page: PageId,
     },
     /// A `{{pdf: blob:…}}` attachment was clicked (P2 PDF viewer).
@@ -149,14 +157,40 @@ enum Item {
         date: NaiveDate,
         page: Option<PageId>,
         title: SharedString,
+        /// "Thursday · Today" above the date (DN-2).
+        caption: SharedString,
+        /// Today's caption is in the accent colour (DN-2).
+        today: bool,
         first: bool,
     },
-    /// A day in the feed with no blocks.
+    /// A day in the feed with nothing on it, folded to one 36 px row (DN-1).
+    DayFolded {
+        date: NaiveDate,
+        weekday: SharedString,
+        title: SharedString,
+    },
+    /// The click-to-start row under an open day that has no blocks yet (today and
+    /// yesterday always stay open, DN-1).
     DayEmpty {
         date: NaiveDate,
     },
     /// The end of the loaded days; older ones load when it comes into view.
     JournalEnd,
+}
+
+/// A day heading in the feed, kept so the sticky header can find the day at the top of
+/// the viewport without walking the items in `render` (DN-3, rule 10).
+#[derive(Debug, Clone)]
+struct DayHeading {
+    /// Index of the day's [`Item::DayHeader`] in `items`.
+    ix: usize,
+    /// One past the day's last item, so a folded day (whose own date is in its row) does
+    /// not pin the previous day's heading over it.
+    end: usize,
+    date: NaiveDate,
+    title: SharedString,
+    caption: SharedString,
+    today: bool,
 }
 
 /// One calendar day of the feed while it is being built.
@@ -243,6 +277,8 @@ pub struct PageView {
     calendar_month: NaiveDate,
     /// Set while showing the Daily Notes feed; `page` is then today's page.
     journal: Option<Journal>,
+    /// The feed's day headings, in item order, for the sticky header (DN-3).
+    day_headings: Vec<DayHeading>,
     /// The page header's "···" menu is open (ALL-3).
     page_menu: bool,
     /// The row the pointer is over, so its bullet can read as a drag handle and its
@@ -317,6 +353,7 @@ impl PageView {
             alias_input: None,
             calendar_month: today,
             journal: None,
+            day_headings: Vec::new(),
             page_menu: false,
             hovered_row: None,
             attribute_blocks: crate::appearance::attribute_blocks(cx),
@@ -364,6 +401,38 @@ impl PageView {
             .as_ref()
             .map(|j| j.days.clone())
             .unwrap_or_default()
+    }
+
+    /// The day heading pinned to the top of the feed at the current scroll offset
+    /// (DN-3): the last heading at or above the first visible item, unless that heading
+    /// is itself exactly at the top. A binary search over the loaded days, so `render`
+    /// does no more work than the offset it already reads (rule 10).
+    fn sticky_heading(&self) -> Option<&DayHeading> {
+        self.journal.as_ref()?;
+        let top = self.list.logical_scroll_top();
+        let ix = self
+            .day_headings
+            .partition_point(|h| h.ix <= top.item_ix)
+            .checked_sub(1)?;
+        let heading = &self.day_headings[ix];
+        if top.item_ix >= heading.end {
+            return None;
+        }
+        let at_top = heading.ix == top.item_ix && top.offset_in_item <= px(0.5);
+        (!at_top).then_some(heading)
+    }
+
+    /// The date whose heading is stuck at the top of the feed, for scripts (DN-3).
+    pub fn sticky_day(&self) -> Option<NaiveDate> {
+        self.sticky_heading().map(|h| h.date)
+    }
+
+    /// How many days the feed shows open, with a date heading (DN-1), for scripts.
+    pub fn open_day_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| matches!(i, Item::DayHeader { .. }))
+            .count()
     }
 
     fn show(&mut self, page: PageId, zoom: Option<BlockId>, cx: &mut Context<Self>) {
@@ -525,12 +594,32 @@ impl PageView {
         }
         self.splice_items(self.items.len(), cx);
         match self.row_index(&block) {
-            Some(ix) => self.list.scroll_to_reveal_item(ix),
+            Some(ix) => {
+                self.list.scroll_to_reveal_item(ix);
+                // DN-3: leave room for the pinned day heading above the row.
+                self.leave_room_for_the_pinned_day(ix);
+            }
             // Still no row (an ordinary collapsed ancestor hides it): stop rather than keep
             // an editor whose focus handle is not drawn.
             None => self.editor.update(cx, |e, cx| e.end(cx)),
         }
         cx.notify();
+    }
+
+    /// DN-3: an edit target above the viewport is revealed at the list's top edge, where
+    /// the pinned day heading would cover it and its caret. Put the row one heading-height
+    /// down instead, so the caret shows below the pin (the strip above it is the pin).
+    fn leave_room_for_the_pinned_day(&self, ix: usize) {
+        let top = self.list.logical_scroll_top();
+        if top.item_ix != ix || top.offset_in_item > px(0.) {
+            return;
+        }
+        if self.sticky_heading().is_some() {
+            self.list.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: -px(STICKY_HEIGHT),
+            });
+        }
     }
 
     fn row_index(&self, block: &BlockId) -> Option<usize> {
@@ -583,6 +672,10 @@ impl PageView {
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.dirty = false;
+        if self.journal.is_none() {
+            // Only the feed pins a day heading (DN-3).
+            self.day_headings.clear();
+        }
         let Some(page) = self.page.clone() else {
             self.replace_items(Vec::new(), cx);
             return;
@@ -738,7 +831,7 @@ impl PageView {
             Some(j) if j.refs_version == refs_version => std::mem::take(&mut j.refs),
             _ => HashMap::new(),
         };
-        let (header, days) = self.app.update(cx, |app, _| {
+        let (header, days, today_date) = self.app.update(cx, |app, _| {
             let collapsed = app.store.collapsed_set().clone();
             let fmt = app.store.date_format().clone();
             let today_date = app.store.today();
@@ -797,35 +890,77 @@ impl PageView {
                     _ => break,
                 }
             }
-            (header, days)
+            (header, days, today_date)
         });
         self.header = header;
         let mut items = Vec::new();
         let mut ids = Vec::new();
+        let mut headings = Vec::new();
+        let yesterday = today_date.pred_opt();
         for (i, day) in days.into_iter().enumerate() {
-            items.push(Item::DayHeader {
-                date: day.date,
-                page: day.page.clone(),
-                title: day.title.into(),
-                first: i == 0,
-            });
-            if !day.rows.iter().any(|i| matches!(i, Item::Row(_))) {
-                items.push(Item::DayEmpty { date: day.date });
+            // Like Roam's feed: Linked References under the day when it has any, and no
+            // Unlinked References (those stay on the day's own page). A day with
+            // references is not empty even when it has no blocks, so it stays open.
+            let refs = day
+                .page
+                .as_ref()
+                .and_then(|p| refs_cache.get(p))
+                .filter(|r| !r.groups.is_empty());
+            // DN-1: a day with nothing on it folds to one 36 px row. Today and yesterday
+            // always stay open, so the day the caret starts in always shows its heading;
+            // folding is a view change only, the day is still written on its first key.
+            // PG-1: rows can exist and still not be visible — a root attribute block folds
+            // to one muted row, so the day keeps its heading but still offers the prompt.
+            let open =
+                !day.rows.is_empty() || refs.is_some() || i == 0 || Some(day.date) == yesterday;
+            // The day's heading, for the sticky header, when the day is open.
+            let mut heading = None;
+            if open {
+                let caption: SharedString = day_caption(day.date, today_date).into();
+                heading = Some(headings.len());
+                headings.push(DayHeading {
+                    ix: items.len(),
+                    end: items.len(),
+                    date: day.date,
+                    title: day.title.clone().into(),
+                    caption: caption.clone(),
+                    today: day.date == today_date,
+                });
+                items.push(Item::DayHeader {
+                    date: day.date,
+                    page: day.page.clone(),
+                    title: day.title.into(),
+                    caption,
+                    today: day.date == today_date,
+                    first: i == 0,
+                });
+                if !day.rows.iter().any(|i| matches!(i, Item::Row(_))) {
+                    items.push(Item::DayEmpty { date: day.date });
+                }
+            } else {
+                items.push(Item::DayFolded {
+                    date: day.date,
+                    weekday: utopia_core::date::weekday_name_of(day.date).into(),
+                    title: day.title.into(),
+                });
             }
             items.extend(day.rows);
-            let Some(page) = day.page else { continue };
-            // Like Roam's feed: Linked References under the day when it has any, and no
-            // Unlinked References (those stay on the day's own page).
-            if let Some(refs) = refs_cache.get(&page).filter(|r| !r.groups.is_empty()) {
-                items.push(Item::RefsHeader {
-                    title: "Linked References".into(),
-                    count: refs.shown(),
-                });
-                self.push_ref_groups(&page, refs, true, &mut items);
+            if let Some(page) = day.page {
+                if let Some(refs) = refs {
+                    items.push(Item::RefsHeader {
+                        title: "Linked References".into(),
+                        count: refs.shown(),
+                    });
+                    self.push_ref_groups(&page, refs, true, &mut items);
+                }
+                ids.push(page);
             }
-            ids.push(page);
+            if let Some(h) = heading {
+                headings[h].end = items.len();
+            }
         }
         items.push(Item::JournalEnd);
+        self.day_headings = headings;
         if let Some(j) = &mut self.journal {
             j.days = ids;
             j.loading = false;
@@ -2019,6 +2154,23 @@ impl PageView {
                         this.page_action("rewrite", cx);
                     }))
             });
+        let pin = self.page.clone().map(|page| {
+            let pinned = crate::appearance::is_pinned(cx, &page);
+            quiet_control(
+                "page-menu-pin",
+                if pinned {
+                    "Unpin from sidebar"
+                } else {
+                    "Pin to sidebar"
+                },
+                &th,
+            )
+            .debug_selector(|| "page-menu-pin".into())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.page_menu = false;
+                cx.emit(PageViewEvent::TogglePin { page: page.clone() });
+            }))
+        });
         let delete = quiet_danger("page-menu-delete", "Delete page", &th)
             .debug_selector(|| "page-menu-delete".into())
             .on_click(cx.listener(|this, _, _, cx| {
@@ -2042,6 +2194,7 @@ impl PageView {
             .child(export.w_full().justify_start())
             .children(rename.map(|r| r.w_full().justify_start()))
             .children(rewrite.map(|r| r.w_full().justify_start()))
+            .children(pin.map(|p| p.w_full().justify_start()))
             // A hairline sets the destructive item apart, always last.
             .child(div().h(px(1.)).my_1().bg(th.line))
             .child(delete.w_full().justify_start())
@@ -2737,6 +2890,8 @@ impl PageView {
                 date,
                 page,
                 title,
+                caption,
+                today,
                 first,
             } => div()
                 .debug_selector(move || if first { "today-title" } else { "day-title" }.into())
@@ -2745,8 +2900,22 @@ impl PageView {
                 .pt_4()
                 .pb_2()
                 .child(
+                    // DN-2: the weekday, plus "Today"/"Yesterday". Titles stay display
+                    // only: identity is still `daily_date` (rule 6).
+                    div()
+                        .debug_selector(move || {
+                            format!("day-caption-{}", utopia_core::date::iso(date))
+                        })
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(if today { th.accent } else { th.muted })
+                        .child(caption),
+                )
+                .child(
                     div()
                         .id(("day-title", ix))
+                        .debug_selector(move || {
+                            format!("day-date-{}", utopia_core::date::iso(date))
+                        })
                         .text_size(px(crate::theme::TITLE_SIZE))
                         .line_height(px(34.))
                         .font_weight(gpui::FontWeight::BOLD)
@@ -2772,6 +2941,45 @@ impl PageView {
                         })),
                 )
                 .into_any_element(),
+            // DN-1: a day with nothing on it is one 36 px row. The whole row is the click
+            // target; the hint only shows on hover, and no page is written until the first
+            // keystroke (FR-1.2).
+            Item::DayFolded {
+                date,
+                weekday,
+                title,
+            } => {
+                let group: SharedString = format!("day-folded-{ix}").into();
+                div()
+                    .id(("day-folded", ix))
+                    .debug_selector(move || format!("day-folded-{}", utopia_core::date::iso(date)))
+                    .group(group.clone())
+                    .h(px(36.))
+                    .px_4()
+                    .pl(px(32.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(crate::theme::BODY_SIZE))
+                    .text_color(th.muted)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(th.hover))
+                    .child(weekday)
+                    .child(title)
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.faint)
+                            .opacity(0.)
+                            .group_hover(group, |s| s.opacity(1.))
+                            .child("Click to start writing"),
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.start_day(date, window, cx)),
+                    )
+                    .into_any_element()
+            }
             Item::DayEmpty { date } => div()
                 .id(("day-empty", ix))
                 .debug_selector(|| "day-empty".into())
@@ -3432,25 +3640,82 @@ impl Render for PageView {
         self.rebuild_if_dirty(cx);
         let th = theme(cx).clone();
         let view = cx.entity();
-        div().size_full().bg(th.bg).child(
-            list(self.list.clone(), move |ix, window, cx| {
-                // List items are laid out as roots, which shrink to their content; a
-                // full-width wrapper gives margins, spacers and rules the column's width.
-                // The column stops at a readable line length and stays centred, like Roam.
-                div()
-                    .w_full()
-                    .flex()
-                    .justify_center()
-                    .child(
-                        div()
-                            .w_full()
-                            .max_w(px(READABLE_WIDTH))
-                            .child(view.update(cx, |this, cx| this.render_item(ix, window, cx))),
-                    )
-                    .into_any_element()
+        // DN-3: the day the column is inside stays at the top of the column while a long
+        // day scrolls. Reading the offset and one heading is all `render` does for it.
+        let sticky = self.sticky_heading().cloned();
+        div()
+            .size_full()
+            .bg(th.bg)
+            .relative()
+            .child(
+                list(self.list.clone(), move |ix, window, cx| {
+                    // List items are laid out as roots, which shrink to their content; a
+                    // full-width wrapper gives margins, spacers and rules the column's width.
+                    // The column stops at a readable line length and stays centred, like Roam.
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div().w_full().max_w(px(READABLE_WIDTH)).child(
+                                view.update(cx, |this, cx| this.render_item(ix, window, cx)),
+                            ),
+                        )
+                        .into_any_element()
+                })
+                .size_full(),
+            )
+            .when_some(sticky, |d, h| {
+                // Drawn after the list so it paints above the rows, and with no hitbox of
+                // its own, so a click at the top of the column still reaches the block.
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .debug_selector(|| "sticky-day".into())
+                                .w_full()
+                                .max_w(px(READABLE_WIDTH))
+                                .h(px(STICKY_HEIGHT))
+                                .px_4()
+                                .pt_1()
+                                .pb_1()
+                                .bg(th.bg)
+                                .border_b_1()
+                                .border_color(th.line)
+                                .child(
+                                    div()
+                                        .text_size(px(crate::theme::CAPTION_SIZE))
+                                        .line_height(px(20.))
+                                        .text_color(if h.today { th.accent } else { th.muted })
+                                        .child(h.caption.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(crate::theme::TITLE_SIZE))
+                                        .line_height(px(34.))
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .child(h.title.clone()),
+                                ),
+                        ),
+                )
             })
-            .size_full(),
-        )
+    }
+}
+
+/// DN-2: the caption above a day in the feed: "Thursday · Today", "Wednesday ·
+/// Yesterday", or just "Monday". Display only (§10.3: a day's identity is its date).
+fn day_caption(date: NaiveDate, today: NaiveDate) -> String {
+    let weekday = utopia_core::date::weekday_name_of(date);
+    match (today - date).num_days() {
+        0 => format!("{weekday} · Today"),
+        1 => format!("{weekday} · Yesterday"),
+        _ => weekday.to_string(),
     }
 }
 
@@ -3498,5 +3763,27 @@ mod tests {
             assert_eq!(code_language(text), None, "{text:?}");
         }
         assert!(!CODE_LANGUAGES.is_empty());
+    }
+
+    /// DN-2: "Thursday · Today", "Wednesday · Yesterday", "Monday".
+    #[test]
+    fn day_captions_name_the_weekday_and_the_neighbours() {
+        // Thursday, November 5th, 2026.
+        let today = NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        assert_eq!(day_caption(today, today), "Thursday · Today");
+        assert_eq!(
+            day_caption(today.pred_opt().unwrap(), today),
+            "Wednesday · Yesterday"
+        );
+        assert_eq!(
+            day_caption(today - chrono::Duration::days(3), today),
+            "Monday"
+        );
+        // Days further back get the weekday alone; the feed never shows a future day.
+        assert_eq!(
+            day_caption(today - chrono::Duration::days(30), today),
+            "Tuesday"
+        );
+        assert_eq!(day_caption(today.succ_opt().unwrap(), today), "Friday");
     }
 }

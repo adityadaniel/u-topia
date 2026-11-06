@@ -33,6 +33,8 @@ pub struct Theme {
     pub danger_bg: Hsla,
     pub danger: Hsla,
     pub warning: Hsla,
+    /// A healthy state that is not a link: the in-sync dot (SB-4).
+    pub success: Hsla,
     pub highlight_bg: Hsla,
     pub code_bg: Hsla,
     pub banner_bg: Hsla,
@@ -66,6 +68,7 @@ impl Theme {
             danger_bg: rgb(0xfbe4e4).into(),
             danger: rgb(0xb42318).into(),
             warning: rgb(0xd97706).into(),
+            success: rgb(0x1f7a3d).into(),
             highlight_bg: rgb(0xfff1a8).into(),
             code_bg: rgb(0xf0f0ee).into(),
             banner_bg: rgb(0xeaf2ff).into(),
@@ -95,6 +98,7 @@ impl Theme {
             danger_bg: rgb(0x4a2222).into(),
             danger: rgb(0xff9c94).into(),
             warning: rgb(0xf0b45a).into(),
+            success: rgb(0x6fd08c).into(),
             highlight_bg: rgb(0x5c5020).into(),
             code_bg: rgb(0x2c2d30).into(),
             banner_bg: rgb(0x22314a).into(),
@@ -224,6 +228,7 @@ mod tests {
             (l.tag, d.tag),
             (l.danger, d.danger),
             (l.warning, d.warning),
+            (l.success, d.success),
         ] {
             assert_ne!(a, b, "a dark theme has its own value for every token");
         }
