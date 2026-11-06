@@ -39,6 +39,7 @@ the same way and run
 | `after-page-menu-pin.png` | SB-3: an ordinary page's "···" menu offers "Pin to sidebar". The menu floats over the page and does not move the layout. |
 | `after-page-menu-unpin.png` | SB-3: the same menu on a pinned page says "Unpin from sidebar"; the Pinned group above shows the page active. |
 | `after-compact.png` | ALL-5 in the sidebar: the same content with `settings.json` `"density": "compact"` — Recent Days, Pinned and Pages rows are all tighter. |
+| `after-settings-pinned.png` | SB-3: Settings → Appearance names the new preference — "Pinned pages", "2 pinned pages" and a Clear control. It is kept in `settings.json`, not `keymap.json` or the graph. |
 
 ## What the screenshots do not show
 
