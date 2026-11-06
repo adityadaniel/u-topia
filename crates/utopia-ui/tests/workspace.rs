@@ -942,6 +942,41 @@ fn one_palette_opens_on_pages_or_blocks(cx: &mut TestAppContext) {
     );
 }
 
+/// SR-2's decision: when a page name wraps to two lines, the group's icon stays on the
+/// top line with the first line of the name, not centred against both.
+#[gpui::test]
+fn group_icon_stays_on_the_top_line_when_a_name_wraps(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    let long = "Atlas Launch Coordination Notes for the Beta Programme, Migration Planning and \
+                the Twenty Testers Invited by Hand";
+    app.update(cx, |app, _| {
+        let page = app.store.create_page(long).unwrap();
+        let b = app.store.ensure_first_block(&page).unwrap();
+        app.store
+            .set_block_text(&page, &b, "zebra crossing", None, None)
+            .unwrap();
+        app.store.commit_block(&page, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let icon = cx
+        .debug_bounds("search-group-icon-0")
+        .expect("the group icon");
+    let title = cx
+        .debug_bounds("search-group-title-0")
+        .expect("the page name");
+    assert!(
+        title.size.height >= gpui::px(36.),
+        "the name wraps onto two lines: {title:?}"
+    );
+    assert!(
+        (f32::from(icon.origin.y) - f32::from(title.origin.y)).abs() < 1.5,
+        "the icon aligns with the first line: {icon:?} {title:?}"
+    );
+}
+
 #[gpui::test]
 fn full_search_and_quick_capture(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);

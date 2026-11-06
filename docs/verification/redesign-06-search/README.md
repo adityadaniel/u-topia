@@ -19,7 +19,9 @@ on the first page.
 `crates/utopia-ui/tests/workspace.rs` (simulated keystrokes and clicks in the real window):
 
 - `search_groups_results_under_their_page` — a header per page, the icon on the top line
-  of the header (SR-2's decision), blocks indented and stacked below it.
+  of the header, blocks indented and stacked below it.
+- `group_icon_stays_on_the_top_line_when_a_name_wraps` — SR-2's decision, with a page name
+  long enough to wrap onto two lines.
 - `search_scope_and_age_filter_the_results` — the Journal chip filters to days; Pages +
   Today drops an October note; the age menu is clicked, not just opened.
 - `search_preview_follows_the_selection` — a page selection has no preview; the first
@@ -64,14 +66,14 @@ Dark mode was not captured; the system appearance was left alone.
 
 ```
 cargo fmt --all -- --check          (no output)
-cargo build --workspace             Finished `dev` profile ... in 7.99s
-cargo test --workspace              289 passed, 0 failed (36 suites)
+cargo build --workspace             Finished `dev` profile ... in 0.81s
+cargo test --workspace              290 passed, 0 failed (36 suites)
   tests/acceptance.rs               36 passed
   tests/layout.rs                   19 passed
   tests/settings.rs                 13 passed
-  tests/workspace.rs                53 passed
+  tests/workspace.rs                54 passed
 cargo clippy --workspace --all-targets -- -D warnings
-                                    Finished `dev` profile ... in 2.19s
+                                    Finished `dev` profile ... in 3.57s
 ```
 
 One earlier run failed `utopia-syncd --test http::lan_relay_serves_and_is_discoverable`
