@@ -741,7 +741,11 @@ fn key_card_row<E: Styled + gpui::prelude::FluentBuilder>(
     th: &Theme,
     density: Density,
 ) -> E {
-    row.px_4()
+    row.w_full()
+        .max_w(px(CONTENT_WIDTH))
+        .mx_auto()
+        .flex_shrink_0()
+        .px_4()
         .py(px(if density == Density::Compact { 7. } else { 11. }))
         .border_l_1()
         .border_r_1()
@@ -915,9 +919,9 @@ impl SettingsView {
             );
         }
 
-        for (gi, (c, rows)) in groups.iter().enumerate() {
+        for (c, rows) in &groups {
             let category = *c;
-            list = list.child(card_top(&th, category.label()).when(gi > 0, |d| d.mt_4()));
+            list = list.child(card_top(&th, category.label()).mt_4());
             for (i, d) in rows.iter().enumerate() {
                 let row = self.render_key_row(d, &conflicts, cx);
                 list = list.child(key_card_row(row, i + 1 == rows.len(), &th, density));
@@ -1118,9 +1122,9 @@ impl SettingsView {
             );
         }
 
-        for (gi, (c, rows)) in groups.iter().enumerate() {
+        for (c, rows) in &groups {
             let category = *c;
-            list = list.child(card_top(&th, category.label()).when(gi > 0, |d| d.mt_4()));
+            list = list.child(card_top(&th, category.label()).mt_4());
             for (i, d) in rows.iter().enumerate() {
                 let row = div()
                     .debug_selector({
