@@ -20,7 +20,7 @@ use crate::editor::{BlockEditor, EditTarget, EditorEvent};
 use crate::field::Goal;
 use crate::line_input::{LineInput, LineInputEvent};
 use crate::rich::{self, ChipState, LinkTarget};
-use crate::theme::{theme, INDENT, LINE_HEIGHT, MAX_VISUAL_DEPTH};
+use crate::theme::{quiet_control, quiet_danger, quiet_menu, theme, INDENT, LINE_HEIGHT, MAX_VISUAL_DEPTH};
 
 /// Transclusions stop expanding at this depth (FR-4.5).
 const MAX_EMBED_DEPTH: u8 = 3;
@@ -228,6 +228,8 @@ pub struct PageView {
     calendar_month: NaiveDate,
     /// Set while showing the Daily Notes feed; `page` is then today's page.
     journal: Option<Journal>,
+    /// The page header's "···" menu is open (ALL-3).
+    page_menu: bool,
     dirty: bool,
     _subs: Vec<Subscription>,
 }
@@ -294,6 +296,7 @@ impl PageView {
             alias_input: None,
             calendar_month: today,
             journal: None,
+            page_menu: false,
             dirty: true,
             _subs: subs,
         }
@@ -363,6 +366,7 @@ impl PageView {
                 .unwrap_or_default();
             self.expanded_groups = saved.into_iter().map(PageId).collect();
         }
+        self.page_menu = false;
         self.refs_key = None;
         self.dirty = true;
         self.rebuild(cx);
@@ -1749,16 +1753,7 @@ impl PageView {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let th = theme(cx).clone();
-        div()
-            .id(id)
-            .px_2()
-            .py_0p5()
-            .rounded_sm()
-            .text_size(px(crate::theme::CAPTION_SIZE))
-            .text_color(th.muted)
-            .cursor_pointer()
-            .hover(|s| s.bg(th.hover))
-            .child(label.into())
+        quiet_control(id, label, &th)
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1785,34 +1780,30 @@ impl PageView {
                 )
             })
             .when(h.kind == PageKind::Daily, |d| {
-                d.child(
-                    self.button("prev-day", "‹", cx)
-                        .text_base()
-                        .on_click(cx.listener(|this, e: &gpui::ClickEvent, w, cx| {
-                            if let Some(date) = this.header.date {
-                                this.pick_date(
-                                    date.pred_opt().unwrap_or(date),
-                                    e.modifiers().shift,
-                                    w,
-                                    cx,
-                                );
-                            }
-                        })),
-                )
-                .child(
-                    self.button("next-day", "›", cx)
-                        .text_base()
-                        .on_click(cx.listener(|this, e: &gpui::ClickEvent, w, cx| {
-                            if let Some(date) = this.header.date {
-                                this.pick_date(
-                                    date.succ_opt().unwrap_or(date),
-                                    e.modifiers().shift,
-                                    w,
-                                    cx,
-                                );
-                            }
-                        })),
-                )
+                d.child(self.button("prev-day", "‹", cx).on_click(cx.listener(
+                    |this, e: &gpui::ClickEvent, w, cx| {
+                        if let Some(date) = this.header.date {
+                            this.pick_date(
+                                date.pred_opt().unwrap_or(date),
+                                e.modifiers().shift,
+                                w,
+                                cx,
+                            );
+                        }
+                    },
+                )))
+                .child(self.button("next-day", "›", cx).on_click(cx.listener(
+                    |this, e: &gpui::ClickEvent, w, cx| {
+                        if let Some(date) = this.header.date {
+                            this.pick_date(
+                                date.succ_opt().unwrap_or(date),
+                                e.modifiers().shift,
+                                w,
+                                cx,
+                            );
+                        }
+                    },
+                )))
             })
             .child(div().flex_1())
             .when(h.deleted, |d| {
@@ -1823,11 +1814,50 @@ impl PageView {
             })
             .when(!h.deleted && !h.draft && self.zoom.is_none(), |d| {
                 d.child(
-                    self.button("delete", "Delete page", cx)
-                        .on_click(cx.listener(|this, _, _, cx| this.page_action("delete", cx))),
+                    self.button("page-menu", "···", cx)
+                        .debug_selector(|| "page-menu".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.page_menu = !this.page_menu;
+                            cx.notify();
+                        })),
                 )
             });
         col = col.child(top);
+        if self.page_menu {
+            // ALL-3: destructive page actions live in a menu, in the danger colour, not as
+            // loose text beside the title.
+            let rename = quiet_control("page-menu-rename", "Rename", &th).on_click(cx.listener(
+                |this, _, window, cx| {
+                    this.page_menu = false;
+                    this.start_rename(window, cx);
+                },
+            ));
+            let delete = quiet_danger("page-menu-delete", "Delete page", &th)
+                .debug_selector(|| "page-menu-delete".into())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.page_menu = false;
+                    this.page_action("delete", cx);
+                }));
+            col = col.child(
+                div().flex().justify_end().child(
+                    div()
+                        .id("page-menu-popup")
+                        .debug_selector(|| "page-menu-popup".into())
+                        .w(px(180.))
+                        .p_1()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .bg(th.surface)
+                        .border_1()
+                        .border_color(th.line)
+                        .rounded_md()
+                        .shadow_md()
+                        .child(rename.w_full().justify_start())
+                        .child(delete.w_full().justify_start()),
+                ),
+            );
+        }
         if !h.zoom_path.is_empty() {
             let mut crumbs = div()
                 .flex()
@@ -2159,7 +2189,7 @@ impl PageView {
                                 format!("Last {} days", (today - d).num_days() + 1)
                             }
                         };
-                        self.button("date-filter", label, cx).on_click(cx.listener(
+                        quiet_menu("date-filter", label, &th).on_click(cx.listener(
                             |this, _, _, cx| {
                                 // Any time → last 7 days → last 30 days → any time.
                                 let today = this.app.read(cx).store.today();
@@ -2175,7 +2205,7 @@ impl PageView {
                             },
                         ))
                     })
-                    .child(self.button("sort", sort_label, cx).on_click(cx.listener(
+                    .child(quiet_menu("sort", sort_label, &th).on_click(cx.listener(
                         |this, _, _, cx| {
                             this.query.sort = match this.query.sort {
                                 RefSort::Title => RefSort::Recency,

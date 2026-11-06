@@ -26,7 +26,7 @@ use crate::actions::{
 };
 use crate::appearance::{self, UiFont};
 use crate::help::{shot_image, TOPICS};
-use crate::theme::theme;
+use crate::theme::{quiet_control, theme};
 
 /// Help prose stops at a readable line length, like the page column does.
 const HELP_WIDTH: f32 = 720.;
@@ -388,28 +388,22 @@ impl SettingsView {
                 .items_center()
                 .justify_between()
                 .pb_2()
-                .child(div().text_size(px(crate::theme::CAPTION_SIZE)).text_color(th.muted).child(if changed == 0 {
-                    "Pick Change, then press the keys you want.".to_string()
-                } else {
-                    format!(
-                        "Pick Change, then press the keys you want. {changed} changed \
-                                 from the default."
-                    )
-                }))
                 .child(
                     div()
-                        .id("reset-all")
-                        .debug_selector(|| "settings-reset-all".into())
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(th.line)
                         .text_size(px(crate::theme::CAPTION_SIZE))
                         .text_color(th.muted)
-                        .cursor_pointer()
-                        .hover(|d| d.bg(th.hover))
-                        .child("Reset All")
+                        .child(if changed == 0 {
+                            "Pick Change, then press the keys you want.".to_string()
+                        } else {
+                            format!(
+                                "Pick Change, then press the keys you want. {changed} changed \
+                                 from the default."
+                            )
+                        }),
+                )
+                .child(
+                    quiet_control("reset-all", "Reset All", &th)
+                        .debug_selector(|| "settings-reset-all".into())
                         .on_click(cx.listener(|this, _, _, cx| this.reset_all(cx))),
                 ),
         );
@@ -508,27 +502,22 @@ impl SettingsView {
                     .gap_2()
                     .child(chip)
                     .child(
-                        div()
-                            .id(SharedString::from(format!("change-{}", d.action)))
-                            .debug_selector(move || format!("settings-change-{}", d.action))
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(th.line)
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.muted)
-                            .cursor_pointer()
-                            .hover(|x| x.bg(th.hover))
-                            .child(if capturing { "Cancel" } else { "Change" })
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                        quiet_control(
+                            SharedString::from(format!("change-{}", d.action)),
+                            if capturing { "Cancel" } else { "Change" },
+                            &th,
+                        )
+                        .debug_selector(move || format!("settings-change-{}", d.action))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
                                 if this.capturing.map(|c| c.action) == Some(d.action) {
                                     this.cancel_capture();
                                     cx.notify();
                                 } else {
                                     this.start_capture(d, window, cx);
                                 }
-                            })),
+                            },
+                        )),
                     )
                     .children(changed.then(|| {
                         div()

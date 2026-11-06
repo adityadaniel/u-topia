@@ -19,7 +19,7 @@ use utopia_store::PdfHighlight;
 
 use crate::app_state::AppState;
 use crate::pdf::{page_cache_path, PAGE_WIDTH};
-use crate::theme::theme;
+use crate::theme::{quiet_control, theme};
 
 pub enum PdfEvent {
     Close,
@@ -431,25 +431,13 @@ impl Render for PdfView {
             .child(div().flex_1())
             .when_some(self.path.clone(), |d, p| {
                 d.child(
-                    div()
-                        .id("pdf-external")
-                        .px_2()
-                        .text_size(px(crate::theme::BODY_SIZE))
-                        .text_color(th.muted)
-                        .cursor_pointer()
-                        .hover(|s| s.text_color(th.accent))
-                        .child("Open in Preview")
+                    quiet_control("pdf-external", "Open in Preview", &th)
                         .on_click(move |_, _, cx| cx.open_with_system(&p)),
                 )
             })
             .child(
-                div()
-                    .id("pdf-close")
-                    .px_2()
-                    .text_size(px(crate::theme::BODY_SIZE))
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(th.accent))
-                    .child("Close")
+                quiet_control("pdf-close", "Close", &th)
+                    .debug_selector(|| "pdf-close".into())
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(PdfEvent::Close))),
             );
         let view = cx.entity();

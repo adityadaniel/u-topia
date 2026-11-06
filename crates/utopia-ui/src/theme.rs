@@ -6,7 +6,10 @@
 //! theme means adding one `Theme` value, never a colour at a call site; a test keeps the
 //! two palettes in step.
 
-use gpui::{rgb, App, Global, Hsla, WindowAppearance};
+use gpui::{
+    div, prelude::*, px, rgb, transparent_black, App, Div, ElementId, Global, Hsla, SharedString,
+    Stateful, WindowAppearance,
+};
 
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -108,6 +111,65 @@ impl Theme {
 pub fn theme(cx: &App) -> &Theme {
     cx.global::<Theme>()
 }
+
+/// A quiet control (ALL-3): 6 px radius, a 13 px label and one hairline that appears only
+/// on hover, so controls read as controls without shouting over the notes. Use
+/// [`quiet_menu`] when a menu opens from it.
+pub fn quiet_control(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    th: &Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .border_1()
+        .border_color(transparent_black())
+        .text_size(px(crate::theme::CONTROL_SIZE))
+        .text_color(th.muted)
+        .cursor_pointer()
+        .hover(|d| d.bg(th.hover).border_color(th.line).text_color(th.text))
+        .child(label.into())
+}
+
+/// A destructive quiet control: "Delete page" in a menu, red at rest and on hover.
+pub fn quiet_danger(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    th: &Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .border_1()
+        .border_color(transparent_black())
+        .text_size(px(crate::theme::CONTROL_SIZE))
+        .text_color(th.danger)
+        .cursor_pointer()
+        .hover(|d| {
+            d.bg(th.danger_bg)
+                .border_color(th.line)
+                .text_color(th.danger)
+        })
+        .child(label.into())
+}
+
+/// A control that opens a menu; the chevron says so.
+pub fn quiet_menu(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    th: &Theme,
+) -> Stateful<Div> {
+    let label: SharedString = label.into();
+    quiet_control(id, format!("{label} ▾"), th)
+}
+
+/// Label size for controls, between body and caption.
+pub const CONTROL_SIZE: f32 = 13.;
 
 /// The one type scale (ALL-1): titles, outline headings, body and captions. Page titles
 /// and day headings share `TITLE_SIZE`; an outline heading never draws larger than H1.

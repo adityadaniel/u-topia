@@ -15,7 +15,7 @@ use utopia_core::PageId;
 use utopia_store::{GraphOptions, PageGraph};
 
 use crate::app_state::AppState;
-use crate::theme::theme;
+use crate::theme::{quiet_control, theme};
 
 const LAYOUT_ITERATIONS: usize = 160;
 const MARGIN: f32 = 48.;
@@ -233,16 +233,9 @@ impl GraphView {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let th = theme(cx).clone();
-        div()
-            .id(id)
-            .px_2()
-            .py_0p5()
-            .rounded_md()
-            .text_size(px(crate::theme::BODY_SIZE))
-            .cursor_pointer()
+        quiet_control(id, label, &th)
             .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
-            .when(!on, |d| d.text_color(th.muted).hover(|s| s.bg(th.hover)))
-            .child(label.into())
+            .when(!on, |d| d.text_color(th.muted))
     }
 }
 

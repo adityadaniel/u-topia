@@ -391,6 +391,32 @@ fn left_sidebar_collapses_to_a_rail(cx: &mut TestAppContext) {
     assert!(cal.origin.y > toggle.origin.y);
 }
 
+/// ALL-3: "Delete page" is a danger item inside the page header's menu, not loose text.
+#[gpui::test]
+fn page_menu_holds_the_danger_delete(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    // An empty day is a draft until its first write (FR-1.2); write one so it has a page
+    // with actions to offer.
+    cx.simulate_input("note");
+    cx.simulate_keystrokes("escape");
+    assert!(
+        cx.debug_bounds("page-menu-delete").is_none(),
+        "the menu starts closed"
+    );
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    let popup = bounds(cx, "page-menu-popup");
+    let delete = bounds(cx, "page-menu-delete");
+    assert!(
+        popup.origin.y >= menu.origin.y + menu.size.height - px(1.),
+        "the menu opens below its control: {popup:?} {menu:?}"
+    );
+    assert!(
+        delete.origin.x >= popup.origin.x && delete.origin.x + delete.size.width <= popup.right(),
+        "the danger item stays inside the menu: {delete:?} {popup:?}"
+    );
+}
+
 /// ALL-1: page title 28, H1 20, body 15 — measured as line boxes, since the heading used to
 /// draw at 24 px (larger than H1 and close to the title).
 #[gpui::test]

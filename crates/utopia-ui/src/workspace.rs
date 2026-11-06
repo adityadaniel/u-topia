@@ -24,7 +24,7 @@ use crate::page_view::{PageView, PageViewEvent};
 use crate::pdf_view::{PdfEvent, PdfView};
 use crate::quick_jump::{JumpPalette, PaletteMode, QuickJumpEvent};
 use crate::sync_runner::{exchange_owned, status_line, BoxTransport, SyncRunner};
-use crate::theme::theme;
+use crate::theme::{quiet_control, theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InspectorTab {
@@ -1105,31 +1105,12 @@ impl Workspace {
                         div()
                             .flex()
                             .gap_1()
+                            .child(quiet_control("open-jump", "⌘K", &th).on_click(cx.listener(
+                                |this, _, window, cx| this.start_jump(JumpMode::Open, window, cx),
+                            )))
                             .child(
-                                div()
-                                    .id("open-jump")
-                                    .px_1()
-                                    .rounded_sm()
-                                    .text_size(px(crate::theme::CAPTION_SIZE))
-                                    .text_color(th.muted)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(th.hover))
-                                    .child("⌘K")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.start_jump(JumpMode::Open, window, cx)
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("collapse-left")
+                                quiet_control("collapse-left", "«", &th)
                                     .debug_selector(|| "collapse-left".into())
-                                    .px_1()
-                                    .rounded_sm()
-                                    .text_size(px(crate::theme::CAPTION_SIZE))
-                                    .text_color(th.muted)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(th.hover))
-                                    .child("«")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.toggle_left(&ToggleLeftSidebar, window, cx)
                                     })),
