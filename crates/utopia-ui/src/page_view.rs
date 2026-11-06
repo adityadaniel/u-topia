@@ -13,13 +13,13 @@ use utopia_core::inline::{extract_refs, plain_text};
 use utopia_core::outline::{self, Focus, Plan};
 use utopia_core::undo::Caret;
 use utopia_core::{BlockId, BlockKind, PageId, PageKind};
-use utopia_store::{BlockRefStatus, LinkedRefs, Mention, PageRow, RefHit, RefQuery, RefSort};
+use utopia_store::{LinkedRefs, Mention, PageRow, RefHit, RefQuery, RefSort};
 
 use crate::app_state::{AppState, Changed, IndexUpdated};
 use crate::editor::{BlockEditor, EditTarget, EditorEvent};
 use crate::field::Goal;
 use crate::line_input::{LineInput, LineInputEvent};
-use crate::rich::{self, ChipState, LinkTarget};
+use crate::rich::{self, LinkTarget};
 use crate::theme::{quiet_control, quiet_danger, quiet_menu, theme, INDENT, MAX_VISUAL_DEPTH};
 
 /// Transclusions stop expanding at this depth (FR-4.5).
@@ -235,6 +235,35 @@ pub struct PageView {
 }
 
 impl EventEmitter<PageViewEvent> for PageView {}
+
+impl crate::reference::RefRowHost for PageView {
+    fn open_reference(
+        &mut self,
+        page: PageId,
+        block: BlockId,
+        sidebar: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |e, cx| e.end(cx));
+        cx.emit(PageViewEvent::Open {
+            page,
+            zoom: None,
+            focus: Some(block),
+            sidebar,
+        });
+    }
+
+    fn follow_reference(
+        &mut self,
+        target: LinkTarget,
+        sidebar: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.follow(target, None, sidebar, window, cx);
+    }
+}
 
 impl PageView {
     pub fn new(
@@ -1270,13 +1299,16 @@ impl PageView {
                 }
             }
             LinkTarget::Block(uid) => {
-                if sidebar {
+                if sidebar || row.is_none() {
+                    // A chip in a read-only row (a Linked Reference) has no row to expand,
+                    // so following it opens the block it points at (FR-4.3).
                     if let Ok(Some(b)) = self.app.read(cx).store.block_row(&BlockId(uid.clone())) {
+                        self.editor.update(cx, |e, cx| e.end(cx));
                         cx.emit(PageViewEvent::Open {
                             page: b.page_id,
                             zoom: Some(b.id),
                             focus: None,
-                            sidebar: true,
+                            sidebar,
                         });
                     }
                 } else if let Some(row) = row {
@@ -1507,17 +1539,6 @@ impl PageView {
 
     // ---------------------------------------------------------------- rendering
 
-    fn chip_state(store: &utopia_store::Store, uid: &str, row_block: &BlockId) -> ChipState {
-        if uid == row_block.as_str() {
-            return ChipState::Cyclic;
-        }
-        match store.block_ref_status(uid) {
-            Ok(BlockRefStatus::Live { text, .. }) => ChipState::Live(text),
-            Ok(BlockRefStatus::Deleted { .. }) => ChipState::Deleted,
-            _ => ChipState::Missing,
-        }
-    }
-
     fn render_rich(
         &self,
         text: &str,
@@ -1530,7 +1551,7 @@ impl PageView {
         let rendered = {
             let store = &self.app.read(cx).store;
             rich::render(text, &th, &mut |uid| {
-                Self::chip_state(store, uid, row_block)
+                crate::reference::chip_state(store, uid, row_block)
             })
         };
         let styled =
@@ -2553,54 +2574,19 @@ impl PageView {
                     .into_any_element()
             }
             Item::Hit(hit) => {
-                let crumbs = hit
-                    .breadcrumb
-                    .iter()
-                    .map(|(_, t)| t.chars().take(30).collect::<String>())
-                    .collect::<Vec<_>>()
-                    .join(" › ");
-                let page = hit.page.clone();
-                let block = hit.block.clone();
-                let text = self.render_rich(&hit.text, &hit.block, None, cx);
-                div()
-                    .id(("hit", ix))
-                    .px_6()
-                    .py_0p5()
-                    .flex()
-                    .flex_col()
-                    .cursor_pointer()
-                    .when(!crumbs.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .text_size(px(crate::theme::CAPTION_SIZE))
-                                .text_color(th.faint)
-                                .child(format!("› {crumbs}")),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .child(div().w(px(14.)).text_color(th.bullet).child("•"))
-                            // As in `render_row`: a flex item's minimum width is its
-                            // unwrapped text unless `min_w_0`, so it would run wide.
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .debug_selector(|| format!("hit-{ix}"))
-                                    .child(text),
-                            ),
-                    )
-                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
-                        this.editor.update(cx, |ed, cx| ed.end(cx));
-                        cx.emit(PageViewEvent::Open {
-                            page: page.clone(),
-                            zoom: None,
-                            focus: Some(block.clone()),
-                            sidebar: e.modifiers().shift,
-                        });
-                    }))
-                    .into_any_element()
+                // The same row the right sidebar draws (RS-1): one renderer, so a reference
+                // reads the same in the page and in the inspector.
+                let th = th.clone();
+                crate::reference::reference_row(
+                    ("hit", ix),
+                    "hit",
+                    ix,
+                    &hit,
+                    &th,
+                    &self.app.read(cx).store,
+                    24.,
+                    cx.entity(),
+                )
             }
             Item::More { page, hidden } => div()
                 .id(("more", ix))

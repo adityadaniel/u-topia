@@ -51,7 +51,8 @@ struct SidebarData {
 
 #[derive(Default)]
 struct InspectorData {
-    incoming: Vec<(PageRow, usize)>,
+    /// Linked References, grouped by source page; each group carries its blocks (RS-1).
+    incoming: Vec<utopia_store::RefGroup>,
     outgoing: Vec<OutgoingRef>,
     /// Unresolved targets with a display title recovered from the source text.
     unresolved: Vec<(OutgoingRef, String)>,
@@ -86,6 +87,31 @@ pub struct Workspace {
     focus: FocusHandle,
     subs: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
+}
+
+impl crate::reference::RefRowHost for Workspace {
+    /// A reference row was clicked: open its page with that block focused (§7). Shift
+    /// stacks the page in this sidebar instead of replacing the main pane.
+    fn open_reference(
+        &mut self,
+        page: PageId,
+        block: BlockId,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open(page, None, Some(block), shift, window, cx);
+    }
+
+    fn follow_reference(
+        &mut self,
+        target: crate::rich::LinkTarget,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.follow_link(target, shift, window, cx);
+    }
 }
 
 impl Focusable for Workspace {
@@ -983,14 +1009,10 @@ impl Workspace {
         if self.inspector_seen.as_ref() != Some(&(page.clone(), v)) {
             self.inspector_seen = Some((page.clone(), v));
             let store = &self.app.read(cx).store;
-            let refs = store
+            let incoming = store
                 .linked_references(&page, &Default::default())
-                .unwrap_or_default();
-            let incoming = refs
-                .groups
-                .into_iter()
-                .map(|g| (g.page, g.hits.len()))
-                .collect();
+                .unwrap_or_default()
+                .groups;
             let outgoing = store.outgoing_refs(&page, None).unwrap_or_default();
             let unresolved = store
                 .unresolved_refs(&page)
@@ -1256,6 +1278,57 @@ impl Workspace {
         .into_any_element()
     }
 
+    /// The muted line a panel shows when it has nothing to list (RS-2, RS-3).
+    fn panel_empty(&self, text: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        let th = theme(cx).clone();
+        div()
+            .px_2()
+            .py_1()
+            .text_size(px(crate::theme::CAPTION_SIZE))
+            .text_color(th.faint)
+            .child(text)
+            .into_any_element()
+    }
+
+    /// Follow a page or block chip clicked in the right sidebar: a page opens in the main
+    /// pane, a block opens its page zoomed to it. An unresolved title is created, exactly as
+    /// following it from the outline does (FR-4.14). Local UI state only — nothing here
+    /// writes a shard beyond that page creation.
+    fn follow_link(
+        &mut self,
+        target: crate::rich::LinkTarget,
+        sidebar: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            crate::rich::LinkTarget::Page(title) => {
+                let page = self.app.update(cx, |app, cx| {
+                    let found = app.store.find_page(&title).ok().flatten();
+                    match found {
+                        Some(p) => Some(p),
+                        None => {
+                            let r = app.store.create_page(&title);
+                            let p = app.report(r);
+                            app.changed(Vec::new(), true, cx);
+                            p
+                        }
+                    }
+                });
+                if let Some(page) = page {
+                    self.open(page, None, None, sidebar, window, cx);
+                }
+            }
+            crate::rich::LinkTarget::Block(uid) => {
+                if let Ok(Some(b)) = self.app.read(cx).store.block_row(&BlockId(uid)) {
+                    self.open(b.page_id, Some(b.id), None, sidebar, window, cx);
+                }
+            }
+            // Attachments and URLs are the page's business, not the panel's.
+            crate::rich::LinkTarget::Url(_) => {}
+        }
+    }
+
     fn render_inspector(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let th = theme(cx).clone();
         let tab = |this: &Self,
@@ -1277,7 +1350,7 @@ impl Workspace {
                     cx.notify();
                 }))
         };
-        let n_in: usize = self.inspector.incoming.iter().map(|(_, n)| n).sum();
+        let n_in: usize = self.inspector.incoming.iter().map(|g| g.hits.len()).sum();
         let tabs = div()
             .flex()
             .gap_1()
@@ -1311,19 +1384,64 @@ impl Workspace {
             .flex_1();
         match self.tab {
             InspectorTab::Incoming => {
-                let rows: Vec<(PageId, String, usize)> = self
-                    .inspector
-                    .incoming
-                    .iter()
-                    .map(|(p, n)| (p.id.clone(), p.title.clone(), *n))
-                    .collect();
-                for (i, (id, title, n)) in rows.into_iter().enumerate() {
-                    body = body.child(self.nav_item(
-                        ("in", i),
-                        format!("{title}  ·  {n}"),
-                        Some(id),
-                        cx,
-                    ));
+                // One group per source page, its count next to the name (LR-2), and below
+                // it each referencing block drawn the way Linked References draws it (RS-1).
+                let groups: Vec<utopia_store::RefGroup> = self.inspector.incoming.clone();
+                let me = cx.entity();
+                if groups.is_empty() {
+                    body = body.child(self.panel_empty("No references yet.", cx));
+                }
+                let mut ix = 0usize;
+                for (gi, group) in groups.iter().enumerate() {
+                    let page = group.page.id.clone();
+                    let header = div()
+                        .id(("ref-group", gi))
+                        .debug_selector(move || format!("ref-group-{gi}"))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .pt_2()
+                        .pb_0p5()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(th.hover))
+                        .child(
+                            div()
+                                .text_size(px(crate::theme::CAPTION_SIZE))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(th.muted)
+                                .child(group.page.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(th.chip_bg)
+                                .text_size(px(crate::theme::CAPTION_SIZE))
+                                .text_color(th.muted)
+                                .child(group.hits.len().to_string()),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                                this.open(page.clone(), None, None, e.modifiers.shift, window, cx)
+                            }),
+                        );
+                    body = body.child(header);
+                    for hit in &group.hits {
+                        body = body.child(crate::reference::reference_row(
+                            ("ref-block", ix),
+                            "ref-block",
+                            ix,
+                            hit,
+                            &th,
+                            &self.app.read(cx).store,
+                            8.,
+                            me.clone(),
+                        ));
+                        ix += 1;
+                    }
                 }
             }
             InspectorTab::Outgoing => {

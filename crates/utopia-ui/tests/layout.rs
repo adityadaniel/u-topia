@@ -333,6 +333,38 @@ fn sidebar_linked_reference_wraps(cx: &mut TestAppContext) {
     assert_wraps_within(hit, left, left + f32::from(side.size.width));
 }
 
+/// RS-1: the right sidebar's References tab shows the referencing block itself — the same
+/// row Linked References draws, wrapped at the panel's edge — not just a page name and a
+/// count.
+#[gpui::test]
+fn inspector_shows_the_referencing_block(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_refs(cx, false);
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let side = bounds(cx, "right-sidebar");
+    let group = bounds(cx, "ref-group-0");
+    let row = bounds(cx, "ref-block-0");
+    assert!(
+        group.origin.y > side.origin.y && group.origin.y < row.origin.y,
+        "the source page heads its blocks: {group:?} {row:?}"
+    );
+    assert!(
+        row.size.height >= px(40.),
+        "the long referencing block wraps onto several lines: {row:?}"
+    );
+    let (x0, x1) = (
+        f32::from(row.origin.x),
+        f32::from(row.origin.x + row.size.width),
+    );
+    assert!(
+        x0 >= f32::from(side.origin.x) && x1 <= f32::from(side.right()) + 0.5,
+        "the row stays inside the panel: {row:?} {side:?}"
+    );
+}
+
 /// FR-3.9: a long unlinked mention wraps too, keeping its "Link" button in the column.
 #[gpui::test]
 fn unlinked_mention_wraps_and_keeps_link_in_view(cx: &mut TestAppContext) {

@@ -14,6 +14,7 @@ pub mod page_view;
 pub mod pdf;
 pub mod pdf_view;
 pub mod quick_jump;
+pub mod reference;
 pub mod rich;
 pub mod settings;
 pub mod sync_runner;

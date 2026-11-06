@@ -436,6 +436,58 @@ fn sidebar_stacks_pages(cx: &mut TestAppContext) {
     );
 }
 
+/// RS-1: clicking a reference in the right sidebar opens the page it came from with that
+/// block focused, and clicking a page chip inside it follows the chip instead.
+#[gpui::test]
+fn a_reference_row_in_the_sidebar_opens_its_block(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (target, source, block) = app.update(cx, |app, _| {
+        let target = app.store.create_page("Target").unwrap();
+        let source = app.store.create_page("Source").unwrap();
+        let b = app.store.ensure_first_block(&source).unwrap();
+        app.store
+            .set_block_text(
+                &source,
+                &b,
+                "the note that references [[Target]]",
+                None,
+                None,
+            )
+            .unwrap();
+        app.store.commit_block(&source, &b).unwrap();
+        app.store.sync_index().unwrap();
+        (target, source, b)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let row = (0..20)
+        .find_map(|ix| {
+            let sel: &'static str = Box::leak(format!("ref-block-{ix}").into_boxed_str());
+            cx.debug_bounds(sel)
+        })
+        .expect("the sidebar lists the reference");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(source),
+        "the reference row opened the page it came from"
+    );
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.block.clone())),
+        Some(block),
+        "the caret is in the block that made the reference"
+    );
+}
+
 #[gpui::test]
 fn keystrokes_are_debounced_then_committed(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);
