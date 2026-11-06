@@ -825,3 +825,95 @@ fn footer_opens_the_sync_view_without_moving_the_page(cx: &mut TestAppContext) {
         "clicking the footer again closes the sync view"
     );
 }
+
+/// SB-5: under Journal, a quiet 7-column month strip. Days with an entry get a dot, today
+/// is drawn in the accent, a day click opens that day, and the month name folds the grid.
+#[gpui::test]
+fn month_strip_is_a_quiet_seven_column_grid(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| seed_days(s, 3));
+    cx.simulate_keystrokes("escape");
+    assert!(
+        cx.debug_bounds("left-calendar").is_none(),
+        "the strip starts folded, as the calendar did"
+    );
+    let strip = bounds(cx, "toggle-calendar");
+    cx.simulate_click(strip.center(), gpui::Modifiers::default());
+    let grid = bounds(cx, "left-calendar");
+    assert!(
+        grid.origin.y >= strip.origin.y + strip.size.height - px(0.5),
+        "the grid is under the month name: {grid:?} {strip:?}"
+    );
+
+    // November 2026 starts on a Sunday, so the first Monday-first row is Oct 26–Nov 1.
+    let row = [
+        "2026-10-26",
+        "2026-10-27",
+        "2026-10-28",
+        "2026-10-29",
+        "2026-10-30",
+        "2026-10-31",
+        "2026-11-01",
+    ];
+    let cells: Vec<Bounds<Pixels>> = row
+        .iter()
+        .map(|iso| bounds_of(cx, format!("cal-{iso}")))
+        .collect();
+    for (i, cell) in cells.iter().enumerate() {
+        assert!(
+            approx(cell.origin.y, f32::from(cells[0].origin.y)),
+            "seven columns share a line: {cell:?}"
+        );
+        assert!(
+            approx(cell.size.width, f32::from(cells[0].size.width)),
+            "columns are equally wide: {cell:?}"
+        );
+        if i > 0 {
+            assert!(
+                cell.origin.x > cells[i - 1].origin.x,
+                "columns go left to right: {cell:?}"
+            );
+        }
+        assert!(
+            cell.origin.x >= grid.origin.x
+                && cell.origin.x + cell.size.width <= grid.origin.x + grid.size.width + px(0.5),
+            "cell {i} stays inside the grid: {cell:?} {grid:?}"
+        );
+    }
+
+    // Seeded days (Nov 2, Nov 1, Oct 31) have dots; an untouched day in the month does not.
+    for iso in ["2026-11-02", "2026-11-01", "2026-10-31"] {
+        bounds_of(cx, format!("cal-dot-{iso}"));
+    }
+    assert!(
+        cx.debug_bounds("cal-dot-2026-11-15").is_none(),
+        "a day with no entry has no dot"
+    );
+    // Today is inside the grid it belongs to.
+    let today = bounds_of(cx, "cal-2026-11-02".into());
+    assert!(
+        today.origin.x >= grid.origin.x && today.right() <= grid.right() + px(0.5),
+        "today's cell is in the strip: {today:?} {grid:?}"
+    );
+
+    // Folding and unfolding is one click on the month name; the list below moves with it.
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let recent_before = bounds(cx, "recent-days-header");
+    cx.simulate_click(strip.center(), gpui::Modifiers::default());
+    assert!(!ws.update(cx, |w, _| w.calendar_open()));
+    let recent = bounds(cx, "recent-days-header");
+    assert!(
+        recent.origin.y < recent_before.origin.y,
+        "the folded month gives the list its room back: {recent:?} {recent_before:?}"
+    );
+    cx.simulate_click(strip.center(), gpui::Modifiers::default());
+    assert!(ws.update(cx, |w, _| w.calendar_open()));
+
+    // A day cell opens that day (a draft until written, FR-1.2).
+    let cell = bounds_of(cx, "cal-2026-10-30".into());
+    cx.simulate_click(cell.center(), gpui::Modifiers::default());
+    let day = NaiveDate::from_ymd_opt(2026, 10, 30).unwrap();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(PageId::for_date(day)));
+}

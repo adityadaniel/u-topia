@@ -1352,42 +1352,27 @@ impl Workspace {
                 cx,
             ))
             .child(
-                self.nav_item(
-                    "toggle-calendar",
-                    if self.calendar_open {
-                        "▾ Calendar"
-                    } else {
-                        "▸ Calendar"
-                    },
-                    None,
-                    cx,
-                )
-                .text_color(th.muted)
-                .debug_selector(|| "toggle-calendar".into())
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_calendar(cx))),
-            )
-            .when(self.calendar_open, |col| {
-                col.child(
-                    div()
-                        .debug_selector(|| "left-calendar".into())
-                        .px_1()
-                        .py_2()
-                        .child(crate::calendar::render(
-                            cx,
-                            self.month,
-                            today,
-                            &self.sidebar.days,
-                            Self::pick_date,
-                            Self::shift_month,
-                        )),
-                )
-            });
+                div()
+                    .pt_1()
+                    .px_1()
+                    .child(crate::calendar::render_month_strip(
+                        cx,
+                        self.month,
+                        today,
+                        &self.sidebar.days,
+                        self.calendar_open,
+                        Self::pick_date,
+                        Self::shift_month,
+                        Self::toggle_calendar,
+                    )),
+            );
         let mut scroll = div()
             .id("left-scroll")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll();
-        scroll = scroll.child(section("RECENT DAYS"));
+        scroll =
+            scroll.child(section("RECENT DAYS").debug_selector(|| "recent-days-header".into()));
         for (i, entry) in self.sidebar.journal.iter().enumerate() {
             scroll = scroll.child(self.recent_day_row(i, entry, cx));
         }
