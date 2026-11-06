@@ -928,6 +928,46 @@ fn seed_help_graph(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Seed a scratch graph for the page-view screenshots (PG-1 … PG-5): a project page with
+/// attributes, an alias, headings, a done and an open to-do, a collapsed parent, a quote
+/// and two code blocks (one that names its language).
+fn seed_page_view(path: &Path) -> Result<()> {
+    use BlockKind::{Bullet, Code, Heading, Quote, Todo};
+    let mut s = Store::open(path)?;
+    let page = s.create_page("Trellis")?;
+    let ids = insert_tree(
+        &mut s,
+        &page,
+        &[
+            (0, Bullet, "status:: dogfooding"),
+            (0, Bullet, "owner:: [[Ana Lovelace]]"),
+            (0, Bullet, "due:: 2026-11-20"),
+            (0, Heading(1), "Goals"),
+            (1, Bullet, "Replace Roam for daily notes by December"),
+            (1, Todo, "Send [[Ana Lovelace]] the migration notes"),
+            (1, Todo, "Draft the release notes"),
+            (0, Heading(2), "Open questions"),
+            (1, Bullet, "Do we need block-level permissions?"),
+            (2, Bullet, "Probably not for v1"),
+            (1, Quote, "Ship the small thing that works."),
+            (1, Code, "rust\nfn main() {\n    println!(\"hello\");\n}"),
+            (1, Code, "make check"),
+            (0, Heading(3), "Later"),
+            (
+                1,
+                Bullet,
+                "Sync between the studio iMac and the MacBook Pro",
+            ),
+        ],
+    )?;
+    // A done to-do, an alias for the toolbar and a collapsed parent to show its arrow.
+    s.set_block_kind(&page, &ids[5], Todo, true)?;
+    s.add_alias(&page, "the board")?;
+    s.set_collapsed(&ids[13], true)?;
+    s.sync_index()?;
+    Ok(())
+}
+
 /// Regenerate the screenshots embedded in Settings → Help.
 ///
 /// Builds the app, seeds a mock graph, then drives the real window with
@@ -1067,9 +1107,12 @@ fn main() -> Result<()> {
         Some("bundle") => bundle(args.iter().any(|a| a == "--debug")),
         Some("mobile") => mobile(args.iter().any(|a| a == "--ios")),
         Some("help-shots") => help_shots(),
+        Some("seed-page-view") => {
+            seed_page_view(Path::new(args.get(1).context("graph path to seed")?))
+        }
         _ => {
             println!(
-                "usage: cargo run -p xtask --release -- bench [--ui]\n       cargo run -p xtask -- bundle [--debug]   (target/Utopia.app, registers utopia://)\n       cargo run -p xtask -- mobile [--ios]     (Swift bindings, checks, iOS shell)\n       cargo run -p xtask -- help-shots         (regenerate Settings -> Help screenshots)\n       cargo run -p xtask --release -- profile-merge   (loop for sampling with `sample`)"
+                "usage: cargo run -p xtask --release -- bench [--ui]\n       cargo run -p xtask -- bundle [--debug]   (target/Utopia.app, registers utopia://)\n       cargo run -p xtask -- mobile [--ios]     (Swift bindings, checks, iOS shell)\n       cargo run -p xtask -- help-shots         (regenerate Settings -> Help screenshots)\n       cargo run -p xtask -- seed-page-view <file.utopia>   (scratch graph for page-view shots)\n       cargo run -p xtask --release -- profile-merge   (loop for sampling with `sample`)"
             );
             Ok(())
         }
