@@ -1801,6 +1801,9 @@ impl PageView {
         div()
             .id("page-menu-popup")
             .debug_selector(|| "page-menu-popup".into())
+            // Without `occlude` the menu is drawn over the page but clicks pass through it
+            // to whatever is underneath, so its items never fire (found by test).
+            .occlude()
             .w(px(180.))
             .p_1()
             .flex()

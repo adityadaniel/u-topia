@@ -562,3 +562,29 @@ fn opening_the_page_menu_does_not_move_the_title(cx: &mut TestAppContext) {
         "the title keeps its bounds when the menu opens"
     );
 }
+
+/// ALL-3 follow-up: the page menu is drawn over the page, so it must also take the clicks
+/// meant for it. Without `occlude` the "Delete page" item is visible but never fires (found
+/// while building the reference menus).
+#[gpui::test]
+fn page_menu_items_take_their_clicks(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_refs(cx, false);
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let delete = bounds(cx, "page-menu-delete");
+    cx.simulate_click(delete.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let app = ws.update(cx, |w, _| w.app().clone());
+    let deleted = app.update(cx, |app, _| {
+        app.store
+            .page_row(&target)
+            .unwrap()
+            .is_some_and(|r| r.deleted_at.is_some())
+    });
+    assert!(deleted, "the danger item deleted the page it belongs to");
+}
