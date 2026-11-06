@@ -56,6 +56,11 @@ pub enum PageViewEvent {
         page: PageId,
         block: BlockId,
     },
+    /// Pin or unpin this page in the left sidebar (SB-3). The workspace owns the local
+    /// preference; the page itself is untouched (rule 9).
+    TogglePin {
+        page: PageId,
+    },
     /// A `{{pdf: blob:…}}` attachment was clicked (P2 PDF viewer).
     OpenPdf {
         hash: String,
@@ -1917,6 +1922,23 @@ impl PageView {
                     this.start_rename(window, cx);
                 }))
         });
+        let pin = self.page.clone().map(|page| {
+            let pinned = crate::appearance::is_pinned(cx, &page);
+            quiet_control(
+                "page-menu-pin",
+                if pinned {
+                    "Unpin from sidebar"
+                } else {
+                    "Pin to sidebar"
+                },
+                &th,
+            )
+            .debug_selector(|| "page-menu-pin".into())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.page_menu = false;
+                cx.emit(PageViewEvent::TogglePin { page: page.clone() });
+            }))
+        });
         let delete = quiet_danger("page-menu-delete", "Delete page", &th)
             .debug_selector(|| "page-menu-delete".into())
             .on_click(cx.listener(|this, _, _, cx| {
@@ -1937,6 +1959,7 @@ impl PageView {
             .rounded_md()
             .shadow_md()
             .children(rename.map(|r| r.w_full().justify_start()))
+            .children(pin.map(|p| p.w_full().justify_start()))
             .child(delete.w_full().justify_start())
     }
 

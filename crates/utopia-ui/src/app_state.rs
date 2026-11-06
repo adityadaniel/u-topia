@@ -5,6 +5,7 @@
 //! structural edits), and [`IndexUpdated`] fires once the writer has made them durable so
 //! reference panels can re-query.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use gpui::{Context, EventEmitter, Subscription, Task};
@@ -37,6 +38,10 @@ pub struct AppState {
     pub notice: Option<String>,
     /// Plugins from `<config>/plugins` (P2), offered in the slash menu.
     pub plugins: Vec<std::rc::Rc<utopia_plugin::Plugin>>,
+    /// Pages that exist only because of a `#tag` (SB-2), cached from the index. Views read
+    /// this; the classification query runs at startup and on [`IndexUpdated`], never in a
+    /// render (rule 10).
+    pub tag_pages: HashSet<PageId>,
     dirty_since: Option<Instant>,
     flush_task: Option<Task<()>>,
     wait_task: Option<Task<()>>,
@@ -51,6 +56,8 @@ impl AppState {
         if let Err(e) = store.set_debounced(true) {
             eprintln!("utopia: {e}");
         }
+        // Classify once here, then on every index update: rendering only reads the cache.
+        let tag_pages = store.hashtag_only_pages().unwrap_or_default();
         Self {
             store,
             version: 0,
@@ -58,6 +65,7 @@ impl AppState {
             last_error: None,
             notice: None,
             plugins: Vec::new(),
+            tag_pages,
             dirty_since: None,
             flush_task: None,
             wait_task: None,
@@ -123,6 +131,9 @@ impl AppState {
 
     fn index_updated(&mut self, cx: &mut Context<Self>) {
         self.refs_version += 1;
+        // Derived from the index and cached: the sidebar must not re-parse references while
+        // drawing a frame (SB-2, rule 10).
+        self.tag_pages = self.store.hashtag_only_pages().unwrap_or_default();
         cx.emit(IndexUpdated);
         cx.notify();
     }
