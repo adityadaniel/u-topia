@@ -444,6 +444,65 @@ fn revealing_a_row_keeps_the_caret_below_the_pinned_date(cx: &mut TestAppContext
     );
 }
 
+/// DN-3: a row that the list considers visible can still be drawn *under* the pinned
+/// date (its heading is 63 px tall). Navigating up to such a row must move it below the
+/// heading, or the caret and the text being edited disappear behind it.
+#[gpui::test]
+fn a_row_under_the_pinned_date_is_moved_below_it(cx: &mut TestAppContext) {
+    let (ws, cx) = setup_feed(cx, &[(0, 80)], H);
+    // Open the feed with the caret in the first block, then move it down a page's worth.
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    for _ in 0..23 {
+        cx.simulate_keystrokes("down");
+    }
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.editor().read(cx).field_text().to_string()),
+        "note 22",
+        "the caret is on note 22 (item 23)"
+    );
+    let main = bounds(cx, "main-pane");
+    // Put note 20 (item 21) at the top of the list, so note 21 (item 22) — the row an Up
+    // lands on — is the second visible row, inside the 63 px the pinned date covers.
+    // A wheel event only reaches what the list has measured so far, so repeat.
+    for _ in 0..8 {
+        let delta = f32::from(bounds(cx, "content-21").origin.y - main.origin.y);
+        if delta.abs() <= 1. {
+            break;
+        }
+        scroll_main(cx, -delta);
+    }
+    assert!(
+        approx(bounds(cx, "content-21").origin.y, f32::from(main.origin.y)),
+        "note 20 sits at the top of the list"
+    );
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_sticky_day(cx)),
+        Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()),
+        "the day's date is pinned over the top of the column"
+    );
+    let pin = bounds(cx, "sticky-day");
+    let hidden = bounds(cx, "content-22");
+    assert!(
+        hidden.origin.y < pin.origin.y + pin.size.height - px(0.5),
+        "the row above the caret really is under the heading: {hidden:?} {pin:?}"
+    );
+
+    // Up from note 22 lands on note 21, which the list thinks is visible.
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.editor().read(cx).field_text().to_string()),
+        "note 21"
+    );
+    let row = bounds(cx, "content-22");
+    assert!(
+        row.origin.y >= pin.origin.y + pin.size.height - px(0.5),
+        "the row being edited stays below the pinned date: row {row:?}, pin {pin:?}"
+    );
+}
+
 /// DN-3 with DN-1: a folded day carries its own date in its 36 px row, so the previous
 /// day's heading is not pinned over it.
 #[gpui::test]

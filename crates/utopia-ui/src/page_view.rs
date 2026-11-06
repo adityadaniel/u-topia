@@ -552,6 +552,12 @@ impl PageView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // DN-3: the row may be drawn under the pinned day heading. Asked of the frame the
+        // user is looking at, before the rebuild below re-measures every row.
+        let line = crate::appearance::density(cx).line_height();
+        let under_heading = self
+            .row_index(&block)
+            .is_some_and(|ix| self.row_overlaps_pinned_day(ix, line));
         self.rebuild_if_dirty(cx);
         let drawn = self.row_index(&block).is_some();
         if !drawn {
@@ -592,11 +598,17 @@ impl PageView {
             // rendered gets no keystrokes).
             self.rebuild(cx);
         }
+        let ix = self.row_index(&block);
         self.splice_items(self.items.len(), cx);
-        match self.row_index(&block) {
+        match ix {
+            // DN-3: the row was under the pinned heading: put its top below it.
+            Some(ix) if under_heading => self.list.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: -px(STICKY_HEIGHT),
+            }),
             Some(ix) => {
                 self.list.scroll_to_reveal_item(ix);
-                // DN-3: leave room for the pinned day heading above the row.
+                // The row the list just put at its top edge is under the heading too.
                 self.leave_room_for_the_pinned_day(ix);
             }
             // Still no row (an ordinary collapsed ancestor hides it): stop rather than keep
@@ -606,9 +618,36 @@ impl PageView {
         cx.notify();
     }
 
-    /// DN-3: an edit target above the viewport is revealed at the list's top edge, where
-    /// the pinned day heading would cover it and its caret. Put the row one heading-height
-    /// down instead, so the caret shows below the pin (the strip above it is the pin).
+    /// DN-3: the pinned day heading is drawn *over* the top of the list, so a row the list
+    /// counts as visible can still be hidden behind it. True when the row's own top sits
+    /// above the heading's bottom edge — the row revealed at the list's top edge, or the
+    /// next short row scrolled up under the 63 px heading. Measured against bounds when the
+    /// list has them, so a tall row that merely *follows* the top one does not trigger a
+    /// scroll it does not need.
+    fn row_overlaps_pinned_day(&self, ix: usize, line_height: f32) -> bool {
+        if self.sticky_heading().is_none() {
+            return false;
+        }
+        let viewport = self.list.viewport_bounds();
+        if viewport.size.height > px(0.) {
+            if let Some(row) = self.list.bounds_for_item(ix) {
+                return row.top() < viewport.top() + px(STICKY_HEIGHT);
+            }
+        }
+        // A splice (an edit starts by re-registering the rows so the editor can keep the
+        // keystrokes) leaves the list with no measured rows until the next layout. Estimate
+        // from the offset instead: the heading covers `STICKY_HEIGHT`, and a row is at
+        // least one line tall, so only the first few rows can hide under it.
+        if -self.list.logical_scroll_top().offset_in_item >= px(STICKY_HEIGHT) {
+            return false;
+        }
+        let rows = (STICKY_HEIGHT / line_height.max(1.)).ceil() as usize;
+        ix <= self.list.logical_scroll_top().item_ix + rows
+    }
+
+    /// DN-3: a row the list reveals at its top edge is under the pinned heading. The rows
+    /// re-measured by a splice have no bounds yet, so this index check stays as the
+    /// fallback for that case.
     fn leave_room_for_the_pinned_day(&self, ix: usize) {
         let top = self.list.logical_scroll_top();
         if top.item_ix != ix || top.offset_in_item > px(0.) {
