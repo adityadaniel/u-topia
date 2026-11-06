@@ -154,11 +154,24 @@ impl Store {
                 .push(m.range.clone());
         }
         let mut page_steps = Vec::with_capacity(steps.len());
+        let mut linked = 0;
         for (src_page, blocks) in steps {
             let mut cmds = Vec::new();
             for (block, mut ranges) in blocks {
-                ranges.sort_by_key(|r| std::cmp::Reverse(r.start));
+                // A title and one of its aliases can match the same words ("New York" and
+                // "York"), so the list holds overlapping ranges. Keep the earliest, longest
+                // span and drop anything that overlaps it: two edits over the same bytes
+                // would rewrite each other's replacements.
+                ranges.sort_by_key(|r| (r.start, std::cmp::Reverse(r.end)));
+                let mut kept: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
                 for range in ranges {
+                    if kept.last().is_none_or(|last| range.start >= last.end) {
+                        kept.push(range);
+                    }
+                }
+                // Apply from the end back so earlier byte offsets stay valid.
+                for range in kept.into_iter().rev() {
+                    linked += 1;
                     cmds.push(Command::SetBlockText {
                         id: block.clone(),
                         edit: utopia_core::TextEdit {
@@ -170,7 +183,6 @@ impl Store {
             }
             page_steps.push((src_page, cmds));
         }
-        let linked = mentions.len();
         self.execute_multi(page_steps, EditOpts::default())?;
         Ok(linked)
     }

@@ -413,3 +413,32 @@ fn promote_all_mentions_links_every_mention_in_one_step() {
     // Nothing to link is zero, not an error.
     assert_eq!(s.promote_all_mentions(&m).unwrap_or(0), 2);
 }
+
+/// LR-5 review fix: a title and one of its aliases can match the same words. The mention
+/// list then holds overlapping ranges ("New York" 0..8 and "York" 4..8), and linking both
+/// would rewrite the text twice over itself.
+#[test]
+fn promote_all_mentions_keeps_overlapping_mentions_apart() {
+    let (mut s, _d) = store();
+    let ny = s.create_page("New York").unwrap();
+    s.add_alias(&ny, "York").unwrap();
+    let src = s.create_page("Travel").unwrap();
+    let b = write(&mut s, &src, "flying to New York in May");
+    let mentions = s.unlinked_references(&ny).unwrap();
+    assert_eq!(
+        mentions.len(),
+        2,
+        "the title and its alias both match: {mentions:?}"
+    );
+
+    assert_eq!(
+        s.promote_all_mentions(&ny).unwrap(),
+        1,
+        "one span, one link"
+    );
+    s.sync_index().unwrap();
+    let text = s.page_state(&src).unwrap().block(&b).unwrap().text.clone();
+    assert_eq!(text, "flying to [[New York]] in May", "no doubled rewrite");
+    assert!(s.unlinked_references(&ny).unwrap().is_empty());
+    doctor_ok(&mut s);
+}
