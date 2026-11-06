@@ -1072,6 +1072,37 @@ fn search_scope_filters_page_titles(cx: &mut TestAppContext) {
         jump.read_with(cx, |j, _| j.page_titles()).is_empty(),
         "Pages must not keep the inserted daily date"
     );
+
+    // With no eligible row, Enter must not create a page outside the chosen scope.
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input("novelpage");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("quick jump reopened");
+    let journal = cx
+        .debug_bounds("search-scope-journal")
+        .expect("the Journal chip");
+    cx.simulate_click(journal.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.scope()),
+        utopia_store::SearchScope::Journal
+    );
+    assert!(
+        jump.read_with(cx, |j, _| j.page_titles()).is_empty(),
+        "Journal has no title row for a novel ordinary page"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        app.update(cx, |app, _| app
+            .store
+            .find_page("novelpage")
+            .unwrap()
+            .is_none()),
+        "Journal scope has no page to create"
+    );
 }
 
 /// SR-5: when page titles fill the results viewport, the block Cmd+Shift+F selects is

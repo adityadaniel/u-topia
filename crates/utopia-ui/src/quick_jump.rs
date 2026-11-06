@@ -394,7 +394,9 @@ impl JumpPalette {
             return;
         }
         let Some(row) = self.rows.get(ix).cloned() else {
-            if self.mode == PaletteMode::Search {
+            // Nothing matched: only quick jump may create, and only when the scope allows
+            // it (the Create row is what carries that decision; SR-3).
+            if self.mode == PaletteMode::Search || !self.offers_create() {
                 return;
             }
             // Nothing matched yet: treat the query as a title (dates resolve first).
