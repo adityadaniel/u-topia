@@ -216,6 +216,22 @@ fn daily_notes_feed_stacks_days(cx: &mut TestAppContext) {
     let older = bounds(cx, "day-title");
     assert!(older.origin.y > row.origin.y, "older days follow today");
     assert!(title.origin.y + title.size.height <= row.origin.y + px(0.5));
+    // DN-2: the weekday caption sits above the date, on today and on older open days,
+    // and is smaller than the date it captions.
+    let today_caption = bounds(cx, "day-caption-2026-11-02");
+    let today_date = bounds(cx, "day-date-2026-11-02");
+    let older_caption = bounds(cx, "day-caption-2026-11-01");
+    let older_date = bounds(cx, "day-date-2026-11-01");
+    for (caption, date) in [(today_caption, today_date), (older_caption, older_date)] {
+        assert!(
+            caption.origin.y + caption.size.height <= date.origin.y + px(0.5),
+            "the caption is above its date: {caption:?} {date:?}"
+        );
+        assert!(
+            caption.size.height < date.size.height,
+            "a caption, not a second title: {caption:?} {date:?}"
+        );
+    }
     assert!(
         cx.debug_bounds("refs-header").is_none(),
         "no references inside the feed"

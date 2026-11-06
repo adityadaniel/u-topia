@@ -134,6 +134,10 @@ enum Item {
         date: NaiveDate,
         page: Option<PageId>,
         title: SharedString,
+        /// "Thursday · Today" above the date (DN-2).
+        caption: SharedString,
+        /// Today's caption is in the accent colour (DN-2).
+        today: bool,
         first: bool,
     },
     /// A day in the feed with no blocks.
@@ -672,7 +676,7 @@ impl PageView {
             Some(j) if j.refs_version == refs_version => std::mem::take(&mut j.refs),
             _ => HashMap::new(),
         };
-        let (header, days) = self.app.update(cx, |app, _| {
+        let (header, days, today_date) = self.app.update(cx, |app, _| {
             let collapsed = app.store.collapsed_set().clone();
             let fmt = app.store.date_format().clone();
             let today_date = app.store.today();
@@ -743,7 +747,7 @@ impl PageView {
                     _ => break,
                 }
             }
-            (header, days)
+            (header, days, today_date)
         });
         self.header = header;
         let mut items = Vec::new();
@@ -753,6 +757,8 @@ impl PageView {
                 date: day.date,
                 page: day.page.clone(),
                 title: day.title.into(),
+                caption: day_caption(day.date, today_date).into(),
+                today: day.date == today_date,
                 first: i == 0,
             });
             if day.rows.is_empty() {
@@ -2420,6 +2426,8 @@ impl PageView {
                 date,
                 page,
                 title,
+                caption,
+                today,
                 first,
             } => div()
                 .debug_selector(move || if first { "today-title" } else { "day-title" }.into())
@@ -2428,8 +2436,22 @@ impl PageView {
                 .pt_4()
                 .pb_2()
                 .child(
+                    // DN-2: the weekday, plus "Today"/"Yesterday". Titles stay display
+                    // only: identity is still `daily_date` (rule 6).
+                    div()
+                        .debug_selector(move || {
+                            format!("day-caption-{}", utopia_core::date::iso(date))
+                        })
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(if today { th.accent } else { th.muted })
+                        .child(caption),
+                )
+                .child(
                     div()
                         .id(("day-title", ix))
+                        .debug_selector(move || {
+                            format!("day-date-{}", utopia_core::date::iso(date))
+                        })
                         .text_size(px(crate::theme::TITLE_SIZE))
                         .line_height(px(34.))
                         .font_weight(gpui::FontWeight::BOLD)
@@ -2876,5 +2898,43 @@ fn human_size(n: u64) -> String {
         0..1024 => format!("{n} B"),
         1024..1_048_576 => format!("{:.0} KB", n as f64 / 1024.),
         _ => format!("{:.1} MB", n as f64 / 1_048_576.),
+    }
+}
+
+/// DN-2: the caption above a day in the feed: "Thursday · Today", "Wednesday ·
+/// Yesterday", or just "Monday". Display only (§10.3: a day's identity is its date).
+fn day_caption(date: NaiveDate, today: NaiveDate) -> String {
+    let weekday = utopia_core::date::weekday_name_of(date);
+    match (today - date).num_days() {
+        0 => format!("{weekday} · Today"),
+        1 => format!("{weekday} · Yesterday"),
+        _ => weekday.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DN-2: "Thursday · Today", "Wednesday · Yesterday", "Monday".
+    #[test]
+    fn day_captions_name_the_weekday_and_the_neighbours() {
+        // Thursday, November 5th, 2026.
+        let today = NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        assert_eq!(day_caption(today, today), "Thursday · Today");
+        assert_eq!(
+            day_caption(today.pred_opt().unwrap(), today),
+            "Wednesday · Yesterday"
+        );
+        assert_eq!(
+            day_caption(today - chrono::Duration::days(3), today),
+            "Monday"
+        );
+        // Days further back get the weekday alone; the feed never shows a future day.
+        assert_eq!(
+            day_caption(today - chrono::Duration::days(30), today),
+            "Tuesday"
+        );
+        assert_eq!(day_caption(today.succ_opt().unwrap(), today), "Friday");
     }
 }
