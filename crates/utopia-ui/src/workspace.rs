@@ -73,6 +73,14 @@ enum JumpMode {
     Extract { page: PageId, block: BlockId },
 }
 
+/// A page stacked in the right sidebar (RS-5): its view, whether its card is folded to the
+/// header, and the title the header shows.
+struct SidePane {
+    view: Entity<PageView>,
+    collapsed: bool,
+    title: SharedString,
+}
+
 #[derive(Default)]
 struct SidebarData {
     journal: Vec<JournalEntry>,
@@ -95,7 +103,7 @@ pub struct Workspace {
     app: Entity<AppState>,
     editor: Entity<BlockEditor>,
     main: Entity<PageView>,
-    panes: Vec<Entity<PageView>>,
+    panes: Vec<SidePane>,
     splits: Vec<Entity<PageView>>,
     right_open: bool,
     /// The right sidebar's width in points (RS-4), kept in `settings.json` (rule 9).
@@ -450,6 +458,20 @@ impl Workspace {
             .collect()
     }
 
+    /// The title a sidebar card shows for `page` (RS-5): the display title, from the shard,
+    /// so a draft day and a renamed page both read right.
+    fn pane_title(&self, page: &PageId, cx: &mut Context<Self>) -> SharedString {
+        self.app
+            .update(cx, |app, _| {
+                let fmt = app.store.date_format().clone();
+                app.store
+                    .page_state(page)
+                    .map(|st| utopia_store::display_title(st, &fmt))
+                    .unwrap_or_default()
+            })
+            .into()
+    }
+
     /// Pages pinned in the sidebar's Pinned tab, in the order they show (RS-3).
     pub fn pinned_pages(&self, _cx: &gpui::App) -> Vec<PageId> {
         self.pinned.iter().map(|(p, _)| p.clone()).collect()
@@ -459,7 +481,7 @@ impl Workspace {
     pub fn sidebar_pages(&self, cx: &gpui::App) -> Vec<PageId> {
         self.panes
             .iter()
-            .filter_map(|p| p.read(cx).page.clone())
+            .filter_map(|p| p.view.read(cx).page.clone())
             .collect()
     }
 
@@ -516,7 +538,7 @@ impl Workspace {
                 cx,
             ),
             PageViewEvent::Close => {
-                self.panes.retain(|p| p != view);
+                self.panes.retain(|p| &p.view != view);
                 self.splits.retain(|p| p != view);
                 cx.notify();
             }
@@ -552,11 +574,11 @@ impl Workspace {
         self.editor.update(cx, |e, cx| e.end(cx));
         if sidebar {
             // Shift-click stacks the page beside the current one (§0, W6).
-            let existing = self
-                .panes
-                .iter()
-                .position(|p| p.read(cx).page.as_ref() == Some(&page) && p.read(cx).zoom == zoom);
-            let view = match existing {
+            let existing = self.panes.iter().position(|p| {
+                p.view.read(cx).page.as_ref() == Some(&page) && p.view.read(cx).zoom == zoom
+            });
+            let pane = match existing {
+                // Re-opening moves the card back to the top but keeps it folded if it was.
                 Some(i) => self.panes.remove(i),
                 None => {
                     let v = cx.new(|cx| {
@@ -565,10 +587,14 @@ impl Workspace {
                     self.subs
                         .push(cx.subscribe_in(&v, window, Self::on_page_event));
                     v.update(cx, |v, cx| v.open(page.clone(), zoom.clone(), cx));
-                    v
+                    SidePane {
+                        view: v,
+                        collapsed: false,
+                        title: self.pane_title(&page, cx),
+                    }
                 }
             };
-            self.panes.insert(0, view);
+            self.panes.insert(0, pane);
             self.right_open = true;
         } else {
             self.pdf = None;
@@ -1095,6 +1121,31 @@ impl Workspace {
                 days: all.iter().filter_map(|p| p.daily_date).collect(),
                 pages: all.into_iter().filter(|p| !p.is_daily()).collect(),
             };
+            // Card headers name their page (RS-5); a rename must reach them.
+            let pages: Vec<Option<PageId>> = self
+                .panes
+                .iter()
+                .map(|p| p.view.read(cx).page.clone())
+                .collect();
+            let titles: Vec<SharedString> = self.app.update(cx, |app, _| {
+                let fmt = app.store.date_format().clone();
+                pages
+                    .into_iter()
+                    .map(|page| {
+                        page.and_then(|p| {
+                            app.store
+                                .page_state(&p)
+                                .ok()
+                                .map(|st| utopia_store::display_title(st, &fmt))
+                        })
+                        .unwrap_or_default()
+                        .into()
+                    })
+                    .collect()
+            });
+            for (pane, title) in self.panes.iter_mut().zip(titles) {
+                pane.title = title;
+            }
         }
         let Some(page) = self.main.read(cx).page.clone() else {
             return;
@@ -2090,15 +2141,87 @@ impl Render for Workspace {
                         .child("Shift-click a link to open it here."),
                 );
             }
-            for p in &self.panes {
-                panel = panel.child(
+            for (i, pane) in self.panes.iter().enumerate() {
+                // RS-5: a card per page, its header carrying the fold arrow and the close ×,
+                // like Roam's right sidebar. A folded card is its header and nothing more.
+                let collapsed = pane.collapsed;
+                let title = pane.title.clone();
+                let mut card = div()
+                    .id(("pane-card", i))
+                    .debug_selector(move || format!("pane-{i}"))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .border_b_1()
+                    .border_color(th.line)
+                    .when(collapsed, |d| d.flex_none())
+                    .when(!collapsed, |d| d.flex_1().min_h(px(140.)));
+                card = card.child(
                     div()
-                        .flex_1()
-                        .min_h(px(140.))
-                        .border_b_1()
-                        .border_color(th.line)
-                        .child(p.clone()),
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_1()
+                        .py_0p5()
+                        .hover(|d| d.bg(th.hover))
+                        .child(
+                            div()
+                                .id(("pane-collapse", i))
+                                .debug_selector(move || format!("pane-collapse-{i}"))
+                                .px_1()
+                                .rounded_sm()
+                                .text_size(px(crate::theme::CONTROL_SIZE))
+                                .text_color(th.muted)
+                                .cursor_pointer()
+                                .hover(|d| d.text_color(th.text))
+                                .child(if collapsed { "▸" } else { "▾" })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(pane) = this.panes.get_mut(i) {
+                                        pane.collapsed = !pane.collapsed;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(move || format!("pane-title-{i}"))
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(crate::theme::CAPTION_SIZE))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(th.muted)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .id(("pane-close", i))
+                                .debug_selector(move || format!("pane-close-{i}"))
+                                .px_1()
+                                .rounded_sm()
+                                .text_size(px(crate::theme::CONTROL_SIZE))
+                                .text_color(th.muted)
+                                .cursor_pointer()
+                                .hover(|d| d.bg(th.hover).text_color(th.text))
+                                .child("×")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if i < this.panes.len() {
+                                        this.panes.remove(i);
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
                 );
+                if !collapsed {
+                    card = card.child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .border_t_1()
+                            .border_color(th.line)
+                            .child(pane.view.clone()),
+                    );
+                }
+                panel = panel.child(card);
             }
             if self.inspector_open {
                 panel = panel.child(self.render_inspector(cx));

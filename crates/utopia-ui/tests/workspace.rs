@@ -652,6 +652,69 @@ fn pinned_pages_can_be_added_and_removed(cx: &mut TestAppContext) {
     );
 }
 
+/// RS-5: pages shift-opened in the sidebar stack as cards with a fold arrow and a close ×.
+#[gpui::test]
+fn sidebar_cards_collapse_and_close(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (alpha, beta) = app.update(cx, |app, _| {
+        (
+            app.store.create_page("Alpha").unwrap(),
+            app.store.create_page("Beta").unwrap(),
+        )
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(alpha.clone(), None, None, true, window, cx);
+        w.open(beta.clone(), None, None, true, window, cx);
+    });
+    // Opening a page in the sidebar is what shows it, so no toggle here.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.sidebar_pages(cx)),
+        vec![beta.clone(), alpha.clone()],
+        "the newest card is on top"
+    );
+    // Each card names its page.
+    assert!(cx.debug_bounds("pane-title-0").is_some());
+    assert!(cx.debug_bounds("pane-title-1").is_some());
+    let expanded = cx.debug_bounds("pane-0").expect("the top card");
+    let fold = cx.debug_bounds("pane-collapse-0").expect("the fold arrow");
+    cx.simulate_click(fold.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let folded = cx.debug_bounds("pane-0").expect("the folded card");
+    assert!(
+        folded.size.height < expanded.size.height && folded.size.height < gpui::px(40.),
+        "a folded card is its header: {folded:?} (was {expanded:?})"
+    );
+    assert!(
+        cx.debug_bounds("pane-title-0").is_some(),
+        "the header, and so the page's name, stays"
+    );
+
+    // The × closes a card; the rest of the stack stays.
+    assert_eq!(ws.update(cx, |w, cx| w.sidebar_pages(cx)).len(), 2);
+    let close = cx.debug_bounds("pane-close-1").expect("the close ×");
+    cx.simulate_click(close.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.sidebar_pages(cx)),
+        vec![beta.clone()],
+        "closing a card removes just that page"
+    );
+
+    // Opening that page again moves its card to the top without a duplicate, still folded.
+    ws.update_in(cx, |w, window, cx| {
+        w.open(beta.clone(), None, None, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.sidebar_pages(cx)), vec![beta]);
+    let again = cx.debug_bounds("pane-0").expect("the card again");
+    assert!(
+        again.size.height < gpui::px(40.),
+        "the card was still folded: {again:?}"
+    );
+}
+
 #[gpui::test]
 fn keystrokes_are_debounced_then_committed(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);
