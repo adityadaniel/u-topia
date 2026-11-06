@@ -686,6 +686,36 @@ impl Store {
         )? as usize)
     }
 
+    /// Which of `pages` exist only because of a hashtag (FR-2.15): every live inbound
+    /// reference spells the title as a tag (`#tag`, `#[[Multi Word]]`), so nothing ever
+    /// linked the page as `[[…]]`. Read from the `ref` index at query time (rule 3), never
+    /// during paint; Quick jump labels those rows "Tag" (QJ-2). A page with no inbound
+    /// references is not a tag page — it just has no links yet.
+    pub fn tag_pages(&self, pages: &[PageId]) -> Result<HashSet<PageId>> {
+        self.read_barrier()?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT b.text, r.anchor_start FROM ref r JOIN block b ON b.id=r.src_block_id
+             WHERE r.dst_page_id=?1 AND r.dst_kind='page' AND b.deleted_at IS NULL",
+        )?;
+        let mut out = HashSet::new();
+        for page in pages {
+            let anchors = stmt
+                .query_map([page.as_str()], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // A tag span starts at its `#`; a `[[…]]` span starts at its first bracket.
+            let tagged = !anchors.is_empty()
+                && anchors
+                    .iter()
+                    .all(|(text, at)| text.as_bytes().get(*at as usize) == Some(&b'#'));
+            if tagged {
+                out.insert(page.clone());
+            }
+        }
+        Ok(out)
+    }
+
     /// "Referenced by (N)" for a block (FR-3.5).
     pub fn block_backlinks(&self, block: &BlockId) -> Result<Vec<RefHit>> {
         self.read_barrier()?;

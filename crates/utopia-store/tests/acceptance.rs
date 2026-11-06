@@ -303,6 +303,27 @@ fn ac_2_5_paste_five_hundred_lines_one_undo() {
 }
 
 #[test]
+fn hashtag_only_pages_are_tag_pages() {
+    let mut s = store();
+    let notes = s.create_page("Notes").unwrap();
+    // Made by a tag in one block and a `[[…]]` link in another: a page, not a tag page.
+    let both = s.create_page("Both").unwrap();
+    let tagged = s.create_page("Atlas").unwrap();
+    let unlinked = s.create_page("Lonely").unwrap();
+    write(&mut s, &notes, "#Atlas and [[Both]]");
+    write(&mut s, &notes, "more #[[Both]]");
+    let tags = s
+        .tag_pages(&[tagged.clone(), both.clone(), unlinked.clone()])
+        .unwrap();
+    assert!(tags.contains(&tagged), "only reachable through #Atlas");
+    assert!(
+        !tags.contains(&both),
+        "one [[Both]] link makes it a page, not a tag"
+    );
+    assert!(!tags.contains(&unlinked), "no references at all is no tag");
+}
+
+#[test]
 fn ac_2_7_hashtag_equals_link() {
     let mut s = store();
     let a = s.create_page("A").unwrap();

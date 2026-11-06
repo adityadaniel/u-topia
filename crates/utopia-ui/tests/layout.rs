@@ -28,6 +28,25 @@ fn setup(cx: &mut TestAppContext) -> &mut VisualTestContext {
     cx
 }
 
+/// Like [`setup`], but the graph already holds `titles` (Quick jump result rows).
+fn setup_titles<'a>(cx: &'a mut TestAppContext, titles: &[&str]) -> &'a mut VisualTestContext {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    for t in titles {
+        store.create_page(t).unwrap();
+    }
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx
+}
+
 /// Today's page on its own (the calendar's "Today"), not the Daily Notes feed.
 fn setup_page(cx: &mut TestAppContext) -> &mut VisualTestContext {
     let cx = setup(cx);
@@ -191,8 +210,8 @@ fn quick_jump_is_centered(cx: &mut TestAppContext) {
     );
 }
 
-/// QJ-1: with nothing typed the palette offers today and yesterday, in that order, and
-/// nothing else — there is no query to search or create from.
+/// QJ-1: with nothing typed the palette offers today and yesterday, in that order, and no
+/// "Create" row — there is no query to create from.
 #[gpui::test]
 fn quick_jump_empty_state_lists_today_and_yesterday(cx: &mut TestAppContext) {
     let cx = setup(cx);
@@ -200,6 +219,14 @@ fn quick_jump_empty_state_lists_today_and_yesterday(cx: &mut TestAppContext) {
     let palette = bounds(cx, "jump-palette");
     let today = bounds(cx, "qj-row-0");
     let yesterday = bounds(cx, "qj-row-1");
+    assert!(
+        cx.debug_bounds("qj-icon-0-day").is_some(),
+        "today is a day row"
+    );
+    assert!(
+        cx.debug_bounds("qj-icon-1-day").is_some(),
+        "yesterday is a day row"
+    );
     assert!(yesterday.origin.y > today.origin.y, "today comes first");
     assert!(
         today.origin.y >= palette.origin.y
@@ -208,8 +235,34 @@ fn quick_jump_empty_state_lists_today_and_yesterday(cx: &mut TestAppContext) {
         "both rows sit inside the palette: {today:?} {yesterday:?} {palette:?}"
     );
     assert!(
-        cx.debug_bounds("qj-row-2").is_none(),
-        "nothing has been opened yet"
+        cx.debug_bounds("jump-create").is_none(),
+        "no create row before anything is typed"
+    );
+}
+
+/// QJ-2: "Create page" is the last row, below a hairline of its own.
+#[gpui::test]
+fn quick_jump_create_row_is_last(cx: &mut TestAppContext) {
+    let cx = setup_titles(cx, &["Brand new page"]);
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input("Brand");
+    let palette = bounds(cx, "jump-palette");
+    let result = bounds(cx, "qj-row-0");
+    let create = bounds(cx, "qj-row-1");
+    assert!(cx.debug_bounds("qj-icon-0-page").is_some(), "a page row");
+    assert!(
+        cx.debug_bounds("qj-icon-1-create").is_some(),
+        "the create row is last"
+    );
+    let hairline = bounds(cx, "jump-create");
+    assert!(
+        hairline.origin.y >= result.origin.y + result.size.height - px(0.5),
+        "the create row sits under its hairline, under the results: {hairline:?} {result:?}"
+    );
+    assert!(create.origin.y > result.origin.y, "{create:?} {result:?}");
+    assert!(
+        create.origin.y + create.size.height <= palette.origin.y + palette.size.height + px(0.5),
+        "inside the palette: {create:?} {palette:?}"
     );
 }
 
@@ -224,8 +277,57 @@ fn quick_jump_does_not_move_the_page(cx: &mut TestAppContext) {
     assert_eq!(before, after, "the palette floats over the page");
 }
 
-/// QJ-1: ten rows (today, yesterday and eight recent pages) keep the palette under its
-/// height cap, so the list scrolls rather than growing without limit.
+/// QJ-2: every row is icon | label | type label, so the icons line up in one gutter and
+/// the type labels share a right edge.
+#[gpui::test]
+fn quick_jump_rows_line_up(cx: &mut TestAppContext) {
+    let cx = setup_titles(cx, &["Atlas Launch", "Ana Lovelace"]);
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input("a");
+    let first = bounds(cx, "qj-row-0");
+    let second = bounds(cx, "qj-row-1");
+    assert!(
+        approx(first.size.height, f32::from(second.size.height)),
+        "{first:?}"
+    );
+    let icon0 = bounds(cx, "qj-icon-0-page");
+    let icon1 = bounds(cx, "qj-icon-1-page");
+    assert!(
+        approx(icon0.origin.x, f32::from(icon1.origin.x)),
+        "one gutter"
+    );
+    assert!(
+        icon0.origin.x > first.origin.x
+            && icon0.origin.x + icon0.size.width < first.origin.x + first.size.width,
+        "the icon leads the row: {icon0:?} {first:?}"
+    );
+    let label0 = bounds(cx, "qj-label-0");
+    let label1 = bounds(cx, "qj-label-1");
+    assert!(
+        approx(label0.origin.x, f32::from(label1.origin.x)),
+        "labels line up"
+    );
+    assert!(
+        label0.origin.x >= icon0.origin.x + icon0.size.width,
+        "the label follows the icon: {label0:?} {icon0:?}"
+    );
+    let detail0 = bounds(cx, "qj-detail-0");
+    let detail1 = bounds(cx, "qj-detail-1");
+    assert!(
+        detail0.origin.x + detail0.size.width <= first.origin.x + first.size.width,
+        "the type label stays inside the row: {detail0:?} {first:?}"
+    );
+    assert!(
+        approx(
+            detail0.origin.x + detail0.size.width,
+            f32::from(detail1.origin.x + detail1.size.width)
+        ),
+        "type labels are right-aligned: {detail0:?} {detail1:?}"
+    );
+}
+
+/// QJ-1/QJ-3: ten rows (today, yesterday and eight recent pages) keep the palette under
+/// its height cap, so the footer stays visible while the list scrolls.
 #[gpui::test]
 fn quick_jump_caps_its_height(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -235,7 +337,7 @@ fn quick_jump_caps_its_height(cx: &mut TestAppContext) {
     let mut store = Store::open_in_memory().unwrap();
     store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
     let mut ids = Vec::new();
-    for title in [
+    for t in [
         "Atlas Launch",
         "Ana Lovelace",
         "Library",
@@ -247,7 +349,7 @@ fn quick_jump_caps_its_height(cx: &mut TestAppContext) {
         "Budget",
         "Inbox",
     ] {
-        ids.push(store.create_page(title).unwrap());
+        ids.push(store.create_page(t).unwrap());
     }
     // Most recently opened first, as the workspace writes it (rule 9).
     let keyed = ids

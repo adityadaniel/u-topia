@@ -1,15 +1,20 @@
 //! Quick jump (Cmd+K, §9.1): fuzzy titles and aliases; Enter opens, Shift/Cmd+Enter opens
 //! in the sidebar, and a novel title offers "Create". Dates resolve to daily pages.
 //!
-//! With nothing typed the palette offers today, yesterday and the pages opened last
-//! (QJ-1). That list is local UI state the workspace keeps in `local_state` (rule 9); the
-//! rest of the rows still come from the index when the query changes, never while
-//! painting (rule 3).
+//! One shell is shared by every palette mode (quick jump, full-text search, quick capture,
+//! free text). In page mode it has a useful empty state — today, yesterday and the pages
+//! opened last (QJ-1) and labelled rows with an icon per type (QJ-2).
+//!
+//! All of this is view state. Rows come from the index (`Store::search_titles`,
+//! `Store::tag_pages`) when the query changes, never while painting (rule 3), and nothing
+//! here writes a shard.
+
+use std::collections::HashSet;
 
 use chrono::NaiveDate;
 use gpui::{
-    div, prelude::*, px, Context, Entity, EventEmitter, MouseButton, MouseDownEvent, Subscription,
-    Window,
+    div, prelude::*, px, AnyElement, Context, Entity, EventEmitter, FontWeight, MouseButton,
+    MouseDownEvent, Subscription, Window,
 };
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, PageId};
@@ -17,7 +22,7 @@ use utopia_store::{BlockHit, TitleHit};
 
 use crate::app_state::AppState;
 use crate::line_input::{LineInput, LineInputEvent};
-use crate::theme::theme;
+use crate::theme::{theme, Theme, CAPTION_SIZE, CONTROL_SIZE};
 
 /// How many pages the empty state offers after today and yesterday (QJ-1).
 pub const RECENT_ROWS: usize = 8;
@@ -30,11 +35,45 @@ pub enum QjItem {
     Day {
         date: NaiveDate,
         title: String,
-        /// "Today" or "Yesterday": the pinned day's label.
+        /// "Today" or "Yesterday": the type label of a pinned day.
         label: &'static str,
     },
     Create(String),
     Block(BlockHit),
+}
+
+/// What a result row is. The palette draws one glyph and one type label per kind (QJ-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    Page,
+    Day,
+    Tag,
+    Block,
+    Create,
+}
+
+impl RowKind {
+    /// The name the row's debug selector carries, for layout tests.
+    fn key(self) -> &'static str {
+        match self {
+            RowKind::Page => "page",
+            RowKind::Day => "day",
+            RowKind::Tag => "tag",
+            RowKind::Block => "block",
+            RowKind::Create => "create",
+        }
+    }
+
+    /// The type label at the right edge of the row.
+    fn label(self) -> &'static str {
+        match self {
+            RowKind::Page => "Page",
+            RowKind::Day => "Day",
+            RowKind::Tag => "Tag",
+            RowKind::Block => "",
+            RowKind::Create => "",
+        }
+    }
 }
 
 /// What the palette is for.
@@ -70,6 +109,8 @@ pub struct JumpPalette {
     app: Entity<AppState>,
     pub input: Entity<LineInput>,
     results: Vec<QjItem>,
+    /// Ids among `results` that exist only because of a `#tag` (QJ-2).
+    tags: HashSet<PageId>,
     /// The pages opened last, newest first, when this palette offers the empty state
     /// (QJ-1). `None` for the modes where the empty state would be a lie: redirecting a
     /// link or extracting a block has nothing to do with the pages you just visited.
@@ -123,6 +164,7 @@ impl JumpPalette {
             app,
             input,
             results: Vec::new(),
+            tags: HashSet::new(),
             recent,
             selected: 0,
             title,
@@ -137,6 +179,7 @@ impl JumpPalette {
         match self.mode {
             PaletteMode::Capture | PaletteMode::Text => {
                 self.results.clear();
+                self.tags.clear();
                 cx.notify();
                 return;
             }
@@ -151,6 +194,7 @@ impl JumpPalette {
                         .unwrap_or_default()
                 };
                 self.results = hits.into_iter().map(QjItem::Block).collect();
+                self.tags.clear();
                 self.selected = 0;
                 cx.notify();
                 return;
@@ -161,6 +205,7 @@ impl JumpPalette {
         if q.trim().is_empty() {
             self.results = self.empty_state(cx);
             self.selected = 0;
+            self.rank_tags(cx);
             cx.notify();
             return;
         }
@@ -198,6 +243,7 @@ impl JumpPalette {
         }
         self.results = results;
         self.selected = 0;
+        self.rank_tags(cx);
         cx.notify();
     }
 
@@ -248,6 +294,30 @@ impl JumpPalette {
         out
     }
 
+    /// Mark the pages that exist only because of a `#tag` (QJ-2). One index query per
+    /// keystroke at most, over the handful of rows on screen.
+    fn rank_tags(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<PageId> = self
+            .results
+            .iter()
+            .filter_map(|r| match r {
+                QjItem::Page(h) => Some(h.page.clone()),
+                _ => None,
+            })
+            .collect();
+        if ids.is_empty() {
+            self.tags.clear();
+            return;
+        }
+        match self.app.read(cx).store.tag_pages(&ids) {
+            Ok(tags) => self.tags = tags,
+            Err(e) => {
+                eprintln!("utopia: {e}");
+                self.tags.clear();
+            }
+        }
+    }
+
     fn step(&mut self, d: isize, cx: &mut Context<Self>) {
         let n = self.results.len() as isize;
         if n > 0 {
@@ -281,12 +351,12 @@ impl JumpPalette {
                 sidebar,
                 focus: None,
             }),
+            QjItem::Day { date, .. } => cx.emit(QuickJumpEvent::ChosenDay { date, sidebar }),
             QjItem::Block(b) => cx.emit(QuickJumpEvent::Chosen {
                 page: b.page,
                 sidebar,
                 focus: Some(b.block),
             }),
-            QjItem::Day { date, .. } => cx.emit(QuickJumpEvent::ChosenDay { date, sidebar }),
             QjItem::Create(t) => self.create(&t, sidebar, cx),
         }
     }
@@ -310,65 +380,151 @@ impl JumpPalette {
             });
         }
     }
+
+    /// What a row says, how it is labelled and what it is (QJ-2).
+    fn row_parts(&self, item: &QjItem) -> (RowKind, String, String) {
+        match item {
+            QjItem::Page(h) => {
+                let kind = if h.daily {
+                    RowKind::Day
+                } else if self.tags.contains(&h.page) {
+                    RowKind::Tag
+                } else {
+                    RowKind::Page
+                };
+                // An alias hit says why it matched; the icon still says what it is.
+                let detail = if h.alias.is_some() {
+                    "Alias".to_string()
+                } else {
+                    kind.label().to_string()
+                };
+                (kind, h.title.clone(), detail)
+            }
+            QjItem::Day { title, label, .. } => (RowKind::Day, title.clone(), label.to_string()),
+            QjItem::Create(t) => (RowKind::Create, format!("Create \"{t}\""), String::new()),
+            QjItem::Block(b) => (
+                RowKind::Block,
+                utopia_core::inline::plain_text(&b.text)
+                    .chars()
+                    .take(80)
+                    .collect(),
+                b.page_title.clone(),
+            ),
+        }
+    }
+
+    /// One result row: icon, label and type label (QJ-2).
+    fn row(&self, i: usize, item: &QjItem, cx: &mut Context<Self>) -> AnyElement {
+        let th = theme(cx).clone();
+        let (kind, label, detail) = self.row_parts(item);
+        let selected = i == self.selected;
+        let accent = kind == RowKind::Create;
+        div()
+            .id(("qj", i))
+            .debug_selector(move || format!("qj-row-{i}"))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .when(accent, |d| d.text_color(th.accent))
+            .hover(|d| d.bg(th.hover))
+            .when(selected, |d| d.bg(th.chip_bg))
+            .child(row_icon(i, kind, &th))
+            .child(
+                div()
+                    .debug_selector(move || format!("qj-label-{i}"))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .child(label),
+            )
+            .child(
+                div()
+                    .debug_selector(move || format!("qj-detail-{i}"))
+                    .flex_none()
+                    .text_size(px(CAPTION_SIZE))
+                    .text_color(if accent { th.accent } else { th.muted })
+                    .child(detail),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                    let beside = e.modifiers.shift || e.modifiers.platform;
+                    this.choose(i, beside, w, cx)
+                }),
+            )
+            .into_any_element()
+    }
+}
+
+/// The one glyph per row type (QJ-2). Drawn rather than set in a font, except `#` and
+/// `+`, so nothing depends on a symbol font being installed.
+fn row_icon(i: usize, kind: RowKind, th: &Theme) -> AnyElement {
+    let slot = div()
+        .id(("qj-icon", i))
+        .debug_selector(move || format!("qj-icon-{i}-{}", kind.key()))
+        .w(px(14.))
+        .flex_none()
+        .flex()
+        .justify_center()
+        .items_center();
+    match kind {
+        RowKind::Page => slot
+            .child(
+                div()
+                    .w(px(8.))
+                    .h(px(10.))
+                    .rounded_xs()
+                    .border_1()
+                    .border_color(th.faint),
+            )
+            .into_any_element(),
+        RowKind::Day => slot
+            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(th.muted))
+            .into_any_element(),
+        RowKind::Tag => slot
+            .text_size(px(CONTROL_SIZE))
+            .text_color(th.tag)
+            .font_weight(FontWeight::SEMIBOLD)
+            .child("#")
+            .into_any_element(),
+        RowKind::Block => slot
+            .child(div().w(px(7.)).h(px(1.)).bg(th.faint))
+            .into_any_element(),
+        RowKind::Create => slot
+            .text_size(px(CONTROL_SIZE))
+            .text_color(th.accent)
+            .font_weight(FontWeight::SEMIBOLD)
+            .child("+")
+            .into_any_element(),
+    }
 }
 
 impl Render for JumpPalette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
-        let rows = self.results.iter().enumerate().map(|(i, r)| {
-            let (label, detail) = match r {
-                QjItem::Page(h) => (
-                    h.title.clone(),
-                    match (&h.alias, h.daily) {
-                        (Some(a), _) => format!("alias: {a}"),
-                        (None, true) => "journal".to_string(),
-                        _ => String::new(),
-                    },
-                ),
-                QjItem::Day { title, label, .. } => (title.clone(), label.to_string()),
-                QjItem::Create(t) => (format!("Create page \"{t}\""), String::new()),
-                QjItem::Block(b) => (
-                    utopia_core::inline::plain_text(&b.text)
-                        .chars()
-                        .take(80)
-                        .collect(),
-                    b.page_title.clone(),
-                ),
-            };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut create: Option<AnyElement> = None;
+        for (i, item) in self.results.iter().enumerate() {
+            let el = self.row(i, item, cx);
+            if matches!(item, QjItem::Create(_)) {
+                create = Some(el);
+            } else {
+                rows.push(el);
+            }
+        }
+        // "Create page" is last, above a hairline, in the accent colour (QJ-2).
+        let create_row = create.map(|el| {
             div()
-                .id(("qj", i))
-                .debug_selector(move || format!("qj-row-{i}"))
-                .flex()
-                .justify_between()
-                .px_3()
-                .py_1()
-                .rounded_sm()
-                .cursor_pointer()
-                .hover(|d| d.bg(th.hover))
-                .when(i == self.selected, |d| d.bg(th.hover))
-                .child(
-                    div()
-                        .debug_selector(move || format!("qj-label-{i}"))
-                        .flex_1()
-                        .min_w(px(0.))
-                        .truncate()
-                        .text_color(th.text)
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .debug_selector(move || format!("qj-detail-{i}"))
-                        .flex_none()
-                        .text_size(px(crate::theme::CAPTION_SIZE))
-                        .text_color(th.muted)
-                        .child(detail),
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                        this.choose(i, e.modifiers.shift, w, cx)
-                    }),
-                )
+                .debug_selector(|| "jump-create".into())
+                .mt_1()
+                .pt_1()
+                .border_t_1()
+                .border_color(th.line)
+                .child(el)
         });
         div()
             .debug_selector(|| "jump-palette".into())
@@ -386,7 +542,7 @@ impl Render for JumpPalette {
             .child(
                 div()
                     .px_1()
-                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_size(px(CAPTION_SIZE))
                     .text_color(th.muted)
                     .child(self.title),
             )
@@ -407,7 +563,8 @@ impl Render for JumpPalette {
                     .flex_col()
                     .max_h(px(320.))
                     .overflow_y_scroll()
-                    .children(rows),
+                    .children(rows)
+                    .children(create_row),
             )
     }
 }

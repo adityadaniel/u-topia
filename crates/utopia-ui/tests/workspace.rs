@@ -235,11 +235,11 @@ fn quick_jump_empty_state_lists_days_and_recent_pages(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("escape cmd-k");
     cx.run_until_parked();
     assert!(
-        cx.debug_bounds("qj-row-0").is_some(),
+        cx.debug_bounds("qj-icon-0-day").is_some(),
         "today is the first row"
     );
     assert!(
-        cx.debug_bounds("qj-row-1").is_some(),
+        cx.debug_bounds("qj-icon-1-day").is_some(),
         "yesterday is the second"
     );
     assert!(
@@ -273,7 +273,7 @@ fn quick_jump_empty_state_lists_days_and_recent_pages(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("cmd-k");
     cx.run_until_parked();
     assert!(
-        cx.debug_bounds("qj-row-2").is_some(),
+        cx.debug_bounds("qj-icon-2-page").is_some(),
         "the recent page follows today and yesterday"
     );
     cx.simulate_keystrokes("down down enter");
@@ -282,6 +282,39 @@ fn quick_jump_empty_state_lists_days_and_recent_pages(cx: &mut TestAppContext) {
         ws.update(cx, |w, cx| w.main_page(cx)),
         Some(reading),
         "Enter opens the highlighted recent page"
+    );
+}
+
+/// QJ-2: a page that only a `#tag` ever reached is labelled a tag page.
+#[gpui::test]
+fn quick_jump_marks_tag_pages(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    cx.simulate_input("reading #atlas");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    assert!(app
+        .update(cx, |app, _| app.store.find_page("atlas").unwrap())
+        .is_some());
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input("atlas");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-icon-0-tag").is_some(),
+        "a page reached only through #atlas is a tag page"
+    );
+    // A page that also has a `[[…]]` link is a page, not a tag (FR-2.15).
+    app.update(cx, |app, _| {
+        app.store.create_page("Atlas launch").unwrap();
+    });
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input("atlas launch");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-icon-0-page").is_some(),
+        "a page nobody tagged is a plain page"
     );
 }
 
