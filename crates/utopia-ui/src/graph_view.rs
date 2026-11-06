@@ -433,6 +433,9 @@ impl GraphView {
         div()
             .id("graph-legend")
             .debug_selector(|| "graph-legend".into())
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .flex()
             .flex_col()
             .gap_0p5()
@@ -454,8 +457,14 @@ impl GraphView {
             )
     }
 
-    fn zoom_controls(&self, th: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+    fn zoom_controls(&self, th: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         div()
+            .id("graph-zoom-controls")
+            .occlude()
+            // GR-3: these float over the canvas. Consume the press so a node underneath
+            // cannot also be opened by the same click.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .flex()
             .items_center()
             .gap_1()

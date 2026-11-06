@@ -3,7 +3,8 @@
 
 use chrono::NaiveDate;
 use gpui::{
-    point, px, size, AppContext as _, Entity, Modifiers, TestAppContext, VisualTestContext,
+    point, px, size, AppContext as _, Entity, Modifiers, MouseButton, TestAppContext,
+    VisualTestContext,
 };
 use utopia_core::PageId;
 use utopia_store::Store;
@@ -1110,6 +1111,57 @@ fn graph_cmd_click_split_restores_focus(cx: &mut TestAppContext) {
         cx.debug_bounds("jump-palette").is_some(),
         "workspace shortcuts work after the split opens"
     );
+}
+
+/// GR-3: a zoom control floats over the canvas, so its click must not also activate a node
+/// that happens to be underneath it.
+#[gpui::test]
+fn graph_zoom_control_does_not_click_through(cx: &mut TestAppContext) {
+    let (_app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let graph = ws.update(cx, |w, _| w.graph_view()).expect("graph shown");
+    let plus = cx
+        .debug_bounds("graph-zoom-in")
+        .expect("zoom control")
+        .center();
+    // At the maximum zoom a click on "+" no longer moves the canvas or the nodes.
+    for _ in 0..24 {
+        cx.simulate_click(plus, Modifiers::default());
+        cx.run_until_parked();
+    }
+    assert!(
+        graph.update(cx, |g, _| g.zoom()) > 7.9,
+        "at the zoom ceiling"
+    );
+
+    // Drag a node until it sits exactly under the control.
+    let canvas = cx.debug_bounds("graph-canvas").expect("canvas");
+    let node = graph.update(cx, |g, _| g.node_screen_pos(0)).unwrap();
+    let delta = plus - node;
+    let start = canvas.origin + point(px(6.), px(6.));
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(start + delta, Some(MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(start + delta, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    let under = graph.update(cx, |g, _| g.node_screen_pos(0)).unwrap();
+    assert!(
+        f32::from((under.x - plus.x).abs()) < 3. && f32::from((under.y - plus.y).abs()) < 3.,
+        "node under the control: {under:?} {plus:?}"
+    );
+
+    let main = ws.update(cx, |w, cx| w.main_page(cx));
+    cx.simulate_click(plus, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        ws.update(cx, |w, _| w.graph_view()).is_some(),
+        "the zoom control does not open the node below it"
+    );
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), main);
 }
 
 #[gpui::test]
