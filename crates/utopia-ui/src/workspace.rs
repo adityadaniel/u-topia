@@ -120,6 +120,9 @@ pub struct Workspace {
     /// Pages pinned in the Pinned tab, resolved to titles, and the ids they came from.
     pinned: Vec<(PageId, String)>,
     pinned_ids: Vec<String>,
+    /// The `refs_version` the resolved titles were read at, so an index update (a rename, a
+    /// merge) re-resolves them even though the id list is unchanged.
+    pinned_version: Option<u64>,
     jump: Option<(Entity<JumpPalette>, JumpMode)>,
     /// The graph view, shown in place of the main page while open (P2).
     graph: Option<Entity<GraphView>>,
@@ -222,6 +225,7 @@ impl Workspace {
             panel_tab: PanelTab::References,
             pinned: Vec::new(),
             pinned_ids: Vec::new(),
+            pinned_version: None,
             jump: None,
             graph: None,
             pdf: None,
@@ -485,6 +489,11 @@ impl Workspace {
     /// Pages pinned in the sidebar's Pinned tab, in the order they show (RS-3).
     pub fn pinned_pages(&self, _cx: &gpui::App) -> Vec<PageId> {
         self.pinned.iter().map(|(p, _)| p.clone()).collect()
+    }
+
+    /// The titles the Pinned tab shows, in the order they show (RS-3).
+    pub fn pinned_titles(&self) -> Vec<String> {
+        self.pinned.iter().map(|(_, title)| title.clone()).collect()
     }
 
     /// Pages stacked in the right sidebar, top first.
@@ -1161,8 +1170,10 @@ impl Workspace {
         if self.resize_from.is_none() {
             self.right_width = crate::appearance::right_sidebar_width(cx);
         }
-        // Pinned pages are a local preference (rule 9); re-read when it changes.
-        if crate::appearance::pinned_pages(cx) != self.pinned_ids {
+        // Pinned pages are a local preference (rule 9); re-read when it changes, and on an
+        // index update so a renamed page's new title reaches its row (RS-3).
+        if crate::appearance::pinned_pages(cx) != self.pinned_ids || self.pinned_version != Some(v)
+        {
             self.load_pinned(cx);
         }
         if self.sidebar_seen != Some(v) {
@@ -2029,6 +2040,7 @@ impl Workspace {
         });
         self.pinned = resolved;
         self.pinned_ids = ids;
+        self.pinned_version = Some(self.app.read(cx).refs_version);
     }
 
     /// Re-read the pinned list after the user changed it from the panel.

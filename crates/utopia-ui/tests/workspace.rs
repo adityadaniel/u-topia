@@ -890,6 +890,50 @@ fn outline_reaches_headings_that_are_folded_away(cx: &mut TestAppContext) {
     );
 }
 
+/// RS-3: a pinned row's title comes from the shard, so renaming the page reaches the
+/// Pinned tab without toggling another pin or restarting.
+#[gpui::test]
+fn a_renamed_pinned_page_shows_its_new_title(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = app.update(cx, |app, _| {
+        let p = app.store.create_page("Old Name").unwrap();
+        let b = app.store.ensure_first_block(&p).unwrap();
+        app.store
+            .set_block_text(&p, &b, "pinned", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+        p
+    });
+    cx.update(|_, cx| utopia_ui::appearance::toggle_pinned_page(cx, page.as_str()));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let tab = cx.debug_bounds("panel-pinned").expect("the Pinned tab");
+    cx.simulate_click(tab.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, _| w.pinned_titles()),
+        vec!["Old Name".to_string()]
+    );
+
+    // Rename through the store, as the page menu's Rename does, and let the index catch up.
+    app.update(cx, |app, cx| {
+        app.store.rename_page(&page, "New Name").unwrap();
+        app.changed(Vec::new(), true, cx);
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, _| w.pinned_titles()),
+        vec!["New Name".to_string()],
+        "the pinned row follows the rename"
+    );
+}
+
 #[gpui::test]
 fn keystrokes_are_debounced_then_committed(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);
