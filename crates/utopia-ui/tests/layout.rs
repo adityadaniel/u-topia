@@ -953,3 +953,26 @@ fn compact_density_tightens_sidebar_rows(cx: &mut TestAppContext) {
         "a page row is shorter in Compact: {before:?} {after:?}"
     );
 }
+
+/// SB-3: a written daily note is a page too (§5.5), so it can be pinned. Pins resolve
+/// against every live page, not only the ordinary Pages list (which excludes daily pages).
+#[gpui::test]
+fn pinned_daily_pages_show_above_pages(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    // The page menu is only offered on a live page (a draft day has none).
+    cx.simulate_input("note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    let pin = bounds(cx, "page-menu-pin");
+    cx.simulate_click(pin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let header = bounds(cx, "pinned-header");
+    let row = bounds_of(cx, "pinned-row-0".into());
+    let pages = bounds(cx, "pages-header");
+    assert!(
+        header.origin.y < row.origin.y && row.origin.y + row.size.height <= pages.origin.y,
+        "the pinned day sits in the Pinned group above Pages: {header:?} {row:?} {pages:?}"
+    );
+}

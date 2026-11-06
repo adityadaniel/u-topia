@@ -47,6 +47,9 @@ enum JumpMode {
 #[derive(Default)]
 struct SidebarData {
     journal: Vec<JournalEntry>,
+    /// Every live page, daily ones included: pins resolve against this (§5.5).
+    all: Vec<PageRow>,
+    /// The ordinary Pages list: `all` without daily pages (they have their own lists).
     pages: Vec<PageRow>,
     days: HashSet<NaiveDate>,
     /// Pages that exist only because of a `#tag` (SB-2). Display only: the list gets a
@@ -1031,7 +1034,8 @@ impl Workspace {
                 journal: store.journal(14).unwrap_or_default(),
                 days: all.iter().filter_map(|p| p.daily_date).collect(),
                 tags: store.hashtag_only_pages().unwrap_or_default(),
-                pages: all.into_iter().filter(|p| !p.is_daily()).collect(),
+                pages: all.iter().filter(|p| !p.is_daily()).cloned().collect(),
+                all,
             };
         }
         let Some(page) = self.main.read(cx).page.clone() else {
@@ -1386,10 +1390,11 @@ impl Workspace {
         }
         let pages = self.sidebar.pages.clone();
         let tags = self.sidebar.tags.clone();
-        // SB-3: pinned pages first, in pin order, above the ordinary list.
+        // SB-3: pinned pages first, in pin order, above the ordinary list. A pin may point
+        // at a daily page, which is not in `pages` but is in `all`.
         let pinned: Vec<PageRow> = crate::appearance::pinned(cx)
             .iter()
-            .filter_map(|id| pages.iter().find(|p| &p.id == id).cloned())
+            .filter_map(|id| self.sidebar.all.iter().find(|p| &p.id == id).cloned())
             .collect();
         if !pinned.is_empty() {
             scroll = scroll.child(section("PINNED").debug_selector(|| "pinned-header".into()));
