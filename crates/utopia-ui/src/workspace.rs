@@ -364,6 +364,9 @@ impl Workspace {
     /// Split panes (P1): an editable page beside the main one (Cmd+Shift+Click). At most
     /// two splits; the oldest closes first.
     pub fn open_split(&mut self, page: PageId, window: &mut Window, cx: &mut Context<Self>) {
+        // Cmd+Shift+Click opens a split without going through `open`, and it is still a page
+        // opened: the Quick jump empty state should offer it next time (QJ-1).
+        self.note_opened(&page, cx);
         let v = cx.new(|cx| PageView::new(self.app.clone(), self.editor.clone(), true, window, cx));
         self.subs
             .push(cx.subscribe_in(&v, window, Self::on_page_event));

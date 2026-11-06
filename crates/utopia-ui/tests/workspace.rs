@@ -507,6 +507,30 @@ fn quick_jump_drops_a_replaced_default_key(cx: &mut TestAppContext) {
     );
 }
 
+/// P3: a page opened in a split pane was still opened, so it belongs in the recent list
+/// the empty state offers.
+#[gpui::test]
+fn quick_jump_records_pages_opened_in_a_split(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let reading = app.update(cx, |app, _| app.store.create_page("Reading log").unwrap());
+    ws.update_in(cx, |w, window, cx| {
+        w.open_split(reading.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    app.update(cx, |app, _| {
+        let stored = app
+            .store
+            .local_get("recent_pages")
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(
+            stored.lines().next(),
+            Some(reading.as_str()),
+            "a split is an open: {stored:?}"
+        );
+    });
+}
+
 #[gpui::test]
 fn query_blocks_list_results(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);
