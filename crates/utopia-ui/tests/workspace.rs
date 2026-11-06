@@ -361,6 +361,51 @@ fn quick_jump_runs_commands(cx: &mut TestAppContext) {
     );
 }
 
+/// QJ-5: a command bound to the editor acts on the block being edited. The palette takes
+/// the focus, but the block stays in edit, so the command is dispatched back to it.
+#[gpui::test]
+fn quick_jump_runs_editor_commands(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("a");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("b");
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input(">Indent");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        rows_str(&rows(&app, &page, cx)),
+        vec![("a", 0), ("b", 1)],
+        "Indent ran on the block that was being edited"
+    );
+}
+
+/// QJ-5: an editor command with no block in edit cannot act, so it is shown as unavailable
+/// rather than offered and silently dropped.
+#[gpui::test]
+fn quick_jump_marks_editor_commands_unavailable(cx: &mut TestAppContext) {
+    let (_app, _ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input(">Indent");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-command-0-Indent-off").is_some(),
+        "Indent needs a block in edit, and none is"
+    );
+    // A command that works anywhere stays available.
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_input(">Today");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-command-0-GoToday").is_some(),
+        "GoToday is a window action"
+    );
+}
+
 #[gpui::test]
 fn query_blocks_list_results(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);

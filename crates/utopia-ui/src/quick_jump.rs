@@ -16,8 +16,8 @@ use std::ops::Range;
 
 use chrono::NaiveDate;
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Entity, EventEmitter, FontWeight, HighlightStyle,
-    MouseButton, MouseDownEvent, StyledText, Subscription, Window,
+    div, prelude::*, px, AnyElement, App, Context, Entity, EventEmitter, FontWeight,
+    HighlightStyle, MouseButton, MouseDownEvent, StyledText, Subscription, Window,
 };
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, PageId};
@@ -25,6 +25,7 @@ use utopia_store::{BlockHit, TitleHit};
 
 use crate::actions::{platform_keys, pretty_keys, ActionDoc, CATALOG};
 use crate::app_state::AppState;
+use crate::editor::BlockEditor;
 use crate::line_input::{LineInput, LineInputEvent};
 use crate::theme::{theme, Theme, CAPTION_SIZE, CONTROL_SIZE};
 
@@ -118,6 +119,9 @@ pub enum QuickJumpEvent {
 
 pub struct JumpPalette {
     app: Entity<AppState>,
+    /// The shared block editor: a command bound to the editor (`Indent`, `Bold`, …) can
+    /// only act while a block is in edit (QJ-5).
+    editor: Entity<BlockEditor>,
     pub input: Entity<LineInput>,
     results: Vec<QjItem>,
     /// Ids among `results` that exist only because of a `#tag` (QJ-2).
@@ -135,17 +139,9 @@ pub struct JumpPalette {
 impl EventEmitter<QuickJumpEvent> for JumpPalette {}
 
 impl JumpPalette {
-    pub fn new(
-        app: Entity<AppState>,
-        title: &'static str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::with_mode(app, title, PaletteMode::Pages, None, window, cx)
-    }
-
     pub fn with_mode(
         app: Entity<AppState>,
+        editor: Entity<BlockEditor>,
         title: &'static str,
         mode: PaletteMode,
         recent: Option<Vec<PageId>>,
@@ -173,6 +169,7 @@ impl JumpPalette {
         input.update(cx, |i, _| i.focus(window));
         let mut me = Self {
             app,
+            editor,
             input,
             results: Vec::new(),
             tags: HashSet::new(),
@@ -376,7 +373,11 @@ impl JumpPalette {
                 sidebar,
                 focus: Some(b.block),
             }),
-            QjItem::Command(d) => cx.emit(QuickJumpEvent::RunCommand(d.action)),
+            QjItem::Command(d) => {
+                if self.command_ready(d, cx) {
+                    cx.emit(QuickJumpEvent::RunCommand(d.action));
+                }
+            }
             QjItem::Create(t) => self.create(&t, sidebar, cx),
         }
     }
@@ -399,6 +400,14 @@ impl JumpPalette {
                 focus: Some(block),
             });
         }
+    }
+
+    /// Whether a command can act right now (QJ-5). `Indent`, `Bold`, `Newline` and the
+    /// rest of the editor bindings are handled by [`BlockEditor`]; with no block in edit
+    /// gpui would dispatch them to nobody, so the palette marks them unavailable instead of
+    /// offering a command that silently does nothing.
+    fn command_ready(&self, d: &ActionDoc, cx: &App) -> bool {
+        d.context.is_none() || self.editor.read(cx).target.is_some()
     }
 
     /// What a row says, how it is labelled and what it is (QJ-2).
@@ -467,6 +476,30 @@ impl JumpPalette {
                 .into_any_element()
         };
         let accent = kind == RowKind::Create;
+        // A command that cannot act (no block in edit) is shown greyed out. For command
+        // rows the selector names the action and its state, so a test can tell which
+        // command a row is — the palette draws text a test cannot read (QJ-5).
+        let (selectable, selector) = match item {
+            QjItem::Command(d) => {
+                let ready = self.command_ready(d, cx);
+                (
+                    ready,
+                    format!(
+                        "qj-command-{i}-{}{}",
+                        d.action,
+                        if ready { "" } else { "-off" }
+                    ),
+                )
+            }
+            _ => (true, format!("qj-label-{i}")),
+        };
+        let label_color = if accent {
+            th.accent
+        } else if selectable {
+            th.text
+        } else {
+            th.faint
+        };
         div()
             .id(("qj", i))
             .debug_selector(move || format!("qj-row-{i}"))
@@ -476,17 +509,18 @@ impl JumpPalette {
             .px_2()
             .py_1()
             .rounded_sm()
-            .cursor_pointer()
+            .when(selectable, |d| d.cursor_pointer())
             .when(accent, |d| d.text_color(th.accent))
-            .hover(|d| d.bg(th.hover))
+            .when(selectable, |d| d.hover(|d| d.bg(th.hover)))
             .when(selected, |d| d.bg(th.chip_bg))
             .child(row_icon(i, kind, &th))
             .child(
                 div()
-                    .debug_selector(move || format!("qj-label-{i}"))
+                    .debug_selector(move || selector)
                     .flex_1()
                     .min_w(px(0.))
                     .truncate()
+                    .text_color(label_color)
                     .child(text),
             )
             .child(
@@ -494,7 +528,7 @@ impl JumpPalette {
                     .debug_selector(move || format!("qj-detail-{i}"))
                     .flex_none()
                     .text_size(px(CAPTION_SIZE))
-                    .text_color(if accent { th.accent } else { th.muted })
+                    .text_color(if selectable { th.muted } else { th.faint })
                     .child(detail),
             )
             .on_mouse_down(

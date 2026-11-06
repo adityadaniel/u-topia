@@ -590,7 +590,9 @@ impl Workspace {
             _ => None,
         };
         let app = self.app.clone();
-        let jump = cx.new(|cx| JumpPalette::with_mode(app, title, palette, recent, window, cx));
+        let editor = self.editor.clone();
+        let jump =
+            cx.new(|cx| JumpPalette::with_mode(app, editor, title, palette, recent, window, cx));
         self.subs.push(cx.subscribe_in(
             &jump,
             window,
@@ -619,9 +621,17 @@ impl Workspace {
                         this.open_date(*date, *sidebar, !*sidebar, window, cx)
                     }
                     // QJ-5: run the command exactly as its keystroke would, once the
-                    // palette is gone and focus is back on the workspace.
+                    // palette is gone. Focus goes back where it was before the palette
+                    // opened: an editor command (`Indent`, `Bold`, …) is handled by the
+                    // block editor, and gpui dispatches through the focused element's
+                    // ancestors only, so the workspace would never reach it.
                     (QuickJumpEvent::RunCommand(name), _) => {
-                        window.focus(&this.focus);
+                        if this.editor.read(cx).target.is_some() {
+                            let handle = this.editor.read(cx).focus_handle(cx);
+                            window.focus(&handle);
+                        } else {
+                            window.focus(&this.focus);
+                        }
                         match action_for(name) {
                             Some(action) => window.dispatch_action(action, cx),
                             None => eprintln!("utopia: no action named {name}"),
