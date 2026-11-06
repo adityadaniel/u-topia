@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::NaiveDate;
 use gpui::{
-    div, list, prelude::*, px, AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    ListAlignment, ListState, MouseButton, MouseDownEvent, SharedString, StyledText, Subscription,
-    Window,
+    anchored, deferred, div, list, point, prelude::*, px, AnyElement, Context, Corner, Entity,
+    EventEmitter, FocusHandle, Focusable, ListAlignment, ListState, MouseButton, MouseDownEvent,
+    SharedString, StyledText, Subscription, Window,
 };
 use utopia_core::inline::{extract_refs, plain_text};
 use utopia_core::outline::{self, Focus, Plan};
@@ -1778,6 +1778,43 @@ impl PageView {
         quiet_control(id, label, &th)
     }
 
+    /// The page actions menu. It is drawn deferred and anchored, so opening it floats over
+    /// the page instead of taking a row in the column (ALL-3).
+    fn page_menu_popup(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let th = theme(cx).clone();
+        // Daily titles are display-only (rule 6): `start_rename` would open the calendar
+        // for them, so Rename is only offered on ordinary pages.
+        let rename = (self.header.kind != PageKind::Daily).then(|| {
+            quiet_control("page-menu-rename", "Rename", &th)
+                .debug_selector(|| "page-menu-rename".into())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.page_menu = false;
+                    this.start_rename(window, cx);
+                }))
+        });
+        let delete = quiet_danger("page-menu-delete", "Delete page", &th)
+            .debug_selector(|| "page-menu-delete".into())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.page_menu = false;
+                this.page_action("delete", cx);
+            }));
+        div()
+            .id("page-menu-popup")
+            .debug_selector(|| "page-menu-popup".into())
+            .w(px(180.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .bg(th.surface)
+            .border_1()
+            .border_color(th.line)
+            .rounded_md()
+            .shadow_md()
+            .children(rename.map(|r| r.w_full().justify_start()))
+            .child(delete.w_full().justify_start())
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
         let th = theme(cx).clone();
         let h = self.header.clone();
@@ -1836,54 +1873,28 @@ impl PageView {
             })
             .when(!h.deleted && !h.draft && self.zoom.is_none(), |d| {
                 d.child(
-                    self.button("page-menu", "···", cx)
-                        .debug_selector(|| "page-menu".into())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.page_menu = !this.page_menu;
-                            cx.notify();
+                    div()
+                        .relative()
+                        .child(
+                            self.button("page-menu", "···", cx)
+                                .debug_selector(|| "page-menu".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.page_menu = !this.page_menu;
+                                    cx.notify();
+                                })),
+                        )
+                        .children(self.page_menu.then(|| {
+                            deferred(
+                                anchored()
+                                    .anchor(Corner::TopRight)
+                                    .offset(point(px(0.), px(6.)))
+                                    .child(self.page_menu_popup(cx)),
+                            )
+                            .with_priority(1)
                         })),
                 )
             });
         col = col.child(top);
-        if self.page_menu {
-            // ALL-3: destructive page actions live in a menu, in the danger colour, not as
-            // loose text beside the title.
-            // Daily titles are display-only (rule 6): `start_rename` would open the
-            // calendar for them, so Rename is only offered on ordinary pages.
-            let rename = (h.kind != PageKind::Daily).then(|| {
-                quiet_control("page-menu-rename", "Rename", &th)
-                    .debug_selector(|| "page-menu-rename".into())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.page_menu = false;
-                        this.start_rename(window, cx);
-                    }))
-            });
-            let delete = quiet_danger("page-menu-delete", "Delete page", &th)
-                .debug_selector(|| "page-menu-delete".into())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.page_menu = false;
-                    this.page_action("delete", cx);
-                }));
-            col = col.child(
-                div().flex().justify_end().child(
-                    div()
-                        .id("page-menu-popup")
-                        .debug_selector(|| "page-menu-popup".into())
-                        .w(px(180.))
-                        .p_1()
-                        .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .bg(th.surface)
-                        .border_1()
-                        .border_color(th.line)
-                        .rounded_md()
-                        .shadow_md()
-                        .children(rename.map(|r| r.w_full().justify_start()))
-                        .child(delete.w_full().justify_start()),
-                ),
-            );
-        }
         if !h.zoom_path.is_empty() {
             let mut crumbs = div()
                 .flex()

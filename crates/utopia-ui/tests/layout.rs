@@ -520,3 +520,45 @@ fn compact_density_is_tighter(cx: &mut TestAppContext) {
         "4 px of block spacing: row {row_after:?}, body {body_after:?}"
     );
 }
+
+/// A fresh page window for one menu state, so no debug bounds from the other state linger.
+fn page_title_with_menu(cx: &mut TestAppContext, menu_open: bool) -> Bounds<Pixels> {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = store.create_page("Menu Target").unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    if menu_open {
+        let menu = cx
+            .debug_bounds("page-menu")
+            .expect("the page menu button is rendered");
+        cx.simulate_click(menu.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("page-menu-popup").is_some(),
+            "the menu opened"
+        );
+    }
+    cx.debug_bounds("page-title")
+        .expect("the page title is rendered")
+}
+
+/// ALL-3: the page menu floats over the page. Opening it must not push the title down.
+#[gpui::test]
+fn opening_the_page_menu_does_not_move_the_title(cx: &mut TestAppContext) {
+    let closed = page_title_with_menu(cx, false);
+    let open = page_title_with_menu(cx, true);
+    assert_eq!(
+        closed, open,
+        "the title keeps its bounds when the menu opens"
+    );
+}
