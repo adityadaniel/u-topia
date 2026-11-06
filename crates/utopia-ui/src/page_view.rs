@@ -2272,6 +2272,7 @@ impl PageView {
             chips = chips.child(
                 div()
                     .id(("filter", i))
+                    .debug_selector(move || format!("filter-chip-{i}"))
                     .px_2()
                     .rounded_md()
                     .text_size(px(crate::theme::CAPTION_SIZE))

@@ -574,8 +574,8 @@ fn opening_the_page_menu_does_not_move_the_title(cx: &mut TestAppContext) {
     );
 }
 
-/// A graph whose "Target" page has two referencing blocks that also mention "Ana Lovelace",
-/// so the reference controls offer a co-reference chip with a count (LR-1).
+/// A graph whose "Target" page has two referencing blocks, one of them also mentioning "Ana
+/// Lovelace", so the reference controls offer a co-reference chip with a count (LR-1).
 fn setup_ref_controls(
     cx: &mut TestAppContext,
 ) -> (&mut VisualTestContext, Entity<Workspace>, PageId) {
@@ -593,12 +593,18 @@ fn setup_ref_controls(
         .set_block_text(
             &src,
             &b,
-            "A note about [[Target]] with [[Ana Lovelace]], and [[Target]] again",
+            "A note about [[Target]] with [[Ana Lovelace]]",
             None,
             None,
         )
         .unwrap();
     store.commit_block(&src, &b).unwrap();
+    let plan = utopia_core::outline::append_block(store.page_state(&src).unwrap(), None);
+    let b2 = store.execute_plan(&src, plan, None).unwrap().unwrap().block;
+    store
+        .set_block_text(&src, &b2, "Another note about [[Target]] alone", None, None)
+        .unwrap();
+    store.commit_block(&src, &b2).unwrap();
     store.sync_index().unwrap();
     let app = cx.new(|_| AppState::new(store));
     let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
@@ -725,10 +731,15 @@ fn first_group(cx: &mut VisualTestContext) -> (Bounds<Pixels>, Bounds<Pixels>) {
     (0..40)
         .find_map(|ix| {
             let title: &'static str = Box::leak(format!("group-title-{ix}").into_boxed_str());
-            let count: &'static str = Box::leak(format!("group-count-{ix}-1").into_boxed_str());
-            Some((cx.debug_bounds(title)?, cx.debug_bounds(count)?))
+            let title = cx.debug_bounds(title)?;
+            // The count is in the selector, so try the counts a small graph can have.
+            (1..=9).find_map(|n| {
+                let count: &'static str =
+                    Box::leak(format!("group-count-{ix}-{n}").into_boxed_str());
+                Some((title, cx.debug_bounds(count)?))
+            })
         })
-        .expect("a referencing group with one hit was rendered")
+        .expect("a referencing group was rendered")
 }
 
 /// LR-2: the count is a small chip right after the page or day name, not a number pushed to
@@ -737,7 +748,7 @@ fn first_group(cx: &mut VisualTestContext) -> (Bounds<Pixels>, Bounds<Pixels>) {
 fn reference_counts_sit_next_to_the_name(cx: &mut TestAppContext) {
     let (cx, _, _) = setup_ref_controls(cx);
     let title = bounds(cx, "refs-title");
-    let count = bounds(cx, "refs-count-1");
+    let count = bounds(cx, "refs-count-2");
     let header = bounds(cx, "refs-header");
     assert!(
         count.origin.x >= title.origin.x + title.size.width - px(1.),
@@ -923,4 +934,30 @@ fn reference_children_are_inline_up_to_the_limit(cx: &mut TestAppContext) {
         third.origin.y >= second.origin.y + second.size.height - px(0.5),
         "the chip opened the rest, in order: {third:?} {second:?}"
     );
+}
+
+/// LR-1: clicking a co-reference chip narrows the references and the choice becomes a filled
+/// chip on the same line; clicking it again widens them back.
+#[gpui::test]
+fn selecting_a_co_reference_chip_filters_and_fills(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_controls(cx);
+    assert!(
+        cx.debug_bounds("filter-chip-0").is_none(),
+        "nothing is selected yet"
+    );
+    let chip = bounds(cx, "suggest-chip-0");
+    let chips = bounds(cx, "refs-chips");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let selected = bounds(cx, "filter-chip-0");
+    assert!(
+        selected.origin.y >= chips.origin.y - px(0.5),
+        "the selected chip joins the chips line: {selected:?} {chips:?}"
+    );
+    // One of the two references also mentions Ana, so the list narrowed to one.
+    bounds(cx, "refs-count-1");
+    let selected = bounds(cx, "filter-chip-0");
+    cx.simulate_click(selected.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    bounds(cx, "refs-count-2");
 }
