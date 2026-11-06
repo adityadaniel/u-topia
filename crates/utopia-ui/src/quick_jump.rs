@@ -322,28 +322,20 @@ impl JumpPalette {
         out
     }
 
-    /// Mark the pages that exist only because of a `#tag` (QJ-2). One index query per
-    /// keystroke at most, over the handful of rows on screen.
+    /// Mark the pages that exist only because of a `#tag` (QJ-2), from the classification
+    /// the commit path published and [`AppState`] cached (SB-2): no query runs here, and
+    /// nothing is recomputed per keystroke (rule 3, rule 10).
     fn rank_tags(&mut self, cx: &mut Context<Self>) {
-        let ids: Vec<PageId> = self
+        let app = self.app.read(cx);
+        self.tags = self
             .results
             .iter()
             .filter_map(|r| match r {
                 QjItem::Page(h) => Some(h.page.clone()),
                 _ => None,
             })
+            .filter(|page| app.tag_pages.contains(page))
             .collect();
-        if ids.is_empty() {
-            self.tags.clear();
-            return;
-        }
-        match self.app.read(cx).store.tag_pages(&ids) {
-            Ok(tags) => self.tags = tags,
-            Err(e) => {
-                eprintln!("utopia: {e}");
-                self.tags.clear();
-            }
-        }
     }
 
     /// A new query starts again at the top, scrolled back to it, so ↑/↓ and Enter agree

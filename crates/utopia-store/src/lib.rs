@@ -15,6 +15,7 @@ mod blockquery;
 mod crypt;
 mod doctor;
 mod export;
+pub use export::{write_export, ExportSnapshot};
 mod extras;
 mod pagegraph;
 mod pages;
@@ -121,6 +122,10 @@ pub struct Store {
     debounced: bool,
     /// Attachment bytes for in-memory graphs (file graphs use the blob directory).
     mem_blobs: HashMap<String, Vec<u8>>,
+    /// Full tag-page classifications this store's own connection has run (SB-2). The
+    /// commit path publishes the set instead, so the UI never runs one; tests read this to
+    /// keep it that way.
+    tag_page_scans: std::sync::atomic::AtomicU64,
 }
 
 impl Store {
@@ -181,11 +186,12 @@ impl Store {
             collapsed,
             clock: None,
             today: None,
-            persister: Persister::Inline,
+            persister: Persister::inline(),
             pending: Vec::new(),
             drafts: HashMap::new(),
             debounced: false,
             mem_blobs: HashMap::new(),
+            tag_page_scans: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -217,6 +223,25 @@ impl Store {
     /// A handle that completes once everything flushed so far is durable.
     pub fn write_ticket(&self) -> WriteTicket {
         self.persister.ticket()
+    }
+
+    /// The tag-page classification as the last commit published it (SB-2). `None` until
+    /// the first commit; [`Store::hashtag_only_pages`] computes and returns it directly.
+    pub fn tag_pages(&self) -> Option<HashSet<PageId>> {
+        self.persister.tag_pages()
+    }
+
+    /// How many whole-graph tag classifications the commit path has run (tests, SB-2). One
+    /// is enough: later commits update only the pages they can affect.
+    pub fn tag_page_full_scans(&self) -> u64 {
+        self.persister.tag_scans()
+    }
+
+    /// How many full tag-page classifications this store's own connection has run. The
+    /// commit path classifies on the writer, so this stays put while the UI edits.
+    pub fn tag_page_scans(&self) -> u64 {
+        self.tag_page_scans
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Hand every pending change to the writer (non-blocking with a writer thread).
@@ -916,7 +941,7 @@ impl Drop for Store {
     fn drop(&mut self) {
         let _ = self.sync_index();
         self.persister.stop();
-        self.persister = Persister::Inline;
+        self.persister = Persister::inline();
         let _ = self.compact();
     }
 }

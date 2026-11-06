@@ -303,27 +303,6 @@ fn ac_2_5_paste_five_hundred_lines_one_undo() {
 }
 
 #[test]
-fn hashtag_only_pages_are_tag_pages() {
-    let mut s = store();
-    let notes = s.create_page("Notes").unwrap();
-    // Made by a tag in one block and a `[[…]]` link in another: a page, not a tag page.
-    let both = s.create_page("Both").unwrap();
-    let tagged = s.create_page("Atlas").unwrap();
-    let unlinked = s.create_page("Lonely").unwrap();
-    write(&mut s, &notes, "#Atlas and [[Both]]");
-    write(&mut s, &notes, "more #[[Both]]");
-    let tags = s
-        .tag_pages(&[tagged.clone(), both.clone(), unlinked.clone()])
-        .unwrap();
-    assert!(tags.contains(&tagged), "only reachable through #Atlas");
-    assert!(
-        !tags.contains(&both),
-        "one [[Both]] link makes it a page, not a tag"
-    );
-    assert!(!tags.contains(&unlinked), "no references at all is no tag");
-}
-
-#[test]
 fn ac_2_7_hashtag_equals_link() {
     let mut s = store();
     let a = s.create_page("A").unwrap();
@@ -889,4 +868,57 @@ fn reopening_mid_session_sees_writer_commits() {
         live_texts(&mut b, &p),
         vec![("from the writer thread".to_string(), 0)]
     );
+}
+
+/// SB-1: the sidebar's muted count says how much was written on a day, so an empty day
+/// (kept only for a link into it) counts zero and a blank row never counts.
+#[test]
+fn sb_1_journal_counts_written_blocks() {
+    let mut s = store();
+    let (p, first) = s.open_daily(date(2026, 11, 2)).unwrap();
+    s.set_block_text(&p, &first, "one", None, None).unwrap();
+    write(&mut s, &p, "two");
+    let blank = write(&mut s, &p, "");
+    assert!(
+        s.page_state(&p).unwrap().block(&blank).unwrap().live,
+        "the blank block exists but is not written on"
+    );
+    assert_eq!(s.page_block_count(&p).unwrap(), 2);
+    let entry = s.journal(14).unwrap().remove(0);
+    assert_eq!(entry.page.id, p);
+    assert_eq!(entry.blocks, 2);
+    assert_eq!(
+        entry.preview.len(),
+        2,
+        "the preview still has one line per block"
+    );
+}
+
+/// SB-2: a page with no blocks of its own that only hashtags point at is a tag page;
+/// `[[link]]` references (and a page with a block of its own) are ordinary pages.
+#[test]
+fn sb_2_hashtag_only_pages_are_marked() {
+    let mut s = store();
+    let (day, b) = s.open_daily(date(2026, 11, 2)).unwrap();
+    s.set_block_text(
+        &day,
+        &b,
+        "#atlas and [[Atlas Launch]] and #[[deep work]]",
+        None,
+        None,
+    )
+    .unwrap();
+    s.commit_block(&day, &b).unwrap();
+    s.sync_index().unwrap();
+    let tags = s.hashtag_only_pages().unwrap();
+    let atlas = s.find_page("atlas").unwrap().expect("the tag made a page");
+    let deep = s.find_page("deep work").unwrap().expect("a multi-word tag");
+    let linked = s.find_page("Atlas Launch").unwrap().unwrap();
+    assert!(tags.contains(&atlas), "{tags:?}");
+    assert!(tags.contains(&deep), "{tags:?}");
+    assert!(!tags.contains(&linked), "a [[link]] page is not a tag page");
+    // Writing on a tag page makes it an ordinary page; the list is display-only.
+    write(&mut s, &atlas, "notes about the atlas");
+    assert!(!s.hashtag_only_pages().unwrap().contains(&atlas));
+    assert_doctor(&mut s);
 }

@@ -296,10 +296,11 @@ fn an_unusable_override_keeps_the_default(cx: &mut TestAppContext) {
 mod appearance {
     use chrono::NaiveDate;
     use gpui::{AppContext as _, Modifiers, TestAppContext, VisualTestContext};
+    use utopia_core::PageId;
     use utopia_store::Store;
     use utopia_ui::actions::install_keymap;
     use utopia_ui::app_state::AppState;
-    use utopia_ui::appearance::{self, Density, UiFont};
+    use utopia_ui::appearance::{self, AttributeBlocks, Density, UiFont};
     use utopia_ui::settings::{SettingsView, Tab};
     use utopia_ui::theme::Theme;
     use utopia_ui::workspace::Workspace;
@@ -328,6 +329,69 @@ mod appearance {
             cx.add_window(move |window, cx| SettingsView::new(path, Tab::Appearance, window, cx));
         cx.run_until_parked();
         (main.into(), settings.into())
+    }
+
+    /// A main window showing "Target" (referenced by a block with four children) and the
+    /// Settings window, both open, as in the app (LR-4).
+    fn open_both_with_reference(
+        cx: &mut TestAppContext,
+        dir: &std::path::Path,
+    ) -> (
+        gpui::AnyWindowHandle,
+        gpui::AnyWindowHandle,
+        utopia_core::PageId,
+        VisualTestContext,
+    ) {
+        use utopia_core::{BlockId, BlockKind, Command};
+        let path = dir.to_path_buf();
+        cx.update(|cx| {
+            cx.set_global(Theme::light());
+            install_keymap(cx, None);
+            appearance::install(cx, &path);
+        });
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+        let target = store.create_page("Target").unwrap();
+        let src = store.create_page("Source").unwrap();
+        let link = BlockId::new();
+        let mut cmds = vec![Command::InsertBlock {
+            id: link.clone(),
+            parent: None,
+            after: None,
+            text: "The release depends on [[Target]]".into(),
+            kind: BlockKind::Bullet,
+        }];
+        let mut after = None;
+        for n in 1..=4 {
+            let id = BlockId::new();
+            cmds.push(Command::InsertBlock {
+                id: id.clone(),
+                parent: Some(link.clone()),
+                after: after.clone(),
+                text: format!("Reason {n}"),
+                kind: BlockKind::Bullet,
+            });
+            after = Some(id);
+        }
+        store.execute(&src, cmds, Default::default()).unwrap();
+        store.sync_index().unwrap();
+        let app = cx.new(|_| AppState::new(store));
+        let main: gpui::AnyWindowHandle = cx
+            .add_window(|window, cx| Workspace::new(app, window, cx))
+            .into();
+        let settings =
+            cx.add_window(move |window, cx| SettingsView::new(path, Tab::Appearance, window, cx));
+        cx.run_until_parked();
+        let mut w = VisualTestContext::from_window(main, cx);
+        let ws = w
+            .update(|window, _| window.root::<Workspace>())
+            .flatten()
+            .expect("workspace root");
+        ws.update_in(&mut w, |w, window, cx| {
+            w.open(target.clone(), None, None, false, window, cx)
+        });
+        w.run_until_parked();
+        (main, settings.into(), target, w)
     }
 
     /// Settings → Appearance: picking IBM Plex Sans applies it to every open window at once
@@ -373,6 +437,9 @@ mod appearance {
                 "version": 1,
                 "font": "ibm-plex-sans",
                 "density": "comfortable",
+                "ref_children": 2,
+                "pinned": [],
+                "attribute-blocks": "compact",
             }))
         );
         assert!(
@@ -441,6 +508,56 @@ mod appearance {
         assert_eq!(settings_json(dir.path()).unwrap()["density"], "comfortable");
     }
 
+    /// SB-3: pins live in settings.json (not keymap.json, never the graph). Settings →
+    /// Appearance says how many there are and can clear them.
+    #[gpui::test]
+    fn pinned_pages_are_local_and_cleared_from_settings(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_main, settings) = open_both(cx, dir.path());
+        let page = PageId("page-a".into());
+        cx.update(|cx| {
+            let on = appearance::toggle_pinned(cx, &page).expect("settings.json is writable");
+            assert!(on);
+        });
+        assert_eq!(
+            settings_json(dir.path()).unwrap()["pinned"],
+            serde_json::json!(["page-a"]),
+            "the pin is local state in settings.json"
+        );
+        assert!(
+            !dir.path().join("keymap.json").exists(),
+            "a pin is not a keybinding"
+        );
+
+        let mut s = VisualTestContext::from_window(settings, cx);
+        s.run_until_parked();
+        assert!(
+            s.debug_bounds("settings-pinned").is_some(),
+            "Settings → Appearance shows the pinned pages"
+        );
+        let clear = s
+            .debug_bounds("settings-clear-pinned")
+            .expect("a Clear control when something is pinned");
+        s.simulate_click(clear.center(), Modifiers::default());
+        s.run_until_parked();
+        assert_eq!(
+            settings_json(dir.path()).unwrap()["pinned"],
+            serde_json::json!([]),
+            "Clear unpins every page"
+        );
+        assert!(s.update(|_, cx| appearance::pinned(cx).is_empty()));
+        // Nothing to clear any more. (The old control's debug bounds linger, so assert on
+        // what replaced it: the status line says the pins are gone.)
+        let view = s
+            .update(|window, _| window.root::<SettingsView>())
+            .flatten()
+            .expect("settings root");
+        assert_eq!(
+            view.update(cx, |v, _| v.status().map(str::to_string)),
+            Some("Unpinned every page.".to_string())
+        );
+    }
+
     /// The saved choice is what a new launch comes up with.
     #[gpui::test]
     fn a_saved_font_is_used_at_startup(cx: &mut TestAppContext) {
@@ -485,5 +602,105 @@ mod appearance {
         assert!(std::fs::read_to_string(dir.path().join("settings.json"))
             .unwrap()
             .contains("comic-sans"));
+    }
+
+    /// PG-1: how attribute blocks are drawn is a third local preference, picked in
+    /// Settings → Appearance, applied to every open window and written to settings.json.
+    #[gpui::test]
+    fn choosing_attribute_blocks_applies_everywhere_and_is_saved(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, settings) = open_both(cx, dir.path());
+        assert_eq!(
+            cx.update(|cx| appearance::attribute_blocks(cx)),
+            AttributeBlocks::Compact,
+            "compact rows are the default"
+        );
+        assert!(settings_json(dir.path()).is_none(), "nothing saved yet");
+
+        let mut s = VisualTestContext::from_window(settings, cx);
+        s.run_until_parked();
+        let option = s
+            .debug_bounds("settings-attributes-blocks")
+            .expect("the As blocks choice is shown");
+        s.simulate_click(option.center(), Modifiers::default());
+        s.run_until_parked();
+        assert_eq!(
+            s.update(|_, cx| appearance::attribute_blocks(cx)),
+            AttributeBlocks::Blocks
+        );
+        let saved = settings_json(dir.path()).expect("settings.json written");
+        assert_eq!(saved["attribute-blocks"], "blocks");
+        assert_eq!(saved["font"], "system", "the other preferences are kept");
+
+        // The main window follows, without being asked, and can be switched back here.
+        let mut w = VisualTestContext::from_window(main, cx);
+        w.run_until_parked();
+        assert!(
+            w.debug_bounds("ui-density-comfortable").is_some(),
+            "the page window still draws"
+        );
+        let option = s
+            .debug_bounds("settings-attributes-compact")
+            .expect("the Compact choice is shown");
+        s.simulate_click(option.center(), Modifiers::default());
+        s.run_until_parked();
+        assert_eq!(
+            settings_json(dir.path()).unwrap()["attribute-blocks"],
+            "compact",
+            "switching back is saved too"
+        );
+    }
+
+    /// LR-4: "Children shown in references" is a local preference (rule 9). Picking 0 folds
+    /// every child behind the chip in a page that is already open; 3 shows three of four.
+    #[gpui::test]
+    fn choosing_reference_children_is_saved_and_applies(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_main, settings, _target, mut w) = open_both_with_reference(cx, dir.path());
+        let ix = (0..40)
+            .find(|ix| {
+                let sel: &'static str = Box::leak(format!("hit-child-{ix}-0").into_boxed_str());
+                w.debug_bounds(sel).is_some()
+            })
+            .expect("the default of two children is shown");
+        let (more_four, more_one): (&'static str, &'static str) = (
+            Box::leak(format!("hit-more-{ix}-4").into_boxed_str()),
+            Box::leak(format!("hit-more-{ix}-1").into_boxed_str()),
+        );
+
+        let mut s = VisualTestContext::from_window(settings, cx);
+        s.run_until_parked();
+        assert!(s.debug_bounds("settings-ref-children-2").is_some());
+        let zero = s
+            .debug_bounds("settings-ref-children-0")
+            .expect("the 0 choice is offered");
+        s.simulate_click(zero.center(), Modifiers::default());
+        s.run_until_parked();
+        assert_eq!(
+            settings_json(dir.path()).expect("settings.json written")["ref_children"],
+            0
+        );
+        assert!(s.debug_bounds("settings-ref-children-0").is_some());
+
+        // The page that was already open folds all four behind the chip.
+        let mut w = VisualTestContext::from_window(_main, cx);
+        w.run_until_parked();
+        assert!(
+            w.debug_bounds(more_four).is_some(),
+            "0 hides all four children"
+        );
+
+        let three = s
+            .debug_bounds("settings-ref-children-3")
+            .expect("the 3 choice is offered");
+        s.simulate_click(three.center(), Modifiers::default());
+        s.run_until_parked();
+        assert_eq!(settings_json(dir.path()).unwrap()["ref_children"], 3);
+        let mut w = VisualTestContext::from_window(_main, cx);
+        w.run_until_parked();
+        assert!(
+            w.debug_bounds(more_one).is_some(),
+            "three shown, one folded"
+        );
     }
 }

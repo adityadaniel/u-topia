@@ -928,6 +928,262 @@ fn seed_help_graph(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Seed a scratch graph for the page-view screenshots (PG-1 … PG-5): a project page with
+/// attributes, an alias, headings, a done and an open to-do, a collapsed parent, a quote
+/// and two code blocks (one that names its language).
+fn seed_page_view(path: &Path) -> Result<()> {
+    use BlockKind::{Bullet, Code, Heading, Quote, Todo};
+    let mut s = Store::open(path)?;
+    let page = s.create_page("Trellis")?;
+    let ids = insert_tree(
+        &mut s,
+        &page,
+        &[
+            (0, Bullet, "status:: dogfooding"),
+            (0, Bullet, "owner:: [[Ana Lovelace]]"),
+            (0, Bullet, "due:: 2026-11-20"),
+            (0, Heading(1), "Goals"),
+            (1, Bullet, "Replace Roam for daily notes by December"),
+            (1, Todo, "Send [[Ana Lovelace]] the migration notes"),
+            (1, Todo, "Draft the release notes"),
+            (0, Heading(2), "Open questions"),
+            (1, Bullet, "Do we need block-level permissions?"),
+            (2, Bullet, "Probably not for v1"),
+            (1, Quote, "Ship the small thing that works."),
+            (1, Code, "rust\nfn main() {\n    println!(\"hello\");\n}"),
+            (1, Code, "make check"),
+            (0, Heading(3), "Later"),
+            (
+                1,
+                Bullet,
+                "Sync between the studio iMac and the MacBook Pro",
+            ),
+        ],
+    )?;
+    // A done to-do, an alias for the toolbar and a collapsed parent to show its arrow.
+    s.set_block_kind(&page, &ids[5], Todo, true)?;
+    s.add_alias(&page, "the board")?;
+    s.set_collapsed(&ids[13], true)?;
+    s.sync_index()?;
+    Ok(())
+}
+
+/// A scratch graph for the Daily Notes feed screenshots (DN-1 to DN-3): a long today so
+/// the pinned date can be caught mid-scroll, a written yesterday, empty days to fold and an
+/// older day with notes. Never seed into a real graph.
+fn seed_daily_feed(path: &Path) -> Result<()> {
+    use BlockKind::{Bullet, Heading, Quote, Todo};
+    let mut s = Store::open(path)?;
+    let today = chrono::Local::now().date_naive();
+
+    let atlas = s.create_page("Atlas Launch")?;
+    insert_tree(
+        &mut s,
+        &atlas,
+        &[
+            (0, Bullet, "status:: in progress"),
+            (0, Bullet, "owner:: [[Ana Lovelace]]"),
+            (0, Heading(2), "Scope"),
+            (1, Bullet, "A beta for twenty testers, invited by hand"),
+            (1, Bullet, "Import from the old format"),
+            (1, Todo, "Draft the release notes"),
+        ],
+    )?;
+    let ana = s.create_page("Ana Lovelace")?;
+    insert_tree(
+        &mut s,
+        &ana,
+        &[
+            (0, Bullet, "role:: reviewer on [[Atlas Launch]]"),
+            (0, Bullet, "Prefers a written summary before a call"),
+        ],
+    )?;
+    let reading = s.create_page("Reading")?;
+    insert_tree(
+        &mut s,
+        &reading,
+        &[(0, Bullet, "A list of what is worth finishing")],
+    )?;
+
+    // Today, long enough to scroll: the heading has to leave the top of the column.
+    let page = s.ensure_daily_page(today)?;
+    insert_tree(
+        &mut s,
+        &page,
+        &[
+            (0, Todo, "Review the [[Atlas Launch]] migration notes"),
+            (
+                1,
+                Bullet,
+                "The import path stays unchanged, so old files still open",
+            ),
+            (1, Todo, "Write the paragraph on merge conflicts"),
+            (0, Todo, "Send [[Ana Lovelace]] the beta list"),
+            (1, Bullet, "Twenty testers, invited by hand"),
+            (0, Bullet, "Draft the release note for the beta"),
+            (1, Quote, "Ship the small thing that works."),
+            (0, Heading(2), "Afternoon"),
+            (
+                0,
+                Bullet,
+                "Met [[Ana Lovelace]] about the [[Atlas Launch]] timeline",
+            ),
+            (1, Bullet, "She wants the beta in testers' hands this month"),
+            (1, Todo, "Send her the migration notes"),
+            (0, Bullet, "[[Reading]] — finished the chapter on CRDTs"),
+            (
+                1,
+                Bullet,
+                "The merge is the interesting part, not the transport",
+            ),
+            (1, Bullet, "Worth rereading before the beta"),
+            (0, Bullet, "#atlas #beta"),
+            (0, Heading(2), "Evening"),
+            (0, Bullet, "Sketched the outline of the beta announcement"),
+            (
+                1,
+                Bullet,
+                "Open with the import path, it is the thing people ask about",
+            ),
+            (1, Bullet, "Then the twenty testers"),
+            (
+                1,
+                Bullet,
+                "Then the date, once [[Ana Lovelace]] has reviewed it",
+            ),
+            (0, Todo, "Book the room for the kickoff"),
+            (0, Bullet, "Picked a title: “The small thing that works”"),
+            (0, Bullet, "Notes for tomorrow"),
+            (
+                1,
+                Todo,
+                "Ask [[Ana Lovelace]] to review the migration notes",
+            ),
+            (1, Todo, "Check the import on the 2019 export"),
+            (1, Bullet, "Keep the old export around for testing"),
+            (
+                0,
+                Bullet,
+                "[[Reading]] — the chapter on local-first software",
+            ),
+            (
+                1,
+                Bullet,
+                "Offline editing is the feature, not the fallback",
+            ),
+            (0, Bullet, "Ideas for the graph view"),
+            (1, Bullet, "Size the nodes by the number of links"),
+            (
+                1,
+                Bullet,
+                "Fade everything that is not a neighbour on hover",
+            ),
+            (0, Todo, "Reply to the testers' thread"),
+            (0, Bullet, "Good day."),
+        ],
+    )?;
+
+    // Yesterday: written, so it stays open (DN-1).
+    let page = s.ensure_daily_page(today - chrono::Duration::days(1))?;
+    insert_tree(
+        &mut s,
+        &page,
+        &[
+            (0, Bullet, "Wrote up the import plan for [[Atlas Launch]]"),
+            (1, Bullet, "Old files have to keep opening, no exceptions"),
+            (0, Todo, "Ask [[Ana Lovelace]] to review it"),
+            (0, Todo, "Book the room for the beta kickoff"),
+        ],
+    )?;
+
+    // An older day with notes, below the two empty days the feed folds (DN-1).
+    let page = s.ensure_daily_page(today - chrono::Duration::days(4))?;
+    insert_tree(
+        &mut s,
+        &page,
+        &[
+            (0, Bullet, "Started sketching the [[Atlas Launch]] scope"),
+            (0, Bullet, "[[Reading]] — two chapters on merge semantics"),
+        ],
+    )?;
+
+    s.sync_index()?;
+    Ok(())
+}
+
+/// The demo graph for the Linked References verification shots: the Help graph plus a
+/// reference block with more children than the inline limit, and unlinked mentions of
+/// "Ana Lovelace", so the shots exercise LR-4 and LR-5 on real content.
+fn seed_refs_graph(path: &Path) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    seed_help_graph(path)?;
+    let mut s = Store::open(path)?;
+    let today = chrono::Local::now().date_naive();
+    let day = PageId::for_date(today);
+    let st = s.page_state(&day)?.clone();
+    let host = st
+        .live_preorder()
+        .into_iter()
+        .find(|(id, _)| {
+            st.block(id)
+                .is_some_and(|b| b.text.contains("Met [[Ana Lovelace]]"))
+        })
+        .map(|(id, _)| id)
+        .context("today's mention of Ana Lovelace")?;
+    let after = st.last_child(Some(&host), true);
+    let id = BlockId::new();
+    s.execute(
+        &day,
+        vec![Command::InsertBlock {
+            id,
+            parent: Some(host),
+            after,
+            text: "She asked for the import plan first".into(),
+            kind: BlockKind::Bullet,
+        }],
+        EditOpts {
+            no_undo: true,
+            ..Default::default()
+        },
+    )?;
+    // Link yesterday, so the feed shows a day with a Linked References section of its own.
+    let yesterday = today - chrono::Duration::days(1);
+    let link = s.date_format().format(yesterday);
+    let plan = outline::append_block(s.page_state(&day)?, None);
+    let id = s
+        .execute_plan(&day, plan, None)?
+        .context("new block")?
+        .block;
+    s.set_block_text(
+        &day,
+        &id,
+        &format!("Plan follows on from [[{link}]]"),
+        None,
+        None,
+    )?;
+    s.commit_block(&day, &id)?;
+
+    let reading = s
+        .find_page("Reading")?
+        .context("the Help graph has a Reading page")?;
+    for text in [
+        "Remember: Ana Lovelace keeps the migration notes",
+        "Ana Lovelace likes a written summary first",
+    ] {
+        let plan = outline::append_block(s.page_state(&reading)?, None);
+        let id = s
+            .execute_plan(&reading, plan, None)?
+            .context("new block")?
+            .block;
+        s.set_block_text(&reading, &id, text, None, None)?;
+        s.commit_block(&reading, &id)?;
+    }
+    s.sync_index()?;
+    Ok(())
+}
+
 /// Regenerate the screenshots embedded in Settings → Help.
 ///
 /// Builds the app, seeds a mock graph, then drives the real window with
@@ -1067,9 +1323,18 @@ fn main() -> Result<()> {
         Some("bundle") => bundle(args.iter().any(|a| a == "--debug")),
         Some("mobile") => mobile(args.iter().any(|a| a == "--ios")),
         Some("help-shots") => help_shots(),
+        Some("seed-refs") => {
+            seed_refs_graph(Path::new(args.get(1).context("graph path")?))?;
+            println!("seeded {}", args[1]);
+            Ok(())
+        }
+        Some("seed-page-view") => {
+            seed_page_view(Path::new(args.get(1).context("graph path to seed")?))
+        }
+        Some("seed-daily") => seed_daily_feed(Path::new(args.get(1).context("graph path")?)),
         _ => {
             println!(
-                "usage: cargo run -p xtask --release -- bench [--ui]\n       cargo run -p xtask -- bundle [--debug]   (target/Utopia.app, registers utopia://)\n       cargo run -p xtask -- mobile [--ios]     (Swift bindings, checks, iOS shell)\n       cargo run -p xtask -- help-shots         (regenerate Settings -> Help screenshots)\n       cargo run -p xtask --release -- profile-merge   (loop for sampling with `sample`)"
+                "usage: cargo run -p xtask --release -- bench [--ui]\n       cargo run -p xtask -- bundle [--debug]   (target/Utopia.app, registers utopia://)\n       cargo run -p xtask -- mobile [--ios]     (Swift bindings, checks, iOS shell)\n       cargo run -p xtask -- help-shots         (regenerate Settings -> Help screenshots)\n       cargo run -p xtask -- seed-refs <graph>  (demo graph for the reference screenshots)\n       cargo run -p xtask -- seed-daily <graph>  (a scratch graph for the Daily Notes shots)\n       cargo run -p xtask -- seed-page-view <file.utopia>   (scratch graph for page-view shots)\n       cargo run -p xtask --release -- profile-merge   (loop for sampling with `sample`)"
             );
             Ok(())
         }

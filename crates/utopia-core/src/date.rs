@@ -429,6 +429,13 @@ fn weekday_name(w: Weekday) -> &'static str {
     WEEKDAYS[w.num_days_from_monday() as usize]
 }
 
+/// The weekday's full English name ("Thursday") for `date`, for captions above a day
+/// (DN-2). Display only: a day's identity is its ISO `daily_date` (§10.3), never its
+/// weekday.
+pub fn weekday_name_of(date: NaiveDate) -> &'static str {
+    weekday_name(date.weekday())
+}
+
 fn take_digits(s: &str, min: usize, max: usize) -> Option<(u32, &str)> {
     let n = s.bytes().take(max).take_while(u8::is_ascii_digit).count();
     if n < min {
@@ -664,6 +671,14 @@ mod tests {
             DateFormat::new("yyyy-MM-dd").format(d(2026, 1, 6)),
             "2026-01-06"
         );
+    }
+
+    /// DN-2: the weekday caption is a rendering of the date, in English, Monday first.
+    #[test]
+    fn weekday_names_follow_the_calendar() {
+        assert_eq!(weekday_name_of(d(2026, 11, 2)), "Monday");
+        assert_eq!(weekday_name_of(d(2026, 11, 5)), "Thursday");
+        assert_eq!(weekday_name_of(d(2026, 11, 8)), "Sunday");
     }
 
     #[test]

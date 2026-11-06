@@ -19,6 +19,9 @@ pub struct Theme {
     pub surface: Hsla,
     pub text: Hsla,
     pub muted: Hsla,
+    /// The warm grey a quotation is set in (PG-5): grey with the page's paper temperature,
+    /// not the cooler interface `muted`.
+    pub quote: Hsla,
     pub faint: Hsla,
     pub line: Hsla,
     pub hover: Hsla,
@@ -30,6 +33,8 @@ pub struct Theme {
     pub danger_bg: Hsla,
     pub danger: Hsla,
     pub warning: Hsla,
+    /// A healthy state that is not a link: the in-sync dot (SB-4).
+    pub success: Hsla,
     pub highlight_bg: Hsla,
     pub code_bg: Hsla,
     pub banner_bg: Hsla,
@@ -51,6 +56,7 @@ impl Theme {
             surface: rgb(0xfafaf9).into(),
             text: rgb(0x1f2328).into(),
             muted: rgb(0x6b7076).into(),
+            quote: rgb(0x6d6357).into(),
             faint: rgb(0xa8acb1).into(),
             line: rgb(0xe4e4e1).into(),
             hover: rgb(0xeeeeec).into(),
@@ -62,6 +68,7 @@ impl Theme {
             danger_bg: rgb(0xfbe4e4).into(),
             danger: rgb(0xb42318).into(),
             warning: rgb(0xd97706).into(),
+            success: rgb(0x1f7a3d).into(),
             highlight_bg: rgb(0xfff1a8).into(),
             code_bg: rgb(0xf0f0ee).into(),
             banner_bg: rgb(0xeaf2ff).into(),
@@ -79,6 +86,7 @@ impl Theme {
             surface: rgb(0x202124).into(),
             text: rgb(0xe6e6e3).into(),
             muted: rgb(0xa0a4a8).into(),
+            quote: rgb(0xb3a795).into(),
             faint: rgb(0x6b6f74).into(),
             line: rgb(0x34363a).into(),
             hover: rgb(0x2c2e31).into(),
@@ -90,6 +98,7 @@ impl Theme {
             danger_bg: rgb(0x4a2222).into(),
             danger: rgb(0xff9c94).into(),
             warning: rgb(0xf0b45a).into(),
+            success: rgb(0x6fd08c).into(),
             highlight_bg: rgb(0x5c5020).into(),
             code_bg: rgb(0x2c2d30).into(),
             banner_bg: rgb(0x22314a).into(),
@@ -170,6 +179,21 @@ pub fn quiet_menu(
 
 /// Label size for controls, between body and caption.
 pub const CONTROL_SIZE: f32 = 13.;
+/// The one monospace family: code blocks (PG-5), whatever font the notes are set in.
+pub const MONO: &str = "Menlo";
+
+/// The small count that follows a name (LR-2): a quiet chip right after the page or day
+/// name, not a number pushed to the far edge of the row.
+pub fn count_chip(count: usize, th: &Theme) -> Div {
+    div()
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .bg(th.chip_bg)
+        .text_size(px(CAPTION_SIZE))
+        .text_color(th.muted)
+        .child(count.to_string())
+}
 
 /// The one type scale (ALL-1): titles, outline headings, body and captions. Page titles
 /// and day headings share `TITLE_SIZE`; an outline heading never draws larger than H1.
@@ -187,6 +211,16 @@ pub const INDENT: f32 = 22.;
 /// The UI caps visual indentation; deeper blocks show a depth badge (§6.1).
 pub const MAX_VISUAL_DEPTH: usize = 12;
 
+/// The point size and line box of an outline heading (PG-3). H1 never passes 20 px, and the
+/// 28 px title stays above all three, so a heading in the outline never competes with it.
+pub fn heading_metrics(level: u8) -> (f32, f32) {
+    match level {
+        1 => (H1_SIZE, 28.),
+        2 => (H2_SIZE, 24.),
+        _ => (H3_SIZE, 22.),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,12 +234,14 @@ mod tests {
         for (a, b) in [
             (l.text, d.text),
             (l.muted, d.muted),
+            (l.quote, d.quote),
             (l.line, d.line),
             (l.surface, d.surface),
             (l.accent, d.accent),
             (l.tag, d.tag),
             (l.danger, d.danger),
             (l.warning, d.warning),
+            (l.success, d.success),
         ] {
             assert_ne!(a, b, "a dark theme has its own value for every token");
         }
@@ -229,5 +265,24 @@ mod tests {
         );
         let (text, body) = (TEXT_SIZE, BODY_SIZE);
         assert!(text == body, "the body size is the default text size");
+    }
+
+    /// PG-3: the three outline steps, each below the 28 px title and above the body, on a
+    /// line box that shrinks with them.
+    #[test]
+    fn outline_headings_step_down_from_the_title() {
+        assert_eq!((H1_SIZE, H2_SIZE, H3_SIZE), (20., 17., 15.5));
+        let mut last = TITLE_SIZE;
+        for level in 1..=3 {
+            let (size, line) = heading_metrics(level);
+            assert!(size < last && size > BODY_SIZE, "level {level}: {size}");
+            assert!(line >= size, "the line box holds level {level}: {line}");
+            last = size;
+        }
+        assert!(
+            heading_metrics(1).1 > heading_metrics(2).1
+                && heading_metrics(2).1 > heading_metrics(3).1,
+            "each heading takes less vertical room than the one above it"
+        );
     }
 }

@@ -1009,6 +1009,138 @@ fn unlinked_references_link_button(cx: &mut TestAppContext) {
     });
 }
 
+/// LR-3: the path above a reference is clickable part by part. The page part opens the
+/// referencing page; an ancestor part opens it with that ancestor focused.
+#[gpui::test]
+fn reference_path_parts_open_their_target(cx: &mut TestAppContext) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    let (app, ws, cx) = setup(cx);
+    let (target, atlas, risks) = app.update(cx, |app, _| {
+        let target = app.store.create_page("Target").unwrap();
+        let atlas = app.store.create_page("Atlas Launch").unwrap();
+        let risks = BlockId::new();
+        let risky = BlockId::new();
+        app.store
+            .execute(
+                &atlas,
+                vec![
+                    Command::InsertBlock {
+                        id: risks.clone(),
+                        parent: None,
+                        after: None,
+                        text: "Risks".into(),
+                        kind: BlockKind::Heading(2),
+                    },
+                    Command::InsertBlock {
+                        id: risky,
+                        parent: Some(risks.clone()),
+                        after: None,
+                        text: "The beta date depends on [[Target]]".into(),
+                        kind: BlockKind::Bullet,
+                    },
+                ],
+                Default::default(),
+            )
+            .unwrap();
+        app.store.sync_index().unwrap();
+        (target, atlas, risks)
+    });
+    let path_part = |cx: &mut VisualTestContext, part: usize| {
+        cx.run_until_parked();
+        (0..40)
+            .find_map(|ix| {
+                let sel: &'static str =
+                    Box::leak(format!("hit-path-part-{ix}-{part}").into_boxed_str());
+                cx.debug_bounds(sel)
+            })
+            .expect("a path part was rendered")
+    };
+
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    let page_part = path_part(cx, 0);
+    cx.simulate_click(page_part.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(atlas.clone()),
+        "the page part opens the page the reference lives on"
+    );
+
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    let ancestor_part = path_part(cx, 1);
+    cx.simulate_click(ancestor_part.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(atlas));
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.block.clone())),
+        Some(risks),
+        "the ancestor part focuses that block"
+    );
+}
+
+/// LR-5: the Unlinked References header carries the count while closed, "Link all" links
+/// every mention at once, and an empty section says so.
+#[gpui::test]
+fn unlinked_references_count_and_link_all(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (m, src) = app.update(cx, |app, _| {
+        let m = app.store.create_page("Mindfulness").unwrap();
+        let src = app.store.create_page("Reading").unwrap();
+        let b = app.store.ensure_first_block(&src).unwrap();
+        app.store
+            .set_block_text(
+                &src,
+                &b,
+                "practising mindfulness daily, then mindfulness again",
+                None,
+                None,
+            )
+            .unwrap();
+        app.store.commit_block(&src, &b).unwrap();
+        app.store.sync_index().unwrap();
+        (m, src)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(m.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    // The count is there before the section is opened.
+    cx.debug_bounds("unlinked-count-2")
+        .expect("the closed header shows how many unlinked mentions there are");
+    let link_all = cx
+        .debug_bounds("link-all")
+        .expect("Link all is offered in the header");
+    cx.simulate_click(link_all.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&app, &src, cx)[0].0,
+        "practising [[Mindfulness]] daily, then [[Mindfulness]] again",
+        "every mention, with the right byte offsets"
+    );
+    app.update(cx, |app, _| {
+        app.store.sync_index().unwrap();
+        assert_eq!(app.store.backlink_count(&m).unwrap(), 1);
+        assert!(app.store.unlinked_references(&m).unwrap().is_empty());
+    });
+    // Opening the now empty section says so, rather than showing a blank space.
+    let header = cx.debug_bounds("unlinked-header").expect("header");
+    cx.simulate_click(header.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.debug_bounds("unlinked-empty")
+        .expect("the empty state names itself");
+    cx.debug_bounds("unlinked-count-0")
+        .expect("and the count is zero");
+}
+
 #[gpui::test]
 fn embeds_render_and_split_panes(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);
@@ -1381,6 +1513,37 @@ fn feed_blank_day_is_written_by_typing(cx: &mut TestAppContext) {
     assert_eq!(written.len(), 1);
     assert!(written[0] < today(), "an older day: {written:?}");
     assert_eq!(day_texts(&app, written[0], cx), ["filled in later"]);
+}
+
+/// DN-1: an empty day after today and yesterday is one row; clicking it starts writing
+/// there, and the day opens (with its heading) once it has a block. Clicking alone writes
+/// nothing (FR-1.2).
+#[gpui::test]
+fn folded_empty_day_opens_on_a_click(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.open_journal_days(cx)),
+        2,
+        "today and yesterday stay open"
+    );
+    let day = today() - chrono::Duration::days(4);
+    let selector: &'static str =
+        Box::leak(format!("day-folded-{}", utopia_core::date::iso(day)).into_boxed_str());
+    let row = cx.debug_bounds(selector).expect("a folded empty day");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(daily_count(&app, cx), 0, "clicking is not writing");
+    cx.simulate_input("picked up later");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(day_texts(&app, day, cx), ["picked up later"]);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.open_journal_days(cx)),
+        3,
+        "the day now shows its date and its block"
+    );
 }
 
 #[gpui::test]
@@ -2036,4 +2199,198 @@ fn auto_closed_relative_date_accepts_with_tab(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(day_texts(&app, today(), cx), [want]);
     assert_tomorrow_linked(&app, cx);
+}
+
+/// SB-2, rule 10: the tag mark comes from a classification cached off the render path; a
+/// store change the app was never told about must not be discovered while drawing a frame.
+#[gpui::test]
+fn tag_marks_come_from_the_index_feed_not_from_render(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        let (p, b) = app.store.open_daily(today()).unwrap();
+        app.store
+            .set_block_text(&p, &b, "#atlas", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    // Make the sidebar re-query its list, without running the index feed: rendering must
+    // still use the cached classification.
+    app.update(cx, |app, cx| {
+        app.refs_version += 1;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("tag-glyph-atlas").is_none(),
+        "render must not call hashtag_only_pages (rule 10)"
+    );
+    // Once the app is told the index moved, the cache refreshes and the mark appears.
+    app.update(cx, |app, cx| app.flush_now(cx));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("tag-glyph-atlas").is_some(),
+        "the index feed refreshed the tag cache"
+    );
+}
+
+/// SB-4: when a new exchange starts, the footer's dot must repaint as "syncing" at once.
+/// Without a notification the window keeps showing the green dot from the previous round
+/// for the whole network exchange.
+#[gpui::test]
+fn sync_dot_turns_amber_when_an_exchange_starts(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use utopia_ui::sync_runner::{BoxTransport, SyncDot};
+
+    let (_app, ws, cx) = setup(cx);
+    let nudge = Arc::new(AtomicBool::new(false));
+    let transport: BoxTransport = Box::new(utopia_sync::relay::RelayTransport::new(
+        utopia_sync::relay::Relay::new(),
+        "graph",
+    ));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(transport, Some(nudge.clone()), cx)
+    });
+    // The first round finishes quickly: the dot is green and painted.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(10));
+    cx.run_until_parked();
+    cx.update(|_, _| {});
+    assert_eq!(ws.update(cx, |w, _| w.sync_dot()), SyncDot::Synced);
+    assert_eq!(
+        ws.update(cx, |w, _| w.rendered_sync_dot()),
+        Some(SyncDot::Synced)
+    );
+
+    // Ask for the next round now and stop at the moment the exchange is in flight.
+    nudge.store(true, Ordering::SeqCst);
+    let mut started = false;
+    for _ in 0..500 {
+        if ws.update(cx, |w, _| w.sync_dot()) == SyncDot::Syncing {
+            started = true;
+            break;
+        }
+        // Move the test clock to the loop's next 250 ms poll (if it registered one), then
+        // run exactly one queued task. The exchange is only queued after the loop takes
+        // the transport, so it cannot run before the state is observed.
+        cx.dispatcher.advance_clock_to_next_delayed();
+        if !cx.background_executor.tick() {
+            break;
+        }
+    }
+    assert!(started, "the second exchange never started");
+    // Flushing effects paints the window only if the state change requested a frame.
+    cx.update(|_, _| {});
+    assert_eq!(
+        ws.update(cx, |w, _| w.rendered_sync_dot()),
+        Some(SyncDot::Syncing),
+        "the in-flight dot was never painted"
+    );
+}
+
+/// SB-2 under the §15.1 budget: the tag-page classification is published by the commit
+/// that changes the index, so an edit (and the index update after its flush) never runs the
+/// whole-graph query on the UI thread.
+#[gpui::test]
+fn an_edit_does_not_classify_tag_pages_on_the_ui_thread(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("tags.utopia")).unwrap();
+    store.set_today(Some(today()));
+    // "atlas" has no blocks of its own and is reached only through a hashtag.
+    store.create_page("atlas").unwrap();
+    let notes = store.create_page("Notes").unwrap();
+    let block = store.ensure_first_block(&notes).unwrap();
+    store
+        .set_block_text(&notes, &block, "Wrote about #atlas", None, None)
+        .unwrap();
+    store.commit_block(&notes, &block).unwrap();
+    store.sync_index().unwrap();
+
+    let app = cx.new(|_| AppState::new(store));
+    assert_eq!(
+        app.update(cx, |app, _| app.tag_pages.len()),
+        1,
+        "atlas is a tag page at startup"
+    );
+    // AppState classifies once at startup; after that the commit publishes the answer.
+    let scans = app.update(cx, |app, _| app.store.tag_page_scans());
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app.clone(), window, cx));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(notes.clone(), None, Some(block.clone()), false, window, cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_input("!");
+    cx.run_until_parked();
+    app.update(cx, |app, cx| app.flush_now(cx));
+    app.update(cx, |app, _| app.store.sync_index().unwrap());
+    cx.run_until_parked();
+    assert_eq!(
+        app.update(cx, |app, _| app.store.tag_page_scans()),
+        scans,
+        "typing and the index update did not re-classify on this thread"
+    );
+    assert_eq!(
+        app.update(cx, |app, _| app.tag_pages.len()),
+        1,
+        "the set published by the commit is current"
+    );
+
+    // A change that drops the hashtag is published as well.
+    app.update(cx, |app, cx| {
+        app.store
+            .set_block_text(&notes, &block, "Wrote about [[atlas]]", None, None)
+            .unwrap();
+        app.store.commit_block(&notes, &block).unwrap();
+        app.flush_now(cx);
+    });
+    app.update(cx, |app, _| app.store.sync_index().unwrap());
+    cx.run_until_parked();
+    assert!(
+        app.update(cx, |app, _| app.tag_pages.is_empty()),
+        "a plain link is not a hashtag-only page"
+    );
+    assert_eq!(app.update(cx, |app, _| app.store.tag_page_scans()), scans);
+}
+
+/// FR-1.2: a journal template gives a draft day blocks before it is written. Clicking that
+/// day must still write nothing; the row the caret goes to is added to the draft in memory
+/// and only becomes a page on the first keystroke, together with the template.
+#[gpui::test]
+fn template_backed_day_is_not_written_by_a_click(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        let t = app.store.create_page("templates/journal").unwrap();
+        let b = app.store.ensure_first_block(&t).unwrap();
+        app.store
+            .set_block_text(&t, &b, "Intention for today", None, None)
+            .unwrap();
+        app.store.commit_block(&t, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let day = today() - chrono::Duration::days(4);
+    let selector: &'static str =
+        Box::leak(format!("day-folded-{}", utopia_core::date::iso(day)).into_boxed_str());
+    let row = cx.debug_bounds(selector).expect("a folded empty day");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        daily_count(&app, cx),
+        0,
+        "clicking a template-backed day is not writing it"
+    );
+    // The template's block and the new note are written together on the first keystroke.
+    cx.simulate_input("filled in later");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        day_texts(&app, day, cx),
+        ["Intention for today", "filled in later"]
+    );
 }
