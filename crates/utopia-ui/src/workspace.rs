@@ -1565,10 +1565,13 @@ impl Workspace {
             PanelTab::Outline => self.render_outline(cx),
             PanelTab::Pinned => self.render_pinned(cx),
         };
+        // With no pages stacked above it, the panel is the sidebar and fills it. With
+        // pages, it keeps a fixed share at the bottom so both stay usable.
+        let only_panel = self.panes.is_empty();
         div()
             .debug_selector(|| format!("panel-{}", self.panel_tab.id()))
-            .h(px(260.))
-            .flex_none()
+            .when(only_panel, |d| d.flex_1().min_h_0())
+            .when(!only_panel, |d| d.h(px(260.)).flex_none())
             .flex()
             .flex_col()
             .gap_1()
