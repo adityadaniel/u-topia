@@ -2566,3 +2566,74 @@ fn co_reference_counts_match_the_hits_they_select(cx: &mut TestAppContext) {
     cx.run_until_parked();
     bounds(cx, "refs-count-2");
 }
+
+/// PG-1 review fix: a root code block that happens to contain `::` (C++'s `std::cout`) is a
+/// code block, not page metadata. The projector never indexes code as an attribute, so the
+/// outline and the metadata header must not either.
+#[gpui::test]
+fn code_blocks_are_not_folded_as_attributes(cx: &mut TestAppContext) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    use utopia_store::EditOpts;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+        utopia_ui::appearance::install(cx, &path);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(today()));
+    let page = store.create_page("Cxx").unwrap();
+    let mut prev: Option<BlockId> = None;
+    let mut cmds = Vec::new();
+    for (kind, text) in [
+        (BlockKind::Bullet, "status:: dogfooding"),
+        (BlockKind::Code, "std::cout << \"hello\";"),
+        (BlockKind::Bullet, "An ordinary note"),
+    ] {
+        let id = BlockId::new();
+        cmds.push(Command::InsertBlock {
+            id: id.clone(),
+            parent: None,
+            after: prev.clone(),
+            text: text.to_string(),
+            kind,
+        });
+        prev = Some(id);
+    }
+    store
+        .execute(
+            &page,
+            cmds,
+            EditOpts {
+                no_undo: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    // The real attribute still folds; the code block keeps its own row right after it.
+    bounds(cx, "attr-1");
+    assert!(
+        cx.debug_bounds("content-1").is_none(),
+        "the attribute block is folded away"
+    );
+    bounds(cx, "content-2");
+    assert!(
+        cx.debug_bounds("attr-2").is_none(),
+        "the code block is not an attribute row"
+    );
+    // And the metadata header does not list `std` as a key either.
+    bounds(cx, "meta-status");
+    assert!(
+        cx.debug_bounds("meta-std").is_none(),
+        "a code block is not page metadata"
+    );
+}

@@ -792,9 +792,9 @@ impl PageView {
                 .live_roots()
                 .iter()
                 .filter_map(|r| {
-                    let t = &st.block(r)?.text;
-                    utopia_core::inline::attribute(t)
-                        .map(|(k, v)| (k, utopia_core::inline::plain_text(&t[v])))
+                    let b = st.block(r)?;
+                    page_attribute(b.kind, &b.text)
+                        .map(|(k, v)| (k, utopia_core::inline::plain_text(&b.text[v])))
                 })
                 .collect();
             header.date = st.meta.daily_date;
@@ -2565,8 +2565,10 @@ impl PageView {
                 .py_1()
                 .text_size(px(crate::theme::BODY_SIZE));
             for (k, v) in &h.attributes {
+                let key = k.clone();
                 grid = grid.child(
                     div()
+                        .debug_selector(move || format!("meta-{key}"))
                         .flex()
                         .gap_2()
                         .child(div().w(px(110.)).text_color(th.muted).child(k.clone()))
@@ -3729,6 +3731,16 @@ fn start_note(
     Ok(id)
 }
 
+/// PG-1's one classification of page metadata: a root `key:: value` block is an attribute,
+/// except a code block — the index never records code as an attribute (`attr_row` is skipped
+/// for `BlockKind::Code`), so `std::cout << …` stays a code block and not a `std` key.
+fn page_attribute(kind: BlockKind, text: &str) -> Option<(String, std::ops::Range<usize>)> {
+    if kind == BlockKind::Code {
+        return None;
+    }
+    utopia_core::inline::attribute(text)
+}
+
 /// PG-1 folds a root `key:: value` block into one compact row and hides its children, so
 /// its subtree is not drawn. The subtree holding `editing` stays open: the row that holds
 /// the editor — and its focus handle — must always be rendered, or every keystroke after
@@ -3748,7 +3760,7 @@ fn is_folded_attribute(
     let Some(block) = st.block(id) else {
         return false;
     };
-    if utopia_core::inline::attribute(&block.text).is_none() {
+    if page_attribute(block.kind, &block.text).is_none() {
         return false;
     }
     match editing {
@@ -3780,7 +3792,7 @@ fn push_page_rows(
         folded = None;
         let Some(b) = st.block(&id) else { continue };
         if compact_attributes && is_folded_attribute(st, true, editing, &id) {
-            if let Some((key, value)) = utopia_core::inline::attribute(&b.text) {
+            if let Some((key, value)) = page_attribute(b.kind, &b.text) {
                 let children = st.live_children(Some(&id)).len();
                 out.push(Item::Attribute {
                     depth,
