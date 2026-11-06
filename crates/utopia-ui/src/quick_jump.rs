@@ -663,42 +663,64 @@ fn commands(query: &str) -> Vec<&'static ActionDoc> {
 /// Byte ranges of the typed letters inside `label`, for the semibold match (QJ-4). A
 /// contiguous, case-insensitive match wins, so `ana` bolds just the `ana` of `Dana`;
 /// otherwise the letters of the fuzzy subsequence are marked one at a time, which is why
-/// `dn` still shows what made `Dana` a result. Case folding can change byte lengths, so
-/// the contiguous pass is only trusted when the folded text has the same length.
+/// `dn` still shows what made `Dana` a result.
+///
+/// Matching compares characters, never offsets into a folded copy of the string: folding
+/// `ẞ` or `İ` moves where the byte boundaries are (they are five bytes either way, but the
+/// lowercase characters are not the same bytes), and a range that splits a character
+/// panics when gpui slices the text for a highlight. Every range returned here therefore
+/// starts and ends on a boundary of `label` (AGENTS.md, text conventions).
 fn highlight_ranges(label: &str, needle: &str) -> Vec<Range<usize>> {
     let needle = needle.trim();
     if needle.is_empty() || label.is_empty() {
         return Vec::new();
     }
-    let lower_label = label.to_lowercase();
-    let lower_needle = needle.to_lowercase();
-    if lower_label.len() == label.len() && lower_needle.len() == needle.len() {
-        let mut out = Vec::new();
-        let mut from = 0;
-        while let Some(i) = lower_label[from..].find(&lower_needle) {
-            let start = from + i;
-            out.push(start..start + needle.len());
-            from = start + needle.len();
-        }
-        if !out.is_empty() {
-            return out;
+    // Each character of the label: its byte range, and its case-folded form (which can be
+    // more than one character: `İ` folds to `i` plus a combining dot).
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut stream: Vec<char> = Vec::new();
+    let mut owner: Vec<usize> = Vec::new();
+    for (i, c) in label.char_indices() {
+        ranges.push(i..i + c.len_utf8());
+        for folded in c.to_lowercase() {
+            stream.push(folded);
+            owner.push(ranges.len() - 1);
         }
     }
+    let want: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    if want.is_empty() {
+        return Vec::new();
+    }
+    // The folded text as one stream, so a contiguous match can be found in it and widened
+    // back to whole characters: `i` in `ẞİ` marks that `İ` (3..5), not one byte of `ẞ`.
     let mut out = Vec::new();
-    let mut it = label.char_indices();
-    for want in lower_needle.chars() {
-        let mut found = None;
-        for (i, c) in it.by_ref() {
-            let mut lower = c.to_lowercase();
-            if lower.next() == Some(want) && lower.next().is_none() {
-                found = Some((i, c));
-                break;
-            }
+    let mut start = 0;
+    while start + want.len() <= stream.len() {
+        if stream[start..start + want.len()] == want[..] {
+            let last = start + want.len() - 1;
+            out.push(ranges[owner[start]].start..ranges[owner[last]].end);
+            start += want.len();
+        } else {
+            start += 1;
         }
-        let Some((i, c)) = found else {
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    // Otherwise the letters of the fuzzy subsequence, one character at a time. Adjacent
+    // ones merge, so two folded characters inside one character stay a single range.
+    let mut out: Vec<Range<usize>> = Vec::new();
+    let mut from = 0;
+    for c in want {
+        let Some(i) = (from..stream.len()).find(|&i| stream[i] == c) else {
             return Vec::new();
         };
-        out.push(i..i + c.len_utf8());
+        from = i + 1;
+        let r = ranges[owner[i]].clone();
+        match out.last_mut() {
+            Some(prev) if prev.end == r.start => prev.end = r.end,
+            _ => out.push(r),
+        }
     }
     out
 }
@@ -724,6 +746,34 @@ mod tests {
         // Ranges are byte ranges into the label, so a non-ASCII title stays intact.
         assert_eq!(highlight_ranges("Café notes", "é"), vec![3..5]);
         assert_eq!(highlight_ranges("Café notes", "notes"), vec![6..11]);
+    }
+
+    /// Case folding can change *where* the byte boundaries are even when the folded text
+    /// has the same length: `ẞİ` and its lowercase are both five bytes, yet offset 2 lies
+    /// inside `ẞ`. A range that splits a character panics gpui's text shaper (§6, rule 11),
+    /// so every range must start and end on a boundary of the original label.
+    #[test]
+    fn match_ranges_stay_on_char_boundaries() {
+        for (label, needle) in [
+            ("ẞİ", "i"),
+            ("İstanbul", "i"),
+            ("İstanbul", "istan"),
+            ("Straße", "s"),
+            ("Straße", "ß"),
+            ("ΣΟΦΊΑ", "σ"),
+            ("ǅungla", "d"),
+            ("Ça va", "ça"),
+        ] {
+            let ranges = highlight_ranges(label, needle);
+            for r in &ranges {
+                assert!(
+                    label.get(r.clone()).is_some(),
+                    "{label:?} / {needle:?}: {r:?} splits a character"
+                );
+            }
+        }
+        // Matching `i` must mark the `İ` it matched, not one byte of its UTF-8.
+        assert_eq!(highlight_ranges("ẞİ", "i"), vec![3..5]);
     }
 
     /// QJ-5: `>` lists the catalog, filtered by label, category or key.
