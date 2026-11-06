@@ -250,11 +250,14 @@ Dependency direction is one-way: `app → ui → (plugin → api) → store → 
 
 - Rust 2021 edition, workspace-level dependency versions in the root `Cargo.toml`
   (`[workspace.dependencies]`). Pin GPUI exactly (`=0.2.2`, risk R1).
-- `vendor/zed-font-kit` is crates.io `zed-font-kit 0.14.1-zed` with one change, in
-  `src/loaders/core_text.rs` `raster_bounds`: glyph bitmaps are measured at the size drawn,
-  plus a pixel of room, so headings in the system font are not clipped
-  (`crates/utopia-ui/tests/glyph_bounds.rs`). It is wired in by `[patch.crates-io]` and
-  excluded from the workspace; drop it when GPUI is upgraded past the bug.
+- `zed-font-kit` is patched (`[patch.crates-io]` in the root `Cargo.toml`) to the fork
+  github.com/adityadaniel/font-kit, branch `utopia/glyph-bounds`, pinned by `rev`: crates.io
+  `zed-font-kit 0.14.1-zed` plus one commit in `src/loaders/core_text.rs` `raster_bounds`, so
+  glyph bitmaps are measured at the size drawn plus a pixel of room and headings in the system
+  font are not clipped (`crates/utopia-ui/tests/glyph_bounds.rs`). CI fails when the patch
+  stops applying (a GPUI upgrade moved off 0.14.1-zed): then drop it, or rebase the fork's
+  commit onto the new version if the bug is still there. Upstream: zed-industries/zed#45957
+  and #63469.
 - Errors: `thiserror` enums in library crates (`DomainError`, `StoreError`), `anyhow` only in
   `utopia-app`.
 - Timestamps: Unix ms UTC (`i64`). Ordering uses fractional positions, never timestamps (§10.7).

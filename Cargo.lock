@@ -8865,6 +8865,7 @@ dependencies = [
 [[package]]
 name = "zed-font-kit"
 version = "0.14.1-zed"
+source = "git+https://github.com/adityadaniel/font-kit?rev=753458b2a14f2b72d0f740a1c70681d5e9529f0c#753458b2a14f2b72d0f740a1c70681d5e9529f0c"
 dependencies = [
  "bitflags 2.13.2",
  "byteorder",

@@ -43,6 +43,13 @@ jobs:
           shared-key: macos-15
 
       # Formatting first: it is seconds, and failing early saves a long build.
+      # zed-font-kit is patched to a fork (root Cargo.toml). If a GPUI upgrade moves off the
+      # patched version, cargo silently stops using it and the glyph clipping returns.
+      - name: zed-font-kit patch still applies
+        run: |
+          cargo tree -p gpui -i zed-font-kit --locked | head -1 | grep -q 'github.com/adityadaniel/font-kit' \
+            || { echo "::error::zed-font-kit [patch.crates-io] is not used; see AGENTS.md"; exit 1; }
+
       - name: cargo fmt
         run: cargo fmt --all -- --check
 

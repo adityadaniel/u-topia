@@ -28,8 +28,8 @@ png = "0.17"
 tempfile.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 
-# tests/glyph_bounds.rs measures glyphs through the same font-kit (patched, see the
-# workspace Cargo.toml) and CoreText calls gpui uses.
+# tests/glyph_bounds.rs measures glyphs through the same font-kit (patched to the fork,
+# see the workspace Cargo.toml) and CoreText calls gpui uses.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 core-text = "21"
 pathfinder_geometry = "0.5"
