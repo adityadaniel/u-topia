@@ -126,6 +126,9 @@ pub struct Store {
     /// commit path publishes the set instead, so the UI never runs one; tests read this to
     /// keep it that way.
     tag_page_scans: std::sync::atomic::AtomicU64,
+    /// Unlinked-reference scans this store has run (LR-5). The count is cached per index
+    /// version; tests read this to check the scan happens off the paint path.
+    unlinked_scans: std::sync::atomic::AtomicU64,
 }
 
 impl Store {
@@ -192,6 +195,7 @@ impl Store {
             debounced: false,
             mem_blobs: HashMap::new(),
             tag_page_scans: std::sync::atomic::AtomicU64::new(0),
+            unlinked_scans: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -241,6 +245,13 @@ impl Store {
     /// commit path classifies on the writer, so this stays put while the UI edits.
     pub fn tag_page_scans(&self) -> u64 {
         self.tag_page_scans
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many unlinked-reference scans this store has run (LR-5). Views cache the answer
+    /// per index version, so this only moves when the index changed.
+    pub fn unlinked_scans(&self) -> u64 {
+        self.unlinked_scans
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

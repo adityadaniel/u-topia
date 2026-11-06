@@ -2357,6 +2357,94 @@ fn an_edit_does_not_classify_tag_pages_on_the_ui_thread(cx: &mut TestAppContext)
     assert_eq!(app.update(cx, |app, _| app.store.tag_page_scans()), scans);
 }
 
+/// LR-5 + rule 10: the unlinked-reference count is refreshed by the index update and by
+/// navigation, not by a frame. A page that is open but not painted (its sidebar pane is
+/// closed) still counts its mentions when the index changes — with the scan in `render`
+/// it would only be counted once something painted it.
+#[gpui::test]
+fn unlinked_count_refreshes_for_a_page_that_is_not_painted(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (main_page, side_page, source) = app.update(cx, |app, _| {
+        let main_page = app.store.create_page("Ana Lovelace").unwrap();
+        let side_page = app.store.create_page("Ada Lovelace").unwrap();
+        let source = app.store.create_page("Notes").unwrap();
+        let b = app.store.ensure_first_block(&source).unwrap();
+        app.store
+            .set_block_text(
+                &source,
+                &b,
+                "Met Ana Lovelace, then Ada Lovelace",
+                None,
+                None,
+            )
+            .unwrap();
+        app.store.commit_block(&source, &b).unwrap();
+        (main_page, side_page, source)
+    });
+    // One page in the main pane, one in the right sidebar; then close the sidebar so the
+    // second view keeps its state but is not rendered.
+    ws.update_in(cx, |w, window, cx| {
+        w.open(main_page.clone(), None, None, false, window, cx);
+        w.open(side_page.clone(), None, None, true, window, cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-shift-\\");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("right-sidebar").is_none(),
+        "the sidebar is closed, so its page is not painted"
+    );
+
+    // A durable index change: both open page views hear it and count their mentions.
+    let before = app.update(cx, |app, _| app.store.unlinked_scans());
+    app.update(cx, |app, cx| {
+        let plan = utopia_core::outline::append_block(app.store.page_state(&source).unwrap(), None);
+        let b = app
+            .store
+            .execute_plan(&source, plan, None)
+            .unwrap()
+            .unwrap()
+            .block;
+        app.store
+            .set_block_text(&source, &b, "Ada Lovelace again", None, None)
+            .unwrap();
+        app.store.commit_block(&source, &b).unwrap();
+        app.flush_now(cx);
+    });
+    cx.run_until_parked();
+    let after = app.update(cx, |app, _| app.store.unlinked_scans());
+    assert_eq!(
+        after - before,
+        2,
+        "both open pages refreshed their count, painted or not"
+    );
+
+    // Painting a frame for any reason does not count again, and the painted page is current.
+    assert!(
+        cx.debug_bounds("unlinked-count-1").is_some(),
+        "the painted page shows its count"
+    );
+    ws.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    assert_eq!(
+        app.update(cx, |app, _| app.store.unlinked_scans()),
+        after,
+        "a frame without an index change costs no scan"
+    );
+    // Reopening the sidebar shows the second page's fresh count without another scan.
+    cx.simulate_keystrokes("cmd-shift-\\");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("right-sidebar").is_some(),
+        "sidebar reopened"
+    );
+    assert_eq!(
+        app.update(cx, |app, _| app.store.unlinked_scans()),
+        after,
+        "the reopened pane uses the count it already refreshed"
+    );
+}
+
 /// FR-1.2: a journal template gives a draft day blocks before it is written. Clicking that
 /// day must still write nothing; the row the caret goes to is added to the draft in memory
 /// and only becomes a page on the first keystroke, together with the template.
