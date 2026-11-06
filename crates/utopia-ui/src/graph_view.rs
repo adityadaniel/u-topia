@@ -8,7 +8,8 @@
 //! fades everything but the page and its neighbours to 25 % and floats a card with the
 //! first block (GR-2); the count and colour key sit at the bottom left and the zoom controls
 //! at the bottom right (GR-3); edges grow from 1 px to 3 px with the stored reference count
-//! and arrowheads point at the target (GR-4).
+//! and arrowheads point at the target (GR-4). "Around this page" moves the local graph into
+//! the right sidebar so the page stays editable (GR-5); "All pages" is the full-screen mode.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -42,6 +43,10 @@ pub enum GraphEvent {
         sidebar: bool,
         split: bool,
     },
+    /// "Around this page": the local graph becomes a right-sidebar panel (GR-5).
+    OpenPanel,
+    /// "All pages" in the panel: back to the full-screen graph (GR-5).
+    Expand,
     Close,
 }
 
@@ -58,6 +63,8 @@ pub struct GraphView {
     /// The page that was open when the graph was shown (the local graph's center).
     origin: Option<PageId>,
     local: bool,
+    /// Drawn in the right sidebar instead of full screen (GR-5).
+    panel: bool,
     include_daily: bool,
     graph: PageGraph,
     /// Largest degree in `graph`; sizes nodes relative to it (GR-1).
@@ -89,12 +96,15 @@ impl GraphView {
     pub fn new(
         app: gpui::Entity<AppState>,
         origin: Option<PageId>,
+        panel: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut v = Self {
             app,
             origin,
-            local: false,
+            // The panel is always "around this page"; the full-screen view opens on all.
+            local: panel,
+            panel,
             // Most links in a daily-notes graph come from journal pages; hiding them by
             // default leaves the picture nearly empty.
             include_daily: true,
@@ -134,6 +144,10 @@ impl GraphView {
         self.laid_out
     }
 
+    pub fn is_panel(&self) -> bool {
+        self.panel
+    }
+
     pub fn zoom(&self) -> f32 {
         self.zoom
     }
@@ -142,12 +156,29 @@ impl GraphView {
         self.hover
     }
 
+    pub fn origin(&self) -> Option<PageId> {
+        self.origin.clone()
+    }
+
     pub fn set_local(&mut self, local: bool, cx: &mut Context<Self>) {
         if self.local == local {
             return;
         }
         self.local = local;
         self.reload(cx);
+    }
+
+    /// Keep the panel around the page that is open beside it (GR-5).
+    pub fn set_origin(&mut self, origin: Option<PageId>, cx: &mut Context<Self>) {
+        if self.origin == origin {
+            return;
+        }
+        self.origin = origin;
+        if self.local {
+            self.reload(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     /// Screen position of a node, for tests and hit-testing.
@@ -509,37 +540,72 @@ impl Render for GraphView {
         });
 
         // GR-3: the filters and Close stay in the top bar; the count moves into the legend.
-        let header = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_4()
-            .py_2()
-            .border_b_1()
-            .border_color(th.line)
-            .child(div().font_weight(gpui::FontWeight::BOLD).child("Graph"))
-            .child(
-                self.chip("graph-all", "All pages", !self.local, cx)
-                    .on_click(cx.listener(|this, _, _, cx| this.set_local(false, cx))),
-            )
-            .when_some(origin_title, |d, title| {
-                d.child(
-                    self.chip("graph-local", format!("Around {title}"), self.local, cx)
-                        .on_click(cx.listener(|this, _, _, cx| this.set_local(true, cx))),
+        let header = if self.panel {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(th.line)
+                .child(
+                    div()
+                        .text_size(px(CONTROL_SIZE))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .child("Around this page"),
                 )
-            })
-            .child(
-                self.chip("graph-daily", "Journal pages", self.include_daily, cx)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.include_daily = !this.include_daily;
-                        this.reload(cx);
-                    })),
-            )
-            .child(div().flex_1())
-            .child(
-                self.chip("graph-close", "Close", false, cx)
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(GraphEvent::Close))),
-            );
+                .child(div().flex_1())
+                .child(
+                    self.chip("graph-expand", "All pages", false, cx)
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(GraphEvent::Expand))),
+                )
+                .child(
+                    self.chip("graph-daily", "Journal", self.include_daily, cx)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.include_daily = !this.include_daily;
+                            this.reload(cx);
+                        })),
+                )
+                .child(
+                    self.chip("graph-close", "✕", false, cx)
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(GraphEvent::Close))),
+                )
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .py_2()
+                .border_b_1()
+                .border_color(th.line)
+                .child(div().font_weight(gpui::FontWeight::BOLD).child("Graph"))
+                .child(
+                    self.chip("graph-all", "All pages", !self.local, cx)
+                        .on_click(cx.listener(|this, _, _, cx| this.set_local(false, cx))),
+                )
+                .when_some(origin_title, |d, title| {
+                    // GR-5: "Around this page" is the sidebar panel, so the page beside it
+                    // stays editable; "All pages" is the full-screen view.
+                    d.child(
+                        self.chip("graph-local", format!("Around {title}"), false, cx)
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(GraphEvent::OpenPanel))),
+                    )
+                })
+                .child(
+                    self.chip("graph-daily", "Journal pages", self.include_daily, cx)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.include_daily = !this.include_daily;
+                            this.reload(cx);
+                        })),
+                )
+                .child(div().flex_1())
+                .child(
+                    self.chip("graph-close", "Close", false, cx)
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(GraphEvent::Close))),
+                )
+        };
 
         // Snapshot for the paint closure.
         let laid_out = self.laid_out;
@@ -763,13 +829,21 @@ impl Render for GraphView {
                 )
             });
 
-        // GR-3: the legend and controls float over the canvas, so they never take space
-        // from the picture.
-        let body = body
-            .child(self.legend(&th).absolute().left_3().bottom_3())
-            .child(self.zoom_controls(&th, cx).absolute().right_3().bottom_3());
+        let selector = if self.panel {
+            "graph-panel-view"
+        } else {
+            "graph-view"
+        };
+        let body = if self.panel {
+            body
+        } else {
+            // GR-3: in the full-screen graph the legend and controls float over the canvas,
+            // so they never take space from the picture.
+            body.child(self.legend(&th).absolute().left_3().bottom_3())
+                .child(self.zoom_controls(&th, cx).absolute().right_3().bottom_3())
+        };
         div()
-            .debug_selector(|| "graph-view".into())
+            .debug_selector(move || selector.into())
             .key_context("GraphView")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|_, e: &gpui::KeyDownEvent, _, cx| {
@@ -783,6 +857,23 @@ impl Render for GraphView {
             .bg(th.bg)
             .child(header)
             .child(body)
+            .when(self.panel, |d| {
+                // The panel has less room, so the key and the zoom controls sit in a footer
+                // under the graph instead of floating over it.
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1()
+                        .border_t_1()
+                        .border_color(th.line)
+                        .child(self.legend(&th).flex_row().flex_wrap().gap_2())
+                        .child(div().flex_1())
+                        .child(self.zoom_controls(&th, cx).flex_none()),
+                )
+            })
     }
 }
 

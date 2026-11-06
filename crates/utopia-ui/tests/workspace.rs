@@ -942,6 +942,59 @@ fn graph_cmd_click_opens_a_split(cx: &mut TestAppContext) {
     );
 }
 
+/// GR-5: "Around this page" is a right-sidebar panel beside the editable page.
+#[gpui::test]
+fn graph_panel_sits_beside_the_page(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let main = ws.update(cx, |w, cx| w.main_page(cx)).unwrap();
+    let local = cx
+        .debug_bounds("graph-local")
+        .expect("Around this page filter")
+        .center();
+    cx.simulate_click(local, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        ws.update(cx, |w, _| w.graph_view()).is_none(),
+        "the full-screen graph gives way to the panel"
+    );
+    let panel = ws.update(cx, |w, _| w.graph_panel()).expect("panel open");
+    assert!(cx.debug_bounds("graph-panel").is_some());
+    assert!(cx.debug_bounds("right-sidebar").is_some());
+    assert_eq!(panel.update(cx, |g, _| g.origin()), Some(main.clone()));
+    assert!(panel.update(cx, |g, _| g.is_laid_out()));
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(main),
+        "the page beside the panel is untouched"
+    );
+
+    // Clicking a page in the panel still edits the main pane, and the panel follows it.
+    let alpha = app.update(cx, |a, _| a.store.find_page("Alpha").unwrap().unwrap());
+    let nodes = panel.update(cx, |g, _| g.node_count());
+    let i = (0..nodes)
+        .find(|&i| panel.update(cx, |g, _| g.node_page(i)) == Some(alpha.clone()))
+        .unwrap();
+    let at = panel.update(cx, |g, _| g.node_screen_pos(i)).unwrap();
+    cx.simulate_click(at, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(alpha.clone()));
+    let panel = ws.update(cx, |w, _| w.graph_panel()).expect("panel stays");
+    assert_eq!(panel.update(cx, |g, _| g.origin()), Some(alpha));
+
+    // "All pages" returns to the full-screen mode.
+    let expand = cx.debug_bounds("graph-expand").unwrap().center();
+    cx.simulate_click(expand, Modifiers::default());
+    cx.run_until_parked();
+    assert!(ws.update(cx, |w, _| w.graph_panel()).is_none());
+    assert!(ws.update(cx, |w, _| w.graph_view()).is_some());
+}
+
 #[gpui::test]
 fn dropped_files_become_attachments(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);
