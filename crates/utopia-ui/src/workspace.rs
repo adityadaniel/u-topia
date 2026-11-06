@@ -199,8 +199,14 @@ impl Workspace {
     }
 
     /// Start background sync for `cfg`: relay or folder, optionally end-to-end encrypted,
-    /// with realtime notices from a relay (§12). Local editing never waits on it.
-    pub fn enable_sync(&mut self, cfg: crate::sync_runner::SyncConfig, cx: &mut Context<Self>) {
+    /// with realtime notices from a relay (§12). Local editing never waits on it. Returns
+    /// whether a runner was actually started; [Self::start_sync] is what the app uses, so
+    /// Settings → Sync only claims a sync that exists.
+    pub fn enable_sync(
+        &mut self,
+        cfg: crate::sync_runner::SyncConfig,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let client = self.app.update(cx, |app, _| {
             utopia_sync::SyncEngine::new(&app.store).map(|e| e.client_id().to_string())
         });
@@ -216,24 +222,49 @@ impl Workspace {
                         nudge.clone(),
                     );
                 }
-                self.enable_sync_with(t, Some(nudge), cx);
+                self.enable_sync_with(t, Some(nudge), cx)
             }
             Err(e) => {
                 eprintln!("utopia: sync disabled: {e}");
                 self.app.update(cx, |app, _| {
                     app.last_error = Some(format!("sync disabled: {e}"))
                 });
+                false
             }
         }
     }
 
+    /// Start sync for `cfg` and publish what Settings → Sync should say (ST-5). The enabled
+    /// facts go out only once a runner exists: a transport that cannot be built, or a LAN
+    /// discovery that finds no relay, leaves the pane saying sync is off rather than
+    /// promising a sync that never started. Returns whether sync is now running.
+    pub fn start_sync(
+        &mut self,
+        cfg: crate::sync_runner::SyncConfig,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let facts = crate::sync_runner::SyncFacts::from_config(&cfg);
+        let started = self.enable_sync(cfg, cx);
+        cx.set_global(if started {
+            facts
+        } else {
+            crate::sync_runner::SyncFacts {
+                target: None,
+                graph: facts.graph,
+                encrypted: false,
+            }
+        });
+        started
+    }
+
     /// Start background sync over an already-built transport (tests, custom transports).
+    /// Returns whether the runner started.
     pub fn enable_sync_with(
         &mut self,
         transport: BoxTransport,
         nudge: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let engine = self
             .app
             .update(cx, |app, _| utopia_sync::SyncEngine::new(&app.store));
@@ -241,7 +272,7 @@ impl Workspace {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("utopia: sync disabled: {e}");
-                return;
+                return false;
             }
         };
         let mut runner = SyncRunner::new(engine, transport);
@@ -333,6 +364,7 @@ impl Workspace {
             }
         }));
         cx.notify();
+        true
     }
 
     /// Split panes (P1): an editable page beside the main one (Cmd+Shift+Click). At most

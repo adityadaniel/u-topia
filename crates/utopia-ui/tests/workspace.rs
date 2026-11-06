@@ -497,6 +497,48 @@ fn caret_survives_remote_edits(cx: &mut TestAppContext) {
     assert_eq!(rows(&app, &page, cx)[0].0, ">> hello big world");
 }
 
+/// Settings → Sync must describe a sync that exists: a config whose transport cannot be
+/// built (here a folder under a regular file) leaves the pane saying sync is off, while one
+/// that starts publishes the transport. Main used to publish the enabled facts first.
+#[gpui::test]
+fn a_sync_that_cannot_start_does_not_claim_to_be_on(cx: &mut TestAppContext) {
+    use utopia_ui::sync_runner::{self, SyncConfig, SyncTarget};
+    let (_app, ws, cx) = setup(cx);
+    let dir = tempfile::tempdir().unwrap();
+    // Its parent is a regular file, so the folder transport cannot be built.
+    let file = dir.path().join("not-a-folder");
+    std::fs::write(&file, b"x").unwrap();
+    let bad = SyncConfig {
+        target: SyncTarget::Folder(file.join("pages")),
+        graph: "g".into(),
+        passphrase: None,
+    };
+    assert!(!ws.update(cx, |w, cx| w.start_sync(bad, cx)));
+    assert!(
+        !cx.update(|_, cx| sync_runner::facts(cx).is_on()),
+        "a failed start must leave Settings saying sync is off"
+    );
+    assert_eq!(
+        cx.update(|_, cx| sync_runner::facts(cx).graph.clone()),
+        Some("g".to_string()),
+        "the graph is still named"
+    );
+
+    let shared = dir.path().join("shared");
+    let good = SyncConfig {
+        target: SyncTarget::Folder(shared.clone()),
+        graph: "g".into(),
+        passphrase: None,
+    };
+    assert!(ws.update(cx, |w, cx| w.start_sync(good, cx)));
+    let facts = cx.update(|_, cx| sync_runner::facts(cx));
+    assert!(facts.is_on(), "a started sync is reported");
+    assert_eq!(
+        facts.target.as_deref(),
+        Some(format!("Folder · {}", shared.display()).as_str())
+    );
+}
+
 #[gpui::test]
 fn background_sync_imports_and_pushes(cx: &mut TestAppContext) {
     use utopia_sync::relay::{Relay, RelayTransport};

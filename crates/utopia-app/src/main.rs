@@ -368,15 +368,14 @@ impl Root {
                                 graph,
                                 passphrase: std::env::var("UTOPIA_SYNC_PASSPHRASE").ok(),
                             };
-                            cx.set_global(utopia_ui::sync_runner::SyncFacts::from_config(&cfg));
-                            ws.update(cx, |w, cx| w.enable_sync(cfg, cx));
+                            ws.update(cx, |w, cx| w.start_sync(cfg, cx));
                             self._lan = Some(relay);
                         }
                         Err(e) => eprintln!("utopia: LAN relay failed: {e}"),
                     }
                 } else if let Some(cfg) = paths::sync_config(&path) {
-                    // Settings → Sync reports this transport; the token stays behind.
-                    cx.set_global(utopia_ui::sync_runner::SyncFacts::from_config(&cfg));
+                    // Settings → Sync reports the transport only once a runner exists; for
+                    // LAN that is after discovery, not when the config is read (ST-5).
                     let lan = matches!(&cfg.target, utopia_ui::sync_runner::SyncTarget::Relay { url, .. } if url == "lan");
                     if lan {
                         // Discover on a background thread; startup never waits on the network.
@@ -399,13 +398,13 @@ impl Root {
                                     {
                                         *u = url;
                                     }
-                                    ws2.update(cx, |w, cx| w.enable_sync(cfg, cx));
+                                    ws2.update(cx, |w, cx| w.start_sync(cfg, cx));
                                 }
                                 None => eprintln!("utopia: no LAN relay found for {}", cfg.graph),
                             });
                         }));
                     } else {
-                        ws.update(cx, |w, cx| w.enable_sync(cfg, cx));
+                        ws.update(cx, |w, cx| w.start_sync(cfg, cx));
                     }
                 }
                 // Links and the automation API run on the main thread against the same
