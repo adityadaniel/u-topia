@@ -1233,6 +1233,8 @@ impl Workspace {
             .map(|p| p.chars().take(160).collect::<String>())
             .unwrap_or_default()
             .into();
+        // The list stays compact at either density: that is the point of SB-1.
+        let compact = crate::appearance::Density::Compact;
         div()
             .id(("recent-day", index))
             .debug_selector(move || format!("recent-day-{index}"))
@@ -1241,8 +1243,8 @@ impl Workspace {
             .gap_2()
             .px_2()
             .rounded_sm()
-            .line_height(px(18.))
-            .text_size(px(13.5))
+            .line_height(px(compact.line_height()))
+            .text_size(px(compact.text_size()))
             .cursor_pointer()
             .text_color(if active { th.accent } else { th.text })
             .when(active, |d| d.bg(th.hover))
