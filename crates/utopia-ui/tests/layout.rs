@@ -446,3 +446,17 @@ fn type_scale_caps_outline_headings_at_h1(cx: &mut TestAppContext) {
         "H1 is 20 px on a 28 px line, never the old 24 px: {h1:?}"
     );
 }
+
+/// ALL-4: the block being edited carries a 2 px accent bar at its left edge.
+#[gpui::test]
+fn focused_block_has_an_accent_bar(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    cx.simulate_input("focused");
+    let bar = bounds(cx, "focus-bar-1");
+    let content = bounds(cx, "content-1");
+    assert!(approx(bar.size.width, 2.), "2 px wide: {bar:?}");
+    assert!(
+        bar.origin.x < content.origin.x,
+        "the bar sits left of the block text: {bar:?} {content:?}"
+    );
+}

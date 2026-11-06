@@ -259,6 +259,7 @@ impl Render for JumpPalette {
                 .py_1()
                 .rounded_sm()
                 .cursor_pointer()
+                .hover(|d| d.bg(th.hover))
                 .when(i == self.selected, |d| d.bg(th.hover))
                 .child(div().text_color(th.text).child(label))
                 .child(

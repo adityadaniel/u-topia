@@ -1665,11 +1665,28 @@ impl PageView {
         let target = r.clone();
         div()
             .id(("row", ix))
+            .debug_selector(move || format!("row-{ix}"))
+            .relative()
             .flex()
             .flex_row()
             .items_start()
             .pl(px(indent))
             .pr_2()
+            // ALL-4: the focused block is marked by a 2 px accent bar, not by a heavier
+            // text colour (the caret already moves). Absolutely placed so it costs no
+            // layout shift when editing starts.
+            .when(editing, |d| {
+                d.child(
+                    div()
+                        .debug_selector(move || format!("focus-bar-{ix}"))
+                        .absolute()
+                        .left(px(indent))
+                        .top(px(0.))
+                        .w(px(2.))
+                        .h(px(LINE_HEIGHT))
+                        .bg(th.accent),
+                )
+            })
             .when(r.embed > 0, |d| {
                 d.bg(th.surface).border_l_2().border_color(th.chip_bg)
             })
@@ -2472,9 +2489,12 @@ impl PageView {
                     .id(("group", ix))
                     .flex()
                     .justify_between()
-                    .px_4()
+                    .mx_2()
+                    .px_2()
                     .pt_2()
+                    .rounded_sm()
                     .cursor_pointer()
+                    .hover(|s| s.bg(th.hover))
                     .child(
                         div()
                             .flex()
@@ -2592,6 +2612,7 @@ impl PageView {
                 .text_size(px(crate::theme::BODY_SIZE))
                 .text_color(th.muted)
                 .cursor_pointer()
+                .hover(|s| s.text_color(th.text))
                 .child(format!(
                     "{} Unlinked References",
                     if open { "▾" } else { "▸" }
