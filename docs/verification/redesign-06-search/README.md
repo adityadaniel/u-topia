@@ -54,6 +54,7 @@ the block editor shows rendered text, not `[[markup]]`.
 | `after-todo-preview.png` | A to-do hit's preview shows the accent "To-do" state chip beside the edit date. |
 | `after-nested-path.png` | A nested hit's path is "Reading › On conflict-free replicated data types", not just the page. |
 | `after-preview-children.png` | A heading hit: "Heading 2" state, "3 children", bullet and to-do markers, and the block's text. |
+| `after-compact.png` | The same query with `"density": "compact"` in `settings.json`: the palette, groups and preview tighten with the rest of the app and retain 860 px width. |
 
 Dark mode was not captured; the system appearance was left alone.
 
