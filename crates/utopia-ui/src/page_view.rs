@@ -821,8 +821,8 @@ impl PageView {
         self.attribute_blocks == crate::appearance::AttributeBlocks::Compact
     }
 
-    /// "Show as blocks" / "Show as attributes" in the header, and a click on a compact row:
-    /// flip the preference, remember it, and rebuild the outline (PG-1).
+    /// The header's "Show as blocks" toggle, and a click on a compact row: set the
+    /// preference, remember it, and rebuild the outline (PG-1).
     fn set_attribute_blocks(
         &mut self,
         blocks: crate::appearance::AttributeBlocks,
