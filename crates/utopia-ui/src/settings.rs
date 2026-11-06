@@ -21,16 +21,18 @@
 //! Cmd+Q would quit the app mid-edit.
 
 use gpui::{
-    div, img, prelude::*, px, AnyWindowHandle, App, Context, Div, FocusHandle, Focusable,
+    div, img, prelude::*, px, AnyWindowHandle, App, Context, Div, Entity, FocusHandle, Focusable,
     FontWeight, Keystroke, SharedString, Subscription, Window,
 };
 use std::path::PathBuf;
 
 use crate::actions::{
     by_category, canonical_keys, doc, pretty_keys, reinstall, ActionDoc, Category, Overrides,
+    CATALOG,
 };
 use crate::appearance::{self, Density, UiFont};
 use crate::help::{shot_image, TOPICS};
+use crate::line_input::{LineInput, LineInputEvent};
 use crate::sync_runner;
 use crate::theme::{quiet_control, theme, Theme};
 
@@ -135,7 +137,11 @@ pub struct SettingsView {
     window: Option<AnyWindowHandle>,
     status: Option<SharedString>,
     topic: usize,
+    /// The filter at the top of the key list (ST-4), by name, description or key.
+    search: Entity<LineInput>,
+    query: String,
     focus: FocusHandle,
+    _subs: Vec<Subscription>,
 }
 
 impl Focusable for SettingsView {
@@ -145,12 +151,7 @@ impl Focusable for SettingsView {
 }
 
 impl SettingsView {
-    pub fn new(
-        config_dir: PathBuf,
-        tab: Tab,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(config_dir: PathBuf, tab: Tab, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // The Appearance tab shows a sample of every font it offers.
         for &f in UiFont::ALL {
             appearance::load_font(cx, f);
@@ -161,6 +162,31 @@ impl SettingsView {
         }
         // Already logged at startup; repeated here so the user sees it.
         warnings.extend(appearance::Prefs::load(&config_dir).1);
+        let search = cx.new(|cx| LineInput::new("Filter by name, description or key", cx));
+        let subs = vec![
+            // Escape clears the field and hands the keyboard back to the window, so the
+            // key list's own shortcuts keep working.
+            cx.subscribe_in(
+                &search,
+                window,
+                |this, _, e: &LineInputEvent, window, cx| match e {
+                    LineInputEvent::Changed(query) => {
+                        if *query != this.query {
+                            this.query = query.clone();
+                            cx.notify();
+                        }
+                    }
+                    LineInputEvent::Cancel => {
+                        this.query.clear();
+                        this.search.update(cx, |s, cx| s.set_text("", cx));
+                        let focus = this.focus.clone();
+                        window.focus(&focus);
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+        ];
         Self {
             config_dir,
             overrides,
@@ -172,7 +198,10 @@ impl SettingsView {
             // force is not what the user wrote (rule 11: degrade, never panic).
             status: warnings.first().map(|w| SharedString::from(w.clone())),
             topic: 0,
+            search,
+            query: String::new(),
             focus: cx.focus_handle(),
+            _subs: subs,
         }
     }
 
@@ -327,6 +356,37 @@ impl SettingsView {
 
     pub fn tab(&self) -> Tab {
         self.tab
+    }
+
+    /// What is typed in the filter field (ST-4).
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// ST-4: the actions the filter lets through, in catalog order.
+    pub fn visible_actions(&self) -> Vec<&'static str> {
+        CATALOG
+            .iter()
+            .filter(|d| self.matches(d))
+            .map(|d| d.action)
+            .collect()
+    }
+
+    fn matches(&self, d: &ActionDoc) -> bool {
+        row_matches(d, &self.overrides.keys_for(d), &self.query)
+    }
+
+    /// The filter's rows, grouped the way the editor lists them. A category with nothing
+    /// left to show is dropped rather than drawn empty.
+    fn visible_groups(&self) -> Vec<(Category, Vec<&'static ActionDoc>)> {
+        let mut out = Vec::new();
+        for &c in Category::all() {
+            let rows: Vec<_> = by_category(c).filter(|d| self.matches(d)).collect();
+            if !rows.is_empty() {
+                out.push((c, rows));
+            }
+        }
+        out
     }
 
     /// Settings → Appearance: put `font` in force in every window and remember it.
@@ -525,6 +585,26 @@ impl Render for SettingsView {
     }
 }
 
+/// ST-4: a row matches when every whitespace-separated term appears in its name, its
+/// description, the action's name or the keys in force (so "⇧⌘K" and "cmd-shift-k" both
+/// work).
+fn row_matches(d: &ActionDoc, keys: &str, query: &str) -> bool {
+    let terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
+    if terms.is_empty() {
+        return true;
+    }
+    let haystack = format!(
+        "{} {} {} {} {}",
+        d.label,
+        d.help,
+        d.action,
+        keys,
+        pretty_keys(keys)
+    )
+    .to_lowercase();
+    terms.iter().all(|t| haystack.contains(t))
+}
+
 /// A card (ST-1): one per category, a hairline border on the page's surface.
 fn card(th: &Theme) -> Div {
     div()
@@ -625,37 +705,76 @@ fn radio(on: bool, th: &Theme) -> Div {
 }
 
 impl SettingsView {
+    /// The filter field (ST-4). Click it, type, and the key list below narrows to the
+    /// actions whose name, description or keys match.
+    fn render_search(&mut self, _cx: &mut Context<Self>) -> Div {
+        let th = theme(_cx).clone();
+        column()
+            .debug_selector(|| "settings-search".into())
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1p5()
+            .rounded_lg()
+            .border_1()
+            .border_color(th.line)
+            .bg(th.surface)
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.faint)
+                    .child("Filter"),
+            )
+            .child(self.search.clone())
+    }
+
     fn render_keybindings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let density = appearance::density(cx);
         let conflicts = self.overrides.conflicts();
         let changed = self.overrides.0.len();
+        let groups = self.visible_groups();
+        let shown: usize = groups.iter().map(|(_, rows)| rows.len()).sum();
 
-        let mut list = pane("settings-keys", "settings-keys").child(
-            column()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_4()
-                .child(
-                    div()
-                        .text_size(px(crate::theme::CAPTION_SIZE))
-                        .text_color(th.muted)
-                        .child(if changed == 0 {
-                            "Pick Change, then press the keys you want.".to_string()
-                        } else {
-                            format!(
-                                "Pick Change, then press the keys you want. {changed} changed \
-                                 from the default."
-                            )
-                        }),
+        let hint = if self.query.trim().is_empty() {
+            if changed == 0 {
+                "Pick Change, then press the keys you want.".to_string()
+            } else {
+                format!(
+                    "Pick Change, then press the keys you want. {changed} changed from the \
+                     default."
                 )
-                .child(
-                    quiet_control("reset-all", "Reset All", &th)
-                        .debug_selector(|| "settings-reset-all".into())
-                        .on_click(cx.listener(|this, _, _, cx| this.reset_all(cx))),
-                ),
-        );
+            }
+        } else {
+            format!(
+                "{shown} of {} shortcuts match “{}”.",
+                CATALOG.len(),
+                self.query.trim()
+            )
+        };
+
+        let mut list = pane("settings-keys", "settings-keys")
+            .child(
+                column()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(hint),
+                    )
+                    .child(
+                        quiet_control("reset-all", "Reset All", &th)
+                            .debug_selector(|| "settings-reset-all".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.reset_all(cx))),
+                    ),
+            )
+            .child(self.render_search(cx));
 
         for (a, b) in &conflicts {
             list = list.child(
@@ -675,14 +794,22 @@ impl SettingsView {
             );
         }
 
-        for &c in Category::all() {
-            let rows: Vec<_> = by_category(c).collect();
-            if rows.is_empty() {
-                continue;
-            }
+        if groups.is_empty() {
+            list = list.child(
+                column()
+                    .debug_selector(|| "settings-no-match".into())
+                    .py_4()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(format!("No shortcut matches “{}”.", self.query.trim())),
+            );
+        }
+
+        for (c, rows) in &groups {
+            let category = *c;
             let mut section = card(&th)
-                .debug_selector(move || format!("settings-card-{}", c.label()))
-                .child(card_title(&th, c.label()));
+                .debug_selector(move || format!("settings-card-{}", category.label()))
+                .child(card_title(&th, category.label()));
             for (i, d) in rows.iter().enumerate() {
                 section = section.child(card_row(self.render_key_row(d, cx), i, &th, density));
             }
@@ -784,22 +911,53 @@ impl SettingsView {
     }
 
     /// The cheat sheet: everything bound right now, grouped the same way as the editor.
+    /// The same filter narrows it, so "what did I put on cmd-shift" has one answer.
     fn render_shortcuts(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let density = appearance::density(cx);
-        let mut list = pane("settings-shortcuts", "settings-shortcuts").child(
-            column()
-                .text_size(px(crate::theme::CAPTION_SIZE))
-                .text_color(th.muted)
-                .child("Every shortcut in the app, as it is bound now."),
-        );
-        for &c in Category::all() {
+        let groups = self.visible_groups();
+        let shown: usize = groups.iter().map(|(_, rows)| rows.len()).sum();
+        let hint = if self.query.trim().is_empty() {
+            "Every shortcut in the app, as it is bound now.".to_string()
+        } else {
+            format!(
+                "{shown} of {} shortcuts match “{}”.",
+                CATALOG.len(),
+                self.query.trim()
+            )
+        };
+        let mut list = pane("settings-shortcuts", "settings-shortcuts")
+            .child(
+                column()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(hint),
+            )
+            .child(self.render_search(cx));
+
+        if groups.is_empty() {
+            list = list.child(
+                column()
+                    .debug_selector(|| "settings-no-match".into())
+                    .py_4()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(format!("No shortcut matches “{}”.", self.query.trim())),
+            );
+        }
+
+        for (c, rows) in &groups {
+            let category = *c;
             let mut section = card(&th)
-                .debug_selector(move || format!("settings-card-{}", c.label()))
-                .child(card_title(&th, c.label()));
-            for (i, d) in by_category(c).enumerate() {
+                .debug_selector(move || format!("settings-card-{}", category.label()))
+                .child(card_title(&th, category.label()));
+            for (i, d) in rows.iter().enumerate() {
                 section = section.child(card_row(
                     div()
+                        .debug_selector({
+                            let action = d.action;
+                            move || format!("settings-shortcut-{action}")
+                        })
                         .flex()
                         .items_baseline()
                         .justify_between()

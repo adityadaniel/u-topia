@@ -363,6 +363,86 @@ fn help_screenshots_fit_the_column(cx: &mut TestAppContext) {
     );
 }
 
+/// ST-4: the field at the top narrows the rows by name, description or key, and no match
+/// says so instead of showing an empty pane.
+#[gpui::test]
+fn search_filters_by_name_description_and_key(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+    let all = view.read_with(cx, |v, _| v.visible_actions().len());
+    assert_eq!(all, utopia_ui::actions::CATALOG.len());
+
+    let field = cx
+        .debug_bounds("settings-search")
+        .expect("the filter field");
+    cx.simulate_click(field.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_input("zoom");
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.query().to_string()), "zoom");
+    assert_eq!(
+        view.read_with(cx, |v, _| v.visible_actions()),
+        ["ZoomIn", "ZoomOut"],
+        "by name"
+    );
+
+    // By keys, in the spelling the catalog stores them in.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.visible_actions()).len(),
+        all,
+        "escape clears the filter"
+    );
+    let field = cx
+        .debug_bounds("settings-search")
+        .expect("the filter field");
+    cx.simulate_click(field.center(), gpui::Modifiers::default());
+    cx.simulate_input("cmd-shift-y");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.visible_actions()),
+        ["GoYesterday"],
+        "by key"
+    );
+
+    // By description ("cheat sheet" is in ShowShortcuts' help text).
+    cx.simulate_keystrokes("escape");
+    let field = cx
+        .debug_bounds("settings-search")
+        .expect("the filter field");
+    cx.simulate_click(field.center(), gpui::Modifiers::default());
+    cx.simulate_input("cheat");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.visible_actions()),
+        ["ShowShortcuts"],
+        "by description"
+    );
+
+    // Nothing matches: the pane says so.
+    cx.simulate_keystrokes("escape");
+    let field = cx
+        .debug_bounds("settings-search")
+        .expect("the filter field");
+    cx.simulate_click(field.center(), gpui::Modifiers::default());
+    cx.simulate_input("zzzz");
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, _| v.visible_actions().is_empty()));
+    assert!(
+        cx.debug_bounds("settings-no-match").is_some(),
+        "the empty state is drawn"
+    );
+}
+
 /// A `keymap.json` that cannot be read must not take the window down with it (rule 11).
 #[gpui::test]
 fn a_broken_keymap_is_reported_not_fatal(cx: &mut TestAppContext) {
