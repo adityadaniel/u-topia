@@ -702,19 +702,23 @@ fn search_groups_results_under_their_page(cx: &mut TestAppContext) {
 /// and opening it is the only thing that happens (the chips do not move).
 #[gpui::test]
 fn search_scope_and_age_filter_the_results(cx: &mut TestAppContext) {
+    use chrono::TimeZone as _;
     use utopia_core::BlockKind;
     let (app, ws, cx) = setup(cx);
+    // Local noon, so the block's local edit date is the intended day in every timezone.
     let ts = |m: u32, d: u32, h| {
         NaiveDate::from_ymd_opt(2026, m, d)
             .unwrap()
             .and_hms_opt(h, 0, 0)
             .unwrap()
-            .and_utc()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap()
             .timestamp_millis()
     };
     app.update(cx, |app, _| {
         // Now: a page and today's day both mention the zebra.
-        app.store.set_clock(Some(ts(11, 2, 18)));
+        app.store.set_clock(Some(ts(11, 2, 12)));
         let atlas = app.store.create_page("Atlas").unwrap();
         let b = app.store.ensure_first_block(&atlas).unwrap();
         app.store
@@ -727,7 +731,7 @@ fn search_scope_and_age_filter_the_results(cx: &mut TestAppContext) {
             .unwrap();
         app.store.commit_block(&day, &db).unwrap();
         // Last month: an old note outside the Today window.
-        app.store.set_clock(Some(ts(10, 1, 18)));
+        app.store.set_clock(Some(ts(10, 1, 12)));
         let old = app.store.create_page("Old").unwrap();
         let b = app.store.ensure_first_block(&old).unwrap();
         app.store
@@ -736,7 +740,7 @@ fn search_scope_and_age_filter_the_results(cx: &mut TestAppContext) {
         app.store
             .set_block_kind(&old, &b, BlockKind::Todo, false)
             .unwrap();
-        app.store.set_clock(Some(ts(11, 2, 18)));
+        app.store.set_clock(Some(ts(11, 2, 12)));
         app.store.sync_index().unwrap();
     });
     cx.simulate_keystrokes("escape cmd-shift-f");
