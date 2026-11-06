@@ -1848,12 +1848,16 @@ impl PageView {
         if self.page_menu {
             // ALL-3: destructive page actions live in a menu, in the danger colour, not as
             // loose text beside the title.
-            let rename = quiet_control("page-menu-rename", "Rename", &th).on_click(cx.listener(
-                |this, _, window, cx| {
-                    this.page_menu = false;
-                    this.start_rename(window, cx);
-                },
-            ));
+            // Daily titles are display-only (rule 6): `start_rename` would open the
+            // calendar for them, so Rename is only offered on ordinary pages.
+            let rename = (h.kind != PageKind::Daily).then(|| {
+                quiet_control("page-menu-rename", "Rename", &th)
+                    .debug_selector(|| "page-menu-rename".into())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.page_menu = false;
+                        this.start_rename(window, cx);
+                    }))
+            });
             let delete = quiet_danger("page-menu-delete", "Delete page", &th)
                 .debug_selector(|| "page-menu-delete".into())
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -1875,7 +1879,7 @@ impl PageView {
                         .border_color(th.line)
                         .rounded_md()
                         .shadow_md()
-                        .child(rename.w_full().justify_start())
+                        .children(rename.map(|r| r.w_full().justify_start()))
                         .child(delete.w_full().justify_start()),
                 ),
             );

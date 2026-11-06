@@ -417,6 +417,26 @@ fn page_menu_holds_the_danger_delete(cx: &mut TestAppContext) {
     );
 }
 
+/// Rule 6: a daily page's title is display-only, so its menu must not offer Rename (which
+/// `start_rename` turns into the calendar on daily pages).
+#[gpui::test]
+fn daily_page_menu_does_not_offer_rename(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    cx.simulate_input("note");
+    cx.simulate_keystrokes("escape");
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("page-menu-delete").is_some(),
+        "the daily page still offers Delete page"
+    );
+    assert!(
+        cx.debug_bounds("page-menu-rename").is_none(),
+        "daily titles are display-only: no Rename action"
+    );
+}
+
 /// ALL-1: page title 28, H1 20, body 15 — measured as line boxes, since the heading used to
 /// draw at 24 px (larger than H1 and close to the title).
 #[gpui::test]
