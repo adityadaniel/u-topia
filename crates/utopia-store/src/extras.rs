@@ -67,6 +67,8 @@ impl Store {
     }
 
     fn unlinked_mentions(&mut self, page: &PageId) -> Result<Vec<Mention>> {
+        self.unlinked_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let st = self.page_state(page)?.clone();
         let mut names = vec![display_title(&st, &self.date_format)];
         names.extend(st.meta.aliases.iter().cloned());

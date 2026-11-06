@@ -356,6 +356,9 @@ impl PageView {
             }),
             cx.subscribe(&app, |this, _, _: &IndexUpdated, cx| {
                 this.dirty = true;
+                // LR-5: the unlinked count is keyed by the index version, so it is refreshed
+                // here rather than in `render` (rule 10: no database work in a frame).
+                this.refresh_unlinked(cx);
                 cx.notify();
             }),
             cx.subscribe_in(&editor, window, Self::on_editor_event),
@@ -505,6 +508,8 @@ impl PageView {
         self.page_menu = false;
         self.controls_menu = None;
         self.refs_key = None;
+        // Navigation is a handler, not a frame: count the mentions before painting (LR-5).
+        self.refresh_unlinked(cx);
         self.dirty = true;
         self.rebuild(cx);
         self.list.reset(self.items.len());
@@ -878,25 +883,14 @@ impl PageView {
         }
         self.push_refs(&page, &mut items, cx);
         if self.zoom.is_none() {
-            // Unlinked References (FR-3.9, LR-5): the header always carries the count, so the
-            // search runs once per page and index version rather than only when opened. It
-            // reads the index without flushing or waiting for the writer, so it is safe in a
-            // render (rule 10); it catches up when the index does.
-            let stale = self
-                .unlinked
-                .as_ref()
-                .is_none_or(|(v, _)| *v != refs_version);
-            if stale {
-                let found = self.app.update(cx, |app, _| {
-                    let r = app.store.unlinked_references_now(&page);
-                    app.report(r).unwrap_or_default()
-                });
-                self.unlinked = Some((refs_version, found));
-            }
-            let count = self.unlinked.as_ref().map(|(_, m)| m.len());
-            let mentions = self
-                .unlinked
-                .as_ref()
+            // Unlinked References (FR-3.9, LR-5): the header always carries the count. It is
+            // read from the cache `refresh_unlinked` fills when the index reports a durable
+            // change or the page opens; the FTS scan behind it is database work and must not
+            // run in a frame (rule 10), so a stale entry shows no number for one frame
+            // rather than scanning here.
+            let current = self.unlinked.as_ref().filter(|(v, _)| *v == refs_version);
+            let count = current.map(|(_, m)| m.len());
+            let mentions = current
                 .map(|(_, m)| m.clone())
                 .filter(|_| self.unlinked_open);
             items.push(Item::UnlinkedHeader {
@@ -912,6 +906,33 @@ impl PageView {
             }
         }
         self.replace_items(items, cx);
+    }
+
+    /// Refresh the unlinked-reference count for the page on screen (FR-3.9, LR-5).
+    ///
+    /// The scan is an FTS query over up to 2,000 blocks per title and alias, so it belongs
+    /// in the index-update and navigation handlers; a paint must never run it (rule 10). The
+    /// answer is cached per index version, so a frame (or a rebuild for any other reason)
+    /// costs nothing.
+    fn refresh_unlinked(&mut self, cx: &mut Context<Self>) {
+        let Some(page) = self.page.clone() else {
+            return;
+        };
+        if self.zoom.is_some() || self.journal.is_some() {
+            // The section is not on screen; `show` refreshes it when it is again.
+            return;
+        }
+        let version = self.app.read(cx).refs_version;
+        if self.unlinked.as_ref().is_some_and(|(v, _)| *v == version) {
+            return;
+        }
+        let found = self.app.update(cx, |app, _| {
+            let r = app.store.unlinked_references_now(&page);
+            app.report(r).unwrap_or_default()
+        });
+        self.unlinked = Some((version, found));
+        self.dirty = true;
+        cx.notify();
     }
 
     fn rebuild_journal(&mut self, today: PageId, limit: usize, cx: &mut Context<Self>) {

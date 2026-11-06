@@ -1,7 +1,7 @@
 //! The Settings keybinding editor (§9.1), driven through GPUI's headless test platform.
 
 use gpui::{px, size, TestAppContext};
-use utopia_ui::actions::{doc, install_keymap, platform_keys, Overrides, Quit};
+use utopia_ui::actions::{active_keys, doc, install_keymap, platform_keys, Overrides, Quit};
 use utopia_ui::settings::{SettingsView, Tab};
 use utopia_ui::theme::Theme;
 
@@ -213,6 +213,29 @@ fn a_broken_keymap_is_reported_not_fatal(cx: &mut TestAppContext) {
             "the user is told the file was unreadable"
         );
     });
+}
+
+/// QJ-5: what the palette shows for a command is the keys in force. Settings installs a
+/// rebinding at once, so a row must describe the new chord, not the catalog default.
+#[gpui::test]
+fn a_rebinding_changes_the_keys_a_command_shows(cx: &mut TestAppContext) {
+    use utopia_ui::actions::reinstall;
+    let mut o = Overrides::default();
+    o.set("GoToday", "alt-cmd-t");
+    cx.update(|cx| {
+        install_keymap(cx, None);
+        reinstall(cx, &o);
+    });
+    let keys = cx.update(|cx| active_keys(cx, doc("GoToday").unwrap()));
+    assert_eq!(keys, "alt-cmd-t");
+    assert_eq!(
+        utopia_ui::actions::pretty_keys(&keys),
+        "⌥⌘T",
+        "rendered the way the palette draws it"
+    );
+    // An action nobody rebound still reports its catalog default.
+    let other = cx.update(|cx| active_keys(cx, doc("GoYesterday").unwrap()));
+    assert_eq!(other, platform_keys("cmd-shift-y"));
 }
 
 /// A rebound action answers to its new keys only: the default it replaced is not left

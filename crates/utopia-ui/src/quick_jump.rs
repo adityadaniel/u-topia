@@ -1,23 +1,89 @@
 //! Quick jump (Cmd+K, §9.1): fuzzy titles and aliases; Enter opens, Shift/Cmd+Enter opens
 //! in the sidebar, and a novel title offers "Create". Dates resolve to daily pages.
+//!
+//! One shell is shared by every palette mode (quick jump, full-text search, quick capture,
+//! free text). In page mode it has a useful empty state — today, yesterday and the pages
+//! opened last (QJ-1) — labelled rows with an icon per type (QJ-2), the typed letters in
+//! semibold (QJ-4), a footer of key hints (QJ-3), and, after a leading `>`, the actions
+//! from [`crate::actions::CATALOG`] with their keys (QJ-5).
+//!
+//! All of this is view state. Rows come from the index (`Store::search_titles`,
+//! `Store::tag_pages`) when the query changes, never while painting (rule 3), and nothing
+//! here writes a shard.
 
+use std::collections::HashSet;
+use std::ops::Range;
+
+use chrono::NaiveDate;
 use gpui::{
-    div, prelude::*, px, Context, Entity, EventEmitter, MouseButton, MouseDownEvent, Subscription,
-    Window,
+    div, prelude::*, px, AnyElement, App, Context, Entity, EventEmitter, FontWeight,
+    HighlightStyle, MouseButton, MouseDownEvent, ScrollHandle, StyledText, Subscription, Window,
 };
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, PageId};
 use utopia_store::{BlockHit, TitleHit};
 
+use crate::actions::{active_keys, pretty_keys, ActionDoc, CATALOG};
 use crate::app_state::AppState;
+use crate::editor::BlockEditor;
 use crate::line_input::{LineInput, LineInputEvent};
-use crate::theme::theme;
+use crate::theme::{theme, Theme, CAPTION_SIZE, CONTROL_SIZE};
+
+/// How many pages the empty state offers after today and yesterday (QJ-1).
+pub const RECENT_ROWS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub enum QjItem {
     Page(TitleHit),
+    /// A day offered by the empty state (QJ-1). It opens by date, so a day nobody has
+    /// written yet still opens as a draft rather than as a page (FR-1.2).
+    Day {
+        date: NaiveDate,
+        title: String,
+        /// "Today" or "Yesterday": the type label of a pinned day.
+        label: &'static str,
+    },
     Create(String),
     Block(BlockHit),
+    /// An action from [`CATALOG`], listed after a leading `>` (QJ-5).
+    Command(&'static ActionDoc),
+}
+
+/// What a result row is. The palette draws one glyph and one type label per kind (QJ-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    Page,
+    Day,
+    Tag,
+    Block,
+    Command,
+    Create,
+}
+
+impl RowKind {
+    /// The name the row's debug selector carries, for layout tests.
+    fn key(self) -> &'static str {
+        match self {
+            RowKind::Page => "page",
+            RowKind::Day => "day",
+            RowKind::Tag => "tag",
+            RowKind::Block => "block",
+            RowKind::Command => "command",
+            RowKind::Create => "create",
+        }
+    }
+
+    /// The type label at the right edge of the row.
+    fn label(self) -> &'static str {
+        match self {
+            RowKind::Page => "Page",
+            RowKind::Day => "Day",
+            RowKind::Tag => "Tag",
+            RowKind::Block => "",
+            RowKind::Command => "",
+            RowKind::Create => "",
+        }
+    }
 }
 
 /// What the palette is for.
@@ -40,15 +106,34 @@ pub enum QuickJumpEvent {
         sidebar: bool,
         focus: Option<BlockId>,
     },
+    /// A day from the empty state (QJ-1): opened by date, draft or not.
+    ChosenDay {
+        date: NaiveDate,
+        sidebar: bool,
+    },
+    /// A command from the catalog (QJ-5), by its `keymap.json` name.
+    RunCommand(&'static str),
     Text(String),
     Dismissed,
 }
 
 pub struct JumpPalette {
     app: Entity<AppState>,
+    /// The shared block editor: a command bound to the editor (`Indent`, `Bold`, …) can
+    /// only act while a block is in edit (QJ-5).
+    editor: Entity<BlockEditor>,
     pub input: Entity<LineInput>,
     results: Vec<QjItem>,
+    /// Ids among `results` that exist only because of a `#tag` (QJ-2).
+    tags: HashSet<PageId>,
+    /// The pages opened last, newest first, when this palette offers the empty state
+    /// (QJ-1). `None` for the modes where the empty state would be a lie: redirecting a
+    /// link or extracting a block has nothing to do with the pages you just visited.
+    recent: Option<Vec<PageId>>,
     selected: usize,
+    /// The result list, so ↑/↓ can bring the selected row into view: the command catalog is
+    /// longer than the palette, and Enter would otherwise run a command nobody can see.
+    scroll: ScrollHandle,
     title: &'static str,
     mode: PaletteMode,
     _sub: Subscription,
@@ -57,24 +142,17 @@ pub struct JumpPalette {
 impl EventEmitter<QuickJumpEvent> for JumpPalette {}
 
 impl JumpPalette {
-    pub fn new(
-        app: Entity<AppState>,
-        title: &'static str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::with_mode(app, title, PaletteMode::Pages, window, cx)
-    }
-
     pub fn with_mode(
         app: Entity<AppState>,
+        editor: Entity<BlockEditor>,
         title: &'static str,
         mode: PaletteMode,
+        recent: Option<Vec<PageId>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let placeholder = match mode {
-            PaletteMode::Pages => "Go to page or date…",
+            PaletteMode::Pages => "Go to page or date, or > for a command…",
             PaletteMode::Search => "Search all blocks…",
             PaletteMode::Capture => "Capture to today's note…",
             PaletteMode::Text => "Title…",
@@ -94,9 +172,13 @@ impl JumpPalette {
         input.update(cx, |i, _| i.focus(window));
         let mut me = Self {
             app,
+            editor,
             input,
             results: Vec::new(),
+            tags: HashSet::new(),
+            recent,
             selected: 0,
+            scroll: ScrollHandle::new(),
             title,
             mode,
             _sub: sub,
@@ -109,6 +191,7 @@ impl JumpPalette {
         match self.mode {
             PaletteMode::Capture | PaletteMode::Text => {
                 self.results.clear();
+                self.tags.clear();
                 cx.notify();
                 return;
             }
@@ -123,11 +206,31 @@ impl JumpPalette {
                         .unwrap_or_default()
                 };
                 self.results = hits.into_iter().map(QjItem::Block).collect();
-                self.selected = 0;
+                self.tags.clear();
+                self.select_first();
                 cx.notify();
                 return;
             }
             PaletteMode::Pages => {}
+        }
+        // QJ-5: a leading `>` lists the command catalog instead of pages.
+        if let Some(rest) = q.strip_prefix('>') {
+            self.results = commands(rest, |d| active_keys(cx, d))
+                .into_iter()
+                .map(QjItem::Command)
+                .collect();
+            self.tags.clear();
+            self.select_first();
+            cx.notify();
+            return;
+        }
+        // QJ-1: with nothing typed, offer today, yesterday and the pages opened last.
+        if q.trim().is_empty() {
+            self.results = self.empty_state(cx);
+            self.select_first();
+            self.rank_tags(cx);
+            cx.notify();
+            return;
         }
         let store = &self.app.read(cx).store;
         let hits = store.search_titles(q, 12).unwrap_or_default();
@@ -162,14 +265,92 @@ impl JumpPalette {
             }
         }
         self.results = results;
-        self.selected = 0;
+        self.select_first();
+        self.rank_tags(cx);
         cx.notify();
+    }
+
+    /// The empty state (QJ-1): today, yesterday, then the pages opened last, newest
+    /// first. Recent pages come from local UI state the workspace keeps (rule 9); a day
+    /// nobody has written yet is offered by date (FR-1.2).
+    fn empty_state(&self, cx: &mut Context<Self>) -> Vec<QjItem> {
+        let app = self.app.read(cx);
+        let store = &app.store;
+        let today = store.today();
+        let yesterday = today.pred_opt();
+        let fmt = store.date_format().clone();
+        let mut out: Vec<QjItem> = vec![QjItem::Day {
+            date: today,
+            title: fmt.format(today),
+            label: "Today",
+        }];
+        if let Some(d) = yesterday {
+            out.push(QjItem::Day {
+                date: d,
+                title: fmt.format(d),
+                label: "Yesterday",
+            });
+        }
+        let Some(recent) = &self.recent else {
+            // Not a "go to page" palette: no empty state.
+            return Vec::new();
+        };
+        for id in recent {
+            if out.len() >= 2 + RECENT_ROWS {
+                break;
+            }
+            let Ok(Some(row)) = store.page_row(id) else {
+                continue; // a draft day that was never written
+            };
+            // Deleted pages, and the tombstoned source of a merge, stay in `local_state`
+            // but must not be offered — nor keep a slot from a live page (QJ-1).
+            if !row.is_live() {
+                continue;
+            }
+            // Today and yesterday are already the first two rows.
+            if row.is_daily() && (row.daily_date == Some(today) || row.daily_date == yesterday) {
+                continue;
+            }
+            out.push(QjItem::Page(TitleHit {
+                page: row.id.clone(),
+                daily: row.is_daily(),
+                title: row.title,
+                alias: None,
+                score: 0,
+            }));
+        }
+        out
+    }
+
+    /// Mark the pages that exist only because of a `#tag` (QJ-2), from the classification
+    /// the commit path published and [`AppState`] cached (SB-2): no query runs here, and
+    /// nothing is recomputed per keystroke (rule 3, rule 10).
+    fn rank_tags(&mut self, cx: &mut Context<Self>) {
+        let app = self.app.read(cx);
+        self.tags = self
+            .results
+            .iter()
+            .filter_map(|r| match r {
+                QjItem::Page(h) => Some(h.page.clone()),
+                _ => None,
+            })
+            .filter(|page| app.tag_pages.contains(page))
+            .collect();
+    }
+
+    /// A new query starts again at the top, scrolled back to it, so ↑/↓ and Enter agree
+    /// on which row is the current one.
+    fn select_first(&mut self) {
+        self.selected = 0;
+        self.scroll.scroll_to_item(0);
     }
 
     fn step(&mut self, d: isize, cx: &mut Context<Self>) {
         let n = self.results.len() as isize;
         if n > 0 {
             self.selected = ((self.selected as isize + d).rem_euclid(n)) as usize;
+            // The catalog is taller than the palette: keep the row Enter would run visible.
+            self.scroll.scroll_to_item(self.selected);
             cx.notify();
         }
     }
@@ -188,7 +369,7 @@ impl JumpPalette {
             }
             // Nothing matched yet: treat the query as a title (dates resolve first).
             let q = self.input.read(cx).text().to_string();
-            if q.trim().is_empty() {
+            if q.trim().is_empty() || q.starts_with('>') {
                 return;
             }
             return self.create(&q, sidebar, cx);
@@ -199,11 +380,17 @@ impl JumpPalette {
                 sidebar,
                 focus: None,
             }),
+            QjItem::Day { date, .. } => cx.emit(QuickJumpEvent::ChosenDay { date, sidebar }),
             QjItem::Block(b) => cx.emit(QuickJumpEvent::Chosen {
                 page: b.page,
                 sidebar,
                 focus: Some(b.block),
             }),
+            QjItem::Command(d) => {
+                if self.command_ready(d, cx) {
+                    cx.emit(QuickJumpEvent::RunCommand(d.action));
+                }
+            }
             QjItem::Create(t) => self.create(&t, sidebar, cx),
         }
     }
@@ -227,54 +414,252 @@ impl JumpPalette {
             });
         }
     }
+
+    /// Whether a command can act right now (QJ-5). `Indent`, `Bold`, `Newline` and the
+    /// rest of the editor bindings are handled by [`BlockEditor`]; with no block in edit
+    /// gpui would dispatch them to nobody, so the palette marks them unavailable instead of
+    /// offering a command that silently does nothing.
+    fn command_ready(&self, d: &ActionDoc, cx: &App) -> bool {
+        d.context.is_none() || self.editor.read(cx).target.is_some()
+    }
+
+    /// What a row says, how it is labelled and what it is (QJ-2). `bound` is the keys in
+    /// force for a command row, which is what the palette shows instead of the default.
+    fn row_parts(&self, item: &QjItem, bound: Option<&str>) -> (RowKind, String, String) {
+        match item {
+            QjItem::Page(h) => {
+                let kind = if h.daily {
+                    RowKind::Day
+                } else if self.tags.contains(&h.page) {
+                    RowKind::Tag
+                } else {
+                    RowKind::Page
+                };
+                // An alias hit says why it matched; the icon still says what it is.
+                let detail = if h.alias.is_some() {
+                    "Alias".to_string()
+                } else {
+                    kind.label().to_string()
+                };
+                (kind, h.title.clone(), detail)
+            }
+            QjItem::Day { title, label, .. } => (RowKind::Day, title.clone(), label.to_string()),
+            QjItem::Create(t) => (RowKind::Create, format!("Create \"{t}\""), String::new()),
+            QjItem::Block(b) => (
+                RowKind::Block,
+                utopia_core::inline::plain_text(&b.text)
+                    .chars()
+                    .take(80)
+                    .collect(),
+                b.page_title.clone(),
+            ),
+            // The keys actually bound, not the catalog default: a rebinding in Settings
+            // applies at once, so the row must not advertise the chord it replaced (§9.1).
+            QjItem::Command(d) => (
+                RowKind::Command,
+                d.label.to_string(),
+                pretty_keys(bound.unwrap_or(d.keys)),
+            ),
+        }
+    }
+
+    /// One result row: icon, label with the match in semibold (QJ-4), type label.
+    fn row(
+        &self,
+        i: usize,
+        item: &QjItem,
+        needle: &str,
+        bound: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let th = theme(cx).clone();
+        let (kind, label, detail) = self.row_parts(item, bound);
+        let selected = i == self.selected;
+        let marks: Vec<(Range<usize>, HighlightStyle)> = if kind == RowKind::Create {
+            Vec::new()
+        } else {
+            highlight_ranges(&label, needle)
+                .into_iter()
+                .map(|r| {
+                    (
+                        r,
+                        HighlightStyle {
+                            font_weight: Some(FontWeight::SEMIBOLD),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect()
+        };
+        let text: AnyElement = if marks.is_empty() {
+            div().child(label).into_any_element()
+        } else {
+            div()
+                .child(StyledText::new(label).with_highlights(marks))
+                .into_any_element()
+        };
+        let accent = kind == RowKind::Create;
+        // A command that cannot act (no block in edit) is shown greyed out. For command
+        // rows the selector names the action and its state, so a test can tell which
+        // command a row is — the palette draws text a test cannot read (QJ-5).
+        let (selectable, selector) = match item {
+            QjItem::Command(d) => {
+                let ready = self.command_ready(d, cx);
+                (
+                    ready,
+                    format!(
+                        "qj-command-{i}-{}{}",
+                        d.action,
+                        if ready { "" } else { "-off" }
+                    ),
+                )
+            }
+            _ => (true, format!("qj-label-{i}")),
+        };
+        let label_color = if accent {
+            th.accent
+        } else if selectable {
+            th.text
+        } else {
+            th.faint
+        };
+        div()
+            .id(("qj", i))
+            .debug_selector(move || format!("qj-row-{i}"))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .when(selectable, |d| d.cursor_pointer())
+            .when(accent, |d| d.text_color(th.accent))
+            .when(selectable, |d| d.hover(|d| d.bg(th.hover)))
+            .when(selected, |d| d.bg(th.chip_bg))
+            .child(row_icon(i, kind, &th))
+            .child(
+                div()
+                    .debug_selector(move || selector)
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_color(label_color)
+                    .child(text),
+            )
+            .child(
+                div()
+                    .debug_selector(move || format!("qj-detail-{i}"))
+                    .flex_none()
+                    .text_size(px(CAPTION_SIZE))
+                    .text_color(if selectable { th.muted } else { th.faint })
+                    .child(detail),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                    let beside = e.modifiers.shift || e.modifiers.platform;
+                    this.choose(i, beside, w, cx)
+                }),
+            )
+            .into_any_element()
+    }
+}
+
+/// The one glyph per row type (QJ-2). Drawn rather than set in a font, except `#` and
+/// `+`, so nothing depends on a symbol font being installed.
+fn row_icon(i: usize, kind: RowKind, th: &Theme) -> AnyElement {
+    let slot = div()
+        .id(("qj-icon", i))
+        .debug_selector(move || format!("qj-icon-{i}-{}", kind.key()))
+        .w(px(14.))
+        .flex_none()
+        .flex()
+        .justify_center()
+        .items_center();
+    match kind {
+        RowKind::Page => slot
+            .child(
+                div()
+                    .w(px(8.))
+                    .h(px(10.))
+                    .rounded_xs()
+                    .border_1()
+                    .border_color(th.faint),
+            )
+            .into_any_element(),
+        RowKind::Day => slot
+            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(th.muted))
+            .into_any_element(),
+        RowKind::Tag => slot
+            .text_size(px(CONTROL_SIZE))
+            .text_color(th.tag)
+            .font_weight(FontWeight::SEMIBOLD)
+            .child("#")
+            .into_any_element(),
+        RowKind::Block => slot
+            .child(div().w(px(7.)).h(px(1.)).bg(th.faint))
+            .into_any_element(),
+        RowKind::Command => slot
+            .text_size(px(CAPTION_SIZE))
+            .text_color(th.muted)
+            .child("⌘")
+            .into_any_element(),
+        RowKind::Create => slot
+            .text_size(px(CONTROL_SIZE))
+            .text_color(th.accent)
+            .font_weight(FontWeight::SEMIBOLD)
+            .child("+")
+            .into_any_element(),
+    }
 }
 
 impl Render for JumpPalette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
-        let rows = self.results.iter().enumerate().map(|(i, r)| {
-            let (label, detail) = match r {
-                QjItem::Page(h) => (
-                    h.title.clone(),
-                    match (&h.alias, h.daily) {
-                        (Some(a), _) => format!("alias: {a}"),
-                        (None, true) => "journal".to_string(),
-                        _ => String::new(),
-                    },
-                ),
-                QjItem::Create(t) => (format!("Create page \"{t}\""), String::new()),
-                QjItem::Block(b) => (
-                    utopia_core::inline::plain_text(&b.text)
-                        .chars()
-                        .take(80)
-                        .collect(),
-                    b.page_title.clone(),
-                ),
-            };
+        let query = self.input.read(cx).text().to_string();
+        let needle = query.strip_prefix('>').unwrap_or(&query).to_string();
+        // The keys in force, read once per frame rather than per row: a rebinding in
+        // Settings replaces the default, and the palette must show what actually works.
+        let bound: Vec<Option<String>> = self
+            .results
+            .iter()
+            .map(|r| match r {
+                QjItem::Command(d) => Some(active_keys(cx, d)),
+                _ => None,
+            })
+            .collect();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut create: Option<AnyElement> = None;
+        for (i, item) in self.results.iter().enumerate() {
+            let el = self.row(
+                i,
+                item,
+                &needle,
+                bound.get(i).and_then(|k| k.as_deref()),
+                cx,
+            );
+            if matches!(item, QjItem::Create(_)) {
+                create = Some(el);
+            } else {
+                rows.push(el);
+            }
+        }
+        // "Create page" is last, above a hairline, in the accent colour (QJ-2).
+        let create_row = create.map(|el| {
             div()
-                .id(("qj", i))
-                .flex()
-                .justify_between()
-                .px_3()
-                .py_1()
-                .rounded_sm()
-                .cursor_pointer()
-                .hover(|d| d.bg(th.hover))
-                .when(i == self.selected, |d| d.bg(th.hover))
-                .child(div().text_color(th.text).child(label))
-                .child(
-                    div()
-                        .text_size(px(crate::theme::CAPTION_SIZE))
-                        .text_color(th.muted)
-                        .child(detail),
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                        this.choose(i, e.modifiers.shift, w, cx)
-                    }),
-                )
+                .debug_selector(|| "jump-create".into())
+                .mt_1()
+                .pt_1()
+                .border_t_1()
+                .border_color(th.line)
+                .child(el)
         });
+        let hints = match self.mode {
+            PaletteMode::Pages => "↑↓ move · ↩ open · ⌘↩ open in split · esc",
+            PaletteMode::Search => "↑↓ move · ↩ open · ⌘↩ open beside · esc",
+            PaletteMode::Capture => "↩ save to today · esc",
+            PaletteMode::Text => "↩ confirm · esc",
+        };
         div()
             .debug_selector(|| "jump-palette".into())
             .w(px(520.))
@@ -291,7 +676,7 @@ impl Render for JumpPalette {
             .child(
                 div()
                     .px_1()
-                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_size(px(CAPTION_SIZE))
                     .text_color(th.muted)
                     .child(self.title),
             )
@@ -304,6 +689,204 @@ impl Render for JumpPalette {
                     .rounded_md()
                     .child(self.input.clone()),
             )
-            .child(div().flex().flex_col().overflow_hidden().children(rows))
+            .child(
+                div()
+                    .id("jump-results")
+                    .debug_selector(|| "jump-results".into())
+                    .flex()
+                    .flex_col()
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .children(rows)
+                    .children(create_row),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "jump-footer".into())
+                    .border_t_1()
+                    .border_color(th.line)
+                    .pt_1()
+                    .px_1()
+                    .text_size(px(CAPTION_SIZE))
+                    .text_color(th.faint)
+                    .child(hints),
+            )
+    }
+}
+
+/// The commands a `>` query lists (QJ-5), in catalog order so an empty query reads as a
+/// menu grouped by category. Matches the label, the category, and the keys in force —
+/// either as `keymap.json` spells them or as the row shows them — so after a rebinding the
+/// command is found by its new chord and not by the default it replaced.
+fn commands(query: &str, keys: impl Fn(&ActionDoc) -> String) -> Vec<&'static ActionDoc> {
+    let q = query.trim().to_lowercase();
+    CATALOG
+        .iter()
+        .filter(|d| {
+            if q.is_empty() {
+                return true;
+            }
+            let bound = keys(d);
+            d.label.to_lowercase().contains(&q)
+                || d.category.label().to_lowercase().contains(&q)
+                || bound.to_lowercase().contains(&q)
+                || pretty_keys(&bound).to_lowercase().contains(&q)
+        })
+        .collect()
+}
+
+/// Byte ranges of the typed letters inside `label`, for the semibold match (QJ-4). A
+/// contiguous, case-insensitive match wins, so `ana` bolds just the `ana` of `Dana`;
+/// otherwise the letters of the fuzzy subsequence are marked one at a time, which is why
+/// `dn` still shows what made `Dana` a result.
+///
+/// Matching compares characters, never offsets into a folded copy of the string: folding
+/// `ẞ` or `İ` moves where the byte boundaries are (they are five bytes either way, but the
+/// lowercase characters are not the same bytes), and a range that splits a character
+/// panics when gpui slices the text for a highlight. Every range returned here therefore
+/// starts and ends on a boundary of `label` (AGENTS.md, text conventions).
+fn highlight_ranges(label: &str, needle: &str) -> Vec<Range<usize>> {
+    let needle = needle.trim();
+    if needle.is_empty() || label.is_empty() {
+        return Vec::new();
+    }
+    // Each character of the label: its byte range, and its case-folded form (which can be
+    // more than one character: `İ` folds to `i` plus a combining dot).
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut stream: Vec<char> = Vec::new();
+    let mut owner: Vec<usize> = Vec::new();
+    for (i, c) in label.char_indices() {
+        ranges.push(i..i + c.len_utf8());
+        for folded in c.to_lowercase() {
+            stream.push(folded);
+            owner.push(ranges.len() - 1);
+        }
+    }
+    let want: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    if want.is_empty() {
+        return Vec::new();
+    }
+    // The folded text as one stream, so a contiguous match can be found in it and widened
+    // back to whole characters: `i` in `ẞİ` marks that `İ` (3..5), not one byte of `ẞ`.
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start + want.len() <= stream.len() {
+        if stream[start..start + want.len()] == want[..] {
+            let last = start + want.len() - 1;
+            out.push(ranges[owner[start]].start..ranges[owner[last]].end);
+            start += want.len();
+        } else {
+            start += 1;
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    // Otherwise the letters of the fuzzy subsequence, one character at a time. Adjacent
+    // ones merge, so two folded characters inside one character stay a single range.
+    let mut out: Vec<Range<usize>> = Vec::new();
+    let mut from = 0;
+    for c in want {
+        let Some(i) = (from..stream.len()).find(|&i| stream[i] == c) else {
+            return Vec::new();
+        };
+        from = i + 1;
+        let r = ranges[owner[i]].clone();
+        match out.last_mut() {
+            Some(prev) if prev.end == r.start => prev.end = r.end,
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// QJ-4: the typed letters are marked inside the result, and nothing else is.
+    #[test]
+    fn the_match_is_marked() {
+        assert_eq!(highlight_ranges("Dana", "dan"), vec![0..3]);
+        assert_eq!(highlight_ranges("Dana", "ANA"), vec![1..4]);
+        // Every occurrence is marked, not just the first.
+        assert_eq!(
+            highlight_ranges("Atlas launch", "a"),
+            vec![0..1, 3..4, 7..8]
+        );
+        // A fuzzy match marks the letters it matched.
+        assert_eq!(highlight_ranges("Dana", "dn"), vec![0..1, 2..3]);
+        assert!(highlight_ranges("Dana", "x").is_empty());
+        assert!(highlight_ranges("Dana", "").is_empty());
+        // Ranges are byte ranges into the label, so a non-ASCII title stays intact.
+        assert_eq!(highlight_ranges("Café notes", "é"), vec![3..5]);
+        assert_eq!(highlight_ranges("Café notes", "notes"), vec![6..11]);
+    }
+
+    /// Case folding can change *where* the byte boundaries are even when the folded text
+    /// has the same length: `ẞİ` and its lowercase are both five bytes, yet offset 2 lies
+    /// inside `ẞ`. A range that splits a character panics gpui's text shaper (§6, rule 11),
+    /// so every range must start and end on a boundary of the original label.
+    #[test]
+    fn match_ranges_stay_on_char_boundaries() {
+        for (label, needle) in [
+            ("ẞİ", "i"),
+            ("İstanbul", "i"),
+            ("İstanbul", "istan"),
+            ("Straße", "s"),
+            ("Straße", "ß"),
+            ("ΣΟΦΊΑ", "σ"),
+            ("ǅungla", "d"),
+            ("Ça va", "ça"),
+        ] {
+            let ranges = highlight_ranges(label, needle);
+            for r in &ranges {
+                assert!(
+                    label.get(r.clone()).is_some(),
+                    "{label:?} / {needle:?}: {r:?} splits a character"
+                );
+            }
+        }
+        // Matching `i` must mark the `İ` it matched, not one byte of its UTF-8.
+        assert_eq!(highlight_ranges("ẞİ", "i"), vec![3..5]);
+    }
+
+    /// QJ-5: `>` lists the catalog, filtered by label, category or key. `keys` is the
+    /// chord in force; with the defaults installed that is the catalog's own.
+    #[test]
+    fn commands_come_from_the_catalog() {
+        let defaults = |d: &ActionDoc| crate::actions::platform_keys(d.keys);
+        assert_eq!(commands("", defaults).len(), CATALOG.len());
+        let today = commands("today", defaults);
+        assert!(
+            today.iter().any(|d| d.action == "GoToday"),
+            "{:?}",
+            today.iter().map(|d| d.action).collect::<Vec<_>>()
+        );
+        assert!(commands("navigation", defaults)
+            .iter()
+            .all(|d| d.category.label() == "Navigation"));
+        assert!(commands("cmd-shift-g", defaults)
+            .iter()
+            .any(|d| d.action == "ShowGraph"));
+        assert!(commands("⇧⌘G", defaults)
+            .iter()
+            .any(|d| d.action == "ShowGraph"));
+        assert!(commands("nonsense-nothing", defaults).is_empty());
+        // A command is found by the chord that is in force, not by the one it replaced.
+        let rebound = |d: &ActionDoc| {
+            if d.action == "GoToday" {
+                "alt-cmd-t".to_string()
+            } else {
+                crate::actions::platform_keys(d.keys)
+            }
+        };
+        assert!(commands("alt-cmd-t", rebound)
+            .iter()
+            .any(|d| d.action == "GoToday"));
+        assert!(!commands("cmd-shift-t", rebound)
+            .iter()
+            .any(|d| d.action == "GoToday"));
     }
 }

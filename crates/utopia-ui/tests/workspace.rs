@@ -227,6 +227,310 @@ fn quick_jump_creates_and_opens(cx: &mut TestAppContext) {
     assert_eq!(rows_str(&rows(&app, &page, cx)), vec![("first thought", 0)]);
 }
 
+/// QJ-1: with nothing typed the palette offers today, yesterday and the pages opened
+/// last, and picking one opens it. The list is local UI state (rule 9), not the index.
+#[gpui::test]
+fn quick_jump_empty_state_lists_days_and_recent_pages(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-icon-0-day").is_some(),
+        "today is the first row"
+    );
+    assert!(
+        cx.debug_bounds("qj-icon-1-day").is_some(),
+        "yesterday is the second"
+    );
+    assert!(
+        cx.debug_bounds("qj-row-2").is_none(),
+        "nothing has been opened yet"
+    );
+    // Create a page through the palette, then leave it: it becomes the first recent page.
+    cx.simulate_input("Reading log");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    let reading = app
+        .update(cx, |app, _| app.store.find_page("Reading log").unwrap())
+        .unwrap();
+    app.update(cx, |app, _| {
+        let stored = app
+            .store
+            .local_get("recent_pages")
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(
+            stored.lines().next(),
+            Some(reading.as_str()),
+            "newest first: {stored:?}"
+        );
+    });
+    // Go elsewhere, then reopen the palette: the page is offered by name, not by query.
+    cx.simulate_keystrokes("cmd-shift-t");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-icon-2-page").is_some(),
+        "the recent page follows today and yesterday"
+    );
+    cx.simulate_keystrokes("down down enter");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(reading),
+        "Enter opens the highlighted recent page"
+    );
+}
+
+/// QJ-2: a page that only a `#tag` ever reached is labelled a tag page.
+#[gpui::test]
+fn quick_jump_marks_tag_pages(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    cx.simulate_input("reading #atlas");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    assert!(app
+        .update(cx, |app, _| app.store.find_page("atlas").unwrap())
+        .is_some());
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input("atlas");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-icon-0-tag").is_some(),
+        "a page reached only through #atlas is a tag page"
+    );
+    // A page that also has a `[[…]]` link is a page, not a tag (FR-2.15).
+    app.update(cx, |app, _| {
+        app.store.create_page("Atlas launch").unwrap();
+    });
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input("atlas launch");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-icon-0-page").is_some(),
+        "a page nobody tagged is a plain page"
+    );
+}
+
+/// QJ-5: `>` lists the actions in the catalog, and picking one runs it as its key would.
+#[gpui::test]
+fn quick_jump_runs_commands(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // Somewhere to come back from: today's own page, then the feed behind the palette.
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input("Reading log");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    let reading = app
+        .update(cx, |app, _| app.store.find_page("Reading log").unwrap())
+        .unwrap();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(reading));
+    // " > " lists commands instead of pages; "Today" runs GoToday.
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input(">Today");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-icon-0-command").is_some(),
+        "the first match is a command row"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let shown = ws.update(cx, |w, cx| w.main_page(cx)).unwrap();
+    let date = app.update(cx, |app, _| {
+        app.store.page_state(&shown).unwrap().meta.daily_date
+    });
+    assert_eq!(date, Some(today()), "GoToday ran from the palette");
+    // The palette is gone and focus is back on the page: typing lands in today's block.
+    cx.simulate_input("ran from the palette");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let page = today_page(&app, cx);
+    assert_eq!(
+        rows_str(&rows(&app, &page, cx)),
+        vec![("ran from the palette", 0)]
+    );
+}
+
+/// QJ-5: a command bound to the editor acts on the block being edited. The palette takes
+/// the focus, but the block stays in edit, so the command is dispatched back to it.
+#[gpui::test]
+fn quick_jump_runs_editor_commands(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("a");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("b");
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input(">Indent");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        rows_str(&rows(&app, &page, cx)),
+        vec![("a", 0), ("b", 1)],
+        "Indent ran on the block that was being edited"
+    );
+}
+
+/// QJ-5: an editor command with no block in edit cannot act, so it is shown as unavailable
+/// rather than offered and silently dropped.
+#[gpui::test]
+fn quick_jump_marks_editor_commands_unavailable(cx: &mut TestAppContext) {
+    let (_app, _ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input(">Indent");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-command-0-Indent-off").is_some(),
+        "Indent needs a block in edit, and none is"
+    );
+    // A command that works anywhere stays available.
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_input(">Today");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-command-0-GoToday").is_some(),
+        "GoToday is a window action"
+    );
+}
+
+/// QJ-1: a page that was opened and then deleted (or merged away, which tombstones the
+/// source) is skipped, and its entry does not use up one of the eight recent slots.
+#[gpui::test]
+fn quick_jump_skips_deleted_recent_pages(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    fn open(ws: &Entity<Workspace>, cx: &mut VisualTestContext, page: PageId) {
+        ws.update_in(cx, |w, window, cx| {
+            w.open(page, None, None, false, window, cx)
+        });
+    }
+    let (reading, trips) = app.update(cx, |app, _| {
+        (
+            app.store.create_page("Reading log").unwrap(),
+            app.store.create_page("Trips").unwrap(),
+        )
+    });
+    open(&ws, cx, reading.clone());
+    open(&ws, cx, trips);
+    cx.run_until_parked();
+    app.update(cx, |app, _| app.store.delete_page(&reading).unwrap());
+    // The UI store is debounced; let the writer catch up so the index is current.
+    app.update(cx, |app, _| app.store.sync_index().unwrap());
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-row-2").is_some(),
+        "the live page is offered"
+    );
+    assert!(
+        cx.debug_bounds("qj-row-3").is_none(),
+        "the deleted page is not offered"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Eight live pages behind a tombstoned one: none of the eight may be displaced, so
+    // nine downs from the top land on the oldest of them.
+    let live: Vec<PageId> = app.update(cx, |app, _| {
+        (0..8)
+            .map(|i| app.store.create_page(&format!("Page {i}")).unwrap())
+            .collect()
+    });
+    for page in &live {
+        open(&ws, cx, page.clone());
+    }
+    let doomed = app.update(cx, |app, _| app.store.create_page("Doomed").unwrap());
+    open(&ws, cx, doomed.clone());
+    cx.run_until_parked();
+    app.update(cx, |app, _| app.store.delete_page(&doomed).unwrap());
+    app.update(cx, |app, _| app.store.sync_index().unwrap());
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down down down down down down down down down enter");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(live[0].clone()),
+        "the tombstone did not take a slot"
+    );
+}
+
+/// QJ-5: the palette lists the keys in force. A binding changed in Settings replaces the
+/// default, so the palette must find (and show) the new chord, not the old one (§9.1).
+#[gpui::test]
+fn quick_jump_finds_commands_by_the_keys_in_force(cx: &mut TestAppContext) {
+    let (_app, _ws, cx) = setup(cx);
+    cx.update(|_window, cx| {
+        let mut o = utopia_ui::actions::Overrides::default();
+        o.set("GoToday", "alt-cmd-t");
+        utopia_ui::actions::reinstall(cx, &o);
+    });
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input(">alt-cmd-t");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-command-0-GoToday").is_some(),
+        "the rebound chord finds Today"
+    );
+}
+
+/// The flip side in a fresh window, so no earlier frame can leave a stale debug bound:
+/// once rebound, the replaced default is no longer advertised or searched.
+#[gpui::test]
+fn quick_jump_drops_a_replaced_default_key(cx: &mut TestAppContext) {
+    let (_app, _ws, cx) = setup(cx);
+    cx.update(|_window, cx| {
+        let mut o = utopia_ui::actions::Overrides::default();
+        o.set("GoToday", "alt-cmd-t");
+        utopia_ui::actions::reinstall(cx, &o);
+    });
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    cx.simulate_input(">cmd-shift-t");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("qj-command-0-GoToday").is_none(),
+        "no command answers to the replaced default any more"
+    );
+}
+
+/// P3: a page opened in a split pane was still opened, so it belongs in the recent list
+/// the empty state offers.
+#[gpui::test]
+fn quick_jump_records_pages_opened_in_a_split(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let reading = app.update(cx, |app, _| app.store.create_page("Reading log").unwrap());
+    ws.update_in(cx, |w, window, cx| {
+        w.open_split(reading.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    app.update(cx, |app, _| {
+        let stored = app
+            .store
+            .local_get("recent_pages")
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(
+            stored.lines().next(),
+            Some(reading.as_str()),
+            "a split is an open: {stored:?}"
+        );
+    });
+}
+
 #[gpui::test]
 fn query_blocks_list_results(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);
@@ -2051,6 +2355,94 @@ fn an_edit_does_not_classify_tag_pages_on_the_ui_thread(cx: &mut TestAppContext)
         "a plain link is not a hashtag-only page"
     );
     assert_eq!(app.update(cx, |app, _| app.store.tag_page_scans()), scans);
+}
+
+/// LR-5 + rule 10: the unlinked-reference count is refreshed by the index update and by
+/// navigation, not by a frame. A page that is open but not painted (its sidebar pane is
+/// closed) still counts its mentions when the index changes — with the scan in `render`
+/// it would only be counted once something painted it.
+#[gpui::test]
+fn unlinked_count_refreshes_for_a_page_that_is_not_painted(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (main_page, side_page, source) = app.update(cx, |app, _| {
+        let main_page = app.store.create_page("Ana Lovelace").unwrap();
+        let side_page = app.store.create_page("Ada Lovelace").unwrap();
+        let source = app.store.create_page("Notes").unwrap();
+        let b = app.store.ensure_first_block(&source).unwrap();
+        app.store
+            .set_block_text(
+                &source,
+                &b,
+                "Met Ana Lovelace, then Ada Lovelace",
+                None,
+                None,
+            )
+            .unwrap();
+        app.store.commit_block(&source, &b).unwrap();
+        (main_page, side_page, source)
+    });
+    // One page in the main pane, one in the right sidebar; then close the sidebar so the
+    // second view keeps its state but is not rendered.
+    ws.update_in(cx, |w, window, cx| {
+        w.open(main_page.clone(), None, None, false, window, cx);
+        w.open(side_page.clone(), None, None, true, window, cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-shift-\\");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("right-sidebar").is_none(),
+        "the sidebar is closed, so its page is not painted"
+    );
+
+    // A durable index change: both open page views hear it and count their mentions.
+    let before = app.update(cx, |app, _| app.store.unlinked_scans());
+    app.update(cx, |app, cx| {
+        let plan = utopia_core::outline::append_block(app.store.page_state(&source).unwrap(), None);
+        let b = app
+            .store
+            .execute_plan(&source, plan, None)
+            .unwrap()
+            .unwrap()
+            .block;
+        app.store
+            .set_block_text(&source, &b, "Ada Lovelace again", None, None)
+            .unwrap();
+        app.store.commit_block(&source, &b).unwrap();
+        app.flush_now(cx);
+    });
+    cx.run_until_parked();
+    let after = app.update(cx, |app, _| app.store.unlinked_scans());
+    assert_eq!(
+        after - before,
+        2,
+        "both open pages refreshed their count, painted or not"
+    );
+
+    // Painting a frame for any reason does not count again, and the painted page is current.
+    assert!(
+        cx.debug_bounds("unlinked-count-1").is_some(),
+        "the painted page shows its count"
+    );
+    ws.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    assert_eq!(
+        app.update(cx, |app, _| app.store.unlinked_scans()),
+        after,
+        "a frame without an index change costs no scan"
+    );
+    // Reopening the sidebar shows the second page's fresh count without another scan.
+    cx.simulate_keystrokes("cmd-shift-\\");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("right-sidebar").is_some(),
+        "sidebar reopened"
+    );
+    assert_eq!(
+        app.update(cx, |app, _| app.store.unlinked_scans()),
+        after,
+        "the reopened pane uses the count it already refreshed"
+    );
 }
 
 /// FR-1.2: a journal template gives a draft day blocks before it is written. Clicking that

@@ -601,6 +601,39 @@ fn tag_classification_is_updated_incrementally() {
     assert_eq!(s.tag_page_full_scans(), full);
 }
 
+/// SB-2 review fix: a page that was a plain page only because of one `[[link]]` becomes a
+/// tag page when that link goes away. The destination is no longer referenced by the page
+/// that changed, so the reclassification has to start from the references the commit
+/// *removed*, not only from the ones it left behind.
+#[test]
+fn a_link_that_goes_away_makes_its_destination_a_tag_page() {
+    let (mut s, _d) = store();
+    let notes = s.create_page("Notes").unwrap();
+    let tagged = s.create_page("Tagged").unwrap();
+    write(&mut s, &tagged, "kept as a tag: #alpha");
+    let link = write(&mut s, &notes, "a plain link: [[alpha]]");
+    s.sync_index().unwrap();
+    let alpha = s.find_page("alpha").unwrap().expect("the tag made a page");
+    let full = s.tag_page_full_scans();
+    assert!(
+        !s.tag_pages().unwrap().contains(&alpha),
+        "one [[link]] keeps the page a page, not a tag"
+    );
+
+    // The link goes away; only the hashtag still reaches the page.
+    s.set_block_text(&notes, &link, "no link any more", None, None)
+        .unwrap();
+    s.commit_block(&notes, &link).unwrap();
+    s.sync_index().unwrap();
+    assert!(
+        s.tag_pages().unwrap().contains(&alpha),
+        "reclassified from the removed reference: {:?}",
+        s.tag_pages()
+    );
+    assert_eq!(s.tag_page_full_scans(), full, "still no whole-graph scan");
+    assert_eq!(s.tag_pages().unwrap(), s.hashtag_only_pages().unwrap());
+}
+
 /// PG-2 review fix: an export copies what it needs off the store, then the serialization and
 /// the file writes take no store at all — that is what lets them run on a background worker
 /// instead of freezing every window. Both routes must write the same files.

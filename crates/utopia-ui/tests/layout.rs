@@ -41,6 +41,15 @@ fn setup_seeded(cx: &mut TestAppContext, seed: impl FnOnce(&mut Store)) -> &mut 
     cx
 }
 
+/// Like [`setup`], but the graph already holds `titles` (Quick jump result rows).
+fn setup_titles<'a>(cx: &'a mut TestAppContext, titles: &[&str]) -> &'a mut VisualTestContext {
+    setup_seeded(cx, |store| {
+        for t in titles {
+            store.create_page(t).unwrap();
+        }
+    })
+}
+
 /// `n` days of history, two blocks each, so the old two-line preview would have shown
 /// both (SB-1).
 fn seed_days(store: &mut Store, n: usize) {
@@ -228,6 +237,254 @@ fn quick_jump_is_centered(cx: &mut TestAppContext) {
         p.origin.y > px(60.) && p.origin.y < px(H / 2.),
         "in the upper half: {p:?}"
     );
+}
+
+/// QJ-1: with nothing typed the palette offers today and yesterday, in that order, and no
+/// "Create" row — there is no query to create from.
+#[gpui::test]
+fn quick_jump_empty_state_lists_today_and_yesterday(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape cmd-k");
+    let palette = bounds(cx, "jump-palette");
+    let today = bounds(cx, "qj-row-0");
+    let yesterday = bounds(cx, "qj-row-1");
+    assert!(
+        cx.debug_bounds("qj-icon-0-day").is_some(),
+        "today is a day row"
+    );
+    assert!(
+        cx.debug_bounds("qj-icon-1-day").is_some(),
+        "yesterday is a day row"
+    );
+    assert!(yesterday.origin.y > today.origin.y, "today comes first");
+    assert!(
+        today.origin.y >= palette.origin.y
+            && yesterday.origin.y + yesterday.size.height
+                <= palette.origin.y + palette.size.height + px(0.5),
+        "both rows sit inside the palette: {today:?} {yesterday:?} {palette:?}"
+    );
+    assert!(
+        cx.debug_bounds("jump-create").is_none(),
+        "no create row before anything is typed"
+    );
+}
+
+/// QJ-3: the key hints are a footer under the results, with a hairline above them.
+#[gpui::test]
+fn quick_jump_footer_sits_under_the_results(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape cmd-k");
+    let palette = bounds(cx, "jump-palette");
+    let footer = bounds(cx, "jump-footer");
+    let last_row = bounds(cx, "qj-row-1");
+    let results = bounds(cx, "jump-results");
+    assert!(
+        footer.origin.y >= results.origin.y + results.size.height - px(0.5),
+        "the footer follows the list: {footer:?} {results:?}"
+    );
+    assert!(
+        footer.origin.y >= last_row.origin.y + last_row.size.height - px(0.5),
+        "and the last row: {footer:?} {last_row:?}"
+    );
+    assert!(
+        footer.origin.y + footer.size.height <= palette.origin.y + palette.size.height + px(0.5),
+        "the footer is inside the palette: {footer:?} {palette:?}"
+    );
+    assert!(approx(footer.size.width, 520. - 18.), "{footer:?}");
+}
+
+/// QJ-2: "Create page" is the last row, below a hairline of its own.
+#[gpui::test]
+fn quick_jump_create_row_is_last(cx: &mut TestAppContext) {
+    let cx = setup_titles(cx, &["Brand new page"]);
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input("Brand");
+    let palette = bounds(cx, "jump-palette");
+    let result = bounds(cx, "qj-row-0");
+    let create = bounds(cx, "qj-row-1");
+    assert!(cx.debug_bounds("qj-icon-0-page").is_some(), "a page row");
+    assert!(
+        cx.debug_bounds("qj-icon-1-create").is_some(),
+        "the create row is last"
+    );
+    let hairline = bounds(cx, "jump-create");
+    assert!(
+        hairline.origin.y >= result.origin.y + result.size.height - px(0.5),
+        "the create row sits under its hairline, under the results: {hairline:?} {result:?}"
+    );
+    assert!(create.origin.y > result.origin.y, "{create:?} {result:?}");
+    assert!(
+        create.origin.y + create.size.height <= palette.origin.y + palette.size.height + px(0.5),
+        "inside the palette: {create:?} {palette:?}"
+    );
+}
+
+/// Opening the palette is an overlay: the page underneath does not move.
+#[gpui::test]
+fn quick_jump_does_not_move_the_page(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    let before = bounds(cx, "main-pane");
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input("Brand new page");
+    let after = bounds(cx, "main-pane");
+    assert_eq!(before, after, "the palette floats over the page");
+}
+
+/// QJ-2: every row is icon | label | type label, so the icons line up in one gutter and
+/// the type labels share a right edge.
+#[gpui::test]
+fn quick_jump_rows_line_up(cx: &mut TestAppContext) {
+    let cx = setup_titles(cx, &["Atlas Launch", "Ana Lovelace"]);
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input("a");
+    let first = bounds(cx, "qj-row-0");
+    let second = bounds(cx, "qj-row-1");
+    assert!(
+        approx(first.size.height, f32::from(second.size.height)),
+        "{first:?}"
+    );
+    let icon0 = bounds(cx, "qj-icon-0-page");
+    let icon1 = bounds(cx, "qj-icon-1-page");
+    assert!(
+        approx(icon0.origin.x, f32::from(icon1.origin.x)),
+        "one gutter"
+    );
+    assert!(
+        icon0.origin.x > first.origin.x
+            && icon0.origin.x + icon0.size.width < first.origin.x + first.size.width,
+        "the icon leads the row: {icon0:?} {first:?}"
+    );
+    let label0 = bounds(cx, "qj-label-0");
+    let label1 = bounds(cx, "qj-label-1");
+    assert!(
+        approx(label0.origin.x, f32::from(label1.origin.x)),
+        "labels line up"
+    );
+    assert!(
+        label0.origin.x >= icon0.origin.x + icon0.size.width,
+        "the label follows the icon: {label0:?} {icon0:?}"
+    );
+    let detail0 = bounds(cx, "qj-detail-0");
+    let detail1 = bounds(cx, "qj-detail-1");
+    assert!(
+        detail0.origin.x + detail0.size.width <= first.origin.x + first.size.width,
+        "the type label stays inside the row: {detail0:?} {first:?}"
+    );
+    assert!(
+        approx(
+            detail0.origin.x + detail0.size.width,
+            f32::from(detail1.origin.x + detail1.size.width)
+        ),
+        "type labels are right-aligned: {detail0:?} {detail1:?}"
+    );
+}
+
+/// QJ-1/QJ-3: ten rows (today, yesterday and eight recent pages) keep the palette under
+/// its height cap, so the footer stays visible while the list scrolls.
+#[gpui::test]
+fn quick_jump_caps_its_height(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let mut ids = Vec::new();
+    for t in [
+        "Atlas Launch",
+        "Ana Lovelace",
+        "Library",
+        "Operations",
+        "Reading log",
+        "Trips",
+        "Recipes",
+        "Garden",
+        "Budget",
+        "Inbox",
+    ] {
+        ids.push(store.create_page(t).unwrap());
+    }
+    // Most recently opened first, as the workspace writes it (rule 9).
+    let keyed = ids
+        .iter()
+        .rev()
+        .map(|p| p.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    store.local_set("recent_pages", &keyed).unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape cmd-k");
+    let palette = bounds(cx, "jump-palette");
+    assert!(
+        palette.size.height <= px(440.) + px(0.5),
+        "the palette caps its height: {palette:?}"
+    );
+    let footer = bounds(cx, "jump-footer");
+    assert!(
+        footer.origin.y + footer.size.height <= palette.origin.y + palette.size.height + px(0.5),
+        "the footer stays inside: {footer:?} {palette:?}"
+    );
+    assert!(
+        cx.debug_bounds("qj-row-9").is_some(),
+        "all ten rows are offered, and the list scrolls"
+    );
+}
+
+/// ALL-5: Compact density does not break the palette — the rows still fit, in order.
+#[gpui::test]
+fn quick_jump_works_at_compact_density(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|_window, cx| {
+        utopia_ui::appearance::set_density(cx, utopia_ui::appearance::Density::Compact, dir.path())
+            .unwrap();
+    });
+    cx.simulate_keystrokes("escape cmd-k");
+    let palette = bounds(cx, "jump-palette");
+    let today = bounds(cx, "qj-row-0");
+    let yesterday = bounds(cx, "qj-row-1");
+    assert!(
+        yesterday.origin.y > today.origin.y,
+        "{today:?} {yesterday:?}"
+    );
+    let footer = bounds(cx, "jump-footer");
+    assert!(
+        footer.origin.y + footer.size.height <= palette.origin.y + palette.size.height + px(0.5),
+        "Compact keeps the footer inside: {footer:?} {palette:?}"
+    );
+}
+
+/// QJ-3/QJ-5: ↑/↓ move through the whole command catalog, so the list has to follow the
+/// selection — otherwise Enter runs a command nobody can see.
+#[gpui::test]
+fn quick_jump_scrolls_the_selection_into_view(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input(">");
+    cx.run_until_parked();
+    let last = utopia_ui::actions::CATALOG.len() - 1;
+    let visible = |cx: &mut VisualTestContext, i: usize| {
+        let row = bounds_of(cx, format!("qj-row-{i}"));
+        let results = bounds(cx, "jump-results");
+        row.origin.y >= results.origin.y - px(1.)
+            && row.origin.y + row.size.height <= results.origin.y + results.size.height + px(1.)
+    };
+    // Up from the first row wraps to the last: the list scrolls down to show it.
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert!(visible(cx, last), "the selected last command is in view");
+    // Down from there wraps back to the top, which scrolls the list up again.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert!(visible(cx, 0), "the first command is in view again");
+    // And walking down past the viewport keeps the selection in view.
+    cx.simulate_keystrokes("down down down down down down down down down down down down");
+    cx.run_until_parked();
+    assert!(visible(cx, 12), "the selection follows the list");
 }
 
 #[gpui::test]
