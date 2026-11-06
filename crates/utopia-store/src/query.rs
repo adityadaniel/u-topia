@@ -340,36 +340,52 @@ impl Store {
             "SELECT p.id, p.title_key FROM page p
              WHERE p.deleted_at IS NULL AND p.kind = 'page'
                AND NOT EXISTS (SELECT 1 FROM block b WHERE b.page_id = p.id
-                                 AND b.deleted_at IS NULL AND trim(b.text) <> '')
-               AND EXISTS (SELECT 1 FROM ref r JOIN block b ON b.id = r.src_block_id
-                            WHERE r.dst_page_id = p.id AND b.deleted_at IS NULL)",
+                                 AND b.deleted_at IS NULL AND trim(b.text) <> '')",
         )?;
         let candidates = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .query_map([], |r| {
+                Ok((PageId(r.get::<_, String>(0)?), r.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
+        }
+        // The source text of every reference into a blockless page, in one query rather
+        // than one per page: the sidebar re-reads this whenever the index moves.
+        let mut sources = self.conn.prepare(
+            "SELECT r.dst_page_id, b.text FROM ref r
+             JOIN block b ON b.id = r.src_block_id
+             JOIN page p ON p.id = r.dst_page_id
+             WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL AND p.kind = 'page'
+               AND NOT EXISTS (SELECT 1 FROM block own WHERE own.page_id = p.id
+                                 AND own.deleted_at IS NULL AND trim(own.text) <> '')",
+        )?;
+        let mut texts: HashMap<PageId, Vec<String>> = HashMap::new();
+        for row in sources.query_map([], |r| {
+            Ok((PageId(r.get::<_, String>(0)?), r.get::<_, String>(1)?))
+        })? {
+            let (page, text) = row?;
+            texts.entry(page).or_default().push(text);
+        }
+        // A reference through an alias reaches the page under the alias's key.
+        let mut aliases = self.conn.prepare("SELECT page_id, alias_key FROM alias")?;
+        let mut alias_keys: HashMap<PageId, HashSet<String>> = HashMap::new();
+        for row in aliases.query_map([], |r| {
+            Ok((PageId(r.get::<_, String>(0)?), r.get::<_, String>(1)?))
+        })? {
+            let (page, key) = row?;
+            alias_keys.entry(page).or_default().insert(key);
+        }
         let mut out = HashSet::new();
-        for (id, title_key) in candidates {
-            // A reference through an alias reaches the page under the alias's key.
+        for (page, title_key) in candidates {
             let mut keys = HashSet::from([title_key]);
-            let mut aliases = self
-                .conn
-                .prepare_cached("SELECT alias_key FROM alias WHERE page_id=?1")?;
-            keys.extend(
-                aliases
-                    .query_map(params![id], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?,
-            );
-            let mut sources = self.conn.prepare_cached(
-                "SELECT b.text FROM ref r JOIN block b ON b.id = r.src_block_id
-                 WHERE r.dst_page_id = ?1 AND b.deleted_at IS NULL",
-            )?;
-            let texts = sources
-                .query_map(params![id], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if let Some(aliases) = alias_keys.get(&page) {
+                keys.extend(aliases.iter().cloned());
+            }
             let mut any = false;
             let mut all_tags = true;
-            for text in texts {
-                for r in extract_refs(&text) {
+            for text in texts.get(&page).map(Vec::as_slice).unwrap_or_default() {
+                for r in extract_refs(text) {
                     if r.is_page_like() && keys.contains(&normalize_title(&r.target)) {
                         any = true;
                         all_tags &= r.kind == RefKind::Tag;
@@ -377,7 +393,7 @@ impl Store {
                 }
             }
             if any && all_tags {
-                out.insert(PageId(id));
+                out.insert(page);
             }
         }
         Ok(out)
