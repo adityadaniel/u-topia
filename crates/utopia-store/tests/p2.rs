@@ -181,6 +181,20 @@ fn page_graph_global_and_local() {
         .unwrap();
     assert_eq!(ab.2, 3, "both directions add up, one edge");
     assert_eq!(g.edges.len(), 3);
+    // GR-4: the graph keeps the direction and count of every stored reference, so the
+    // view can draw an arrowhead without resolving anything at paint time (rule 3).
+    let dir = |from: &str, to: &str| {
+        g.directed
+            .iter()
+            .find(|e| e.0 == ix(from) && e.1 == ix(to))
+            .map(|e| e.2)
+    };
+    assert_eq!(dir("A", "B"), Some(2));
+    assert_eq!(dir("B", "A"), Some(1));
+    assert_eq!(dir("A", "C"), Some(1));
+    assert_eq!(dir("B", "D"), Some(1));
+    assert_eq!(dir("D", "B"), None, "direction is not invented");
+    assert_eq!(g.directed.len(), 4, "{:?}", g.directed);
     // Local graph of D at depth 1: D and B only.
     let d = s.find_page("D").unwrap().unwrap();
     let local = s

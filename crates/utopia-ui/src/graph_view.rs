@@ -7,7 +7,8 @@
 //! link count, the page the graph was opened from keeps a 2 px accent ring (GR-1); hovering
 //! fades everything but the page and its neighbours to 25 % and floats a card with the
 //! first block (GR-2); the count and colour key sit at the bottom left and the zoom controls
-//! at the bottom right (GR-3).
+//! at the bottom right (GR-3); edges grow from 1 px to 3 px with the stored reference count
+//! and arrowheads point at the target (GR-4).
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -124,6 +125,11 @@ impl GraphView {
         self.graph.edges.len()
     }
 
+    /// Directed `(source, target, count)` edges from the stored references (GR-4).
+    pub fn directed_edges(&self) -> &[(usize, usize, usize)] {
+        &self.graph.directed
+    }
+
     pub fn is_laid_out(&self) -> bool {
         self.laid_out
     }
@@ -225,6 +231,11 @@ impl GraphView {
 
     fn radius(degree: usize, max_degree: usize) -> f32 {
         Self::diameter(degree, max_degree) / 2.
+    }
+
+    /// GR-4: 1 px for one reference, 2 px for two, 3 px for three or more.
+    fn edge_width(references: usize) -> f32 {
+        1. + (references.saturating_sub(1) as f32).min(2.)
     }
 
     fn hit(&self, at: Point<Pixels>) -> Option<usize> {
@@ -455,6 +466,35 @@ fn lit_nodes(nodes: usize, edges: &[(usize, usize, usize)], hover: Option<usize>
     lit
 }
 
+/// GR-4: a small filled triangle just before the target node, pointing along the stored
+/// reference direction.
+fn arrowhead(
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+    target_radius: f32,
+) -> Option<gpui::Path<Pixels>> {
+    let (fx, fy) = (f32::from(from.x), f32::from(from.y));
+    let (tx, ty) = (f32::from(to.x), f32::from(to.y));
+    let (dx, dy) = (tx - fx, ty - fy);
+    let d = dx.hypot(dy);
+    if d < target_radius + 12. {
+        return None;
+    }
+    let (ux, uy) = (dx / d, dy / d);
+    let tip = (
+        tx - ux * (target_radius + 1.),
+        ty - uy * (target_radius + 1.),
+    );
+    let base = (tip.0 - ux * 7., tip.1 - uy * 7.);
+    let (px_, py_) = (-uy * 3.5, ux * 3.5);
+    let mut path = PathBuilder::fill();
+    path.move_to(point(px(tip.0), px(tip.1)));
+    path.line_to(point(px(base.0 + px_), px(base.1 + py_)));
+    path.line_to(point(px(base.0 - px_), px(base.1 - py_)));
+    path.close();
+    path.build().ok()
+}
+
 impl Render for GraphView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
@@ -506,6 +546,7 @@ impl Render for GraphView {
         let screen: Vec<(f32, f32)> = self.pos.clone();
         let nodes = self.graph.nodes.clone();
         let edges = self.graph.edges.clone();
+        let directed = self.graph.directed.clone();
         let max_degree = self.max_degree;
         let lit = self.lit.clone();
         let (pan, zoom, hover) = (self.pan, self.zoom, self.hover);
@@ -547,37 +588,55 @@ impl Render for GraphView {
                         let lit = |i: usize| lit.get(i).copied().unwrap_or(false);
                         // GR-2: while hovering, only the page and its neighbours stay lit.
                         let faded = |i: usize| hover.is_some() && !lit(i);
-                        // Edges first, neighbours of the hovered node highlighted; the rest
-                        // fade while a page is hovered (GR-2).
-                        let mut faint = PathBuilder::stroke(px(1.));
-                        let mut strong = PathBuilder::stroke(px(1.5));
-                        let (mut any_faint, mut any_strong) = (false, false);
-                        for &(a, b, _) in &edges {
-                            let lit = hover.is_some_and(|h| h == a || h == b);
-                            let pb = if lit { &mut strong } else { &mut faint };
-                            pb.move_to(at(screen[a]));
-                            pb.line_to(at(screen[b]));
-                            if lit {
-                                any_strong = true;
+                        // GR-4: one width bucket per stored reference count, split by
+                        // whether the hover highlights it. Six cheap passes beat one path
+                        // per edge.
+                        for width in [1., 2., 3.] {
+                            for accent in [false, true] {
+                                let mut path = PathBuilder::stroke(px(width));
+                                let mut any = false;
+                                for &(a, b, references) in &edges {
+                                    let touching = hover.is_some_and(|h| h == a || h == b);
+                                    let lit_edge = hover.is_some() && touching;
+                                    if lit_edge != accent
+                                        || GraphView::edge_width(references) != width
+                                    {
+                                        continue;
+                                    }
+                                    path.move_to(at(screen[a]));
+                                    path.line_to(at(screen[b]));
+                                    any = true;
+                                }
+                                if !any {
+                                    continue;
+                                }
+                                let color = if accent {
+                                    th.accent
+                                } else if hover.is_some() {
+                                    th.line.opacity(FADE)
+                                } else {
+                                    th.line
+                                };
+                                if let Ok(p) = path.build() {
+                                    window.paint_path(p, color);
+                                }
+                            }
+                        }
+                        // GR-4: arrowheads point at the target of each stored reference.
+                        for &(a, b, _) in &directed {
+                            let touching = hover.is_some_and(|h| h == a || h == b);
+                            let color = if hover.is_some() {
+                                if touching {
+                                    th.accent
+                                } else {
+                                    th.line.opacity(FADE)
+                                }
                             } else {
-                                any_faint = true;
-                            }
-                        }
-                        if any_faint {
-                            if let Ok(p) = faint.build() {
-                                window.paint_path(
-                                    p,
-                                    if hover.is_some() {
-                                        th.line.opacity(FADE)
-                                    } else {
-                                        th.line
-                                    },
-                                );
-                            }
-                        }
-                        if any_strong {
-                            if let Ok(p) = strong.build() {
-                                window.paint_path(p, th.accent);
+                                th.line
+                            };
+                            let r = GraphView::radius(nodes[b].degree, max_degree);
+                            if let Some(p) = arrowhead(at(screen[a]), at(screen[b]), r) {
+                                window.paint_path(p, color);
                             }
                         }
                         // Nodes, then labels for the hovered node, the origin and the
@@ -755,5 +814,22 @@ mod tests {
         assert_eq!(lit_nodes(4, &edges, Some(0)), [true, true, false, false]);
         assert_eq!(lit_nodes(4, &edges, Some(1)), [true, true, true, false]);
         assert_eq!(lit_nodes(4, &edges, Some(3)), [false, false, false, true]);
+    }
+
+    /// GR-4: edge width comes from the stored reference count, capped at 3 px.
+    #[test]
+    fn edge_width_grows_with_stored_references() {
+        assert_eq!(GraphView::edge_width(1), 1.);
+        assert_eq!(GraphView::edge_width(2), 2.);
+        assert_eq!(GraphView::edge_width(3), 3.);
+        assert_eq!(GraphView::edge_width(42), 3.);
+    }
+
+    /// GR-4: an arrowhead stops short of the target node rather than crossing it.
+    #[test]
+    fn arrowhead_points_at_the_target() {
+        let arrow = arrowhead(point(px(0.), px(0.)), point(px(100.), px(0.)), 6.).unwrap();
+        let _ = arrow;
+        assert!(arrowhead(point(px(0.), px(0.)), point(px(8.), px(0.)), 6.).is_none());
     }
 }
