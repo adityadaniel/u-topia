@@ -583,6 +583,118 @@ fn a_clash_link_scrolls_to_the_other_card(cx: &mut TestAppContext) {
     );
 }
 
+/// A clash link must reveal the *row* it names, not just its category: "New Block" shares
+/// Cmd+A with "Select All" in the 25-row Editing card, and scrolling only to that card leaves
+/// Select All above the viewport. The window is tall enough for the Outline row to be on
+/// screen so the link can be clicked.
+#[gpui::test]
+fn a_clash_link_reveals_a_row_in_a_tall_category(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = Overrides::default();
+    o.set("Newline", "cmd-a");
+    std::fs::write(dir.path().join("keymap.json"), o.to_json()).unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(1150.)));
+    cx.run_until_parked();
+    let pane = cx.debug_bounds("settings-keys").unwrap();
+    let link = cx
+        .debug_bounds("settings-clash-link-SelectAll")
+        .expect("the link under New Block");
+    cx.simulate_click(link.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.flashed()), Some("SelectAll"));
+    let row = cx
+        .debug_bounds("settings-row-SelectAll")
+        .expect("the Select All row");
+    assert!(
+        f32::from(row.origin.y) >= f32::from(pane.origin.y) - 1.
+            && f32::from(row.origin.y + row.size.height)
+                <= f32::from(pane.origin.y + pane.size.height) + 1.,
+        "the target row is in the viewport: {row:?} in {pane:?}"
+    );
+}
+
+/// REVIEW finding 3: the filter may hide the clashing row; following the link must reveal it.
+#[gpui::test]
+fn repro_clash_link_reveals_a_filtered_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = Overrides::default();
+    o.set("GoToday", "cmd-q");
+    std::fs::write(dir.path().join("keymap.json"), o.to_json()).unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+    let field = cx.debug_bounds("settings-search").unwrap();
+    cx.simulate_click(field.center(), gpui::Modifiers::default());
+    cx.simulate_input("today");
+    cx.run_until_parked();
+    let filtered = view.read_with(cx, |v, _| v.visible_actions());
+    assert!(filtered.contains(&"GoToday"), "{filtered:?}");
+    assert!(
+        !filtered.contains(&"Quit"),
+        "the target is hidden: {filtered:?}"
+    );
+    let link = cx
+        .debug_bounds("settings-clash-link-Quit")
+        .expect("the link under Today");
+    let pane = cx.debug_bounds("settings-keys").unwrap();
+    cx.simulate_click(link.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.flashed()), Some("Quit"));
+    assert_eq!(
+        view.read_with(cx, |v, _| v.query().to_string()),
+        "",
+        "the filter is cleared so the target is really shown"
+    );
+    let row = cx.debug_bounds("settings-row-Quit").expect("the Quit row");
+    assert!(
+        f32::from(row.origin.y) >= f32::from(pane.origin.y) - 1.
+            && f32::from(row.origin.y + row.size.height)
+                <= f32::from(pane.origin.y + pane.size.height) + 1.,
+        "the target row is in the viewport: {row:?} in {pane:?}"
+    );
+}
+
+/// REVIEW finding 4: two rows linking to the same action used to share one element ID.
+/// Clicking the later link must record its own click.
+#[gpui::test]
+fn repro_both_rows_clash_links_work(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = Overrides::default();
+    o.set("GoToday", "cmd-q");
+    o.set("GoYesterday", "cmd-q");
+    std::fs::write(dir.path().join("keymap.json"), o.to_json()).unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+    // Both Today and Yesterday link to Quit; the duplicate `clash-Quit` ID means one of the
+    // two links shares its mouse state with the other.
+    let link = cx
+        .debug_bounds("settings-clash-link-Quit")
+        .expect("a link to Quit");
+    cx.simulate_click(link.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.flashed()), Some("Quit"));
+}
+
 /// A `keymap.json` that cannot be read must not take the window down with it (rule 11).
 #[gpui::test]
 fn a_broken_keymap_is_reported_not_fatal(cx: &mut TestAppContext) {

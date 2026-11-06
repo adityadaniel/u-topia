@@ -185,8 +185,7 @@ impl SettingsView {
                         }
                     }
                     LineInputEvent::Cancel => {
-                        this.query.clear();
-                        this.search.update(cx, |s, cx| s.set_text("", cx));
+                        this.clear_filter(cx);
                         let focus = this.focus.clone();
                         window.focus(&focus);
                         cx.notify();
@@ -373,6 +372,28 @@ impl SettingsView {
         &self.query
     }
 
+    /// Where an action's row sits among the key list's direct children (ST-3): the toolbar,
+    /// the filter, then each category's header and its rows.
+    fn key_list_index(&self, action: &str) -> Option<usize> {
+        let mut ix = KEY_LIST_LEADING;
+        for (_, rows) in self.visible_groups() {
+            ix += 1; // the category's header
+            for d in rows {
+                if d.action == action {
+                    return Some(ix);
+                }
+                ix += 1;
+            }
+        }
+        None
+    }
+
+    /// Empty the filter field and the query behind it.
+    fn clear_filter(&mut self, cx: &mut Context<Self>) {
+        self.query.clear();
+        self.search.update(cx, |s, cx| s.set_text("", cx));
+    }
+
     /// The row a clash link just jumped to, while it stays highlighted (ST-3).
     pub fn flashed(&self) -> Option<&'static str> {
         self.flash
@@ -382,12 +403,8 @@ impl SettingsView {
     /// leads somewhere instead of just naming the problem.
     fn jump_to(&mut self, target: &'static ActionDoc, cx: &mut Context<Self>) {
         self.flash = Some(target.action);
-        if let Some(ix) = self
-            .visible_groups()
-            .iter()
-            .position(|(c, _)| *c == target.category)
-        {
-            self.keys_scroll.scroll_to_item(KEY_LIST_LEADING + ix);
+        if let Some(ix) = self.key_list_index(target.action) {
+            self.keys_scroll.scroll_to_item(ix);
         }
         let me = cx.entity().downgrade();
         let flash = target.action;
@@ -711,6 +728,63 @@ fn card_row<E: Styled + gpui::prelude::FluentBuilder>(
         .when(i > 0, |d| d.border_t_1().border_color(th.line))
 }
 
+/// A row of a key-list card. The card's body is drawn by its rows because the rows are
+/// direct children of the scroll region, so a clash link can scroll to the row itself
+/// (ST-3); the header and the last row round the card's ends.
+fn key_card_row<E: Styled + gpui::prelude::FluentBuilder>(
+    row: E,
+    last: bool,
+    th: &Theme,
+    density: Density,
+) -> E {
+    row.px_4()
+        .py(px(if density == Density::Compact { 7. } else { 11. }))
+        .border_l_1()
+        .border_r_1()
+        .border_t_1()
+        .border_color(th.line)
+        .when(last, |d| d.border_b_1().rounded_b_lg())
+}
+
+/// The top of a key-list card: the category in a rounded, bordered strip.
+fn card_top(th: &Theme, label: &str) -> Div {
+    column()
+        .debug_selector(move || format!("settings-card-{label}"))
+        .bg(th.surface)
+        .border_1()
+        .border_b_0()
+        .border_color(th.line)
+        .rounded_t_lg()
+        .px_4()
+        .pt_3()
+        .pb_1p5()
+        .text_size(px(crate::theme::CAPTION_SIZE))
+        .text_color(th.faint)
+        .font_weight(FontWeight::MEDIUM)
+        .child(label.to_string())
+}
+
+/// The scrolling key list. Unlike [`pane`], its direct children are the category headers and
+/// the rows themselves: `ScrollHandle::scroll_to_item` only targets direct children, and a
+/// clash link must reveal the destination *row*, not merely its category (ST-3).
+fn key_pane(
+    id: &'static str,
+    selector: &'static str,
+    handle: &ScrollHandle,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || selector.into())
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .px_6()
+        .py_5()
+        .track_scroll(handle)
+}
+
 /// The scroll region every pane shares: one centred readable column.
 fn pane(id: &'static str, selector: &'static str) -> gpui::Stateful<Div> {
     div()
@@ -804,8 +878,7 @@ impl SettingsView {
             )
         };
 
-        let mut list = pane("settings-keys", "settings-keys")
-            .track_scroll(&self.keys_scroll)
+        let mut list = key_pane("settings-keys", "settings-keys", &self.keys_scroll)
             .child(
                 column()
                     .flex()
@@ -824,12 +897,13 @@ impl SettingsView {
                             .on_click(cx.listener(|this, _, _, cx| this.reset_all(cx))),
                     ),
             )
-            .child(self.render_search(cx));
+            .child(self.render_search(cx).mt_3());
 
         if groups.is_empty() {
             list = list.child(
                 column()
                     .debug_selector(|| "settings-no-match".into())
+                    .mt_4()
                     .py_4()
                     .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.muted)
@@ -837,20 +911,13 @@ impl SettingsView {
             );
         }
 
-        for (c, rows) in &groups {
+        for (gi, (c, rows)) in groups.iter().enumerate() {
             let category = *c;
-            let mut section = card(&th)
-                .debug_selector(move || format!("settings-card-{}", category.label()))
-                .child(card_title(&th, category.label()));
+            list = list.child(card_top(&th, category.label()).when(gi > 0, |d| d.mt_4()));
             for (i, d) in rows.iter().enumerate() {
-                section = section.child(card_row(
-                    self.render_key_row(d, &conflicts, cx),
-                    i,
-                    &th,
-                    density,
-                ));
+                let row = self.render_key_row(d, &conflicts, cx);
+                list = list.child(key_card_row(row, i + 1 == rows.len(), &th, density));
             }
-            list = list.child(section);
         }
         list
     }
@@ -932,6 +999,7 @@ impl SettingsView {
             .debug_selector(move || format!("settings-row-{}", d.action))
             .flex()
             .flex_col()
+            .bg(th.surface)
             .hover(|x| x.bg(th.hover))
             .when(flashed, |x| x.bg(th.banner_bg))
             .child(
@@ -1001,7 +1069,11 @@ impl SettingsView {
         let density = appearance::density(cx);
         let groups = self.visible_groups();
         let shown: usize = groups.iter().map(|(_, rows)| rows.len()).sum();
-        let mut list = pane("settings-shortcuts", "settings-shortcuts");
+        let mut list = key_pane(
+            "settings-shortcuts",
+            "settings-shortcuts",
+            &self.keys_scroll,
+        );
         if !self.query.trim().is_empty() {
             list = list.child(
                 column()
@@ -1015,12 +1087,16 @@ impl SettingsView {
                     )),
             );
         }
-        list = list.child(self.render_search(cx));
+        list = list.child(
+            self.render_search(cx)
+                .when(!self.query.trim().is_empty(), |d| d.mt_3()),
+        );
 
         if groups.is_empty() {
             list = list.child(
                 column()
                     .debug_selector(|| "settings-no-match".into())
+                    .mt_4()
                     .py_4()
                     .text_size(px(crate::theme::CAPTION_SIZE))
                     .text_color(th.muted)
@@ -1028,35 +1104,30 @@ impl SettingsView {
             );
         }
 
-        for (c, rows) in &groups {
+        for (gi, (c, rows)) in groups.iter().enumerate() {
             let category = *c;
-            let mut section = card(&th)
-                .debug_selector(move || format!("settings-card-{}", category.label()))
-                .child(card_title(&th, category.label()));
+            list = list.child(card_top(&th, category.label()).when(gi > 0, |d| d.mt_4()));
             for (i, d) in rows.iter().enumerate() {
-                section = section.child(card_row(
-                    div()
-                        .debug_selector({
-                            let action = d.action;
-                            move || format!("settings-shortcut-{action}")
-                        })
-                        .flex()
-                        .items_baseline()
-                        .justify_between()
-                        .gap_4()
-                        .child(div().text_size(px(crate::theme::BODY_SIZE)).child(d.label))
-                        .child(
-                            div()
-                                .text_size(px(crate::theme::CAPTION_SIZE))
-                                .text_color(th.muted)
-                                .child(pretty_keys(&self.overrides.keys_for(d))),
-                        ),
-                    i,
-                    &th,
-                    density,
-                ));
+                let row = div()
+                    .debug_selector({
+                        let action = d.action;
+                        move || format!("settings-shortcut-{action}")
+                    })
+                    .flex()
+                    .items_baseline()
+                    .justify_between()
+                    .gap_4()
+                    .bg(th.surface)
+                    .hover(|x| x.bg(th.hover))
+                    .child(div().text_size(px(crate::theme::BODY_SIZE)).child(d.label))
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(pretty_keys(&self.overrides.keys_for(d))),
+                    );
+                list = list.child(key_card_row(row, i + 1 == rows.len(), &th, density));
             }
-            list = list.child(section);
         }
         list
     }
