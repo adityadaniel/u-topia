@@ -1014,11 +1014,18 @@ impl Store {
             self.flush()?;
         }
         // A draft that promotion merged into the day (see `resolve_promotion`) has this
-        // group's commands in the survivor's shard now. Point the undo step there too, or
-        // undo would change the survivor in memory and commit nothing (rule 2).
+        // group's commands in the survivor's shard now. Point the undo step *and the two
+        // saved carets* there too: undo/redo restore the caret into the page it names, and a
+        // discarded id would put the editor on a row the view does not draw (rule 2, FR-1.2).
         for step in &mut group.steps {
             if let Some(to) = self.redirect(&step.page) {
                 step.page = to;
+            }
+        }
+        for caret in [&mut group.caret_before, &mut group.caret_after] {
+            let Some(caret) = caret else { continue };
+            if let Some(to) = self.redirect(&caret.page) {
+                caret.page = to;
             }
         }
         if !opts.no_undo {

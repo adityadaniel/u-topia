@@ -3348,6 +3348,65 @@ fn fr_1_2_typing_survives_a_merged_promotion(cx: &mut TestAppContext) {
     assert_eq!(rows(&app, &live, cx), [("ty".to_string(), 0)]);
 }
 
+/// The undo group saved the draft's id in its carets. Undo and redo put the editor back on
+/// that id while the feed renders the survivor, so `BlockEditor::is_editing` stops matching
+/// and the focused row disappears (FR-1.2, AGENTS.md "the list keeps rendering the row
+/// being edited").
+#[gpui::test]
+fn fr_1_2_undo_after_a_merged_promotion_keeps_the_editor(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let draft = app.update(cx, |app, _| app.store.draft_daily(day).unwrap());
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(draft.clone()));
+    // Another device wrote the day under a fresh id; only that page arrives.
+    let live = app.update(cx, |app, _| {
+        let mut remote = Store::open_in_memory().unwrap();
+        remote.set_today(Some(day));
+        let gone = remote.ensure_daily_page(day).unwrap();
+        remote.delete_page(&gone).unwrap();
+        let live = remote.ensure_daily_page(day).unwrap();
+        let shard = remote.export_since(&live, &Default::default()).unwrap();
+        app.store.import_batch(&[(live.clone(), shard)]).unwrap();
+        live
+    });
+    app.update(cx, |app, cx| app.changed(Vec::new(), false, cx));
+    cx.run_until_parked();
+    // One keystroke promotes the draft and merges it into the day's page.
+    cx.simulate_input("t");
+    cx.run_until_parked();
+    let target_page = |ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
+        ws.update(cx, |w, cx| {
+            w.editor().read(cx).target.as_ref().map(|t| t.page.clone())
+        })
+    };
+    // Undo restores the caret: it must point at the page that owns the day.
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(
+        target_page(&ws, cx),
+        Some(live.clone()),
+        "undo puts the caret back on the day"
+    );
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(live.clone()));
+    // So does redo.
+    cx.simulate_keystrokes("cmd-shift-z");
+    cx.run_until_parked();
+    assert_eq!(
+        target_page(&ws, cx),
+        Some(live.clone()),
+        "redo puts the caret back on the day"
+    );
+    // The focused row is drawn, so the next keystroke reaches the day.
+    cx.simulate_input("y");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &live, cx), [("ty".to_string(), 0)]);
+}
+
 /// P3 of the draft-day review: visiting a date writes nothing, so none of the visit paths
 /// may report a structural change (which forces a synchronous index flush and an
 /// `IndexUpdated` cycle) (FR-1.2, FR-1.5).
