@@ -3294,6 +3294,60 @@ fn shortcuts_work_after_scrolling_the_caret_away(cx: &mut TestAppContext) {
     assert_eq!(shown, PageId::for_date(today().pred_opt().unwrap()));
 }
 
+/// P2 of the draft-day review: the first keystroke on a draft whose day a remote copy
+/// already owns merges the draft into that page. The editor and the view still hold the
+/// draft's id; they must follow it, or every later keystroke would edit a shard that no
+/// longer exists (FR-1.2, rule 5).
+#[gpui::test]
+fn fr_1_2_typing_survives_a_merged_promotion(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let draft = app.update(cx, |app, _| app.store.draft_daily(day).unwrap());
+    // Show the day as a draft, caret in its first block, before the remote copy lands.
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(draft.clone()));
+    // Another device deleted the day's deterministic id and wrote it under a fresh one;
+    // only that page arrives, while the draft is still open here.
+    let live = app.update(cx, |app, _| {
+        let mut remote = Store::open_in_memory().unwrap();
+        remote.set_today(Some(day));
+        let gone = remote.ensure_daily_page(day).unwrap();
+        remote.delete_page(&gone).unwrap();
+        let live = remote.ensure_daily_page(day).unwrap();
+        let shard = remote.export_since(&live, &Default::default()).unwrap();
+        app.store.import_batch(&[(live.clone(), shard)]).unwrap();
+        live
+    });
+    app.update(cx, |app, cx| app.changed(Vec::new(), false, cx));
+    cx.run_until_parked();
+    // First keystroke: promotes the draft, merges it into the day's page and redirects.
+    cx.simulate_input("t");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(live.clone()),
+        "the view follows the day"
+    );
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.page.clone())),
+        Some(live.clone()),
+        "the editor follows the day"
+    );
+    // The second keystroke must land on the day, not on the discarded draft.
+    cx.simulate_input("y");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &live, cx), [("ty".to_string(), 0)]);
+}
+
 #[gpui::test]
 fn fr_1_2_a_day_becomes_a_page_when_written(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);

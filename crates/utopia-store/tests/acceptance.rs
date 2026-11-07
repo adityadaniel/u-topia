@@ -297,8 +297,8 @@ fn fr_1_2_promoted_draft_does_not_resurrect_a_deleted_page() {
     );
     // Imported tombstones do not create a local trash row, but the shard stays deleted.
     assert!(
-        local.page_state(&gone).unwrap().meta.deleted_at.is_some(),
-        "the trashed page stays deleted"
+        local.page_row(&gone).unwrap().is_some_and(|r| !r.is_live()),
+        "the trashed page stays out of the index"
     );
 
     // And our shards must not bring them back on the other device either.
@@ -317,6 +317,33 @@ fn fr_1_2_promoted_draft_does_not_resurrect_a_deleted_page() {
             .any(|(id, ..)| *id == gone),
         "the trashed page stays trashed"
     );
+}
+
+/// Continuing issue 3 / P2: after a merged promotion the editor still targets the draft's
+/// id. The id was never durable, so it is a session alias for the day (`Store::redirect`):
+/// every later keystroke must reach the page that owns the date (rule 5).
+#[test]
+fn fr_1_2_typing_after_a_merged_promotion_reaches_the_day() {
+    let d = date(2026, 11, 2);
+    let mut remote = store();
+    let gone = remote.ensure_daily_page(d).unwrap();
+    remote.delete_page(&gone).unwrap();
+    let live = remote.ensure_daily_page(d).unwrap();
+    write(&mut remote, &live, "remote two");
+    let shard = remote.export_since(&live, &Frontier::default()).unwrap();
+
+    let mut s = store();
+    let draft = s.draft_daily(d).unwrap();
+    s.import_batch(&[(live.clone(), shard)]).unwrap();
+    let block = s.page_state(&draft).unwrap().live_roots()[0].clone();
+    s.set_block_text(&draft, &block, "t", None, None).unwrap();
+    // The editor has not been told yet: same page id, same block id.
+    assert_eq!(s.redirect(&draft), Some(live.clone()));
+    s.set_block_text(&draft, &block, "ty", None, None).unwrap();
+    s.sync_index().unwrap();
+    let texts = live_texts(&mut s, &live);
+    assert!(texts.iter().any(|(t, _)| t == "ty"), "{texts:?}");
+    assert!(!s.is_draft(&draft));
 }
 
 #[test]

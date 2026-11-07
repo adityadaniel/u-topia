@@ -27,6 +27,15 @@ pub struct Changed {
 #[derive(Debug, Clone)]
 pub struct IndexUpdated;
 
+/// The page a view or the editor holds is now an alias for another page (FR-1.2): a
+/// promoted draft merged into the page that already owned its day. Whoever holds `from`
+/// must retarget `to`; the old id has no shard of its own.
+#[derive(Debug, Clone)]
+pub struct PageReplaced {
+    pub from: PageId,
+    pub to: PageId,
+}
+
 pub struct AppState {
     pub store: Store,
     /// Bumped on every change.
@@ -50,6 +59,7 @@ pub struct AppState {
 
 impl EventEmitter<Changed> for AppState {}
 impl EventEmitter<IndexUpdated> for AppState {}
+impl EventEmitter<PageReplaced> for AppState {}
 
 impl AppState {
     pub fn new(mut store: Store) -> Self {
@@ -86,6 +96,22 @@ impl AppState {
     }
 
     pub fn changed(&mut self, pages: Vec<PageId>, structural: bool, cx: &mut Context<Self>) {
+        // A promoted draft that merged into the day (FR-1.2) leaves its id as a session
+        // alias: announce the replacement so views and the editor retarget, and report the
+        // survivor in `Changed` so subscriptions keyed on the page match.
+        let pages: Vec<PageId> = pages
+            .into_iter()
+            .map(|page| match self.store.redirect(&page) {
+                Some(to) => {
+                    cx.emit(PageReplaced {
+                        from: page,
+                        to: to.clone(),
+                    });
+                    to
+                }
+                None => page,
+            })
+            .collect();
         self.version += 1;
         cx.emit(Changed { pages, structural });
         if structural {

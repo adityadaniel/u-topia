@@ -15,7 +15,7 @@ use utopia_core::undo::Caret;
 use utopia_core::{BlockId, BlockKind, PageId, PageKind};
 use utopia_store::{LinkedRefs, Mention, PageRow, RefChildren, RefHit, RefQuery, RefSort};
 
-use crate::app_state::{AppState, Changed, IndexUpdated};
+use crate::app_state::{AppState, Changed, IndexUpdated, PageReplaced};
 use crate::editor::{BlockEditor, EditTarget, EditorEvent};
 use crate::field::Goal;
 use crate::line_input::{LineInput, LineInputEvent};
@@ -431,6 +431,16 @@ impl PageView {
                         .as_ref()
                         .is_some_and(|j| j.days.iter().any(|d| e.pages.contains(d)));
                 if e.structural || e.pages.is_empty() || shown || this.has_embeds() {
+                    this.dirty = true;
+                    cx.notify();
+                }
+            }),
+            // A promoted draft merged into the day's page (FR-1.2): this view may be
+            // showing the discarded id, so follow the page that owns the day.
+            cx.subscribe(&app, |this, _, e: &PageReplaced, cx| {
+                if this.page.as_ref() == Some(&e.from) {
+                    this.page = Some(e.to.clone());
+                    this.refs_key = None;
                     this.dirty = true;
                     cx.notify();
                 }

@@ -831,6 +831,10 @@ impl Store {
             // Another device wrote this day first: drop the local draft so its unsent
             // empty block never merges into theirs.
             self.discard_draft(page);
+            // A shard for the id of a draft that promotion merged away makes that id a page
+            // of its own again: drop the session alias, or identity logic (dedupe, restore)
+            // would act on the day instead of the page this shard describes (rule 4).
+            self.promotions.remove(page);
             let did = if self.page_exists(page)? {
                 self.load_doc(page)?.doc.import(bytes)?
             } else {

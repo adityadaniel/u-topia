@@ -503,6 +503,8 @@ impl Store {
     // ---------------------------------------------------------------- shards
 
     pub fn page_exists(&self, page: &PageId) -> Result<bool> {
+        // Deliberately not redirected: an incoming shard for a draft's old id (FR-1.2) is a
+        // different page and must be imported under its own id, not folded into the day.
         if self.docs.contains_key(page) || self.drafts.contains_key(page) {
             return Ok(true);
         }
@@ -515,6 +517,10 @@ impl Store {
     }
 
     fn load_doc(&mut self, page: &PageId) -> Result<&mut DocEntry> {
+        // A promoted draft that merged into the day's page (FR-1.2) leaves its id behind as
+        // a session alias: reads follow the page that owns the day, so a view or an editor
+        // that still holds the old id keeps working.
+        let page = &self.redirect(page).unwrap_or_else(|| page.clone());
         // A draft day has no `page_doc` row yet: its shard is inside the draft entry, and
         // every reader must find it there rather than look for a row (FR-1.2).
         if self.drafts.contains_key(page) {
@@ -705,6 +711,13 @@ impl Store {
         steps: Vec<(PageId, Vec<Command>)>,
         opts: EditOpts,
     ) -> Result<Vec<(PageId, DocDelta)>> {
+        // A promoted draft that merged into the day (FR-1.2) is an alias: writes to its id
+        // apply to the page that owns the day, so an editor holding the old id keeps
+        // typing into the same block instead of a shard that no longer exists (rule 5).
+        let steps: Vec<(PageId, Vec<Command>)> = steps
+            .into_iter()
+            .map(|(page, cmds)| (self.redirect(&page).unwrap_or(page), cmds))
+            .collect();
         let now = self.now();
         let mut group = UndoGroup::new(now);
         group.coalesce = opts.coalesce.clone();
