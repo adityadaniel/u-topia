@@ -637,6 +637,22 @@ fn encrypted_device(
     (s, c)
 }
 
+/// §12.3 step 4: the pre-`cursor:` positions are retired on the first engine open, so a
+/// legacy graph re-pulls once instead of keeping dead keys forever.
+#[test]
+fn ac_12_3_legacy_seq_positions_are_removed() {
+    let s = Store::open_in_memory().unwrap();
+    s.sync_set("seq:page-1", "42").unwrap();
+    s.sync_set("seq:page-2", "7").unwrap();
+    s.sync_set("cursor:page-3", "keep").unwrap();
+    let _engine = utopia_sync::SyncEngine::new(&s).unwrap();
+    assert!(s.sync_prefixed("seq").unwrap().is_empty());
+    assert_eq!(
+        s.sync_get("cursor:page-3").unwrap().as_deref(),
+        Some("keep")
+    );
+}
+
 /// §9.3/§12.6: a reachable relay that could not take one page is a partial round, not
 /// "Offline with 0 changes queued" and not a plain success.
 #[test]

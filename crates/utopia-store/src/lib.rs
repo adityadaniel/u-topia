@@ -938,6 +938,14 @@ impl Store {
         Ok(out)
     }
 
+    /// Delete every `sync_state` entry whose key starts with `prefix:`; returns how many.
+    pub fn sync_delete_prefixed(&self, prefix: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM sync_state WHERE key LIKE ?1",
+            [format!("{prefix}:%")],
+        )?)
+    }
+
     pub fn sync_set(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO sync_state(key, value) VALUES (?1, ?2)",

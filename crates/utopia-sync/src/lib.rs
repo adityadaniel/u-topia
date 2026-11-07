@@ -533,6 +533,14 @@ impl SyncEngine {
                 id
             }
         };
+        // Retire the pre-`cursor:` positions once: a bare `seq:<page>` is a relay sequence
+        // with no transport tag and no file-count meaning, so it is not comparable with
+        // any head. Dropping it makes the first round pull every page once, idempotently
+        // (§12.3 step 4).
+        let stale = store.sync_delete_prefixed("seq")?;
+        if stale > 0 {
+            eprintln!("utopia-sync: dropped {stale} pre-cursor sync position(s)");
+        }
         Ok(Self {
             client_id,
             pending_snapshots: Vec::new(),
