@@ -403,7 +403,15 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
         }
     }
     let space = t.cursor_space();
+    // Batches of one page are causally ordered (`prepare` splits a page's outbox by
+    // `MAX_PUSH_BYTES`). Once one is refused, a later batch must not reach the relay
+    // without its predecessors: a peer could pull it, advance its cursor over an update
+    // Loro only holds pending, and lose it on restart. Other pages still go through.
+    let mut refused: BTreeSet<PageId> = BTreeSet::new();
     for (page, seqs, req) in out.pushes {
+        if refused.contains(&page) {
+            continue;
+        }
         match t.push(&page, req) {
             Ok(resp) => {
                 // Duplicates are success: the relay already has them (§12.6, 409).
@@ -419,6 +427,7 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
                 if f.is_terminal() {
                     return Err(e);
                 }
+                refused.insert(page);
                 inc.failed.push(f);
             }
         }

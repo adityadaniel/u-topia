@@ -124,6 +124,108 @@ fn ac_12_3_switching_transport_pulls_the_new_transport_from_zero() {
     assert!(seen.contains(&"from the relay".to_string()), "{seen:?}");
 }
 
+/// A relay that refuses the first push for one page and accepts any later one.
+struct RefuseFirstBatch {
+    inner: RelayTransport,
+    page: PageId,
+    pushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    refused: bool,
+}
+
+impl utopia_sync::Transport for RefuseFirstBatch {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.inner.manifest(if_none_match)
+    }
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        if page == &self.page {
+            self.pushes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.refused {
+                self.refused = true;
+                return Err(utopia_sync::SyncError::Transport(
+                    "HTTP 413: quota exceeded".into(),
+                ));
+            }
+        }
+        self.inner.push(page, req)
+    }
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.inner.pull(page, since_seq)
+    }
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// §12.3 step 2: a page whose outbox spans several batches must not send batch 2 after
+/// batch 1 was refused — the relay would hold later updates without their predecessors,
+/// and a peer could advance its cursor over an update it only holds pending.
+#[test]
+fn ac_12_3_a_refused_batch_stops_the_pages_later_batches() {
+    let relay = Relay::new();
+    let (mut a, _) = device(&relay);
+    let page = a.create_page("Long").unwrap();
+    write(&mut a, &page, &"x".repeat(600_000));
+    write(&mut a, &page, &"y".repeat(600_000));
+    let pending = a.outbox_pending(100).unwrap();
+    let bytes: usize = pending.iter().map(|row| row.3.len()).sum();
+    assert!(
+        bytes > utopia_sync::MAX_PUSH_BYTES,
+        "the page needs several push batches: {bytes}"
+    );
+
+    let pushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut ca = SyncClient::new(
+        RefuseFirstBatch {
+            inner: RelayTransport::new(relay.clone(), "g1"),
+            page: page.clone(),
+            pushes: pushes.clone(),
+            refused: false,
+        },
+        &a,
+    )
+    .unwrap();
+    let result = ca.sync_once(&mut a);
+    assert!(
+        matches!(result, Err(utopia_sync::SyncError::Transport(_))),
+        "nothing moved: {result:?}"
+    );
+    assert_eq!(
+        pushes.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the refused batch was offered"
+    );
+    assert_eq!(
+        relay.log_len("g1", page.as_str()),
+        0,
+        "no later batch reached the relay"
+    );
+    assert_eq!(
+        a.outbox_pending(100).unwrap().len(),
+        pending.len(),
+        "every row is still queued"
+    );
+}
+
 /// A relay that takes the pushes but times out on the manifest read that follows them.
 struct NoSecondManifest {
     inner: RelayTransport,
