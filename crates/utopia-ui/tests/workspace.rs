@@ -4190,6 +4190,163 @@ fn ac_13_5_composition_leaves_the_idle_commit_to_its_timer(cx: &mut TestAppConte
     assert_eq!(rows(&app, &page, cx)[0].0, "see [[November 3rd, 2026]]にほ");
 }
 
+/// §13.5: a click on another block mid-composition is queued until the input method lets
+/// go of the buffer, then applied: the marked text is persisted in the block it belonged
+/// to and the other block starts editing.
+#[gpui::test]
+fn ac_13_5_begin_on_another_block_waits_for_the_ime(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    use utopia_ui::editor::EditTarget;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("ab");
+    cx.run_until_parked();
+    let editor = ws.update(cx, |w, _| w.editor());
+    let (host, first) = editor.read_with(cx, |e, _| {
+        let t = e.target.clone().expect("editing");
+        (t.host, t.block)
+    });
+    let second = add_block(&app, &page, "second", cx);
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "にほ", None, window, cx)
+    });
+    cx.run_until_parked();
+    editor.update_in(cx, |e, window, cx| {
+        e.begin(
+            EditTarget {
+                host,
+                page: page.clone(),
+                block: second.clone(),
+            },
+            None,
+            None,
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        editor.read_with(cx, |e, _| e.target.as_ref().map(|t| t.block.clone())),
+        Some(first.clone()),
+        "the buffer still belongs to the input method"
+    );
+    assert_eq!(text_and_caret(&ws, cx).0, "abにほ");
+    // The input method commits, and the click takes effect.
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_text_in_range(None, "にほ", window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        editor.read_with(cx, |e, _| e.target.as_ref().map(|t| t.block.clone())),
+        Some(second.clone())
+    );
+    assert_eq!(text_and_caret(&ws, cx).0, "second");
+    assert_eq!(rows(&app, &page, cx)[0].0, "abにほ");
+}
+
+/// §13.5 covers every shape the platform uses: explicit UTF-16 ranges over text with a
+/// non-BMP character before the caret, a dead key committing over its own mark, and
+/// `unmarkText` (what AppKit sends when the IME is told to let go), which must keep the
+/// marked glyphs as committed text.
+#[gpui::test]
+fn ac_13_5_ime_ranges_and_unmark_commit_cleanly(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("😀 x");
+    cx.run_until_parked();
+    let editor = ws.update(cx, |w, _| w.editor());
+    // A dead key (Option+e) marks `´`: two bytes, one UTF-16 unit, after a 2-unit emoji.
+    let marked = editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "´", None, window, cx);
+        e.marked_text_range(window, cx)
+    });
+    assert_eq!(marked, Some(4..5), "UTF-16 offsets, not bytes");
+    // The letter that completes it commits over the marked range the platform names.
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_text_in_range(Some(4..5), "é", window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(text_and_caret(&ws, cx).0, "😀 xé");
+    assert_eq!(rows(&app, &page, cx)[0].0, "😀 xé");
+    // `unmarkText`: the input method lets go without a commit; what it marked is text.
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "にほ", None, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "😀 xé", "still provisional");
+    editor.update_in(cx, |e, window, cx| e.unmark_text(window, cx));
+    cx.run_until_parked();
+    assert_eq!(text_and_caret(&ws, cx).0, "😀 xéにほ");
+    assert_eq!(rows(&app, &page, cx)[0].0, "😀 xéにほ");
+    assert_eq!(
+        editor.update_in(cx, |e, window, cx| e.marked_text_range(window, cx)),
+        None
+    );
+}
+
+/// §13.5: an IME that empties its marked text (Escape twice in Kotoeri) ends the
+/// composition, and a request queued behind it runs then rather than being stranded.
+#[gpui::test]
+fn ac_13_5_empty_marked_text_ends_the_composition(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    let editor = ws.update(cx, |w, _| w.editor());
+    editor.update_in(cx, |e, window, cx| {
+        assert!(e.insert_text("see [[tomorrow]]", window, cx));
+    });
+    cx.run_until_parked();
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "にほ", None, window, cx);
+        // Escape went to the IME first: the host asked for the block to be finished.
+        e.commit(cx);
+        // The IME gives up on its text.
+        e.replace_and_mark_text_in_range(None, "", None, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(text_and_caret(&ws, cx).0, "see [[November 3rd, 2026]]");
+    assert_eq!(rows(&app, &page, cx)[0].0, "see [[November 3rd, 2026]]");
+}
+
+/// §13.5, kept as it is: a store change to a still-live block under a composition is
+/// last-writer-wins on the block, so the text the user just committed replaces it. Only a
+/// block that went away ends the edit (`ac_13_5_ime_composition_ends_when_its_block_is_deleted`).
+#[gpui::test]
+fn ac_13_5_a_live_store_change_under_a_composition_keeps_the_users_text(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("ab");
+    cx.run_until_parked();
+    let block = app.update(cx, |app, _| {
+        app.store.page_state(&page).unwrap().live_roots()[0].clone()
+    });
+    let editor = ws.update(cx, |w, _| w.editor());
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "にほ", None, window, cx)
+    });
+    cx.run_until_parked();
+    // Undo (or a remote device) rewrites the block while the IME composes.
+    app.update(cx, |app, cx| {
+        app.store
+            .set_block_text(&page, &block, "a", None, None)
+            .unwrap();
+        app.changed(vec![page.clone()], true, cx);
+    });
+    cx.run_until_parked();
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_text_in_range(None, "にほ", window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&app, &page, cx)[0].0,
+        "abにほ",
+        "the composition is the newer edit of this block; merging concurrent edits is the \
+         CRDT's job, not the editor's"
+    );
+}
+
 /// No page titled like a relative date, and the day's page linked instead.
 fn assert_tomorrow_linked(app: &Entity<AppState>, cx: &mut VisualTestContext) {
     app.update(cx, |app, _| {
