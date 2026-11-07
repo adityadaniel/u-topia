@@ -578,13 +578,13 @@ impl BlockEditor {
         if self.field.composing() {
             return;
         }
-        self.settle(cx);
-        self.after_composition(window, cx);
+        let persisted = self.settle(cx);
+        self.after_composition(window, cx, persisted);
     }
 
     /// Persist what the buffer holds and look at the store again (§13.5), once the
-    /// composition is over whichever way it ended.
-    fn settle(&mut self, cx: &mut Context<Self>) {
+    /// composition is over whichever way it ended. `true` when the stored text changed.
+    fn settle(&mut self, cx: &mut Context<Self>) -> bool {
         if std::mem::take(&mut self.pending_sync) {
             // A store change landed while the input method owned the buffer. If the block
             // is gone the composition has nowhere to go: end the edit before persisting
@@ -600,12 +600,13 @@ impl BlockEditor {
                 // and only emptying the trash loses them. Then stop editing it.
                 self.persist(cx);
                 self.detach(cx);
-                return;
+                return false;
             }
         }
-        self.persist(cx);
+        let changed = self.persist(cx);
         self.anchor_caret(cx);
         self.refresh_autocomplete(cx);
+        changed
     }
 
     /// Take the input method's marked text as committed (§13.5): `unmarkText` semantics by
@@ -638,9 +639,13 @@ impl BlockEditor {
     }
 
     /// The input method let go of the buffer (§13.5): do what a host asked for meanwhile.
-    fn after_composition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn after_composition(&mut self, window: &mut Window, cx: &mut Context<Self>, persisted: bool) {
         match self.deferred.take() {
             None => {}
+            // The composition's own edit re-armed the idle commit, so let that run 300 ms
+            // from now as it would without a composition, instead of committing (NFC,
+            // hashtags, page creation, undo seal) synchronously for every IME phrase.
+            Some(Deferred::Commit { finished: false }) if persisted => {}
             Some(Deferred::Commit { finished }) => self.commit_block(finished, cx),
             Some(Deferred::Begin {
                 target,
@@ -650,8 +655,12 @@ impl BlockEditor {
         }
     }
 
-    fn persist(&mut self, cx: &mut Context<Self>) {
-        let Some(t) = self.target.clone() else { return };
+    /// Write the buffer to the store; `true` when the block's text changed (which is also
+    /// when the idle commit is re-armed).
+    fn persist(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(t) = self.target.clone() else {
+            return false;
+        };
         let text = self.field.text.clone();
         let caret = self.field.cursor();
         let changed = self.app.update(cx, |app, cx| {
@@ -687,6 +696,7 @@ impl BlockEditor {
                 }
             }));
         }
+        changed
     }
 
     /// The caret is inside a `[[…]]`/`#[[…]]` still being typed. Auto-pairing closes the

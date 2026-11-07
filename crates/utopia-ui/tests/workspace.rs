@@ -4147,6 +4147,49 @@ fn ac_13_5_a_later_request_supersedes_a_queued_begin(cx: &mut TestAppContext) {
     );
 }
 
+/// §13.5: the idle commit a host queued before the composition does not run on top of the
+/// IME's own persist. It waits for the 300 ms timer that persist re-arms, as it would
+/// without a composition; otherwise every IME phrase runs the commit (NFC, hashtags, page
+/// creation, undo seal) synchronously on the UI thread.
+#[gpui::test]
+fn ac_13_5_composition_leaves_the_idle_commit_to_its_timer(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    let editor = ws.update(cx, |w, _| w.editor());
+    editor.update_in(cx, |e, window, cx| {
+        assert!(e.insert_text("see [[tomorrow]]", window, cx));
+    });
+    cx.run_until_parked();
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "にほ", None, window, cx)
+    });
+    cx.run_until_parked();
+    // The idle timer fires mid-composition and is queued.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    // The input method commits.
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_text_in_range(None, "にほ", window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        text_and_caret(&ws, cx).0,
+        "see [[tomorrow]]にほ",
+        "the queued idle commit waits for its timer, not for the input method"
+    );
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    assert_eq!(
+        text_and_caret(&ws, cx).0,
+        "see [[November 3rd, 2026]]にほ",
+        "and then it runs as usual"
+    );
+    assert_eq!(rows(&app, &page, cx)[0].0, "see [[November 3rd, 2026]]にほ");
+}
+
 /// No page titled like a relative date, and the day's page linked instead.
 fn assert_tomorrow_linked(app: &Entity<AppState>, cx: &mut VisualTestContext) {
     app.update(cx, |app, _| {
