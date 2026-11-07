@@ -81,10 +81,33 @@ pub type OutboxRow = (i64, PageId, i64, Vec<u8>);
 
 struct DocEntry {
     doc: LoroPageDoc,
-    /// Version already durable in `page_doc` + `page_update`.
-    persisted: utopia_doc::Frontier,
+    /// Version confirmed durable in `page_doc` + `page_update`. Only a committed job may
+    /// advance it, never the act of submitting one (store-commit-pipeline issue 1).
+    durable: utopia_doc::Frontier,
     has_snapshot: bool,
     pending_updates: i64,
+    /// The last job submitted for this shard, and the frontier its update log will reach.
+    /// Promoted into `durable` on completion, discarded on failure.
+    in_flight: Option<InFlight>,
+}
+
+/// A submitted (not yet confirmed) commit for one page (store-commit-pipeline).
+struct InFlight {
+    seq: u64,
+    frontier: utopia_doc::Frontier,
+    /// The job writes a full snapshot: it replaces `page_doc` and clears the update log.
+    snapshot: bool,
+    /// The job appends one `page_update` row.
+    update: bool,
+}
+
+/// One page's share of a commit, prepared before anything is taken from `pending`.
+struct PreparedPage {
+    page: PageId,
+    frontier: utopia_doc::Frontier,
+    writes_snapshot: bool,
+    writes_update: bool,
+    job: PageJob,
 }
 
 impl DocEntry {
@@ -268,76 +291,213 @@ impl Store {
     }
 
     /// Hand every pending change to the writer (non-blocking with a writer thread).
+    ///
+    /// A failed writer is a state: this refuses new jobs, keeps `pending` for the repair,
+    /// and leaves every in-memory shard alone (rule 5). `sync_index` is the repair path.
     pub fn flush(&mut self) -> Result<()> {
+        self.reconcile_writer();
+        if let Some(e) = self.persister.failure() {
+            return Err(e);
+        }
         if self.pending.is_empty() {
             return Ok(());
         }
+        // Prepare before taking `pending`: a failing snapshot/export must not strand the
+        // queue (issue 9).
         let pending = std::mem::take(&mut self.pending);
-        let mut pages = Vec::with_capacity(pending.len());
-        for (page, delta, enqueue) in &pending {
-            let Some(entry) = self.docs.get_mut(page) else {
-                continue;
-            };
-            let frontier = entry.doc.frontier();
-            let changed = frontier != entry.persisted;
-            let snapshot = if !entry.has_snapshot || entry.pending_updates >= COMPACT_AFTER {
-                entry.pending_updates = 0;
-                Some((entry.doc.snapshot()?, frontier.0.clone()))
-            } else {
-                None
-            };
-            let update = if changed {
-                Some(entry.doc.export_since(&entry.persisted)?)
-            } else {
-                None
-            };
-            // A snapshot in the same job already covers the update.
-            let log_update = if snapshot.is_none() {
-                update.clone()
-            } else {
-                None
-            };
-            if log_update.is_some() {
-                entry.pending_updates += 1;
+        let prepared = {
+            let docs = &mut self.docs;
+            let mut prepared = Vec::with_capacity(pending.len());
+            let mut failed = None;
+            for (page, delta, enqueue) in &pending {
+                let Some(entry) = docs.get_mut(page) else {
+                    continue;
+                };
+                // An earlier submitted job's update lands first, so later updates build on
+                // it; a snapshot is only skipped when one is confirmed durable.
+                let frontier = entry.doc.frontier();
+                let base = entry
+                    .in_flight
+                    .as_ref()
+                    .map_or(&entry.durable, |f| &f.frontier);
+                let snapshot = if !entry.has_snapshot || entry.pending_updates >= COMPACT_AFTER {
+                    match entry.doc.snapshot() {
+                        Ok(snap) => Some((snap, frontier.0.clone())),
+                        Err(e) => {
+                            failed = Some(e.into());
+                            break;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let update = if frontier != *base {
+                    match entry.doc.export_since(base) {
+                        Ok(update) => Some(update),
+                        Err(e) => {
+                            failed = Some(e.into());
+                            break;
+                        }
+                    }
+                } else {
+                    None
+                };
+                // A snapshot in the same job already covers the update.
+                let log_update = if snapshot.is_none() {
+                    update.clone()
+                } else {
+                    None
+                };
+                prepared.push(PreparedPage {
+                    page: page.clone(),
+                    frontier,
+                    writes_snapshot: snapshot.is_some(),
+                    writes_update: log_update.is_some(),
+                    job: PageJob {
+                        page: page.clone(),
+                        state: entry.doc.state().clone(),
+                        delta: delta.clone(),
+                        snapshot,
+                        update: log_update,
+                        outbox: if *enqueue { update } else { None },
+                    },
+                });
             }
-            entry.persisted = frontier;
-            entry.has_snapshot = true;
-            pages.push(PageJob {
-                page: page.clone(),
-                state: entry.doc.state().clone(),
-                delta: delta.clone(),
-                snapshot,
-                update: log_update,
-                outbox: if *enqueue { update } else { None },
-            });
+            match failed {
+                Some(e) => Err(e),
+                None => Ok(prepared),
+            }
+        };
+        let prepared = match prepared {
+            Ok(p) => p,
+            Err(e) => {
+                self.pending = pending;
+                return Err(e);
+            }
+        };
+        let mut pages = Vec::with_capacity(prepared.len());
+        let mut bookkeeping = Vec::with_capacity(prepared.len());
+        for p in prepared {
+            pages.push(p.job);
+            bookkeeping.push((p.page, p.frontier, p.writes_snapshot, p.writes_update));
+        }
+        if pages.is_empty() {
+            return Ok(());
         }
         let job = Job {
             pages,
             fmt: self.date_format.clone(),
             now: self.now(),
         };
-        let result = self.persister.submit(&mut self.conn, job);
-        if result.is_err() {
-            // Reload the affected shards from the last durable state.
-            for (p, _, _) in &pending {
-                self.docs.remove(p);
+        let seq = match self.persister.submit(&mut self.conn, job) {
+            Ok(seq) => seq,
+            Err(e) => {
+                // Nothing was submitted: keep the queue so the repair can ship it.
+                self.pending = pending;
+                return Err(e);
+            }
+        };
+        for (page, frontier, snapshot, update) in bookkeeping {
+            if let Some(entry) = self.docs.get_mut(&page) {
+                entry.in_flight = Some(InFlight {
+                    seq,
+                    frontier,
+                    snapshot,
+                    update,
+                });
             }
         }
-        result
+        // Inline graphs commit inside `submit`; promote them at once.
+        self.reconcile_writer();
+        Ok(())
+    }
+
+    /// Promote the shards of jobs the writer confirmed, and no others. `completed` never
+    /// counts a failed job, so a failed submission stays `in_flight` until it is repaired.
+    fn reconcile_writer(&mut self) {
+        let completed = self.persister.completed();
+        for entry in self.docs.values_mut() {
+            let Some(in_flight) = entry.in_flight.take() else {
+                continue;
+            };
+            if in_flight.seq > completed {
+                entry.in_flight = Some(in_flight);
+                continue;
+            }
+            entry.durable = in_flight.frontier;
+            entry.has_snapshot = true;
+            if in_flight.snapshot {
+                entry.pending_updates = 0;
+            } else if in_flight.update {
+                entry.pending_updates += 1;
+            }
+        }
+    }
+
+    /// Reconcile a failed writer without losing a character (rule 5): promote the jobs that
+    /// did commit, then queue every shard whose durable copy is behind as a full snapshot.
+    /// Returns the pages that were requeued (used to retire repaired drafts).
+    fn repair_writer(&mut self) -> Vec<PageId> {
+        self.reconcile_writer();
+        let mut requeued = Vec::new();
+        let mut drafts = Vec::new();
+        for (page, entry) in self.docs.iter_mut() {
+            // A submitted job that was not confirmed cannot be trusted: the writer either
+            // rolled it back or dropped it. The shard is rewritten whole below.
+            let was_durable = entry.has_snapshot;
+            entry.in_flight = None;
+            if entry.has_snapshot && entry.doc.frontier() == entry.durable {
+                continue;
+            }
+            if !was_durable {
+                if let Some(date) = entry.doc.state().meta.daily_date {
+                    drafts.push((date, page.clone()));
+                }
+            }
+            entry.has_snapshot = false;
+            requeued.push(page.clone());
+        }
+        // A draft whose first commit failed is still a draft (FR-1.2): the feed keeps its
+        // page id, and the next edit does not mint a second page for the same day.
+        for (date, page) in drafts {
+            self.drafts.entry(date).or_insert(page);
+        }
+        for page in &requeued {
+            match self.pending.iter_mut().find(|(p, _, _)| p == page) {
+                Some((_, delta, enqueue)) => {
+                    *delta = None;
+                    *enqueue = true;
+                }
+                None => self.pending.push((page.clone(), None, true)),
+            }
+        }
+        self.persister.clear_failure();
+        requeued
     }
 
     /// Wait until the index reflects every change (flush + wait). Required before
     /// operations that read the index to decide what to write (create, rename, merge).
+    ///
+    /// A writer failure is repaired here by rewriting the affected shards as snapshots,
+    /// and still reported to this caller: the commit it asked for did not land.
     pub fn sync_index(&mut self) -> Result<()> {
-        self.flush()?;
-        let r = self.persister.wait();
-        if r.is_err() {
-            // The disk lags the in-memory shards: drop them so they reload consistently.
-            self.docs.clear();
-            self.pending.clear();
-            self.drafts.clear();
+        let flushed = self.flush();
+        let waited = self.persister.wait();
+        self.reconcile_writer();
+        if let Some(failure) = self.persister.failure() {
+            let requeued = self.repair_writer();
+            let retried = self.flush().and_then(|()| self.persister.wait());
+            self.reconcile_writer();
+            if retried.is_ok() {
+                // Those pages are durable now, so they are no longer drafts.
+                self.drafts.retain(|_, p| !requeued.contains(p));
+            }
+            return match retried {
+                Ok(()) => Err(failure),
+                Err(e) => Err(e),
+            };
         }
-        r
+        flushed.and(waited)
     }
 
     /// Strict mode waits for in-flight commits before an index read.
@@ -500,14 +660,15 @@ impl Store {
                 rows
             };
             let doc = LoroPageDoc::load(page.clone(), &snap, &updates, self.peer)?;
-            let persisted = doc.frontier();
+            let durable = doc.frontier();
             self.docs.insert(
                 page.clone(),
                 DocEntry {
                     doc,
-                    persisted,
+                    durable,
                     has_snapshot: true,
                     pending_updates: updates.len() as i64,
+                    in_flight: None,
                 },
             );
         }
@@ -517,9 +678,10 @@ impl Store {
     fn new_doc(&mut self, page: &PageId) -> &mut DocEntry {
         self.docs.entry(page.clone()).or_insert_with(|| DocEntry {
             doc: LoroPageDoc::new(page.clone(), self.peer),
-            persisted: utopia_doc::Frontier::default(),
+            durable: utopia_doc::Frontier::default(),
             has_snapshot: false,
             pending_updates: 0,
+            in_flight: None,
         })
     }
 
