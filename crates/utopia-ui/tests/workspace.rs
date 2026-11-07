@@ -1268,6 +1268,67 @@ fn a_renamed_pinned_page_shows_its_new_title(cx: &mut TestAppContext) {
     );
 }
 
+/// LR-4 with RS-1's shared row: a link inside an inline reference child is followed.
+/// The child used to be drawn without its own hit-testing, so a click on its link fell
+/// through to the row's handler and opened the referencing block instead.
+#[gpui::test]
+fn a_link_inside_an_inline_reference_child_is_followed(cx: &mut TestAppContext) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    let (app, ws, cx) = setup(cx);
+    let (target, source, other) = app.update(cx, |app, _| {
+        let target = app.store.create_page("Target").unwrap();
+        let source = app.store.create_page("Source").unwrap();
+        let other = app.store.create_page("Other Page").unwrap();
+        let parent = app.store.ensure_first_block(&source).unwrap();
+        app.store
+            .set_block_text(&source, &parent, "see [[Target]]", None, None)
+            .unwrap();
+        // A child whose whole body is a page link: its first characters are the link.
+        let child = BlockId::new();
+        app.store
+            .execute(
+                &source,
+                vec![Command::InsertBlock {
+                    id: child,
+                    parent: Some(parent.clone()),
+                    after: None,
+                    text: "[[Other Page]]".into(),
+                    kind: BlockKind::Bullet,
+                }],
+                Default::default(),
+            )
+            .unwrap();
+        app.store.commit_block(&source, &parent).unwrap();
+        app.store.sync_index().unwrap();
+        (target, source, other)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let child = (0..40)
+        .find_map(|ix| {
+            let sel: &'static str = Box::leak(format!("hit-child-{ix}-0").into_boxed_str());
+            cx.debug_bounds(sel)
+        })
+        .expect("the reference's first child is drawn inline (LR-4)");
+    // The child starts with a bullet, then its text; the link is at the start of the text.
+    let link = gpui::point(child.origin.x + gpui::px(28. + 16.), child.center().y);
+    cx.simulate_click(link, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(other),
+        "the child's link was followed, not the referencing block opened"
+    );
+    assert_ne!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(source),
+        "the row's own target was not opened"
+    );
+}
+
 #[gpui::test]
 fn keystrokes_are_debounced_then_committed(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);

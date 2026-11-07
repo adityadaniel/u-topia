@@ -206,19 +206,34 @@ pub fn reference_row<H: RefRowHost + 'static>(
     }
 
     let main_body = body(&hit.text, &hit.block, &th, store);
-    let (row_host, body_host) = (host.clone(), host);
+    let (row_host, body_host) = (host.clone(), host.clone());
 
-    // LR-4: the first children inline, then a chip that opens the rest.
+    // LR-4: the first children inline, then a chip that opens the rest. Each child is its
+    // own shaped text, so it gets its own hit-testing: a link inside it is followed, and a
+    // click on anything else falls through to the row, which opens the referencing block.
     let mut kids = div().flex().flex_col();
     for (i, (child, child_text)) in row.children.iter().enumerate() {
         let child_body = body(child_text, child, &th, store);
+        let child_host = host.clone();
         kids = kids.child(
             div()
                 .debug_selector(|| format!("hit-child-{ix}-{i}"))
                 .flex()
                 .ml(px(14.))
                 .child(bullet())
-                .child(child_body.element),
+                .child(child_body.element)
+                .on_mouse_down(MouseButton::Left, move |e, window, cx| {
+                    let Ok(i) = child_body.layout.index_for_position(e.position) else {
+                        return;
+                    };
+                    let Some(target) = child_body.rendered.link_at(i).cloned() else {
+                        return;
+                    };
+                    cx.stop_propagation();
+                    child_host.update(cx, |this, cx| {
+                        this.follow_reference(target, e.modifiers.shift, window, cx)
+                    });
+                }),
         );
     }
     let more = (row.hidden > 0).then(|| {
