@@ -3844,27 +3844,14 @@ fn ac_13_5_host_commit_waits_for_the_ime(cx: &mut TestAppContext) {
     assert_eq!(
         text_and_caret(&ws, cx).0,
         "abにほ",
-        "the idle commit waits for the input method too"
+        "the idle commit waits for the input method"
     );
     assert_eq!(rows(&app, &page, cx)[0].0, "ab");
-    // The host finishes the block (what Escape, a click elsewhere or navigation does).
-    editor.update(cx, |e, cx| e.end(cx));
-    cx.run_until_parked();
-    assert_eq!(
-        rows(&app, &page, cx)[0].0,
-        "ab",
-        "nothing provisional is persisted"
-    );
-    assert_eq!(
-        text_and_caret(&ws, cx).0,
-        "abにほ",
-        "the composition still owns the buffer"
-    );
     assert!(
         ws.update(cx, |w, cx| w.editor().read(cx).target.is_some()),
-        "the block is still being edited; the end waits for the input method"
+        "still editing, and still composing"
     );
-    // The input method commits.
+    // The input method commits; now the queued commit runs.
     editor.update_in(cx, |e, window, cx| {
         e.replace_text_in_range(None, "にほ", window, cx)
     });
@@ -3874,9 +3861,10 @@ fn ac_13_5_host_commit_waits_for_the_ime(cx: &mut TestAppContext) {
         "abにほ",
         "the committed composition is what persists"
     );
-    assert!(
-        ws.update(cx, |w, cx| w.editor().read(cx).target.is_none()),
-        "the deferred end ran once the composition was committed"
+    assert_eq!(
+        editor.update_in(cx, |e, window, cx| e.marked_text_range(window, cx)),
+        None,
+        "no composition is left running"
     );
 }
 
@@ -4024,6 +4012,88 @@ fn ac_13_5_line_input_set_text_notifies_the_host(cx: &mut TestAppContext) {
         vec!["November Retro".to_string()],
         "the results are for the text the field shows"
     );
+}
+
+/// Add a second root block after the page's first, for scripts that move between blocks.
+fn add_block(
+    app: &Entity<AppState>,
+    page: &PageId,
+    text: &str,
+    cx: &mut VisualTestContext,
+) -> utopia_core::BlockId {
+    use utopia_core::{BlockKind, Command};
+    let id = utopia_core::BlockId::new();
+    app.update(cx, |app, _| {
+        let after = app.store.page_state(page).unwrap().live_roots()[0].clone();
+        app.store
+            .execute(
+                page,
+                vec![Command::InsertBlock {
+                    id: id.clone(),
+                    parent: None,
+                    after: Some(after),
+                    text: text.to_string(),
+                    kind: BlockKind::Bullet,
+                }],
+                Default::default(),
+            )
+            .unwrap();
+    });
+    id
+}
+
+/// §13.5: every host that ends an edit does it to move focus (the palette, the graph,
+/// another pane). The editor is then no longer the window's input handler and gpui never
+/// tells the platform input context, so the IME's commit or `unmarkText` can never arrive:
+/// the marked text must be taken as committed there, or the editor composes for the rest
+/// of the session with every edit path returning early.
+#[gpui::test]
+fn ac_13_5_focus_leaving_commits_the_ime_composition(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    use utopia_ui::editor::EditTarget;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("ab");
+    cx.run_until_parked();
+    let editor = ws.update(cx, |w, _| w.editor());
+    let host = editor.read_with(cx, |e, _| e.target.clone().expect("editing").host);
+    let second = add_block(&app, &page, "second", cx);
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "にほ", None, window, cx)
+    });
+    cx.run_until_parked();
+    // Cmd+Shift+F ends the edit and gives the palette the keyboard.
+    cx.simulate_keystrokes("cmd-shift-f");
+    cx.run_until_parked();
+    assert_eq!(
+        editor.update_in(cx, |e, window, cx| e.marked_text_range(window, cx)),
+        None,
+        "the composition is over: the input method can no longer reach the field"
+    );
+    assert_eq!(
+        rows(&app, &page, cx)[0].0,
+        "abにほ",
+        "and what it marked was committed, not lost"
+    );
+    // The editor edits again normally.
+    editor.update_in(cx, |e, window, cx| {
+        e.begin(
+            EditTarget {
+                host,
+                page: page.clone(),
+                block: second.clone(),
+            },
+            None,
+            None,
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    assert_eq!(text_and_caret(&ws, cx).0, "second");
+    cx.simulate_input("!");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[1].0, "second!");
 }
 
 /// No page titled like a relative date, and the day's page linked instead.

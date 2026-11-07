@@ -263,6 +263,18 @@ impl Workspace {
                     }
                 },
             ),
+            // §13.5: the input method can only reach the editor while its handle has
+            // focus, and gpui does not tell the platform's input context when focus
+            // moves. A composition left behind by a host that focuses elsewhere (the
+            // window deactivating, a popup, a pane) would never get its commit, so take
+            // it as committed text here.
+            cx.on_focus_out(
+                &editor.read(cx).focus_handle(cx),
+                window,
+                |this, _, _window, cx| {
+                    this.editor.update(cx, |e, cx| e.focus_lost(cx));
+                },
+            ),
             cx.observe(&app, |_, _, cx| cx.notify()),
         ];
         app.update(cx, |a, cx| a.install_quit_hook(cx));

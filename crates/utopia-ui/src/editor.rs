@@ -212,12 +212,14 @@ pub fn completion_text(kind: AcKind, item: &AcItem, after_caret: &str) -> (Strin
 /// these may run then: finishing the block reads and rewrites the buffer through the
 /// provisional glyphs, and starting another block replaces the buffer outright
 /// (`set_text`). They wait for the input method instead (`after_composition`).
+///
+/// `end` and a focus move do not wait: they take the marked text as committed
+/// (`accept_composition`), because the platform never hands another IME event to a field
+/// that has stopped being its input handler.
 #[derive(Debug, Clone, PartialEq)]
 enum Deferred {
     /// Finish the block and carry on editing it; `finished: false` is the idle commit.
     Commit { finished: bool },
-    /// `end`: finish the block, drop the target and tell the host the editor blurred.
-    End,
     /// `begin` elsewhere (another block, or another caret in this one).
     Begin {
         target: EditTarget,
@@ -228,13 +230,12 @@ enum Deferred {
 
 impl Deferred {
     /// A request that goes further replaces one that goes less far, so the idle commit a
-    /// click interrupts cannot displace the click, and neither can outlive an `end`.
+    /// click interrupts cannot displace the click.
     fn rank(&self) -> u8 {
         match self {
             Deferred::Commit { finished: false } => 0,
             Deferred::Commit { finished: true } => 1,
-            Deferred::End => 2,
-            Deferred::Begin { .. } => 3,
+            Deferred::Begin { .. } => 2,
         }
     }
 }
@@ -367,9 +368,11 @@ impl BlockEditor {
     /// workspace can take focus back if nothing else claims it.
     pub fn end(&mut self, cx: &mut Context<Self>) {
         if self.field.composing() {
-            // The IME owns the buffer; finish and blur when it lets go (§13.5).
-            self.defer(Deferred::End);
-            return;
+            // Every caller ends an edit because it is about to move focus (a page, the
+            // palette, the graph, another pane), and gpui gives the platform's input
+            // context no hint: the IME's commit can never reach a field that stopped being
+            // its input handler. Close the composition here instead (§13.5).
+            self.accept_composition(cx);
         }
         self.commit(cx);
         let was_editing = self.target.take().is_some();
@@ -579,6 +582,13 @@ impl BlockEditor {
         if self.field.composing() {
             return;
         }
+        self.settle(cx);
+        self.after_composition(window, cx);
+    }
+
+    /// Persist what the buffer holds and look at the store again (§13.5), once the
+    /// composition is over whichever way it ended.
+    fn settle(&mut self, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.pending_sync) {
             // A store change landed while the input method owned the buffer. If the block
             // is gone the composition has nowhere to go: end the edit before persisting
@@ -595,7 +605,25 @@ impl BlockEditor {
         self.persist(cx);
         self.anchor_caret(cx);
         self.refresh_autocomplete(cx);
-        self.after_composition(window, cx);
+    }
+
+    /// Take the input method's marked text as committed (§13.5): `unmarkText` semantics by
+    /// hand, for the paths where the platform will not send one. Anything a host queued for
+    /// this field is stale — the host is moving focus, so a queued `begin` would put the
+    /// caret on a row the host has left.
+    fn accept_composition(&mut self, cx: &mut Context<Self>) {
+        self.field.end_composition();
+        self.deferred = None;
+        self.settle(cx);
+    }
+
+    /// The editor's handle lost focus (§13.5). The input method can no longer reach this
+    /// field, so a live composition must be closed here; without it a composition whose
+    /// owner moved focus without calling `end` would never end.
+    pub fn focus_lost(&mut self, cx: &mut Context<Self>) {
+        if self.field.composing() {
+            self.accept_composition(cx);
+        }
     }
 
     /// Queue a host request that must wait for the input method (§13.5).
@@ -614,7 +642,6 @@ impl BlockEditor {
         match self.deferred.take() {
             None => {}
             Some(Deferred::Commit { finished }) => self.commit_block(finished, cx),
-            Some(Deferred::End) => self.end(cx),
             Some(Deferred::Begin {
                 target,
                 caret,
