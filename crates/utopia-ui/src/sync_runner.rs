@@ -292,7 +292,14 @@ pub fn sync_dot(runner: Option<&SyncRunner>) -> SyncDot {
 
 /// Human status line for the sidebar, from the one state the dot reads.
 pub fn status_line(runner: &SyncRunner, now_ms: i64) -> (String, bool) {
-    status_text(runner.last.as_ref(), now_ms)
+    match runner.phase {
+        // A round is running: the dot is amber, so the line must not show the time of the
+        // last finished round as if nothing were happening (SB-4).
+        SyncPhase::Preparing | SyncPhase::Exchanging | SyncPhase::Applying => {
+            ("Sync: syncing…".into(), false)
+        }
+        SyncPhase::Idle { .. } => status_text(runner.last.as_ref(), now_ms),
+    }
 }
 
 /// The line for one outcome.
@@ -402,6 +409,37 @@ mod tests {
         let (s, warn) = status_text(Some(&local), 0);
         assert_eq!(s, "● Sync: local error — database: no such table: sync_state");
         assert!(warn);
+    }
+
+    /// SB-4: the dot and the line read the same state. During a round the dot is amber, so
+    /// the line must not still claim the time of the last round.
+    #[test]
+    fn the_status_line_follows_the_round_phase() {
+        let engine = utopia_sync::SyncEngine::new(&utopia_store::Store::open_in_memory().unwrap())
+            .expect("engine");
+        let transport: BoxTransport = Box::new(utopia_sync::relay::RelayTransport::new(
+            utopia_sync::relay::Relay::new(),
+            "g",
+        ));
+        let mut runner = SyncRunner::new(engine, transport);
+        runner.last = Some(SyncStatus::Synced { at_ms: 0 });
+        assert_eq!(status_line(&runner, 150_000).0, "Synced 2m ago");
+        let transport = runner.begin_round().expect("a round starts");
+        assert_eq!(
+            status_line(&runner, 150_000).0,
+            "Sync: syncing…",
+            "the dot says syncing, so the line cannot say Synced 2m ago"
+        );
+        runner.exchange();
+        assert_eq!(status_line(&runner, 150_000).0, "Sync: syncing…");
+        runner.exchange_returned();
+        assert_eq!(status_line(&runner, 150_000).0, "Sync: syncing…");
+        runner.end_round(
+            transport,
+            &Ok(SyncReport::default()),
+            SyncStatus::Synced { at_ms: 150_000 },
+        );
+        assert_eq!(status_line(&runner, 150_000).0, "Synced just now");
     }
 
     /// Only one round at a time, and the transport always comes home: `begin_round` is the
