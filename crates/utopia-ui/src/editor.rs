@@ -252,6 +252,9 @@ pub struct BlockEditor {
     edits: u64,
     /// What a host asked for while the input method was composing (§13.5).
     deferred: Option<Deferred>,
+    /// A store change arrived while the input method owned the buffer (§13.5):
+    /// `sync_from_store` could not look, so it looks once the composition ends.
+    pending_sync: bool,
     _sub: Subscription,
 }
 
@@ -295,6 +298,7 @@ impl BlockEditor {
             idle: None,
             edits: 0,
             deferred: None,
+            pending_sync: false,
             _sub: sub,
         }
     }
@@ -379,16 +383,12 @@ impl BlockEditor {
     fn sync_from_store(&mut self, cx: &mut Context<Self>) {
         let Some(t) = self.target.clone() else { return };
         if self.field.composing() {
+            // §13.5: the buffer is the input method's. Neither rewriting it under the
+            // composition nor dropping the change is acceptable, so look again later.
+            self.pending_sync = true;
             return;
         }
-        let text = self.app.update(cx, |app, _| {
-            app.store.page_state(&t.page).ok().and_then(|st| {
-                st.block(&t.block)
-                    .filter(|b| b.live)
-                    .map(|b| b.text.clone())
-            })
-        });
-        match text {
+        match self.stored_text(&t, cx) {
             Some(text) if text != self.field.text => {
                 // Changed underneath us (undo, rewrite, sync): keep the caret in range.
                 let anchored = self.anchor.clone().and_then(|a| {
@@ -401,14 +401,28 @@ impl BlockEditor {
                 cx.notify();
             }
             Some(_) => {}
-            None => {
-                // The block went away (undo of its creation, deletion, merge).
-                self.target = None;
-                self.ac = None;
-                cx.emit(EditorEvent::Blurred);
-                cx.notify();
-            }
+            None => self.detach(cx),
         }
+    }
+
+    /// The target's stored text, or `None` when the block went away (its creation undone,
+    /// deleted, merged). `Some("")` is a live empty block.
+    fn stored_text(&self, t: &EditTarget, cx: &mut Context<Self>) -> Option<String> {
+        self.app.update(cx, |app, _| {
+            app.store.page_state(&t.page).ok().and_then(|st| {
+                st.block(&t.block)
+                    .filter(|b| b.live)
+                    .map(|b| b.text.clone())
+            })
+        })
+    }
+
+    /// Stop editing: the block went away (undo of its creation, deletion, merge).
+    fn detach(&mut self, cx: &mut Context<Self>) {
+        self.target = None;
+        self.ac = None;
+        cx.emit(EditorEvent::Blurred);
+        cx.notify();
     }
 
     fn anchor_caret(&mut self, cx: &mut Context<Self>) {
@@ -564,6 +578,19 @@ impl BlockEditor {
     fn after_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.field.composing() {
             return;
+        }
+        if std::mem::take(&mut self.pending_sync) {
+            // A store change landed while the input method owned the buffer. If the block
+            // is gone the composition has nowhere to go: end the edit before persisting
+            // rather than write into a tombstone (§13.5, rule 5). A block that merely
+            // changed keeps what the user just committed: the persist below is newer.
+            let gone = self
+                .target
+                .clone()
+                .is_some_and(|t| self.stored_text(&t, cx).is_none());
+            if gone {
+                self.detach(cx);
+            }
         }
         self.persist(cx);
         self.anchor_caret(cx);
