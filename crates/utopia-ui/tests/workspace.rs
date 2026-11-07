@@ -3244,6 +3244,56 @@ fn fr_1_1_feed_stops_at_the_oldest_daily_page(cx: &mut TestAppContext) {
     assert_eq!(daily_count(&app, cx), 1);
 }
 
+/// FR-1.2: visiting a day without writing on it only makes a draft, so it must not
+/// extend the feed: the feed still ends at the oldest *written* day, not at whatever
+/// date was last opened from the calendar.
+#[gpui::test]
+fn fr_1_2_visited_day_does_not_extend_the_feed(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // Three written days: the oldest is two days back.
+    let oldest = today() - chrono::Duration::days(2);
+    app.update(cx, |app, _| {
+        for i in 0..3 {
+            let d = today() - chrono::Duration::days(i);
+            let (p, b) = app.store.open_daily(d).unwrap();
+            app.store
+                .set_block_text(&p, &b, &format!("note {i}"), None, None)
+                .unwrap();
+            app.store.commit_block(&p, &b).unwrap();
+        }
+        app.store.sync_index().unwrap();
+    });
+    // Visit (do not write) a day years back: a draft for the session (FR-1.2).
+    let visited = NaiveDate::from_ymd_opt(2019, 1, 1).unwrap();
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(visited, false, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(
+        app.update(cx, |app, _| app.store.is_draft(&PageId::for_date(visited))),
+        "opening a date only drafts it"
+    );
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    // The visited draft must not make the feed load towards 2019.
+    for _ in 0..20 {
+        scroll_main(cx, -4000.);
+    }
+    assert!(
+        cx.debug_bounds("feed-end").is_some(),
+        "the feed ends at the oldest written day, not at the visited draft"
+    );
+    let shown = ws
+        .update(cx, |w, cx| w.journal_shown_through(cx))
+        .expect("in the feed");
+    assert!(
+        shown <= oldest && shown > oldest - chrono::Duration::days(10),
+        "the window stays within one batch of the oldest written day: {shown} vs {oldest}"
+    );
+    // Visiting wrote nothing.
+    assert_eq!(daily_count(&app, cx), 3);
+}
+
 fn scroll_main(cx: &mut VisualTestContext, dy: f32) {
     let main = cx.debug_bounds("main-pane").expect("main pane");
     cx.simulate_event(gpui::ScrollWheelEvent {

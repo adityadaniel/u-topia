@@ -190,28 +190,21 @@ impl Store {
         Ok(id)
     }
 
-    /// The oldest live daily page on this device, drafts included: the day the Daily
-    /// Notes feed finishes loading at (FR-1.2). `None` when the graph has no day at all.
+    /// The oldest daily page that exists on this device: the day the Daily Notes feed
+    /// finishes loading at (FR-1.2). Drafts are excluded on purpose: a day that was only
+    /// visited is not a page, so it must not extend the feed (a visit to 2019 would
+    /// otherwise re-open the feed for the whole session). The first write promotes the
+    /// draft and the next feed rebuild picks it up. Trashed days are excluded too.
     pub fn oldest_daily(&self) -> Result<Option<NaiveDate>> {
         self.read_barrier()?;
-        let stored = self
+        Ok(self
             .conn
             .query_row(
                 "SELECT MIN(daily_date) FROM page WHERE kind='daily' AND deleted_at IS NULL",
                 [],
                 |r| r.get::<_, Option<String>>(0),
             )?
-            .and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok());
-        let drafted = self
-            .drafts
-            .iter()
-            .filter(|(_, p)| self.docs.contains_key(*p))
-            .map(|(d, _)| *d)
-            .min();
-        Ok(match (stored, drafted) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        })
+            .and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()))
     }
 
     /// Daily pages dated `from..=to`, drafts included: what the Daily Notes feed shows for

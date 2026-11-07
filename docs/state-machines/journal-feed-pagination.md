@@ -20,18 +20,20 @@ calendar window for scripts; `journal_days` remains the page list. The file:line
 and the transition list below describe `main` before this change.
 
 - **Issue 1, unbounded growth and no terminal state — fixed.** A rebuild asks
-  `Store::oldest_daily` (oldest live daily page, drafts included, trashed days excluded)
-  and `Feed::settle` returns `Exhausted` once that day is inside the loaded window.
+  `Store::oldest_daily` (oldest stored daily page; drafts and trashed days are excluded,
+  so visiting an old date does not extend the feed) and `Feed::settle` returns
+  `Exhausted` once that day is inside the loaded window.
   `Exhausted` never requests another batch and draws "No earlier notes." (debug selector
   `feed-end`) instead of the "Loading older days…" sentinel. The state is recomputed on
   every rebuild, so a page created or synced in later re-opens the feed instead of
-  latching it shut. Tests: `fr_1_1_feed_stops_at_the_oldest_daily_page`
-  (`crates/utopia-ui/tests/workspace.rs`), `fr_1_2_oldest_daily_page_bounds_the_feed`
-  (`crates/utopia-store/tests/acceptance.rs`), and `feed_exhausts_at_the_oldest_daily_page`
-  (unit). Deliberate behaviour change: scrolling no longer walks back through blank
-  days older than the oldest daily page; use the calendar, a `[[date]]` link or Cmd+Shift+D
-  to reach such a day. That is what `Exhausted` means (FR-1.2 still lists every calendar
-  day back to the oldest note).
+  latching it shut. Tests: `fr_1_1_feed_stops_at_the_oldest_daily_page`,
+  `fr_1_2_visited_day_does_not_extend_the_feed` (`crates/utopia-ui/tests/workspace.rs`),
+  `fr_1_2_oldest_daily_page_bounds_the_feed` (`crates/utopia-store/tests/acceptance.rs`),
+  and `feed_exhausts_at_the_oldest_daily_page` (unit). Deliberate behaviour change:
+  scrolling no longer walks back through blank days older than the oldest daily page;
+  use the calendar, a `[[date]]` link or Cmd+Shift+D to reach such a day — but only a day
+  written that way moves the feed's floor, not a bare visit (FR-1.2). That is what
+  `Exhausted` means (FR-1.2 still lists every calendar day back to the oldest note).
 - **Issue 2, two units for "how much is loaded" — fixed by naming.** `Feed` dates count
   calendar days; `Journal::pages` is the page list, which is never longer than the
   window. Test: `feed_window_counts_calendar_days_not_pages`.
