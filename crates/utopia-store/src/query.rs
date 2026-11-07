@@ -1377,25 +1377,6 @@ pub(crate) fn classify_tag_page(conn: &Connection, page: &PageId) -> Result<Opti
     Ok(Some(any && all_tags))
 }
 
-/// Pages referenced by any block of `sources` right now (SB-2): a commit can change the
-/// classification of these, so the writer updates just their entries.
-pub(crate) fn dst_pages_of_sources(
-    conn: &Connection,
-    sources: &[PageId],
-) -> Result<HashSet<PageId>> {
-    let mut out = HashSet::new();
-    let mut stmt = conn.prepare_cached(
-        "SELECT DISTINCT dst_page_id FROM ref
-         WHERE src_page_id=?1 AND dst_kind='page' AND dst_page_id IS NOT NULL",
-    )?;
-    for page in sources {
-        for row in stmt.query_map([page.as_str()], |r| r.get::<_, String>(0))? {
-            out.insert(PageId(row?));
-        }
-    }
-    Ok(out)
-}
-
 /// Whether anything references `page` at all (SB-2): a published tag page whose last
 /// reference went away is no longer one, and this is the cheap way to notice.
 pub(crate) fn has_any_ref(conn: &Connection, page: &PageId) -> Result<bool> {

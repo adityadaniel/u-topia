@@ -241,6 +241,12 @@ impl Store {
         self.persister.tag_scans()
     }
 
+    /// How many per-page classifications the commit path has run (tests, SB-2). A commit
+    /// classifies only the pages it wrote and the destinations whose ref edges changed.
+    pub fn tag_page_classifications(&self) -> u64 {
+        self.persister.tag_classifications()
+    }
+
     /// How many full tag-page classifications this store's own connection has run. The
     /// commit path classifies on the writer, so this stays put while the UI edits.
     pub fn tag_page_scans(&self) -> u64 {
@@ -441,9 +447,10 @@ impl Store {
             fmt: &fmt,
             now: self.clock.unwrap_or_else(utopia_core::now_ms),
         };
-        projector.reresolve(&project::ResolutionWork {
+        projector.reresolve(&mut project::ResolutionWork {
             keys,
             pages: HashSet::new(),
+            changed: HashSet::new(),
         })?;
         tx.commit()?;
         self.date_format = fmt;
