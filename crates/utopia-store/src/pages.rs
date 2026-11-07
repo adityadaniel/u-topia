@@ -15,7 +15,7 @@ use utopia_core::{BlockId, BlockKind, Command, DomainError, PageId, PageKind, Pa
 use utopia_doc::PageDoc;
 
 use crate::project::{display_title, resolve_page_key};
-use crate::{EditOpts, Result, Store, StoreError};
+use crate::{DraftDay, EditOpts, Result, Store, StoreError};
 
 impl Store {
     fn live_daily(&self, date: NaiveDate) -> Result<Option<PageId>> {
@@ -81,14 +81,15 @@ impl Store {
     pub fn ensure_daily_page(&mut self, date: NaiveDate) -> Result<PageId> {
         self.sync_index()?;
         if let Some(p) = self.live_daily(date)? {
+            // A draft of a day that now has a page is stale: drop it (FR-1.2).
+            if let Some(draft) = self.draft_page(date) {
+                self.discard_draft(&draft);
+            }
             return Ok(p);
         }
-        if let Some(p) = self.drafts.get(&date).cloned() {
-            if self.docs.contains_key(&p) {
-                self.queue(&[(p.clone(), None)], true)?;
-                return Ok(p);
-            }
-            self.drafts.remove(&date);
+        if let Some(p) = self.draft_page(date) {
+            self.queue(&[(p.clone(), None)], true)?;
+            return Ok(p);
         }
         let mut id = PageId::for_date(date);
         if self.id_taken(&id)? {
@@ -116,12 +117,14 @@ impl Store {
     pub fn draft_daily(&mut self, date: NaiveDate) -> Result<PageId> {
         self.sync_index()?;
         if let Some(p) = self.live_daily(date)? {
+            // A draft of a day that now has a page is stale: drop it (FR-1.2).
+            if let Some(draft) = self.draft_page(date) {
+                self.discard_draft(&draft);
+            }
             return Ok(p);
         }
-        if let Some(p) = self.drafts.get(&date) {
-            if self.docs.contains_key(p) {
-                return Ok(p.clone());
-            }
+        if let Some(p) = self.draft_page(date) {
+            return Ok(p);
         }
         let mut id = PageId::for_date(date);
         if self.id_taken(&id)? {
@@ -142,7 +145,7 @@ impl Store {
             });
         }
         let now = self.now();
-        let entry = self.new_doc(&id);
+        let mut entry = self.fresh_entry(&id);
         entry.doc.apply(
             &Command::SetPageMeta(PageMetaPatch {
                 kind: Some(PageKind::Daily),
@@ -153,12 +156,10 @@ impl Store {
             now,
         )?;
         for cmd in &cmds {
-            if let Err(e) = entry.doc.apply(cmd, now) {
-                self.docs.remove(&id);
-                return Err(e.into());
-            }
+            // Nothing was inserted into `drafts` yet, so a failure leaves no trace.
+            entry.doc.apply(cmd, now)?;
         }
-        self.drafts.insert(date, id.clone());
+        self.drafts.insert(id.clone(), DraftDay { date, entry });
         Ok(id)
     }
 
@@ -174,10 +175,10 @@ impl Store {
         let id = BlockId::new();
         let now = self.now();
         let entry = self
-            .docs
+            .drafts
             .get_mut(page)
             .ok_or_else(|| StoreError::NotFound(format!("draft {page}")))?;
-        entry.doc.apply(
+        entry.entry.doc.apply(
             &Command::InsertBlock {
                 id: id.clone(),
                 parent: None,
@@ -213,24 +214,40 @@ impl Store {
                 out.insert(d, PageId(id));
             }
         }
-        for (d, p) in &self.drafts {
-            if (from..=to).contains(d) && self.docs.contains_key(p) {
-                out.entry(*d).or_insert_with(|| p.clone());
+        for (p, d) in &self.drafts {
+            if (from..=to).contains(&d.date) {
+                out.entry(d.date).or_insert_with(|| p.clone());
             }
         }
         Ok(out)
     }
 
-    /// Whether `page` is a draft day (shown, never written).
+    /// Whether `page` is a draft day (shown, never written). A draft always has its shard:
+    /// it lives inside the draft entry (FR-1.2).
     pub fn is_draft(&self, page: &PageId) -> bool {
-        self.drafts.values().any(|p| p == page)
+        self.drafts.contains_key(page)
     }
 
-    /// Stop tracking `page` as a draft; true if it was one.
-    pub(crate) fn take_draft(&mut self, page: &PageId) -> bool {
-        let before = self.drafts.len();
-        self.drafts.retain(|_, p| p != page);
-        self.drafts.len() != before
+    /// The draft for `date`, if the day has been looked at but never written (FR-1.2).
+    pub fn draft_page(&self, date: NaiveDate) -> Option<PageId> {
+        self.drafts
+            .iter()
+            .find(|(_, d)| d.date == date)
+            .map(|(p, _)| p.clone())
+    }
+
+    /// Promote a draft (FR-1.2): the shard moves from the draft entry into `docs`, so the
+    /// next commit writes the whole page. Returns the day it belonged to. This is the only
+    /// Draft → Live transition.
+    pub(crate) fn promote_draft(&mut self, page: &PageId) -> Option<NaiveDate> {
+        let draft = self.drafts.remove(page)?;
+        self.docs.insert(page.clone(), draft.entry);
+        Some(draft.date)
+    }
+
+    /// Forget a draft without writing it: its shard was only ever in memory.
+    pub(crate) fn discard_draft(&mut self, page: &PageId) {
+        self.drafts.remove(page);
     }
 
     /// Visiting a page: make sure there is a block to type into (§9.3) and return the
@@ -740,9 +757,7 @@ impl Store {
         for (page, bytes) in batch {
             // Another device wrote this day first: drop the local draft so its unsent
             // empty block never merges into theirs.
-            if self.take_draft(page) {
-                self.docs.remove(page);
-            }
+            self.discard_draft(page);
             let did = if self.page_exists(page)? {
                 self.load_doc(page)?.doc.import(bytes)?
             } else {

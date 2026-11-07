@@ -93,6 +93,18 @@ impl DocEntry {
     }
 }
 
+/// A calendar day that has been looked at but never written (FR-1.2): shown in the Daily
+/// Notes feed, editable in place, but not projected, synced or seen by `doctor` until its
+/// first character is committed.
+///
+/// The shard lives inside the entry rather than in `Store::docs`, so "a draft whose shard
+/// is gone" cannot be expressed: `is_draft`, `day`-lookups and `page_state` all read this
+/// one value, and promotion is the only transition that moves it into `docs`.
+struct DraftDay {
+    date: NaiveDate,
+    entry: DocEntry,
+}
+
 /// Options for recording an edit in the undo history.
 #[derive(Debug, Clone, Default)]
 pub struct EditOpts {
@@ -117,8 +129,9 @@ pub struct Store {
     persister: Persister,
     /// Pages with in-memory changes not yet handed to the writer.
     pending: Vec<(PageId, Option<DocDelta>, bool)>,
-    /// Daily pages shown but never written: in memory only until their first edit (FR-1.2).
-    drafts: HashMap<NaiveDate, PageId>,
+    /// Daily pages shown but never written (FR-1.2), by page id: in memory only until
+    /// their first edit.
+    drafts: HashMap<PageId, DraftDay>,
     debounced: bool,
     /// Attachment bytes for in-memory graphs (file graphs use the blob directory).
     mem_blobs: HashMap<String, Vec<u8>>,
@@ -354,7 +367,7 @@ impl Store {
         let mut promoted = false;
         for (page, delta) in pages {
             // A draft's first edit writes the whole page (meta, first block, the edit).
-            let delta = if self.take_draft(page) {
+            let delta = if self.promote_draft(page).is_some() {
                 promoted = true;
                 None
             } else {
@@ -466,7 +479,7 @@ impl Store {
     // ---------------------------------------------------------------- shards
 
     pub fn page_exists(&self, page: &PageId) -> Result<bool> {
-        if self.docs.contains_key(page) {
+        if self.docs.contains_key(page) || self.drafts.contains_key(page) {
             return Ok(true);
         }
         self.read_barrier()?;
@@ -478,6 +491,11 @@ impl Store {
     }
 
     fn load_doc(&mut self, page: &PageId) -> Result<&mut DocEntry> {
+        // A draft day has no `page_doc` row yet: its shard is inside the draft entry, and
+        // every reader must find it there rather than look for a row (FR-1.2).
+        if self.drafts.contains_key(page) {
+            return Ok(&mut self.drafts.get_mut(page).expect("checked above").entry);
+        }
         if !self.docs.contains_key(page) {
             let snap: Option<Vec<u8>> = self
                 .conn
@@ -515,12 +533,21 @@ impl Store {
     }
 
     fn new_doc(&mut self, page: &PageId) -> &mut DocEntry {
-        self.docs.entry(page.clone()).or_insert_with(|| DocEntry {
+        if !self.docs.contains_key(page) {
+            let entry = self.fresh_entry(page);
+            self.docs.insert(page.clone(), entry);
+        }
+        self.docs.get_mut(page).expect("inserted above")
+    }
+
+    /// A new, empty shard for `page` that has never been written.
+    fn fresh_entry(&self, page: &PageId) -> DocEntry {
+        DocEntry {
             doc: LoroPageDoc::new(page.clone(), self.peer),
             persisted: utopia_doc::Frontier::default(),
             has_snapshot: false,
             pending_updates: 0,
-        })
+        }
     }
 
     /// Anchor a caret in a block so it survives remote merges (§6.5).
