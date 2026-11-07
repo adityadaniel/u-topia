@@ -1,14 +1,18 @@
-//! The Settings window (§9.1, `OpenSettings` / Cmd+,). Four tabs:
+//! The Settings window (§9.1, `OpenSettings` / Cmd+,). Five tabs, in a list down the left
+//! side as System Settings has it (ST-5):
 //!
+//! - **Appearance** — the font notes and the interface are set in (System or the bundled
+//!   IBM Plex Sans) and how densely blocks are set (Comfortable or Compact). Applies to
+//!   every window at once; kept in `settings.json` ([`crate::appearance`]), not in
+//!   `keymap.json`.
 //! - **Keybindings** — every action in [`crate::actions::CATALOG`] with the keys in force,
 //!   rebindable by pressing the combination you want. Changes apply at once and are written
 //!   to `keymap.json`; only the actions you changed are stored.
 //! - **Shortcuts** — the cheat sheet of everything currently bound, which is also what the
 //!   Help menu's "Keyboard Shortcuts" opens.
-//! - **Appearance** — the font notes and the interface are set in (System or the bundled
-//!   IBM Plex Sans) and how densely blocks are set (Comfortable or Compact). Applies to
-//!   every window at once; kept in `settings.json` ([`crate::appearance`]), not in
-//!   `keymap.json`.
+//! - **Sync** — where this graph syncs to and whether its pages are encrypted on the way
+//!   (§12). Read only: the transport is resolved from the environment and the keychain at
+//!   launch, and no secret is shown.
 //! - **Help** — a tour of the app's features, with screenshots taken from the app itself.
 //!
 //! Capture uses a gpui *keystroke interceptor* rather than a key-down handler on purpose:
@@ -17,20 +21,29 @@
 //! Cmd+Q would quit the app mid-edit.
 
 use gpui::{
-    div, img, prelude::*, px, AnyWindowHandle, App, Context, FocusHandle, Focusable, FontWeight,
-    Keystroke, SharedString, Subscription, Window,
+    div, img, prelude::*, px, AnyWindowHandle, App, Context, Div, Entity, FocusHandle, Focusable,
+    FontWeight, Keystroke, ScrollHandle, SharedString, Subscription, Window,
 };
 use std::path::PathBuf;
 
 use crate::actions::{
     by_category, canonical_keys, doc, pretty_keys, reinstall, ActionDoc, Category, Overrides,
+    CATALOG,
 };
-use crate::appearance::{self, Density, UiFont};
+use crate::appearance::{self, AttributeBlocks, Density, UiFont};
 use crate::help::{shot_image, TOPICS};
-use crate::theme::{quiet_control, theme};
+use crate::line_input::{LineInput, LineInputEvent};
+use crate::sync_runner;
+use crate::theme::{quiet_control, theme, Theme};
 
-/// Help prose stops at a readable line length, like the page column does.
-const HELP_WIDTH: f32 = 720.;
+/// Every pane is set in one readable column (ST-1), like the page column does.
+const CONTENT_WIDTH: f32 = 720.;
+/// The tab list down the left side, as System Settings has it (ST-5).
+const RAIL_WIDTH: f32 = 220.;
+/// The children a key list draws before its first category card: the toolbar and the
+/// filter field. `ScrollHandle::scroll_to_item` counts them, so a clash link can bring the
+/// card that holds the other row into view (ST-3).
+const KEY_LIST_LEADING: usize = 2;
 /// Screenshots are shown at a fixed size. gpui derives an image's aspect ratio from the
 /// decoded bytes, but that lands a frame after layout, so a width alone leaves the element
 /// at its intrinsic height; giving both keeps the box the right shape from the first frame.
@@ -40,24 +53,79 @@ const HELP_SHOT_HEIGHT: f32 = HELP_SHOT_WIDTH * 798. / 1200.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
+    Appearance,
     Keybindings,
     Shortcuts,
-    Appearance,
+    Sync,
     Help,
 }
 
 impl Tab {
     fn label(self) -> &'static str {
         match self {
+            Tab::Appearance => "Appearance",
             Tab::Keybindings => "Keybindings",
             Tab::Shortcuts => "Shortcuts",
-            Tab::Appearance => "Appearance",
+            Tab::Sync => "Sync",
             Tab::Help => "Help",
         }
     }
 
+    /// The glyph at the left of the tab: a letter or a symbol, drawn in the tab's colour.
+    /// Text rather than an image because the app ships no icons and a glyph inherits the
+    /// type size, the density and the font the user picked.
+    fn icon(self) -> &'static str {
+        match self {
+            Tab::Appearance => "Aa",
+            Tab::Keybindings => "⌘",
+            Tab::Shortcuts => "☰",
+            Tab::Sync => "↻",
+            Tab::Help => "?",
+        }
+    }
+
+    /// One line under the pane title, so a tab explains itself.
+    fn summary(self) -> &'static str {
+        match self {
+            Tab::Appearance => {
+                "The font your notes and the interface are set in (code stays in Menlo), \
+                 and how tightly blocks are set."
+            }
+            Tab::Keybindings => {
+                "Every action in the app and the keys it answers to. Click a \
+                                 key to change it."
+            }
+            Tab::Shortcuts => "Everything bound right now, as a cheat sheet.",
+            Tab::Sync => {
+                "Where this graph syncs to, and whether its pages are encrypted on \
+                          the way."
+            }
+            Tab::Help => {
+                "A short tour of what the app can do, with pictures of the real \
+                          thing."
+            }
+        }
+    }
+
+    /// How a debug selector names the tab.
+    fn key(self) -> &'static str {
+        match self {
+            Tab::Appearance => "appearance",
+            Tab::Keybindings => "keybindings",
+            Tab::Shortcuts => "shortcuts",
+            Tab::Sync => "sync",
+            Tab::Help => "help",
+        }
+    }
+
     fn all() -> &'static [Tab] {
-        &[Tab::Keybindings, Tab::Shortcuts, Tab::Appearance, Tab::Help]
+        &[
+            Tab::Appearance,
+            Tab::Keybindings,
+            Tab::Shortcuts,
+            Tab::Sync,
+            Tab::Help,
+        ]
     }
 }
 
@@ -73,7 +141,15 @@ pub struct SettingsView {
     window: Option<AnyWindowHandle>,
     status: Option<SharedString>,
     topic: usize,
+    /// The filter at the top of the key list (ST-4), by name, description or key.
+    search: Entity<LineInput>,
+    query: String,
+    /// The row a clash link jumped to (ST-3), kept highlighted for a moment.
+    flash: Option<&'static str>,
+    /// The scrolling key list, so a clash link can bring the other row into view.
+    keys_scroll: ScrollHandle,
     focus: FocusHandle,
+    _subs: Vec<Subscription>,
 }
 
 impl Focusable for SettingsView {
@@ -83,12 +159,7 @@ impl Focusable for SettingsView {
 }
 
 impl SettingsView {
-    pub fn new(
-        config_dir: PathBuf,
-        tab: Tab,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(config_dir: PathBuf, tab: Tab, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // The Appearance tab shows a sample of every font it offers.
         for &f in UiFont::ALL {
             appearance::load_font(cx, f);
@@ -99,6 +170,30 @@ impl SettingsView {
         }
         // Already logged at startup; repeated here so the user sees it.
         warnings.extend(appearance::Prefs::load(&config_dir).1);
+        let search = cx.new(|cx| LineInput::new("name, description or key", cx));
+        let subs = vec![
+            // Escape clears the field and hands the keyboard back to the window, so the
+            // key list's own shortcuts keep working.
+            cx.subscribe_in(
+                &search,
+                window,
+                |this, _, e: &LineInputEvent, window, cx| match e {
+                    LineInputEvent::Changed(query) => {
+                        if *query != this.query {
+                            this.query = query.clone();
+                            cx.notify();
+                        }
+                    }
+                    LineInputEvent::Cancel => {
+                        this.clear_filter(cx);
+                        let focus = this.focus.clone();
+                        window.focus(&focus);
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+        ];
         Self {
             config_dir,
             overrides,
@@ -110,7 +205,12 @@ impl SettingsView {
             // force is not what the user wrote (rule 11: degrade, never panic).
             status: warnings.first().map(|w| SharedString::from(w.clone())),
             topic: 0,
+            search,
+            query: String::new(),
+            flash: None,
+            keys_scroll: ScrollHandle::default(),
             focus: cx.focus_handle(),
+            _subs: subs,
         }
     }
 
@@ -267,6 +367,97 @@ impl SettingsView {
         self.tab
     }
 
+    /// What is typed in the filter field (ST-4).
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Where an action's row sits among the key list's direct children (ST-3): the toolbar,
+    /// the filter, then each category's header and its rows.
+    fn key_list_index(&self, action: &str) -> Option<usize> {
+        let mut ix = KEY_LIST_LEADING;
+        for (_, rows) in self.visible_groups() {
+            ix += 1; // the category's header
+            for d in rows {
+                if d.action == action {
+                    return Some(ix);
+                }
+                ix += 1;
+            }
+        }
+        None
+    }
+
+    /// Empty the filter field and the query behind it.
+    fn clear_filter(&mut self, cx: &mut Context<Self>) {
+        self.query.clear();
+        self.search.update(cx, |s, cx| s.set_text("", cx));
+    }
+
+    /// The row a clash link just jumped to, while it stays highlighted (ST-3).
+    pub fn flashed(&self) -> Option<&'static str> {
+        self.flash
+    }
+
+    /// ST-3: bring the row that shares this key into view and mark it, so "Also used by"
+    /// leads somewhere instead of just naming the problem.
+    fn jump_to(&mut self, target: &'static ActionDoc, cx: &mut Context<Self>) {
+        // The filter may be hiding the row the link points at; show it before scrolling.
+        if !self.matches(target) {
+            self.clear_filter(cx);
+        }
+        self.flash = Some(target.action);
+        if let Some(ix) = self.key_list_index(target.action) {
+            self.keys_scroll.scroll_to_item(ix);
+        }
+        let me = cx.entity().downgrade();
+        let flash = target.action;
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1800))
+                .await;
+            let _ = me.update(cx, |this, cx| {
+                if this.flash == Some(flash) {
+                    this.flash = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// How far the key list is scrolled (px), so a test can see a clash link's jump (ST-3).
+    pub fn key_list_offset(&self) -> f32 {
+        f32::from(self.keys_scroll.offset().y)
+    }
+
+    /// ST-4: the actions the filter lets through, in catalog order.
+    pub fn visible_actions(&self) -> Vec<&'static str> {
+        CATALOG
+            .iter()
+            .filter(|d| self.matches(d))
+            .map(|d| d.action)
+            .collect()
+    }
+
+    fn matches(&self, d: &ActionDoc) -> bool {
+        row_matches(d, &self.overrides.keys_for(d), &self.query)
+    }
+
+    /// The filter's rows, grouped the way the editor lists them. A category with nothing
+    /// left to show is dropped rather than drawn empty.
+    fn visible_groups(&self) -> Vec<(Category, Vec<&'static ActionDoc>)> {
+        let mut out = Vec::new();
+        for &c in Category::all() {
+            let rows: Vec<_> = by_category(c).filter(|d| self.matches(d)).collect();
+            if !rows.is_empty() {
+                out.push((c, rows));
+            }
+        }
+        out
+    }
+
     /// Settings → Appearance: put `font` in force in every window and remember it.
     pub fn choose_font(&mut self, font: UiFont, cx: &mut Context<Self>) {
         let before = appearance::ui_font(cx);
@@ -295,6 +486,39 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Settings → Appearance: how many children a reference shows inline (LR-4).
+    pub fn choose_ref_children(&mut self, count: usize, cx: &mut Context<Self>) {
+        let before = appearance::ref_children(cx);
+        self.status = Some(
+            match appearance::set_ref_children(cx, count, &self.config_dir) {
+                Err(e) => format!(
+                    "{count} applies now, but could not save {}: {e}",
+                    appearance::FILE
+                )
+                .into(),
+                Ok(()) if before == count => {
+                    format!("References already show {count} children.").into()
+                }
+                Ok(()) => format!("References now show {count} children.").into(),
+            },
+        );
+        cx.notify();
+    }
+
+    /// Settings → Appearance: remove every pinned page (SB-3). The pages are untouched;
+    /// only the sidebar's local order changes.
+    pub fn clear_pins(&mut self, cx: &mut Context<Self>) {
+        self.status = Some(match appearance::clear_pinned(cx) {
+            Ok(()) => "Unpinned every page.".into(),
+            Err(e) => format!(
+                "The pins are gone for this session, but could not save {}: {e}",
+                appearance::FILE
+            )
+            .into(),
+        });
+        cx.notify();
+    }
+
     /// Settings → Appearance: switch density in every window and remember it (ALL-5).
     pub fn choose_density(&mut self, density: Density, cx: &mut Context<Self>) {
         let before = appearance::density(cx);
@@ -312,6 +536,25 @@ impl SettingsView {
                 Ok(()) => format!("The density is now {}.", density.label()).into(),
             },
         );
+        cx.notify();
+    }
+
+    /// Settings → Appearance: how pages draw their attribute blocks (PG-1). The same
+    /// preference the page's "Show as blocks" toggle writes.
+    pub fn choose_attribute_blocks(&mut self, value: AttributeBlocks, cx: &mut Context<Self>) {
+        let before = appearance::attribute_blocks(cx);
+        self.status = Some(match appearance::set_attribute_blocks(cx, value) {
+            Err(e) => format!(
+                "{} applies now, but could not save {}: {e}",
+                value.label(),
+                appearance::FILE
+            )
+            .into(),
+            Ok(()) if before == value => {
+                format!("Attribute blocks are already {}.", value.label()).into()
+            }
+            Ok(()) => format!("Attribute blocks are now {}.", value.label()).into(),
+        });
         cx.notify();
     }
 }
@@ -333,31 +576,16 @@ impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let density = appearance::density(cx);
-        let tabs = Tab::all().iter().map(|&t| {
-            let on = t == self.tab;
-            div()
-                .id(SharedString::from(format!("tab-{}", t.label())))
-                .debug_selector(move || format!("settings-tab-{}", t.label()))
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .text_size(px(crate::theme::BODY_SIZE))
-                .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
-                .when(!on, |d| d.text_color(th.muted))
-                .child(t.label())
-                .on_click(cx.listener(move |this, _, _, cx| this.set_tab(t, cx)))
-        });
-        let tabs: Vec<_> = tabs.collect();
         let font = appearance::ui_font(cx);
 
         let body = match self.tab {
             Tab::Keybindings => self.render_keybindings(cx).into_any_element(),
             Tab::Shortcuts => self.render_shortcuts(cx).into_any_element(),
             Tab::Appearance => self.render_appearance(cx).into_any_element(),
+            Tab::Sync => self.render_sync(cx).into_any_element(),
             Tab::Help => self.render_help(cx).into_any_element(),
         };
-        // One debug selector per element: the body names the font, the header the density.
+        // One debug selector per element: the body names the font, the rail the density.
         let body = div()
             .debug_selector(move || format!("settings-ui-font-{}", font.key()))
             .flex()
@@ -368,6 +596,82 @@ impl Render for SettingsView {
             // inside it, pushing the status line out of reach.
             .min_h_0()
             .child(body);
+
+        // ST-5: the tabs are a list down the left side, as System Settings has it, each
+        // with a glyph so the list reads at a glance.
+        let tabs: Vec<_> = Tab::all()
+            .iter()
+            .map(|&t| {
+                let on = t == self.tab;
+                div()
+                    .id(SharedString::from(format!("nav-{}", t.key())))
+                    .debug_selector(move || format!("settings-nav-{}", t.key()))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py(px(if density == Density::Compact { 5. } else { 8. }))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(crate::theme::CONTROL_SIZE))
+                    .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
+                    .when(!on, |d| d.text_color(th.text).hover(|x| x.bg(th.hover)))
+                    .child(
+                        div()
+                            .w(px(18.))
+                            .flex_none()
+                            .text_color(if on { th.accent } else { th.muted })
+                            .child(t.icon()),
+                    )
+                    .child(t.label())
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_tab(t, cx)))
+            })
+            .collect();
+        let rail = div()
+            // Names the density in force, for tests (the root names the font; an element
+            // carries only one debug selector).
+            .debug_selector(move || format!("settings-ui-density-{}", density.key()))
+            .w(px(RAIL_WIDTH))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .px_3()
+            .py_4()
+            .border_r_1()
+            .border_color(th.line)
+            .bg(th.sidebar_bg)
+            .child(
+                div()
+                    .px_2()
+                    .pb_3()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.faint)
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("Settings"),
+            )
+            .children(tabs);
+
+        // The pane title sits in the same column as its cards, not at the window's edge.
+        let header = div().px_6().pt_6().pb_1().child(
+            column()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(crate::theme::H1_SIZE))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(self.tab.label()),
+                )
+                .child(
+                    div()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.muted)
+                        .child(self.tab.summary()),
+                ),
+        );
 
         div()
             .debug_selector(|| "settings".into())
@@ -383,24 +687,26 @@ impl Render for SettingsView {
             .font_family(appearance::font_family(cx))
             .child(
                 div()
-                    // Names the density in force, for tests (the root names the font; an
-                    // element carries only one debug selector).
-                    .debug_selector(move || format!("settings-ui-density-{}", density.key()))
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_4()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(th.line)
-                    .child(div().font_weight(FontWeight::BOLD).mr_2().child("Settings"))
-                    .children(tabs),
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .child(rail)
+                    .child(
+                        div()
+                            .debug_selector(|| "settings-pane".into())
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(header)
+                            .child(body),
+                    ),
             )
-            .child(body)
             .children(self.status.clone().map(|s| {
                 div()
                     .debug_selector(|| "settings-status".into())
-                    .px_4()
+                    .px_6()
                     .py_2()
                     .border_t_1()
                     .border_color(th.line)
@@ -412,227 +718,515 @@ impl Render for SettingsView {
     }
 }
 
+/// ST-4: a row matches when every whitespace-separated term appears in its name, its
+/// description, the action's name or the keys in force (so "⇧⌘K" and "cmd-shift-k" both
+/// work).
+fn row_matches(d: &ActionDoc, keys: &str, query: &str) -> bool {
+    let terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
+    if terms.is_empty() {
+        return true;
+    }
+    let haystack = format!(
+        "{} {} {} {} {}",
+        d.label,
+        d.help,
+        d.action,
+        keys,
+        pretty_keys(keys)
+    )
+    .to_lowercase();
+    terms.iter().all(|t| haystack.contains(t))
+}
+
+/// A card (ST-1): one per category, a hairline border on the page's surface.
+fn card(th: &Theme) -> Div {
+    div()
+        .w_full()
+        .max_w(px(CONTENT_WIDTH))
+        .mx_auto()
+        // A card is as tall as its rows; the pane scrolls instead of squeezing it.
+        .flex_shrink_0()
+        .rounded_lg()
+        .border_1()
+        .border_color(th.line)
+        .bg(th.surface)
+        .overflow_hidden()
+}
+
+/// The caption at the top of a card.
+fn card_title(th: &Theme, label: &str) -> Div {
+    div()
+        .px_4()
+        .pt_3()
+        .pb_1p5()
+        .text_size(px(crate::theme::CAPTION_SIZE))
+        .text_color(th.faint)
+        .font_weight(FontWeight::MEDIUM)
+        .child(label.to_string())
+}
+
+/// One fact on a card: a label and its value, the value free to wrap.
+fn fact_row(label: &'static str, value: String, th: &Theme) -> Div {
+    div()
+        .flex()
+        .items_baseline()
+        .justify_between()
+        .gap_4()
+        .child(div().text_size(px(crate::theme::BODY_SIZE)).child(label))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted)
+                .text_right()
+                .child(value),
+        )
+}
+
+/// One row inside a card: the hairline between rows is the point of ST-1.
+fn card_row<E: Styled + gpui::prelude::FluentBuilder>(
+    row: E,
+    i: usize,
+    th: &Theme,
+    density: Density,
+) -> E {
+    row.px_4()
+        .py(px(if density == Density::Compact { 7. } else { 11. }))
+        .when(i > 0, |d| d.border_t_1().border_color(th.line))
+}
+
+/// A row of a key-list card. The card's body is drawn by its rows because the rows are
+/// direct children of the scroll region, so a clash link can scroll to the row itself
+/// (ST-3); the header and the last row round the card's ends.
+fn key_card_row<E: Styled + gpui::prelude::FluentBuilder>(
+    row: E,
+    last: bool,
+    th: &Theme,
+    density: Density,
+) -> E {
+    row.w_full()
+        .max_w(px(CONTENT_WIDTH))
+        .mx_auto()
+        .flex_shrink_0()
+        .px_4()
+        .py(px(if density == Density::Compact { 7. } else { 11. }))
+        .border_l_1()
+        .border_r_1()
+        .border_t_1()
+        .border_color(th.line)
+        .when(last, |d| d.border_b_1().rounded_b_lg())
+}
+
+/// The top of a key-list card: the category in a rounded, bordered strip.
+fn card_top(th: &Theme, label: &str) -> Div {
+    column()
+        .debug_selector(move || format!("settings-card-{label}"))
+        .bg(th.surface)
+        .border_1()
+        .border_b_0()
+        .border_color(th.line)
+        .rounded_t_lg()
+        .px_4()
+        .pt_3()
+        .pb_1p5()
+        .text_size(px(crate::theme::CAPTION_SIZE))
+        .text_color(th.faint)
+        .font_weight(FontWeight::MEDIUM)
+        .child(label.to_string())
+}
+
+/// The scrolling key list. Unlike [`pane`], its direct children are the category headers and
+/// the rows themselves: `ScrollHandle::scroll_to_item` only targets direct children, and a
+/// clash link must reveal the destination *row*, not merely its category (ST-3).
+fn key_pane(
+    id: &'static str,
+    selector: &'static str,
+    handle: &ScrollHandle,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || selector.into())
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .px_6()
+        .py_5()
+        .track_scroll(handle)
+}
+
+/// A row of an Appearance card. Like the key list, the cards' rows are direct children of
+/// the scroll region (the header and the last row round the card's ends); a row is a touch
+/// tighter than a key row so all four preference cards fit one desktop screen.
+fn appearance_row<E: Styled + gpui::prelude::FluentBuilder>(row: E, last: bool, th: &Theme) -> E {
+    row.w_full()
+        .max_w(px(CONTENT_WIDTH))
+        .mx_auto()
+        .flex_shrink_0()
+        .px_4()
+        .py(px(8.))
+        .border_l_1()
+        .border_r_1()
+        .border_t_1()
+        .border_color(th.line)
+        .when(last, |d| d.border_b_1().rounded_b_lg())
+}
+
+/// The scroll region every pane shares: one centred readable column.
+fn pane(id: &'static str, selector: &'static str) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || selector.into())
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .px_6()
+        .py_5()
+        .gap_4()
+}
+
+/// A child of [`pane`]: fills the pane, but never past the readable width.
+fn column() -> Div {
+    div()
+        .w_full()
+        .max_w(px(CONTENT_WIDTH))
+        .mx_auto()
+        .flex_shrink_0()
+}
+
+/// A drawn radio mark: "●"/"○" would come from whichever font is in force, and IBM Plex
+/// Sans has neither, so the fallback drew them at another size.
+fn radio(on: bool, th: &Theme) -> Div {
+    div()
+        .size(px(14.))
+        .flex_none()
+        .rounded_full()
+        .border_1()
+        .border_color(if on { th.accent } else { th.faint })
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(on, |d| {
+            d.child(div().size(px(8.)).rounded_full().bg(th.accent))
+        })
+}
+
 impl SettingsView {
+    /// The filter field (ST-4). Click it, type, and the key list below narrows to the
+    /// actions whose name, description or keys match.
+    fn render_search(&mut self, cx: &mut Context<Self>) -> Div {
+        let th = theme(cx).clone();
+        column()
+            .debug_selector(|| "settings-search".into())
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1p5()
+            .rounded_lg()
+            .border_1()
+            .border_color(th.line)
+            .bg(th.surface)
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.faint)
+                    .child("Filter"),
+            )
+            .child(self.search.clone())
+    }
+
     fn render_keybindings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
+        let density = appearance::density(cx);
         let conflicts = self.overrides.conflicts();
         let changed = self.overrides.0.len();
+        let groups = self.visible_groups();
+        let shown: usize = groups.iter().map(|(_, rows)| rows.len()).sum();
 
-        let mut list = div()
-            .id("settings-keys")
-            .debug_selector(|| "settings-keys".into())
-            .flex()
-            .flex_col()
-            .flex_1()
-            .overflow_y_scroll()
-            .px_4()
-            .py_3()
-            .gap_1();
-
-        list = list.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .pb_2()
-                .child(
-                    div()
-                        .text_size(px(crate::theme::CAPTION_SIZE))
-                        .text_color(th.muted)
-                        .child(if changed == 0 {
-                            "Pick Change, then press the keys you want.".to_string()
-                        } else {
-                            format!(
-                                "Pick Change, then press the keys you want. {changed} changed \
-                                 from the default."
-                            )
-                        }),
+        let hint = if self.query.trim().is_empty() {
+            if changed == 0 {
+                "Click a key, then press the combination you want. Esc keeps the one you had."
+                    .to_string()
+            } else {
+                format!(
+                    "Click a key, then press the combination you want. {changed} changed from \
+                     the default."
                 )
-                .child(
-                    quiet_control("reset-all", "Reset All", &th)
-                        .debug_selector(|| "settings-reset-all".into())
-                        .on_click(cx.listener(|this, _, _, cx| this.reset_all(cx))),
-                ),
-        );
+            }
+        } else {
+            format!(
+                "{shown} of {} shortcuts match “{}”.",
+                CATALOG.len(),
+                self.query.trim()
+            )
+        };
 
-        for (a, b) in &conflicts {
+        let mut list = key_pane("settings-keys", "settings-keys", &self.keys_scroll)
+            .child(
+                column()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(hint),
+                    )
+                    .child(
+                        quiet_control("reset-all", "Reset All", &th)
+                            .debug_selector(|| "settings-reset-all".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.reset_all(cx))),
+                    ),
+            )
+            .child(self.render_search(cx).mt_3());
+
+        if groups.is_empty() {
             list = list.child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .bg(th.danger_bg)
+                column()
+                    .debug_selector(|| "settings-no-match".into())
+                    .mt_4()
+                    .py_4()
                     .text_size(px(crate::theme::CAPTION_SIZE))
-                    .text_color(th.danger)
-                    .child(format!(
-                        "{} and {} are both on {}.",
-                        a.label,
-                        b.label,
-                        pretty_keys(&self.overrides.keys_for(a))
-                    )),
+                    .text_color(th.muted)
+                    .child(format!("No shortcut matches “{}”.", self.query.trim())),
             );
         }
 
-        for &c in Category::all() {
-            let mut any = false;
-            let mut section = div().flex().flex_col().pt_3().gap_0p5();
-            section = section.child(
-                div()
-                    .pb_1()
-                    .text_size(px(crate::theme::CAPTION_SIZE))
-                    .text_color(th.faint)
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(c.label()),
-            );
-            for d in by_category(c) {
-                any = true;
-                section = section.child(self.render_key_row(d, cx));
-            }
-            if any {
-                list = list.child(section);
+        for (c, rows) in &groups {
+            let category = *c;
+            list = list.child(card_top(&th, category.label()).mt_4());
+            for (i, d) in rows.iter().enumerate() {
+                let row = self.render_key_row(d, &conflicts, cx);
+                list = list.child(key_card_row(row, i + 1 == rows.len(), &th, density));
             }
         }
         list
     }
 
-    fn render_key_row(&self, d: &'static ActionDoc, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_key_row(
+        &self,
+        d: &'static ActionDoc,
+        conflicts: &[(&'static ActionDoc, &'static ActionDoc)],
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
         let th = theme(cx).clone();
         let capturing = self.capturing.map(|c| c.action) == Some(d.action);
         let keys = self.overrides.keys_for(d);
         let changed = self.overrides.is_changed(d.action);
-        let chip = if capturing {
+        let flashed = self.flash == Some(d.action);
+        // ST-3: whoever else answers to these keys in the same place, said under the row
+        // itself rather than in a banner at the top of the window.
+        let others: Vec<&'static ActionDoc> = conflicts
+            .iter()
+            .filter_map(|(a, b)| {
+                if a.action == d.action {
+                    Some(*b)
+                } else if b.action == d.action {
+                    Some(*a)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // ST-2: the key chip *is* the control. Click it and it waits for the next
+        // combination; there is no separate Change button to hunt for.
+        let chip = div()
+            .id(SharedString::from(format!("chip-{}", d.action)))
+            .debug_selector(move || format!("settings-chip-{}", d.action))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(if capturing { th.accent } else { th.line })
+            .bg(if capturing { th.banner_bg } else { th.chip_bg })
+            .text_color(if capturing { th.accent } else { th.text })
+            .text_size(px(crate::theme::CAPTION_SIZE))
+            .cursor_pointer()
+            .hover(|x| x.border_color(th.accent))
+            .child(if capturing {
+                "Press keys…".to_string()
+            } else {
+                pretty_keys(&keys)
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.capturing.map(|c| c.action) == Some(d.action) {
+                    this.cancel_capture();
+                    this.status = Some("Left unchanged.".into());
+                    cx.notify();
+                } else {
+                    this.start_capture(d, window, cx);
+                }
+            }));
+
+        // A changed row carries a small undo mark; it puts the catalog default back.
+        let reset = changed.then(|| {
             div()
-                .px_2()
+                .id(SharedString::from(format!("reset-{}", d.action)))
+                .debug_selector(move || format!("settings-reset-{}", d.action))
+                .flex_none()
+                .px_1()
                 .py_0p5()
                 .rounded_md()
-                .bg(th.banner_bg)
-                .text_color(th.accent)
                 .text_size(px(crate::theme::CAPTION_SIZE))
-                .child("Press keys… (esc to keep)")
-        } else {
-            div()
-                .px_2()
-                .py_0p5()
-                .rounded_md()
-                .bg(th.chip_bg)
-                .text_size(px(crate::theme::CAPTION_SIZE))
-                .text_color(th.text)
-                .child(pretty_keys(&keys))
-        };
-        div()
+                .text_color(th.muted)
+                .cursor_pointer()
+                .hover(|x| x.bg(th.hover).text_color(th.text))
+                .child("↺")
+                .on_click(cx.listener(move |this, _, _, cx| this.reset_one(d, cx)))
+        });
+
+        let mut row = div()
+            // The row's id scopes everything inside it (chips, reset marks, clash links):
+            // two rows may link to the same action, and their elements must not share one
+            // GPUI element id.
+            .id(SharedString::from(format!("row-{}", d.action)))
             .debug_selector(move || format!("settings-row-{}", d.action))
             .flex()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .px_3()
-            .py_1p5()
-            .rounded_md()
+            .flex_col()
+            .bg(th.surface)
             .hover(|x| x.bg(th.hover))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .child(div().child(d.label))
-                    .child(
-                        div()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.muted)
-                            .child(d.help),
-                    ),
-            )
+            .when(flashed, |x| x.bg(th.banner_bg))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(chip)
+                    .justify_between()
+                    .gap_4()
                     .child(
-                        quiet_control(
-                            SharedString::from(format!("change-{}", d.action)),
-                            if capturing { "Cancel" } else { "Change" },
-                            &th,
-                        )
-                        .debug_selector(move || format!("settings-change-{}", d.action))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                if this.capturing.map(|c| c.action) == Some(d.action) {
-                                    this.cancel_capture();
-                                    cx.notify();
-                                } else {
-                                    this.start_capture(d, window, cx);
-                                }
-                            },
-                        )),
-                    )
-                    .children(changed.then(|| {
                         div()
-                            .id(SharedString::from(format!("reset-{}", d.action)))
-                            .debug_selector(move || format!("settings-reset-{}", d.action))
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.accent)
-                            .cursor_pointer()
-                            .hover(|x| x.bg(th.hover))
-                            .child("Reset")
-                            .on_click(cx.listener(move |this, _, _, cx| this.reset_one(d, cx)))
-                    })),
-            )
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .child(div().child(d.label))
+                            .child(
+                                div()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
+                                    .text_color(th.muted)
+                                    .child(d.help),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .children(reset)
+                            .child(chip),
+                    ),
+            );
+
+        if !others.is_empty() {
+            let mut line = div()
+                .debug_selector(move || format!("settings-clash-{}", d.action))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .pt_1()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.warning)
+                .child("Also used by");
+            let source = d.action;
+            for (i, other) in others.iter().copied().enumerate() {
+                if i > 0 {
+                    line = line.child(div().child("and"));
+                }
+                line = line.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "clash-{}-{}",
+                            source, other.action
+                        )))
+                        .debug_selector(move || {
+                            format!("settings-clash-link-{}-{}", source, other.action)
+                        })
+                        .underline()
+                        .cursor_pointer()
+                        .hover(|x| x.text_color(th.text))
+                        .child(other.label)
+                        .on_click(cx.listener(move |this, _, _, cx| this.jump_to(other, cx))),
+                );
+            }
+            row = row.child(line);
+        }
+        row
     }
 
     /// The cheat sheet: everything bound right now, grouped the same way as the editor.
+    /// The same filter narrows it, so "what did I put on cmd-shift" has one answer.
     fn render_shortcuts(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
-        let mut list = div()
-            .id("settings-shortcuts")
-            .debug_selector(|| "settings-shortcuts".into())
-            .flex()
-            .flex_col()
-            .flex_1()
-            .overflow_y_scroll()
-            .px_4()
-            .py_3();
-        list = list.child(
-            div()
-                .pb_2()
-                .text_size(px(crate::theme::CAPTION_SIZE))
-                .text_color(th.muted)
-                .child("Every shortcut in the app, as it is bound now."),
+        let density = appearance::density(cx);
+        let groups = self.visible_groups();
+        let shown: usize = groups.iter().map(|(_, rows)| rows.len()).sum();
+        let mut list = key_pane(
+            "settings-shortcuts",
+            "settings-shortcuts",
+            &self.keys_scroll,
         );
-        for &c in Category::all() {
-            let rows = by_category(c).map(|d| {
-                div()
+        if !self.query.trim().is_empty() {
+            list = list.child(
+                column()
+                    .debug_selector(|| "settings-search-count".into())
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(format!(
+                        "{shown} of {} shortcuts match “{}”.",
+                        CATALOG.len(),
+                        self.query.trim()
+                    )),
+            );
+        }
+        list = list.child(
+            self.render_search(cx)
+                .when(!self.query.trim().is_empty(), |d| d.mt_3()),
+        );
+
+        if groups.is_empty() {
+            list = list.child(
+                column()
+                    .debug_selector(|| "settings-no-match".into())
+                    .mt_4()
+                    .py_4()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(format!("No shortcut matches “{}”.", self.query.trim())),
+            );
+        }
+
+        for (c, rows) in &groups {
+            let category = *c;
+            list = list.child(card_top(&th, category.label()).mt_4());
+            for (i, d) in rows.iter().enumerate() {
+                let row = div()
+                    .debug_selector({
+                        let action = d.action;
+                        move || format!("settings-shortcut-{action}")
+                    })
                     .flex()
                     .items_baseline()
                     .justify_between()
                     .gap_4()
-                    .py_0p5()
+                    .bg(th.surface)
+                    .hover(|x| x.bg(th.hover))
                     .child(div().text_size(px(crate::theme::BODY_SIZE)).child(d.label))
                     .child(
                         div()
                             .text_size(px(crate::theme::CAPTION_SIZE))
                             .text_color(th.muted)
                             .child(pretty_keys(&self.overrides.keys_for(d))),
-                    )
-            });
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .pt_3()
-                    .child(
-                        div()
-                            .pb_1()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.faint)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(c.label()),
-                    )
-                    .children(rows),
-            );
+                    );
+                list = list.child(key_card_row(row, i + 1 == rows.len(), &th, density));
+            }
         }
         list
     }
@@ -640,90 +1234,61 @@ impl SettingsView {
     fn render_appearance(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let current = appearance::ui_font(cx);
-        let options = UiFont::ALL.iter().map(|&f| {
+
+        let mut list = pane("settings-appearance", "settings-appearance")
+            .gap_0()
+            .child(card_top(&th, "Font"));
+        for (i, &f) in UiFont::ALL.iter().enumerate() {
             let on = f == current;
-            div()
-                .id(SharedString::from(format!("font-{}", f.key())))
-                .debug_selector(move || format!("settings-font-{}", f.key()))
-                .flex()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .border_1()
-                .border_color(if on { th.accent } else { th.line })
-                .when(on, |d| d.bg(th.chip_bg))
-                .cursor_pointer()
-                .hover(|x| x.bg(th.hover))
-                // A drawn radio mark: "●"/"○" would come from whichever font is in force,
-                // and IBM Plex Sans has neither, so the fallback drew them at another size.
-                .child(
-                    div()
-                        .size(px(14.))
-                        .flex_none()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(if on { th.accent } else { th.faint })
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(on, |d| {
-                            d.child(div().size(px(8.)).rounded_full().bg(th.accent))
-                        }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .child(div().child(f.label()))
-                        // Each sample in its own font, whichever one is in force.
-                        .child(
-                            div()
-                                .font_family(f.family())
-                                .text_color(th.muted)
-                                .child("Bob dug a big bog by the pond, quickly."),
-                        ),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| this.choose_font(f, cx)))
-        });
-        let options: Vec<_> = options.collect();
+            list = list.child(appearance_row(
+                div()
+                    .id(SharedString::from(format!("font-{}", f.key())))
+                    .debug_selector(move || format!("settings-font-{}", f.key()))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .when(on, |d| d.bg(th.chip_bg))
+                    .cursor_pointer()
+                    .hover(|x| x.bg(th.hover))
+                    .child(radio(on, &th))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .child(div().child(f.label()))
+                            // Each sample in its own font, whichever one is in force.
+                            .child(
+                                div()
+                                    .font_family(f.family())
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
+                                    .text_color(th.muted)
+                                    .child("Bob dug a big bog by the pond, quickly."),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_font(f, cx))),
+                i + 1 == UiFont::ALL.len(),
+                &th,
+            ));
+        }
+
         let sidebar_width = appearance::right_sidebar_width(cx);
         let current_density = appearance::density(cx);
-        let densities: Vec<_> = Density::ALL
-            .iter()
-            .map(|&d| {
-                let on = d == current_density;
-                let th = th.clone();
+        list = list.child(card_top(&th, "Density").mt_4());
+        for (i, &d) in Density::ALL.iter().enumerate() {
+            let on = d == current_density;
+            let th = th.clone();
+            list = list.child(appearance_row(
                 div()
                     .id(SharedString::from(format!("density-{}", d.key())))
                     .debug_selector(move || format!("settings-density-{}", d.key()))
                     .flex()
                     .items_center()
                     .gap_3()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if on { th.accent } else { th.line })
                     .when(on, |x| x.bg(th.chip_bg))
                     .cursor_pointer()
                     .hover(|x| x.bg(th.hover))
-                    .child(
-                        div()
-                            .size(px(14.))
-                            .flex_none()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(if on { th.accent } else { th.faint })
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(on, |x| {
-                                x.child(div().size(px(8.)).rounded_full().bg(th.accent))
-                            }),
-                    )
+                    .child(radio(on, &th))
                     .child(
                         div()
                             .flex()
@@ -742,122 +1307,224 @@ impl SettingsView {
                                     }),
                             ),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.choose_density(d, cx)))
-            })
-            .collect();
-        div()
-            .id("settings-appearance")
-            .debug_selector(|| "settings-appearance".into())
-            .flex()
-            .flex_col()
-            .flex_1()
-            .overflow_y_scroll()
-            .px_4()
-            .py_3()
-            .gap_2()
-            .child(
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_density(d, cx))),
+                i + 1 == Density::ALL.len(),
+                &th,
+            ));
+        }
+
+        // LR-4: how many children a Linked Reference shows inline, then PG-1's attribute
+        // rows, both local preferences.
+        let current_children = appearance::ref_children(cx);
+        list = list.child(card_top(&th, "References").mt_4());
+        list = list.child(appearance_row(
+            div()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted)
+                .child(
+                    "How many children a Linked Reference shows inline. 0 keeps them all \
+                     behind its \"+N more\" chip.",
+                ),
+            false,
+            &th,
+        ));
+        list = list.child(appearance_row(
+            {
+                let mut row = div().flex().items_center().gap_2().child(
+                    div()
+                        .flex_none()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.muted)
+                        .child("Children shown"),
+                );
+                for n in 0..=appearance::REF_CHILDREN_MAX {
+                    let on = n == current_children;
+                    let th = th.clone();
+                    row = row.child(
+                        div()
+                            .id(SharedString::from(format!("ref-children-{n}")))
+                            .debug_selector(move || format!("settings-ref-children-{n}"))
+                            .w(px(40.))
+                            .py_1()
+                            .flex()
+                            .justify_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if on { th.accent } else { th.line })
+                            .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
+                            .when(!on, |d| d.text_color(th.muted))
+                            .cursor_pointer()
+                            .hover(|x| x.bg(th.hover))
+                            .child(n.to_string())
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.choose_ref_children(n, cx)),
+                            ),
+                    );
+                }
+                row
+            },
+            false,
+            &th,
+        ));
+        list = list.child(appearance_row(
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(div().child("Attribute blocks"))
+                .child(
+                    div()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.muted)
+                        .child(
+                            "A page's key:: value blocks also appear in the metadata header. \
+                             Compact rows draw them once, quietly, under it.",
+                        ),
+                ),
+            false,
+            &th,
+        ));
+        let current_attributes = appearance::attribute_blocks(cx);
+        for (i, &a) in AttributeBlocks::ALL.iter().enumerate() {
+            let on = a == current_attributes;
+            list = list.child(appearance_row(
                 div()
-                    .w_full()
-                    .max_w(px(HELP_WIDTH))
+                    .id(SharedString::from(format!("attributes-{}", a.key())))
+                    .debug_selector(move || format!("settings-attributes-{}", a.key()))
                     .flex()
-                    .flex_col()
-                    .gap_2()
+                    .items_center()
+                    .gap_3()
+                    .when(on, |x| x.bg(th.chip_bg))
+                    .cursor_pointer()
+                    .hover(|x| x.bg(th.hover))
+                    .child(radio(on, &th))
                     .child(
                         div()
-                            .pt_3()
-                            .pb_1()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.faint)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Font"),
-                    )
-                    .child(div().text_size(px(crate::theme::CAPTION_SIZE)).text_color(th.muted).child(
-                        "Used for your notes and the interface, in every window, as soon as \
-                         you pick it. Code blocks stay in Menlo.",
-                    ))
-                    .children(options)
-                    .child(
-                        div()
-                            .pt_4()
-                            .pb_1()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.faint)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Density"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.muted)
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .child(div().child(a.label()))
                             .child(
-                                "How much space your notes take. Local to this machine, \
-                                 kept in settings.json, never synced.",
+                                div()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
+                                    .text_color(th.muted)
+                                    .child(a.hint()),
                             ),
                     )
-                    .children(densities)
-                    // RS-4: the width the sidebar's drag handle set. The handle is the
-                    // control; this row reports it and offers a way back to the default.
-                    .child(
-                        div()
-                            .pt_4()
-                            .pb_1()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.faint)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Right sidebar"),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(move || {
-                                format!("settings-sidebar-width-{}", sidebar_width.round() as i32)
-                            })
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.muted)
-                            .child(format!(
-                                "Width: {} px. Drag the sidebar's left edge to resize it; the \
-                                 width is kept in settings.json and never synced.",
-                                sidebar_width.round() as i32
-                            )),
-                    )
-                    .child(
-                        div().pt_1().child(
-                            quiet_control(
-                                "sidebar-reset",
-                                format!(
-                                    "Reset to {} px",
-                                    appearance::RIGHT_SIDEBAR_DEFAULT_WIDTH as i32
-                                ),
-                                &th,
-                            )
-                            .debug_selector(|| "settings-sidebar-reset".into())
-                            .on_click(cx.listener(|this, _, _, cx| this.reset_sidebar_width(cx))),
-                        ),
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.choose_attribute_blocks(a, cx)),
                     ),
+                i + 1 == AttributeBlocks::ALL.len(),
+                &th,
+            ));
+        }
+
+        // SB-3: the pages pinned to the sidebar live in settings.json.
+        let pinned = appearance::pinned(cx).len();
+        list = list.child(card_top(&th, "Pinned pages").mt_4());
+        list = list.child(appearance_row(
+            div()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted)
+                .child(
+                    "Pages pinned to the top of the sidebar (SB-3). Local to this machine, \
+                     kept in settings.json, never synced.",
+                ),
+            false,
+            &th,
+        ));
+        list = list.child(appearance_row(
+            div()
+                .debug_selector(|| "settings-pinned".into())
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .child(
+                    div()
+                        .text_color(if pinned == 0 { th.muted } else { th.text })
+                        .child(match pinned {
+                            0 => "No pinned pages".to_string(),
+                            1 => "1 pinned page".to_string(),
+                            n => format!("{n} pinned pages"),
+                        }),
+                )
+                .when(pinned > 0, |d| {
+                    d.child(
+                        quiet_control("settings-clear-pinned", "Clear", &th)
+                            .debug_selector(|| "settings-clear-pinned".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_pins(cx))),
+                    )
+                }),
+            true,
+            &th,
+        ));
+
+        // RS-4: the width the sidebar's drag handle set. The handle is the control; this
+        // row reports it and offers a way back to the default.
+        list = list.child(card_top(&th, "Right sidebar").mt_4());
+        list = list.child(appearance_row(
+            div()
+                .debug_selector(move || {
+                    format!("settings-sidebar-width-{}", sidebar_width.round() as i32)
+                })
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted)
+                .child(format!(
+                    "Width: {} px. Drag the sidebar's left edge to resize it; the width is \
+                     kept in settings.json and never synced.",
+                    sidebar_width.round() as i32
+                )),
+            false,
+            &th,
+        ));
+        list.child(appearance_row(
+            quiet_control(
+                "sidebar-reset",
+                format!(
+                    "Reset to {} px",
+                    appearance::RIGHT_SIDEBAR_DEFAULT_WIDTH as i32
+                ),
+                &th,
             )
+            .debug_selector(|| "settings-sidebar-reset".into())
+            .on_click(cx.listener(|this, _, _, cx| this.reset_sidebar_width(cx))),
+            true,
+            &th,
+        ))
     }
 
+    /// The tour: one readable column of prose, with the topics as chips above it. The old
+    /// second column of topics is gone now that the tabs themselves are a list at the left
+    /// (ST-5); the screenshots get the full 720 px column instead of a clipped half.
     fn render_help(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let selected = self.topic.min(TOPICS.len().saturating_sub(1));
-        let nav = TOPICS.iter().enumerate().map(|(i, t)| {
-            let on = i == selected;
-            div()
-                .id(SharedString::from(format!("help-nav-{i}")))
-                .debug_selector(move || format!("help-nav-{i}"))
-                .px_3()
-                .py_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .text_size(px(crate::theme::BODY_SIZE))
-                .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
-                .when(!on, |d| d.text_color(th.text).hover(|x| x.bg(th.hover)))
-                .child(t.title)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.topic = i;
-                    cx.notify();
-                }))
-        });
-        let nav: Vec<_> = nav.collect();
+        let nav: Vec<_> = TOPICS
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let on = i == selected;
+                div()
+                    .id(SharedString::from(format!("help-nav-{i}")))
+                    .debug_selector(move || format!("help-nav-{i}"))
+                    .px_2()
+                    .py_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(crate::theme::CONTROL_SIZE))
+                    .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
+                    .when(!on, |d| {
+                        d.text_color(th.muted)
+                            .hover(|x| x.bg(th.hover).text_color(th.text))
+                    })
+                    .child(t.title)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.topic = i;
+                        cx.notify();
+                    }))
+            })
+            .collect();
 
         let t = &TOPICS[selected];
         let shortcuts: Vec<_> = t
@@ -889,70 +1556,156 @@ impl SettingsView {
 
         // `w_full` first, then `max_w`: a flex child's width is only definite once it is
         // told to fill its parent, and without a definite width the prose does not wrap.
-        let mut column = div()
-            .w_full()
-            .max_w(px(HELP_WIDTH))
+        let mut body = column()
             .flex()
             .flex_col()
             .gap_3()
+            .child(div().flex().flex_wrap().gap_1().children(nav))
             .child(
                 div()
+                    .pt_3()
                     .text_size(px(crate::theme::H1_SIZE))
                     .font_weight(FontWeight::BOLD)
                     .child(t.title),
             )
             .child(div().text_color(th.muted).child(t.summary));
         for p in t.body {
-            column = column.child(div().text_size(px(crate::theme::BODY_SIZE)).child(*p));
+            body = body.child(div().text_size(px(crate::theme::BODY_SIZE)).child(*p));
         }
         if !shortcuts.is_empty() {
-            column = column.child(div().flex().flex_wrap().gap_3().pt_1().children(shortcuts));
+            body = body.child(div().flex().flex_wrap().gap_3().pt_1().children(shortcuts));
         }
         if let Some(image) = shot_image(t) {
-            column = column.child(
-                div().debug_selector(|| "help-shot".into()).pt_2().child(
-                    img(image)
-                        .w(px(HELP_SHOT_WIDTH))
-                        .h(px(HELP_SHOT_HEIGHT))
-                        .rounded_md()
-                        .border_1()
-                        .border_color(th.line),
-                ),
+            body = body.child(
+                div()
+                    .debug_selector(|| "help-shot".into())
+                    .w(px(HELP_SHOT_WIDTH))
+                    .flex_none()
+                    .pt_2()
+                    .child(
+                        img(image)
+                            .w(px(HELP_SHOT_WIDTH))
+                            .h(px(HELP_SHOT_HEIGHT))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(th.line),
+                    ),
             );
         }
-        let detail = div()
-            .id("help-detail")
-            .debug_selector(|| "help-detail".into())
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w(px(0.))
-            .overflow_y_scroll()
-            .px_6()
-            .py_4()
-            .child(column);
+        pane("help-detail", "help-detail").child(body)
+    }
 
-        div()
-            .flex()
-            .flex_row()
-            .flex_1()
-            .overflow_hidden()
-            .child(
+    /// Settings → Sync (ST-5): what the transport in force is, and how it is set up. Read
+    /// only on purpose: the relay URL, token and passphrase are resolved from the
+    /// environment and the keychain at launch (§12), and secrets are never echoed here or
+    /// written to `settings.json` (§15.6, rule 9).
+    fn render_sync(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let th = theme(cx).clone();
+        let density = appearance::density(cx);
+        let facts = sync_runner::facts(cx);
+        let (status, status_help) = if facts.is_on() {
+            (
+                "Sync is on for this graph.",
+                "Page changes are exchanged in the background; the sidebar of the main \
+                 window shows the latest round.",
+            )
+        } else {
+            (
+                "Sync is off for this graph.",
+                "Utopia is local-only: nothing leaves this machine unless you start it with \
+                 a sync target.",
+            )
+        };
+        let transport = facts
+            .target
+            .clone()
+            .unwrap_or_else(|| "Local only (no relay, no shared folder)".to_string());
+        let encryption = if !facts.is_on() {
+            "Nothing to encrypt: sync is off"
+        } else if facts.encrypted {
+            "End-to-end encrypted: the relay only sees ciphertext"
+        } else {
+            "Not encrypted: a relay can read page payloads"
+        };
+
+        let mut this_graph = card(&th)
+            .debug_selector(|| "settings-sync".into())
+            .child(card_title(&th, "This graph"))
+            .child(card_row(
                 div()
-                    .id("help-nav")
                     .flex()
                     .flex_col()
-                    .w(px(260.))
-                    .flex_none()
-                    .overflow_y_scroll()
-                    .border_r_1()
-                    .border_color(th.line)
-                    .bg(th.sidebar_bg)
-                    .px_2()
-                    .py_3()
                     .gap_0p5()
-                    .children(nav),
-            )
-            .child(detail)
+                    .child(div().text_size(px(crate::theme::BODY_SIZE)).child(status))
+                    .child(
+                        div()
+                            .text_size(px(crate::theme::CAPTION_SIZE))
+                            .text_color(th.muted)
+                            .child(status_help),
+                    ),
+                0,
+                &th,
+                density,
+            ))
+            .child(card_row(
+                fact_row("Transport", transport, &th)
+                    .debug_selector(|| "settings-sync-transport".into()),
+                1,
+                &th,
+                density,
+            ))
+            .child(card_row(
+                fact_row(
+                    "Graph id",
+                    facts.graph.clone().unwrap_or_else(|| "unknown".to_string()),
+                    &th,
+                ),
+                2,
+                &th,
+                density,
+            ))
+            .child(card_row(
+                fact_row("Encryption", encryption.to_string(), &th),
+                3,
+                &th,
+                density,
+            ));
+
+        this_graph = this_graph.child(card_row(
+            div()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted)
+                .child(
+                    "Sync is configured when Utopia starts, not in this window: \
+                     UTOPIA_SYNC_URL (or `lan`) for a relay, UTOPIA_SYNC_FOLDER for a shared \
+                     folder. The relay token and the end-to-end passphrase come from the \
+                     environment or the macOS keychain (services utopia-sync and \
+                     utopia-sync-passphrase), never from the graph.",
+                ),
+            4,
+            &th,
+            density,
+        ));
+
+        let how = card(&th)
+            .debug_selector(|| "settings-sync-how".into())
+            .child(card_title(&th, "How it is set up"))
+            .child(card_row(
+                div()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(
+                        "Nothing on this pane is written down: settings.json holds only \
+                         local preferences, and the graph holds no token. Restart Utopia \
+                         with different variables to point it somewhere else.",
+                    ),
+                0,
+                &th,
+                density,
+            ));
+
+        pane("settings-sync-pane", "settings-sync-pane")
+            .child(this_graph)
+            .child(how)
     }
 }

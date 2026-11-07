@@ -311,6 +311,13 @@ impl Root {
             }
             Ok(store) => {
                 paths::remember_graph(&self.config, &path);
+                // Settings → Sync can name the graph even when sync is off; the transport
+                // is filled in below when one is configured.
+                cx.set_global(utopia_ui::sync_runner::SyncFacts {
+                    target: None,
+                    graph: Some(paths::graph_id(&path)),
+                    encrypted: false,
+                });
                 let plugins = self.config.join("plugins");
                 let app = cx.new(|_| {
                     let mut a = AppState::new(store);
@@ -361,12 +368,14 @@ impl Root {
                                 graph,
                                 passphrase: std::env::var("UTOPIA_SYNC_PASSPHRASE").ok(),
                             };
-                            ws.update(cx, |w, cx| w.enable_sync(cfg, cx));
+                            ws.update(cx, |w, cx| w.start_sync(cfg, cx));
                             self._lan = Some(relay);
                         }
                         Err(e) => eprintln!("utopia: LAN relay failed: {e}"),
                     }
                 } else if let Some(cfg) = paths::sync_config(&path) {
+                    // Settings → Sync reports the transport only once a runner exists; for
+                    // LAN that is after discovery, not when the config is read (ST-5).
                     let lan = matches!(&cfg.target, utopia_ui::sync_runner::SyncTarget::Relay { url, .. } if url == "lan");
                     if lan {
                         // Discover on a background thread; startup never waits on the network.
@@ -389,13 +398,13 @@ impl Root {
                                     {
                                         *u = url;
                                     }
-                                    ws2.update(cx, |w, cx| w.enable_sync(cfg, cx));
+                                    ws2.update(cx, |w, cx| w.start_sync(cfg, cx));
                                 }
                                 None => eprintln!("utopia: no LAN relay found for {}", cfg.graph),
                             });
                         }));
                     } else {
-                        ws.update(cx, |w, cx| w.enable_sync(cfg, cx));
+                        ws.update(cx, |w, cx| w.start_sync(cfg, cx));
                     }
                 }
                 // Links and the automation API run on the main thread against the same

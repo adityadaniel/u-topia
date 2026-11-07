@@ -84,7 +84,7 @@ impl Store {
             rows
         };
         work.keys.extend(keys);
-        projector.reresolve(&work)?;
+        projector.reresolve(&mut work)?;
         Ok(())
     }
 

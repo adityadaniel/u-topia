@@ -41,7 +41,8 @@ dir), the only `*.utopia` in `~/Documents/Utopia`; otherwise onboarding asks for
 both env vars at a scratch folder when trying the app so you never touch the user's real graph.
 `settings.json` holds local UI preferences (never synced, rule 9), a versioned object:
 `{"version": 1, "font": "system" | "ibm-plex-sans", "density": "comfortable" | "compact",
-"right_sidebar_width": 380.0, "pinned_pages": []}` (`utopia_ui::appearance`); a missing file or
+"ref_children": 2, "attribute-blocks": "compact" | "blocks", "pinned": [],
+"right_sidebar_width": 380.0}` (`utopia_ui::appearance`); a missing file or
 an unknown value means the default, logged; it is written atomically and keeps keys it does
 not know.
 
@@ -65,7 +66,8 @@ Steps (`;` or newline separated): `keys <k…>`, `type <text>` (lines are trimme
 after `type` keeps a leading one), `wait <ms>`, `scroll <dy>` (a real AppKit wheel event in the
 main pane; negative scrolls down), `click <x> <y>` (a real AppKit left click in points
 from the top left of the content, so halve a Retina PNG's pixels and take off the 28 pt title
-bar), `shot <png>`, `drop <file>` (as
+bar), `hover <x> <y>` (move the pointer there without pressing, for hover states), `shot <png>`,
+`drop <file>` (as
 from Finder),
 `ws open-pdf` / `ws highlight <page> <x> <y> <w> <h>` (area) / `ws select <page> <x0> <y0> <x1> <y1>`
 (text selection), `target main|last` (which window the steps after it drive and capture —

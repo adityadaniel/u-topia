@@ -162,6 +162,34 @@ impl Store {
         Ok(id)
     }
 
+    /// Append an empty root block to a draft day, in memory only (FR-1.2): the click that
+    /// starts writing must not write the day, even when a journal template already gave it
+    /// blocks. Nothing is queued, projected or flushed; the first keystroke promotes the
+    /// whole draft, this block included, in one write.
+    pub fn draft_append_block(&mut self, page: &PageId) -> Result<BlockId> {
+        if !self.is_draft(page) {
+            return Err(StoreError::Invalid("not a draft day".into()));
+        }
+        let after = self.page_state(page)?.last_child(None, false);
+        let id = BlockId::new();
+        let now = self.now();
+        let entry = self
+            .docs
+            .get_mut(page)
+            .ok_or_else(|| StoreError::NotFound(format!("draft {page}")))?;
+        entry.doc.apply(
+            &Command::InsertBlock {
+                id: id.clone(),
+                parent: None,
+                after,
+                text: String::new(),
+                kind: BlockKind::Bullet,
+            },
+            now,
+        )?;
+        Ok(id)
+    }
+
     /// Daily pages dated `from..=to`, drafts included: what the Daily Notes feed shows for
     /// those days (the rest are blank days, written only if you type on them).
     pub fn days_between(

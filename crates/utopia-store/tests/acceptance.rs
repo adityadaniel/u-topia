@@ -869,3 +869,314 @@ fn reopening_mid_session_sees_writer_commits() {
         vec![("from the writer thread".to_string(), 0)]
     );
 }
+
+/// SR-1: each hit carries the byte ranges of the matched terms in the plain text the
+/// palette draws, so the view never has to scan for them (and never marks a bracket the
+/// renderer hides). Prefixes match at a word start, as the FTS tokenizer does.
+#[test]
+fn sr_1_search_marks_the_matched_terms() {
+    let mut s = store();
+    let p = s.create_page("Notes").unwrap();
+    write(
+        &mut s,
+        &p,
+        "The **zebra** crossing and [[Zebra Crossing]] again",
+    );
+    write(&mut s, &p, "bathes in the sun");
+    let hits = s.search_blocks("zeb", 5).unwrap();
+    assert_eq!(hits.len(), 1);
+    let plain = utopia_core::inline::plain_text(&hits[0].text);
+    let marked: Vec<&str> = hits[0].anchors.iter().map(|&(a, b)| &plain[a..b]).collect();
+    assert_eq!(marked, vec!["zebra", "Zebra"], "{plain:?}");
+    // The ranges are the ones gpui's StyledText requires: sorted and non-overlapping.
+    assert!(hits[0].anchors.windows(2).all(|w| w[0].1 <= w[1].0));
+    assert!(
+        s.search_blocks("thes", 5).unwrap().is_empty(),
+        "a match inside a word is not the index's match either"
+    );
+    // Two terms merge into one painted run rather than a nested highlight.
+    let both = utopia_store::match_anchors("zebra crossing", "zeb cross");
+    assert_eq!(both, vec![(0, 5), (6, 14)], "the whole word is washed");
+}
+
+/// SR-2: results sit under a header per page, with that page's blocks in one group and
+/// the page's title/daily flag from the index.
+#[test]
+fn sr_2_search_groups_results_by_page() {
+    let mut s = store();
+    let a = s.create_page("Atlas").unwrap();
+    write(&mut s, &a, "atlas launch plan");
+    write(&mut s, &a, "atlas risks");
+    let b = s.create_page("Notes").unwrap();
+    write(&mut s, &b, "the atlas is late");
+    let groups = s.search_groups("atlas", 30).unwrap();
+    assert_eq!(groups.len(), 2, "{groups:?}");
+    assert!(!groups[0].daily && !groups[1].daily);
+    let atlas = groups.iter().find(|g| g.title == "Atlas").unwrap();
+    assert_eq!(atlas.page, a);
+    assert_eq!(atlas.hits.len(), 2);
+    assert!(atlas.hits.iter().all(|h| h.page == a));
+    let notes = groups.iter().find(|g| g.title == "Notes").unwrap();
+    assert_eq!(notes.page, b);
+    assert_eq!(notes.hits.len(), 1);
+}
+
+/// SR-3: the scope chips narrow to daily pages, ordinary pages or to-dos, and the age
+/// menu drops hits older than the window. A daily hit is dated by its day, other blocks
+/// by the local date of their last edit.
+#[test]
+fn sr_3_search_scopes_and_age() {
+    use utopia_core::BlockKind;
+    use utopia_store::{SearchAge, SearchScope};
+
+    // Seed at local noon so "the block was edited today" holds in every timezone.
+    let ts = |y, m, d, h| {
+        date(y, m, d)
+            .and_hms_opt(h, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap()
+            .timestamp_millis()
+    };
+    let mut s = store();
+    s.set_clock(Some(ts(2026, 11, 2, 12)));
+    let atlas = s.create_page("Atlas").unwrap();
+    write(&mut s, &atlas, "atlas launch");
+    let (day, db) = s.open_daily(date(2026, 11, 2)).unwrap();
+    s.set_block_text(&day, &db, "atlas daily note", None, None)
+        .unwrap();
+    s.commit_block(&day, &db).unwrap();
+    let work = s.create_page("Work").unwrap();
+    let todo = write(&mut s, &work, "atlas todo");
+    s.set_block_kind(&work, &todo, BlockKind::Todo, false)
+        .unwrap();
+
+    // An older block, written before the window.
+    s.set_clock(Some(ts(2026, 10, 1, 12)));
+    let old = s.create_page("Old").unwrap();
+    write(&mut s, &old, "atlas old");
+    s.set_clock(Some(ts(2026, 11, 2, 12)));
+    s.sync_index().unwrap();
+
+    let pages = |s: &Store, scope, age| -> Vec<String> {
+        let mut v: Vec<String> = s
+            .search_blocks_filtered("atlas", scope, age, 50)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.page_title)
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        pages(&s, SearchScope::All, SearchAge::AnyTime),
+        vec!["Atlas", "November 2nd, 2026", "Old", "Work"]
+    );
+    assert_eq!(
+        pages(&s, SearchScope::Journal, SearchAge::AnyTime),
+        vec!["November 2nd, 2026"]
+    );
+    assert_eq!(
+        pages(&s, SearchScope::Pages, SearchAge::Today),
+        vec!["Atlas", "Work"],
+        "the October note is outside Today"
+    );
+    assert_eq!(
+        pages(&s, SearchScope::Todos, SearchAge::AnyTime),
+        vec!["Work"]
+    );
+    let daily = s
+        .search_groups_filtered("atlas", SearchScope::Journal, SearchAge::Today, 30)
+        .unwrap();
+    assert_eq!(daily.len(), 1);
+    assert!(daily[0].daily && daily[0].hits.len() == 1);
+    assert_eq!(
+        s.search_blocks_filtered("atlas", SearchScope::All, SearchAge::Year, 50)
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+/// SR-4: the preview of a search hit carries its path from the root, its state and its
+/// first children (with the total count), read from the index rather than at paint time.
+#[test]
+fn sr_4_preview_has_path_children_and_state() {
+    use utopia_core::BlockKind;
+
+    let mut s = store();
+    let p = s.create_page("Atlas").unwrap();
+    let parent = write(&mut s, &p, "Risks");
+    let plan = outline::append_block(s.page_state(&p).unwrap(), Some(&parent));
+    let hit = run(&mut s, &p, plan).unwrap();
+    s.set_block_text(&p, &hit, "zebra migration is late", None, None)
+        .unwrap();
+    s.set_block_kind(&p, &hit, BlockKind::Todo, true).unwrap();
+    // A couple of children under the hit, one more than the preview lists.
+    for i in 0..(utopia_store::PREVIEW_CHILDREN + 1) {
+        let plan = outline::append_block(s.page_state(&p).unwrap(), Some(&hit));
+        let c = run(&mut s, &p, plan).unwrap();
+        s.set_block_text(&p, &c, &format!("child {i}"), None, None)
+            .unwrap();
+    }
+    s.sync_index().unwrap();
+    let preview = s.preview_block(&hit).unwrap().expect("a live block");
+    assert_eq!(preview.page, p);
+    assert_eq!(preview.page_title, "Atlas");
+    assert!(!preview.daily);
+    assert_eq!(preview.path.len(), 1, "the parent above the hit");
+    assert_eq!(preview.path[0].1, "Risks");
+    assert_eq!((preview.kind, preview.checked), (BlockKind::Todo, true));
+    assert_eq!(
+        preview.child_count,
+        utopia_store::PREVIEW_CHILDREN + 1,
+        "the count is the whole list"
+    );
+    assert_eq!(
+        preview.children.len(),
+        utopia_store::PREVIEW_CHILDREN,
+        "the pane lists the first few"
+    );
+    assert_eq!(preview.children[0].text, "child 0");
+    // No panic on user data: a missing block is `None`, never an error.
+    assert!(s.preview_block(&BlockId("nope".into())).unwrap().is_none());
+}
+
+/// SR-3: the age window is part of the query. A pile of older matches must not starve the
+/// candidate list: 305 October blocks used to fill the 10x over-fetch before one Today
+/// block was ever looked at, so Today came back empty.
+#[test]
+fn sr_3_age_window_is_applied_before_the_limit() {
+    use utopia_store::{SearchAge, SearchScope};
+
+    let ts = |m, d, h| {
+        date(2026, m, d)
+            .and_hms_opt(h, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap()
+            .timestamp_millis()
+    };
+    let mut s = store();
+    s.set_clock(Some(ts(11, 2, 12)));
+    let (day, b) = s.open_daily(date(2026, 11, 2)).unwrap();
+    s.set_block_text(&day, &b, "zebra newest", None, None)
+        .unwrap();
+    s.commit_block(&day, &b).unwrap();
+
+    s.set_clock(Some(ts(10, 1, 12)));
+    let old = s.create_page("Archive").unwrap();
+    for i in 0..305 {
+        write(&mut s, &old, &format!("zebra old {i}"));
+    }
+    s.set_clock(Some(ts(11, 2, 12)));
+    s.sync_index().unwrap();
+
+    let hits = s
+        .search_blocks_filtered("zebra", SearchScope::All, SearchAge::Today, 30)
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.page == day),
+        "Today must still find the day's block (got {} hits)",
+        hits.len()
+    );
+}
+
+/// SR-3: Today and the past windows end today. A future daily page (reachable through
+/// day navigation) must not pass Today or Past week/month/year; Any time still has it.
+#[test]
+fn sr_3_age_window_excludes_future_days() {
+    use utopia_store::{SearchAge, SearchScope};
+
+    let mut s = store();
+    let (today, b) = s.open_daily(date(2026, 11, 2)).unwrap();
+    s.set_block_text(&today, &b, "zebra today", None, None)
+        .unwrap();
+    s.commit_block(&today, &b).unwrap();
+    let (tomorrow, b) = s.open_daily(date(2026, 11, 3)).unwrap();
+    s.set_block_text(&tomorrow, &b, "zebra tomorrow", None, None)
+        .unwrap();
+    s.commit_block(&tomorrow, &b).unwrap();
+    s.sync_index().unwrap();
+
+    let days = |age| -> Vec<Option<NaiveDate>> {
+        let mut d: Vec<_> = s
+            .search_blocks_filtered("zebra", SearchScope::All, age, 30)
+            .unwrap()
+            .into_iter()
+            .map(|h| s.page_row(&h.page).unwrap().and_then(|p| p.daily_date))
+            .collect();
+        d.sort();
+        d
+    };
+    assert_eq!(
+        days(SearchAge::Today),
+        vec![Some(date(2026, 11, 2))],
+        "tomorrow is not Today"
+    );
+    assert_eq!(
+        days(SearchAge::Week),
+        vec![Some(date(2026, 11, 2))],
+        "nor in the past week"
+    );
+    assert_eq!(
+        days(SearchAge::AnyTime),
+        vec![Some(date(2026, 11, 2)), Some(date(2026, 11, 3))],
+        "Any time is unrestricted"
+    );
+}
+
+/// SB-1: the sidebar's muted count says how much was written on a day, so an empty day
+/// (kept only for a link into it) counts zero and a blank row never counts.
+#[test]
+fn sb_1_journal_counts_written_blocks() {
+    let mut s = store();
+    let (p, first) = s.open_daily(date(2026, 11, 2)).unwrap();
+    s.set_block_text(&p, &first, "one", None, None).unwrap();
+    write(&mut s, &p, "two");
+    let blank = write(&mut s, &p, "");
+    assert!(
+        s.page_state(&p).unwrap().block(&blank).unwrap().live,
+        "the blank block exists but is not written on"
+    );
+    assert_eq!(s.page_block_count(&p).unwrap(), 2);
+    let entry = s.journal(14).unwrap().remove(0);
+    assert_eq!(entry.page.id, p);
+    assert_eq!(entry.blocks, 2);
+    assert_eq!(
+        entry.preview.len(),
+        2,
+        "the preview still has one line per block"
+    );
+}
+
+/// SB-2: a page with no blocks of its own that only hashtags point at is a tag page;
+/// `[[link]]` references (and a page with a block of its own) are ordinary pages.
+#[test]
+fn sb_2_hashtag_only_pages_are_marked() {
+    let mut s = store();
+    let (day, b) = s.open_daily(date(2026, 11, 2)).unwrap();
+    s.set_block_text(
+        &day,
+        &b,
+        "#atlas and [[Atlas Launch]] and #[[deep work]]",
+        None,
+        None,
+    )
+    .unwrap();
+    s.commit_block(&day, &b).unwrap();
+    s.sync_index().unwrap();
+    let tags = s.hashtag_only_pages().unwrap();
+    let atlas = s.find_page("atlas").unwrap().expect("the tag made a page");
+    let deep = s.find_page("deep work").unwrap().expect("a multi-word tag");
+    let linked = s.find_page("Atlas Launch").unwrap().unwrap();
+    assert!(tags.contains(&atlas), "{tags:?}");
+    assert!(tags.contains(&deep), "{tags:?}");
+    assert!(!tags.contains(&linked), "a [[link]] page is not a tag page");
+    // Writing on a tag page makes it an ordinary page; the list is display-only.
+    write(&mut s, &atlas, "notes about the atlas");
+    assert!(!s.hashtag_only_pages().unwrap().contains(&atlas));
+    assert_doctor(&mut s);
+}

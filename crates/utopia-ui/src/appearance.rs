@@ -1,5 +1,5 @@
 //! Appearance preferences (Settings → Appearance): which font the notes and the interface
-//! are set in, how tightly blocks are set, and the shape of the right sidebar.
+//! are set in.
 //!
 //! They live in `<config dir>/settings.json`, next to `keymap.json` and resolved the same way
 //! (`UTOPIA_CONFIG_DIR`). Window and UI preferences are local to the machine and never sync
@@ -11,29 +11,40 @@
 //!   "version": 1,
 //!   "font": "system",
 //!   "density": "comfortable",
-//!   "right_sidebar_width": 380.0,
-//!   "pinned_pages": []
+//!   "ref_children": 2,
+//!   "pinned": [],
+//!   "attribute-blocks": "compact",
+//!   "right_sidebar_width": 380.0
 //! }
 //! ```
 //!
 //! `font` is `"system"` (the default) or `"ibm-plex-sans"`; `density` is
-//! `"comfortable"` (the default) or `"compact"` (ALL-5); `right_sidebar_width` is the width
-//! the right sidebar was dragged to (RS-4); `pinned_pages` lists the page ids kept in the
-//! right sidebar's Pinned tab, most recent first (RS-3). A missing file means
-//! defaults; an unreadable file, an unknown value or a newer version is logged and read as
-//! far as it can be, never a panic (rule 11). Keys this version does not know are kept when
-//! the file is rewritten, so a newer release's preferences survive a round trip through an
-//! older one.
+//! `"comfortable"` (the default) or `"compact"` (ALL-5); `ref_children` is how many
+//! children a Linked Reference shows inline, 0 to `REF_CHILDREN_MAX` (LR-4, default 2,
+//! 0 folds every child behind the "+N more" chip); `pinned` is the list of page ids the
+//! sidebars keep, in the order they were pinned — one list shared by the left sidebar's
+//! Pinned group (SB-3) and the right sidebar's Pinned tab (RS-3); `attribute-blocks` is
+//! `"compact"` (the default) or `"blocks"` (PG-1); `right_sidebar_width` is the width that
+//! sidebar was dragged to (RS-4). A missing file
+//! means defaults; an
+//! unreadable file, an unknown value or a newer version is logged and read as far as it can
+//! be, never a panic (rule 11). Keys this version does not know are kept when the file is
+//! rewritten, so a newer release's preferences survive a round trip through an older one.
 
 use gpui::{App, Global, SharedString};
 use serde_json::{Map, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use utopia_core::PageId;
 
 use crate::fonts::{register_ibm_plex_sans, IBM_PLEX_SANS};
 use crate::theme::{BODY_SIZE, LINE_HEIGHT};
 
 pub const FILE: &str = "settings.json";
 pub const VERSION: u64 = 1;
+/// How many children a Linked Reference shows inline by default (LR-4).
+pub const DEFAULT_REF_CHILDREN: usize = 2;
+/// The largest "Children shown in references" the Appearance tab offers.
+pub const REF_CHILDREN_MAX: usize = 3;
 
 /// The font the UI and notes are set in. Code blocks stay in Menlo either way.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -145,17 +156,65 @@ pub fn clamp_sidebar_width(width: f32) -> f32 {
     }
 }
 
+/// How a page draws its `Key:: value` root blocks (PG-1). The metadata header always keeps
+/// the projection; this only decides whether the blocks are also drawn in full.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttributeBlocks {
+    /// One compact "key · value" row per attribute, in the muted colour (the default).
+    #[default]
+    Compact,
+    /// The ordinary outline blocks, as before the setting existed.
+    Blocks,
+}
+
+impl AttributeBlocks {
+    pub const ALL: &'static [AttributeBlocks] =
+        &[AttributeBlocks::Compact, AttributeBlocks::Blocks];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            AttributeBlocks::Compact => "compact",
+            AttributeBlocks::Blocks => "blocks",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|a| a.key() == key)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AttributeBlocks::Compact => "Compact rows",
+            AttributeBlocks::Blocks => "As blocks",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            AttributeBlocks::Compact => {
+                "One muted \"key · value\" row per attribute, under the metadata header."
+            }
+            AttributeBlocks::Blocks => "The attribute blocks themselves, as before.",
+        }
+    }
+}
+
 /// What `settings.json` holds.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
     pub font: UiFont,
     pub density: Density,
+    /// Children shown inline under a referencing block (LR-4); 0 folds them all.
+    pub ref_children: usize,
+    /// How a page draws its `key:: value` blocks (PG-1).
+    pub attribute_blocks: AttributeBlocks,
+    /// Page ids kept at the top of the sidebar, in the order they were pinned (SB-3), and
+    /// listed in the right sidebar's Pinned tab (RS-3). Local state: a pin is a pointer to
+    /// a page, not a property of the page, so it never goes into a CRDT shard (rule 9).
+    pub pinned: Vec<PageId>,
     /// How wide the right sidebar is, in points (RS-4). Clamped to
     /// [`RIGHT_SIDEBAR_MIN_WIDTH`]..=[`RIGHT_SIDEBAR_MAX_WIDTH`] when read and written.
     pub right_sidebar_width: f32,
-    /// Pages pinned in the right sidebar's Pinned tab (RS-3), most recent first. Ids are
-    /// stable across renames; one from another graph simply does not resolve.
-    pub pinned_pages: Vec<String>,
     /// Keys this version does not understand, written back untouched.
     rest: Map<String, Value>,
 }
@@ -165,8 +224,10 @@ impl Default for Prefs {
         Self {
             font: UiFont::default(),
             density: Density::default(),
+            ref_children: DEFAULT_REF_CHILDREN,
+            attribute_blocks: AttributeBlocks::default(),
+            pinned: Vec::new(),
             right_sidebar_width: RIGHT_SIDEBAR_DEFAULT_WIDTH,
-            pinned_pages: Vec::new(),
             rest: Map::new(),
         }
     }
@@ -239,24 +300,63 @@ impl Prefs {
                 RIGHT_SIDEBAR_DEFAULT_WIDTH
             }
         };
-        let pinned_pages = match rest.remove("pinned_pages") {
-            None => Vec::new(),
-            Some(Value::Array(items)) => items
-                .into_iter()
-                .filter_map(|v| match v {
-                    Value::String(s) => Some(s),
-                    other => {
-                        warnings.push(format!(
-                            "{FILE}: pinned_pages holds {other}, which is not a page id; \
-                             skipping it"
-                        ));
-                        None
-                    }
-                })
-                .collect(),
+        let ref_children = match rest.remove("ref_children") {
+            None => DEFAULT_REF_CHILDREN,
+            Some(Value::Number(n)) => match n.as_u64() {
+                Some(n) if n <= REF_CHILDREN_MAX as u64 => n as usize,
+                _ => {
+                    warnings.push(format!(
+                        "{FILE}: ref_children should be 0 to {REF_CHILDREN_MAX}, not {n}; \
+                         using {DEFAULT_REF_CHILDREN}"
+                    ));
+                    DEFAULT_REF_CHILDREN
+                }
+            },
             Some(v) => {
                 warnings.push(format!(
-                    "{FILE}: pinned_pages should be a list, not {v}; starting empty"
+                    "{FILE}: ref_children should be a number, not {v}; \
+                     using {DEFAULT_REF_CHILDREN}"
+                ));
+                DEFAULT_REF_CHILDREN
+            }
+        };
+        let attribute_blocks = match rest.remove("attribute-blocks") {
+            None => AttributeBlocks::default(),
+            Some(Value::String(s)) => AttributeBlocks::from_key(&s).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "{FILE}: unknown attribute-blocks {s:?}; using compact rows"
+                ));
+                AttributeBlocks::default()
+            }),
+            Some(v) => {
+                warnings.push(format!(
+                    "{FILE}: attribute-blocks should be a string, not {v}; using compact rows"
+                ));
+                AttributeBlocks::default()
+            }
+        };
+        let pinned = match rest.remove("pinned") {
+            None => Vec::new(),
+            Some(Value::Array(items)) => {
+                let mut pinned: Vec<PageId> = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::String(id) if !id.is_empty() => {
+                            let id = PageId(id);
+                            if !pinned.contains(&id) {
+                                pinned.push(id);
+                            }
+                        }
+                        other => warnings.push(format!(
+                            "{FILE}: ignoring pinned page {other}; page ids are strings"
+                        )),
+                    }
+                }
+                pinned
+            }
+            Some(v) => {
+                warnings.push(format!(
+                    "{FILE}: pinned should be a list of page ids, not {v}; using none"
                 ));
                 Vec::new()
             }
@@ -265,8 +365,10 @@ impl Prefs {
             Self {
                 font,
                 density,
+                ref_children,
+                attribute_blocks,
+                pinned,
                 right_sidebar_width,
-                pinned_pages,
                 rest,
             },
             warnings,
@@ -283,13 +385,17 @@ impl Prefs {
             serde_json::Number::from_f64(clamp_sidebar_width(self.right_sidebar_width) as f64)
                 .map_or(Value::Null, Value::Number),
         );
+        m.insert("ref_children".into(), self.ref_children.into());
         m.insert(
-            "pinned_pages".into(),
+            "attribute-blocks".into(),
+            self.attribute_blocks.key().into(),
+        );
+        m.insert(
+            "pinned".into(),
             Value::Array(
-                self.pinned_pages
+                self.pinned
                     .iter()
-                    .cloned()
-                    .map(Value::String)
+                    .map(|p| Value::String(p.as_str().to_string()))
                     .collect(),
             ),
         );
@@ -324,10 +430,10 @@ impl Prefs {
 #[derive(Default)]
 pub struct Appearance {
     pub prefs: Prefs,
+    /// Where `settings.json` lives (set by [`install`]); empty in tests that never install
+    /// one, where preferences still apply for the session but are not written.
+    config_dir: PathBuf,
     plex_registered: bool,
-    /// Where `settings.json` lives, so a view that owns a preference (the right sidebar's
-    /// pinned pages, RS-3) can write it without being handed the path.
-    config_dir: Option<std::path::PathBuf>,
 }
 
 impl Global for Appearance {}
@@ -341,8 +447,8 @@ pub fn install(cx: &mut App, config_dir: &Path) -> Vec<String> {
     let font = prefs.font;
     cx.set_global(Appearance {
         prefs,
+        config_dir: config_dir.to_path_buf(),
         plex_registered: false,
-        config_dir: Some(config_dir.to_path_buf()),
     });
     apply(cx, font);
     warnings
@@ -359,16 +465,10 @@ pub fn font_family(cx: &App) -> SharedString {
     ui_font(cx).family().into()
 }
 
-/// Write the preferences in force to the installed `settings.json`. A view that changed one
-/// calls this; a failed write is returned, not fatal (the choice still holds this session).
-pub fn remember(cx: &mut App) -> std::io::Result<()> {
-    cx.refresh_windows();
-    let appearance = cx.default_global::<Appearance>();
-    match appearance.config_dir.clone() {
-        Some(dir) => appearance.prefs.save(&dir),
-        // No settings file (tests, early startup): the preference still applies here.
-        None => Ok(()),
-    }
+/// The density in force. Comfortable when nothing was installed (tests, early startup).
+pub fn density(cx: &App) -> Density {
+    cx.try_global::<Appearance>()
+        .map_or(Density::default(), |a| a.prefs.density)
 }
 
 /// The right sidebar's width in force (RS-4). 380 when nothing was installed.
@@ -393,34 +493,68 @@ pub fn reset_right_sidebar_width(cx: &mut App, config_dir: &Path) -> std::io::Re
     cx.global::<Appearance>().prefs.save(config_dir)
 }
 
-/// The pages pinned in the right sidebar's Pinned tab, most recent first (RS-3).
-pub fn pinned_pages(cx: &App) -> Vec<String> {
+/// How many children a Linked Reference shows inline (LR-4), clamped to the offered range.
+pub fn ref_children(cx: &App) -> usize {
     cx.try_global::<Appearance>()
-        .map(|a| a.prefs.pinned_pages.clone())
-        .unwrap_or_default()
+        .map_or(DEFAULT_REF_CHILDREN, |a| a.prefs.ref_children)
+        .min(REF_CHILDREN_MAX)
 }
 
-/// Pin `page`, or unpin it when it is already pinned (RS-3). Local UI state, kept in
-/// `settings.json` (rule 9): it never enters a CRDT shard and never syncs.
-pub fn toggle_pinned_page(cx: &mut App, page: &str) {
-    {
-        let appearance = cx.default_global::<Appearance>();
-        match appearance.prefs.pinned_pages.iter().position(|p| p == page) {
-            Some(i) => {
-                appearance.prefs.pinned_pages.remove(i);
-            }
-            None => appearance.prefs.pinned_pages.insert(0, page.to_string()),
+/// How pages draw their attribute blocks (PG-1). Compact rows when nothing was installed.
+pub fn attribute_blocks(cx: &App) -> AttributeBlocks {
+    cx.try_global::<Appearance>()
+        .map_or(AttributeBlocks::default(), |a| a.prefs.attribute_blocks)
+}
+
+/// Pages pinned to the top of the sidebar, in pin order (SB-3). Empty when nothing was
+/// installed (tests, early startup).
+pub fn pinned(cx: &App) -> Vec<PageId> {
+    cx.try_global::<Appearance>()
+        .map_or_else(Vec::new, |a| a.prefs.pinned.clone())
+}
+
+pub fn is_pinned(cx: &App, page: &PageId) -> bool {
+    cx.try_global::<Appearance>()
+        .is_some_and(|a| a.prefs.pinned.contains(page))
+}
+
+/// Pin or unpin `page` (SB-3) and remember it in `settings.json`. Returns the new state.
+/// A failed write is returned, not fatal: the pin still applies for this session (rule 11).
+pub fn toggle_pinned(cx: &mut App, page: &PageId) -> std::io::Result<bool> {
+    let a = cx.default_global::<Appearance>();
+    let on = match a.prefs.pinned.iter().position(|p| p == page) {
+        Some(i) => {
+            a.prefs.pinned.remove(i);
+            false
         }
-    }
-    if let Err(e) = remember(cx) {
-        eprintln!("utopia: {FILE}: {e}");
-    }
+        None => {
+            a.prefs.pinned.push(page.clone());
+            true
+        }
+    };
+    let saved = remember(cx);
+    // The sidebar and an open page menu both show the pin state.
+    cx.refresh_windows();
+    saved.map(|()| on)
 }
 
-/// The density in force. Comfortable when nothing was installed (tests, early startup).
-pub fn density(cx: &App) -> Density {
-    cx.try_global::<Appearance>()
-        .map_or(Density::default(), |a| a.prefs.density)
+/// Unpin every page (Settings → Appearance). Returns whether a write failed.
+pub fn clear_pinned(cx: &mut App) -> std::io::Result<()> {
+    cx.default_global::<Appearance>().prefs.pinned.clear();
+    let saved = remember(cx);
+    cx.refresh_windows();
+    saved
+}
+
+/// Write the preferences in force to the installed `settings.json`; nothing to do for a
+/// test that never installed a config dir. A view that owns a preference (a pin, the right
+/// sidebar's dragged width, RS-4) calls this instead of being handed the path.
+pub fn remember(cx: &mut App) -> std::io::Result<()> {
+    let a = cx.default_global::<Appearance>();
+    if a.config_dir.as_os_str().is_empty() {
+        return Ok(());
+    }
+    a.prefs.save(&a.config_dir)
 }
 
 /// Switch font in every open window now, and remember it in `config_dir/settings.json`.
@@ -435,6 +569,24 @@ pub fn set_density(cx: &mut App, density: Density, config_dir: &Path) -> std::io
     cx.default_global::<Appearance>().prefs.density = density;
     cx.refresh_windows();
     cx.global::<Appearance>().prefs.save(config_dir)
+}
+
+/// Change how many children a reference shows inline (LR-4) and remember it. Open reference
+/// panels notice the change on their next render and rebuild their rows.
+pub fn set_ref_children(cx: &mut App, count: usize, config_dir: &Path) -> std::io::Result<()> {
+    cx.default_global::<Appearance>().prefs.ref_children = count.min(REF_CHILDREN_MAX);
+    cx.refresh_windows();
+    cx.global::<Appearance>().prefs.save(config_dir)
+}
+
+/// Switch attribute blocks in every open window now and remember it (PG-1). Unlike the font
+/// and density this can be set from the page itself, so the save goes through the config
+/// dir `install` recorded; a test that never installed one stays in memory.
+pub fn set_attribute_blocks(cx: &mut App, value: AttributeBlocks) -> std::io::Result<()> {
+    cx.default_global::<Appearance>().prefs.attribute_blocks = value;
+    let saved = remember(cx);
+    cx.refresh_windows();
+    saved
 }
 
 /// Make `font` drawable: the bundled faces are handed to gpui the first time they are
@@ -463,8 +615,10 @@ mod tests {
         let p = Prefs {
             font: UiFont::IbmPlexSans,
             density: Density::Compact,
+            ref_children: 0,
+            attribute_blocks: AttributeBlocks::Blocks,
+            pinned: vec![PageId("page-a".into()), PageId("page-b".into())],
             right_sidebar_width: 420.0,
-            pinned_pages: vec!["page-1".into(), "page-2".into()],
             ..Default::default()
         };
         let json = p.to_json();
@@ -475,11 +629,50 @@ mod tests {
                 "version": 1,
                 "font": "ibm-plex-sans",
                 "density": "compact",
+                "ref_children": 0,
+                "attribute-blocks": "blocks",
+                "pinned": ["page-a", "page-b"],
                 "right_sidebar_width": 420.0,
-                "pinned_pages": ["page-1", "page-2"],
             })
         );
         assert_eq!(Prefs::from_json(&json), (p, vec![]));
+    }
+
+    /// PG-1: attribute blocks default to compact rows, and a value this version does not
+    /// know is the default with a warning, not a crash (rule 11).
+    #[test]
+    fn attribute_blocks_default_to_compact() {
+        let (p, warnings) = Prefs::from_json("{}");
+        assert_eq!(p.attribute_blocks, AttributeBlocks::Compact);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (p, _) = Prefs::from_json(r#"{"version": 1, "attribute-blocks": "blocks"}"#);
+        assert_eq!(p.attribute_blocks, AttributeBlocks::Blocks);
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "attribute-blocks": "hidden"}"#);
+        assert_eq!(p.attribute_blocks, AttributeBlocks::Compact);
+        assert!(warnings[0].contains("hidden"), "{warnings:?}");
+    }
+
+    /// SB-3: pins are page ids in `settings.json`, in pin order; a repeated id counts once
+    /// and anything that is not a page id is skipped with a warning, never a panic.
+    #[test]
+    fn pinned_pages_round_trip_and_degrade() {
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned": ["a", "a", "b"]}"#);
+        assert!(
+            warnings.is_empty(),
+            "a repeated id is not an error: {warnings:?}"
+        );
+        assert_eq!(p.pinned, [PageId("a".into()), PageId("b".into())]);
+        let v: Value = serde_json::from_str(&p.to_json()).unwrap();
+        assert_eq!(v["pinned"], serde_json::json!(["a", "b"]));
+
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned": ["a", 3, ""]}"#);
+        assert_eq!(p.pinned, [PageId("a".into())], "only page ids survive");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned": "a"}"#);
+        assert!(p.pinned.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(Prefs::default().pinned, Vec::<PageId>::new());
     }
 
     /// Rule 11: whatever is in the file, the app comes up, on System, and says why.
@@ -502,6 +695,29 @@ mod tests {
     fn missing_keys_are_defaults_without_complaint() {
         assert_eq!(Prefs::from_json("{}"), (Prefs::default(), vec![]));
         assert_eq!(Prefs::default().density, Density::Comfortable);
+        assert_eq!(
+            Prefs::default().ref_children,
+            DEFAULT_REF_CHILDREN,
+            "LR-4: two children inline unless the user says otherwise"
+        );
+        assert_eq!(DEFAULT_REF_CHILDREN, 2);
+    }
+
+    /// LR-4: a bad "Children shown in references" value falls back to 2 and says so; 0 is a
+    /// real choice (fold every child behind the chip), not a missing value.
+    #[test]
+    fn ref_children_is_read_and_bounded() {
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "ref_children": 0}"#);
+        assert_eq!(p.ref_children, 0);
+        assert!(warnings.is_empty());
+        let (p, _) = Prefs::from_json(r#"{"version": 1, "ref_children": 3}"#);
+        assert_eq!(p.ref_children, 3);
+        for bad in ["12", "-1", "\"two\"", "true"] {
+            let (p, warnings) =
+                Prefs::from_json(&format!(r#"{{"version": 1, "ref_children": {bad}}}"#));
+            assert_eq!(p.ref_children, DEFAULT_REF_CHILDREN, "{bad}");
+            assert_eq!(warnings.len(), 1, "{bad}: {warnings:?}");
+        }
     }
 
     /// RS-4: the sidebar width is clamped to what the layout can show, and junk is the
@@ -529,20 +745,6 @@ mod tests {
             serde_json::from_str::<Value>(&p.to_json()).unwrap()["right_sidebar_width"],
             serde_json::json!(RIGHT_SIDEBAR_MAX_WIDTH as f64)
         );
-    }
-
-    /// RS-3: the pinned list is a list of page ids; anything else is skipped, not fatal.
-    #[test]
-    fn pinned_pages_survive_a_round_trip_and_reject_junk() {
-        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned_pages": ["a", 3, "b"]}"#);
-        assert_eq!(p.pinned_pages, ["a", "b"]);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned_pages": "a"}"#);
-        assert!(p.pinned_pages.is_empty());
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned_pages": ["x"]}"#);
-        assert_eq!(p.pinned_pages, ["x"]);
-        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     /// An unknown density is the comfortable one, said out loud, never a panic (rule 11).

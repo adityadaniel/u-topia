@@ -5,6 +5,7 @@
 //! structural edits), and [`IndexUpdated`] fires once the writer has made them durable so
 //! reference panels can re-query.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use gpui::{Context, EventEmitter, Subscription, Task};
@@ -37,6 +38,10 @@ pub struct AppState {
     pub notice: Option<String>,
     /// Plugins from `<config>/plugins` (P2), offered in the slash menu.
     pub plugins: Vec<std::rc::Rc<utopia_plugin::Plugin>>,
+    /// Pages that exist only because of a `#tag` (SB-2), cached from the index. Views read
+    /// this; the classification query runs at startup and on [`IndexUpdated`], never in a
+    /// render (rule 10).
+    pub tag_pages: HashSet<PageId>,
     dirty_since: Option<Instant>,
     flush_task: Option<Task<()>>,
     wait_task: Option<Task<()>>,
@@ -51,6 +56,9 @@ impl AppState {
         if let Err(e) = store.set_debounced(true) {
             eprintln!("utopia: {e}");
         }
+        // Classify once at startup; each commit publishes the new set with the job (SB-2),
+        // so neither the sidebar's render nor an index update runs the query (rule 10).
+        let tag_pages = store.hashtag_only_pages().unwrap_or_default();
         Self {
             store,
             version: 0,
@@ -58,6 +66,7 @@ impl AppState {
             last_error: None,
             notice: None,
             plugins: Vec::new(),
+            tag_pages,
             dirty_since: None,
             flush_task: None,
             wait_task: None,
@@ -123,6 +132,12 @@ impl AppState {
 
     fn index_updated(&mut self, cx: &mut Context<Self>) {
         self.refs_version += 1;
+        // The commit that just landed published the tag-page classification with it (SB-2):
+        // take that copy. Re-classifying here would put a whole-graph query on the UI thread
+        // after every keystroke flush (§15.1, rule 10).
+        if let Some(pages) = self.store.tag_pages() {
+            self.tag_pages = pages;
+        }
         cx.emit(IndexUpdated);
         cx.notify();
     }

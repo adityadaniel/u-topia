@@ -27,6 +27,48 @@ pub struct SyncConfig {
     pub passphrase: Option<String>,
 }
 
+/// What Settings → Sync can say about the transport in force (§12, ST-5): where it goes and
+/// whether the payloads are encrypted. Built from [`SyncConfig`], with the bearer token left
+/// out on purpose — secrets never reach the UI, `settings.json` or a screenshot (§15.6).
+/// The app installs it once the config is resolved; with no global installed (tests, a
+/// headless run) sync reads as off.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncFacts {
+    /// Human-readable transport, e.g. "Relay · https://relay.example" or "Folder · /…".
+    pub target: Option<String>,
+    /// The graph's id, which the relay uses to find its pages.
+    pub graph: Option<String>,
+    pub encrypted: bool,
+}
+
+impl gpui::Global for SyncFacts {}
+
+impl SyncFacts {
+    pub fn from_config(cfg: &SyncConfig) -> Self {
+        let target = match &cfg.target {
+            SyncTarget::Relay { url, .. } if url == "lan" => {
+                "Relay · LAN, discovered with mDNS".to_string()
+            }
+            SyncTarget::Relay { url, .. } => format!("Relay · {url}"),
+            SyncTarget::Folder(dir) => format!("Folder · {}", dir.display()),
+        };
+        Self {
+            target: Some(target),
+            graph: Some(cfg.graph.clone()),
+            encrypted: cfg.passphrase.is_some(),
+        }
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.target.is_some()
+    }
+}
+
+/// The sync facts in force; sync off when the app has installed none.
+pub fn facts(cx: &gpui::App) -> SyncFacts {
+    cx.try_global::<SyncFacts>().cloned().unwrap_or_default()
+}
+
 pub type BoxTransport = Box<dyn Transport + Send>;
 
 /// Build the transport stack for a config: relay or folder, optionally encrypted.
@@ -122,6 +164,46 @@ pub fn exchange_owned(
     (r, t)
 }
 
+/// What the sidebar's single sync dot says (SB-4): grey when sync is off, green when the
+/// last round finished, amber while a round is in flight or still connecting, red when the
+/// relay refused, was unreachable or speaks another protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncDot {
+    Off,
+    Synced,
+    Syncing,
+    Error,
+}
+
+impl SyncDot {
+    /// Spelled into the element's debug selector, so a test can tell the states apart.
+    pub fn key(self) -> &'static str {
+        match self {
+            SyncDot::Off => "off",
+            SyncDot::Synced => "synced",
+            SyncDot::Syncing => "syncing",
+            SyncDot::Error => "error",
+        }
+    }
+}
+
+pub fn sync_dot(runner: Option<&SyncRunner>) -> SyncDot {
+    let Some(runner) = runner else {
+        return SyncDot::Off;
+    };
+    // The transport is checked out of the runner while the background thread exchanges.
+    if runner.transport.is_none() {
+        return SyncDot::Syncing;
+    }
+    match runner.status {
+        None => SyncDot::Syncing,
+        Some(SyncStatus::Synced { .. }) => SyncDot::Synced,
+        Some(SyncStatus::Offline { .. })
+        | Some(SyncStatus::NeedsAuth)
+        | Some(SyncStatus::Unsupported) => SyncDot::Error,
+    }
+}
+
 /// Human status line for the sidebar.
 pub fn status_line(status: Option<&SyncStatus>, now_ms: i64) -> (String, bool) {
     match status {
@@ -148,6 +230,63 @@ pub fn status_line(status: Option<&SyncStatus>, now_ms: i64) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ST-5: Settings → Sync shows where the graph goes, and never the token or the
+    /// passphrase that got it there (§15.6).
+    #[test]
+    fn sync_facts_never_carry_secrets() {
+        let cfg = SyncConfig {
+            target: SyncTarget::Relay {
+                url: "https://relay.example".into(),
+                token: Some("t0ken".into()),
+            },
+            graph: "graph-1".into(),
+            passphrase: Some("p4ssphrase".into()),
+        };
+        let facts = SyncFacts::from_config(&cfg);
+        assert_eq!(
+            facts.target.as_deref(),
+            Some("Relay · https://relay.example")
+        );
+        assert_eq!(facts.graph.as_deref(), Some("graph-1"));
+        assert!(facts.encrypted);
+        let shown = format!("{facts:?}");
+        assert!(!shown.contains("t0ken"), "{shown}");
+        assert!(!shown.contains("p4ssphrase"), "{shown}");
+
+        let folder = SyncConfig {
+            target: SyncTarget::Folder("/tmp/shared notes".into()),
+            graph: "graph-2".into(),
+            passphrase: None,
+        };
+        let facts = SyncFacts::from_config(&folder);
+        assert_eq!(facts.target.as_deref(), Some("Folder · /tmp/shared notes"));
+        assert!(!facts.encrypted);
+
+        assert!(!SyncFacts::default().is_on(), "no config means sync is off");
+    }
+
+    #[test]
+    fn the_dot_tells_off_synced_syncing_and_error_apart() {
+        assert_eq!(sync_dot(None), SyncDot::Off);
+        // A runner with a transport and no round yet is connecting.
+        let engine = utopia_sync::SyncEngine::new(&utopia_store::Store::open_in_memory().unwrap())
+            .expect("engine");
+        let transport: BoxTransport = Box::new(utopia_sync::relay::RelayTransport::new(
+            utopia_sync::relay::Relay::new(),
+            "g",
+        ));
+        let mut runner = SyncRunner::new(engine, transport);
+        assert_eq!(sync_dot(Some(&runner)), SyncDot::Syncing);
+        runner.status = Some(SyncStatus::Synced { at_ms: 0 });
+        assert_eq!(sync_dot(Some(&runner)), SyncDot::Synced);
+        runner.status = Some(SyncStatus::Offline { queued: 2 });
+        assert_eq!(sync_dot(Some(&runner)), SyncDot::Error);
+        // An exchange in flight wins over the last round's status.
+        runner.status = Some(SyncStatus::Synced { at_ms: 0 });
+        runner.transport = None;
+        assert_eq!(sync_dot(Some(&runner)), SyncDot::Syncing);
+    }
 
     #[test]
     fn status_lines() {
