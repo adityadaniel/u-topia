@@ -28,9 +28,14 @@ fixed (each fix has a failing-first test; see the commit list).
 - **The discarded id stays a session alias.** `Store::redirect(&PageId)` maps it to the
   survivor; `load_doc`/`execute_multi` follow it (reads and writes keep working), `AppState`
   resolves it in `changed()` and emits `PageReplaced { from, to }`, and `BlockEditor` and
-  `PageView` retarget themselves. `import_batch` drops the alias when a shard for the old id
+  `PageView` retarget themselves. A stale draft retired for a day that sync already owns
+  (`draft_daily`/`ensure_daily_page`) records the same alias, and the store queues the
+  replacement for `changed()` to announce even when the caller named no page. `id_taken`
+  reserves an id that is still an alias, so a recreated day gets a fresh id instead of being
+  shadowed by the survivor. `import_batch` drops the alias when a shard for the old id
   arrives, because the id is a page of its own again and identity logic must not act on the
-  day instead. Undo steps are pointed at the survivor too (`execute_multi`), so undo commits.
+  day instead. Undo steps *and their saved carets* are pointed at the survivor
+  (`execute_multi`), so undo/redo commit and keep the editor on a row the view draws.
 
 Issues, as numbered below:
 
