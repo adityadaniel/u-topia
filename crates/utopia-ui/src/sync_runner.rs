@@ -199,7 +199,8 @@ pub fn sync_dot(runner: Option<&SyncRunner>) -> SyncDot {
     match runner.status {
         None => SyncDot::Syncing,
         Some(SyncStatus::Synced { .. }) => SyncDot::Synced,
-        Some(SyncStatus::Offline { .. })
+        Some(SyncStatus::Partial { .. })
+        | Some(SyncStatus::Offline { .. })
         | Some(SyncStatus::NeedsAuth)
         | Some(SyncStatus::Unsupported) => SyncDot::Error,
     }
@@ -219,6 +220,17 @@ pub fn status_line(status: Option<&SyncStatus>, now_ms: i64) -> (String, bool) {
                 format!("{}h ago", secs / 3600)
             };
             (format!("Synced {ago}"), false)
+        }
+        Some(SyncStatus::Partial { failed, queued }) => {
+            let pages = if *failed == 1 { "page" } else { "pages" };
+            if *queued == 0 {
+                (format!("● Synced — {failed} {pages} could not sync"), true)
+            } else {
+                (
+                    format!("● {failed} {pages} could not sync — {queued} changes queued"),
+                    true,
+                )
+            }
         }
         Some(SyncStatus::Offline { queued }) => {
             (format!("● Offline — {queued} changes queued"), true)
@@ -283,6 +295,11 @@ mod tests {
         assert_eq!(sync_dot(Some(&runner)), SyncDot::Synced);
         runner.status = Some(SyncStatus::Offline { queued: 2 });
         assert_eq!(sync_dot(Some(&runner)), SyncDot::Error);
+        runner.status = Some(SyncStatus::Partial {
+            failed: 1,
+            queued: 0,
+        });
+        assert_eq!(sync_dot(Some(&runner)), SyncDot::Error);
         // An exchange in flight wins over the last round's status.
         runner.status = Some(SyncStatus::Synced { at_ms: 0 });
         runner.transport = None;
@@ -324,5 +341,23 @@ mod tests {
         let (s, warn) = status_line(Some(&SyncStatus::Offline { queued: 3 }), 0);
         assert_eq!(s, "● Offline — 3 changes queued");
         assert!(warn);
+        // A reachable relay that could not take one page is not "offline".
+        let (s, warn) = status_line(
+            Some(&SyncStatus::Partial {
+                failed: 1,
+                queued: 0,
+            }),
+            0,
+        );
+        assert_eq!(s, "● Synced — 1 page could not sync");
+        assert!(warn);
+        let (s, _) = status_line(
+            Some(&SyncStatus::Partial {
+                failed: 2,
+                queued: 5,
+            }),
+            0,
+        );
+        assert_eq!(s, "● 2 pages could not sync — 5 changes queued");
     }
 }

@@ -22,7 +22,7 @@ pub mod relay;
 /// The v1 wire format, shared with the relay server.
 pub use utopia_proto as wire;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -293,23 +293,42 @@ impl SyncReport {
 /// Status shown in the sidebar (§9.2, §9.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncStatus {
-    Synced { at_ms: i64 },
-    Offline { queued: usize },
+    Synced {
+        at_ms: i64,
+    },
+    /// The relay was reachable and the round applied what it could, but some pages failed:
+    /// not "Offline" (the network is up), and not plain "Synced" either (§12.6).
+    Partial {
+        failed: usize,
+        queued: usize,
+    },
+    Offline {
+        queued: usize,
+    },
     NeedsAuth,
     Unsupported,
 }
 
 impl SyncStatus {
     pub fn from_result(r: &Result<SyncReport>, store: &Store) -> Self {
+        let queued = || store.outbox_pending(usize::MAX >> 1).map_or(0, |v| v.len());
         match r {
             Ok(r) if r.failed.is_empty() => SyncStatus::Synced { at_ms: store.now() },
+            Ok(r) => {
+                let failed = r
+                    .failed
+                    .iter()
+                    .map(|f| f.page.clone())
+                    .collect::<BTreeSet<_>>()
+                    .len();
+                SyncStatus::Partial {
+                    failed,
+                    queued: queued(),
+                }
+            }
             Err(SyncError::Unauthorized) => SyncStatus::NeedsAuth,
             Err(SyncError::ProtocolVersion(_)) => SyncStatus::Unsupported,
-            // A round can import some pages and fail others: it is not "Synced", the
-            // remaining outbox rows are still waiting.
-            Ok(_) | Err(_) => SyncStatus::Offline {
-                queued: store.outbox_pending(usize::MAX >> 1).map_or(0, |v| v.len()),
-            },
+            Err(_) => SyncStatus::Offline { queued: queued() },
         }
     }
 }

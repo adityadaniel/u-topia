@@ -557,6 +557,28 @@ fn encrypted_device(
     (s, c)
 }
 
+/// §9.3/§12.6: a reachable relay that could not take one page is a partial round, not
+/// "Offline with 0 changes queued" and not a plain success.
+#[test]
+fn ac_12_6_a_partial_round_has_its_own_status() {
+    let store = Store::open_in_memory().unwrap();
+    let report = utopia_sync::SyncReport {
+        pushed: 2,
+        failed: vec![utopia_sync::Failure {
+            page: None,
+            kind: utopia_sync::FailureKind::Transport("HTTP 400".into()),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        SyncStatus::from_result(&Ok(report), &store),
+        SyncStatus::Partial {
+            failed: 1,
+            queued: 0
+        }
+    );
+}
+
 /// §12.6: a page this device cannot read (here: plaintext left by a device without the
 /// passphrase) must not stop every other page's pull, nor lose their cursors.
 #[test]
