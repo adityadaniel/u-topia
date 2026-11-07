@@ -3190,6 +3190,60 @@ fn daily_notes_feed_scrolls_into_older_days(cx: &mut TestAppContext) {
     assert_eq!(daily_count(&app, cx), 26);
 }
 
+/// FR-1.1/FR-1.2: the feed lists every calendar day back to the oldest daily page and
+/// then stops. Without a terminal state the sentinel kept asking for another batch for
+/// as long as it was laid out, walking back through empty years.
+#[gpui::test]
+fn fr_1_1_feed_stops_at_the_oldest_daily_page(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // One page, older than the first batch, so there is something to load.
+    let oldest = today() - chrono::Duration::days(23);
+    app.update(cx, |app, _| {
+        let (p, b) = app.store.open_daily(oldest).unwrap();
+        app.store
+            .set_block_text(&p, &b, "the first note", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    // Scroll far past the last real day.
+    for _ in 0..20 {
+        scroll_main(cx, -4000.);
+    }
+    let pages = ws.update(cx, |w, cx| w.journal_days(cx));
+    assert_eq!(pages.len(), 2, "today's draft and the only written day");
+    assert_eq!(pages[0], today_page(&app, cx), "today comes first");
+    // The end of the feed is a terminal state, not an endless sentinel.
+    assert!(
+        cx.debug_bounds("feed-end").is_some(),
+        "the feed says it has no earlier notes once the oldest day is loaded"
+    );
+    let shown = ws
+        .update(cx, |w, cx| w.journal_shown_through(cx))
+        .expect("in the feed");
+    assert!(
+        shown <= oldest,
+        "the oldest day is inside the loaded window: {shown} vs {oldest}"
+    );
+    assert!(
+        shown > oldest - chrono::Duration::days(10),
+        "stops within one batch of the oldest day, not years past it: {shown}"
+    );
+    // Scrolling on asks for nothing more: the window is final.
+    for _ in 0..5 {
+        scroll_main(cx, -4000.);
+    }
+    assert_eq!(
+        ws.update(cx, |w, cx| w.journal_shown_through(cx)),
+        Some(shown),
+        "an exhausted feed never loads another batch"
+    );
+    // Nothing was created by scrolling (FR-1.2).
+    assert_eq!(daily_count(&app, cx), 1);
+}
+
 fn scroll_main(cx: &mut VisualTestContext, dy: f32) {
     let main = cx.debug_bounds("main-pane").expect("main pane");
     cx.simulate_event(gpui::ScrollWheelEvent {

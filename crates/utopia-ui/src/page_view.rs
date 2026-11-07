@@ -191,6 +191,9 @@ enum Item {
     },
     /// The end of the loaded days; older ones load when it comes into view.
     JournalEnd,
+    /// The end of the feed (FR-1.2): the oldest daily page is loaded, so no older day
+    /// can hold anything. Drawn instead of [`Item::JournalEnd`].
+    JournalExhausted,
 }
 
 /// A day heading in the feed, kept so the sticky header can find the day at the top of
@@ -233,13 +236,19 @@ enum Feed {
         shown_through: NaiveDate,
         want_through: NaiveDate,
     },
+    /// Every calendar day back to the oldest live daily page is loaded, so there is
+    /// nothing older to ask for. Recomputed on each rebuild: a page created or arriving
+    /// by sync re-opens the feed instead of latching it shut.
+    Exhausted { shown_through: NaiveDate },
 }
 
 impl Feed {
     /// How far back the loaded window reaches.
     fn shown_through(&self) -> NaiveDate {
         match *self {
-            Feed::Idle { shown_through } | Feed::Loading { shown_through, .. } => shown_through,
+            Feed::Idle { shown_through }
+            | Feed::Loading { shown_through, .. }
+            | Feed::Exhausted { shown_through } => shown_through,
         }
     }
 
@@ -247,19 +256,36 @@ impl Feed {
     fn want_through(&self) -> NaiveDate {
         match *self {
             Feed::Loading { want_through, .. } => want_through,
-            Feed::Idle { shown_through } => shown_through,
+            Feed::Idle { shown_through } | Feed::Exhausted { shown_through } => shown_through,
         }
     }
 
-    /// Ask for the next batch, or `None` when one is already in flight.
+    /// Ask for the next batch: only from an idle feed, one request at a time.
     fn request(&self) -> Option<Feed> {
         match *self {
-            Feed::Idle { shown_through } => Some(Feed::Loading {
-                shown_through,
-                want_through: shown_through
-                    .checked_sub_days(chrono::Days::new(JOURNAL_BATCH as u64))?,
-            }),
-            Feed::Loading { .. } => None,
+            Feed::Idle { shown_through } => Some(
+                match shown_through.checked_sub_days(chrono::Days::new(JOURNAL_BATCH as u64)) {
+                    Some(want_through) => Feed::Loading {
+                        shown_through,
+                        want_through,
+                    },
+                    // Older than any representable date: nothing to load.
+                    None => Feed::Exhausted { shown_through },
+                },
+            ),
+            Feed::Loading { .. } | Feed::Exhausted { .. } => None,
+        }
+    }
+
+    /// Resolve a rebuild that loaded down to `shown_through`, given the oldest live
+    /// daily page (`None`: the graph has no days at all).
+    fn settle(self, shown_through: NaiveDate, oldest: Option<NaiveDate>) -> Feed {
+        match oldest {
+            // The oldest page is inside the loaded window: every older calendar day is
+            // blank, so loading them would only walk back through empty years.
+            Some(oldest) if shown_through <= oldest => Feed::Exhausted { shown_through },
+            None => Feed::Exhausted { shown_through },
+            Some(_) => Feed::Idle { shown_through },
         }
     }
 
@@ -981,6 +1007,9 @@ impl PageView {
             self.day_headings.clear();
         }
         let Some(page) = self.page.clone() else {
+            // A feed always has a page (`open_journal` → `show`), and its state is kept
+            // as it is: clearing it here would drop a batch that is already in flight.
+            debug_assert!(self.journal.is_none(), "a feed without a page");
             self.replace_items(Vec::new(), cx);
             return;
         };
@@ -1159,13 +1188,16 @@ impl PageView {
             Some(j) if j.refs_version == refs_version => std::mem::take(&mut j.refs),
             _ => HashMap::new(),
         };
-        let (header, days, today_date, shown_through) = self.app.update(cx, |app, _| {
+        let (header, days, today_date, shown_through, oldest) = self.app.update(cx, |app, _| {
             let collapsed = app.store.collapsed_set().clone();
             let fmt = app.store.date_format().clone();
             let today_date = app.store.today();
             // The requested window is absolute, so a rebuild never grows it by accident.
             let from = want_through.min(today_date);
             let mut pages = app.store.days_between(from, today_date).unwrap_or_default();
+            // The feed stops at the oldest daily page (FR-1.2). A failed read is reported
+            // and leaves the feed idle rather than claiming there is nothing older.
+            let oldest = app.report(app.store.oldest_daily());
             // Today comes from the caller (its draft), not the index, which may lag.
             pages.insert(today_date, today.clone());
             let mut header = Header {
@@ -1217,7 +1249,7 @@ impl PageView {
                     _ => break,
                 }
             }
-            (header, days, today_date, from)
+            (header, days, today_date, from, oldest)
         });
         self.header = header;
         let mut items = Vec::new();
@@ -1288,13 +1320,24 @@ impl PageView {
                 headings[h].end = items.len();
             }
         }
-        items.push(Item::JournalEnd);
+        // A rebuild resolves the window it just loaded into a terminal or open state.
+        // A read error stays `Idle`, so the next rebuild tries again instead of the feed
+        // claiming there are no earlier notes.
+        let next_feed = match (self.journal.as_ref(), oldest) {
+            (Some(j), Some(oldest)) => j.feed.clone().settle(shown_through, oldest),
+            (Some(_), None) | (None, _) => Feed::Idle { shown_through },
+        };
+        items.push(if next_feed.sentinel() {
+            Item::JournalEnd
+        } else {
+            Item::JournalExhausted
+        });
         self.day_headings = headings;
         if let Some(j) = &mut self.journal {
             j.pages = ids;
             j.refs = refs_cache;
             j.refs_version = refs_version;
-            j.feed = Feed::Idle { shown_through };
+            j.feed = next_feed;
         }
         self.replace_items(items, cx);
     }
@@ -3638,6 +3681,15 @@ impl PageView {
                     .child("Loading older days…")
                     .into_any_element()
             }
+            Item::JournalExhausted => div()
+                .debug_selector(|| "feed-end".into())
+                .px_4()
+                .pt_8()
+                .pb_6()
+                .text_size(px(crate::theme::BODY_SIZE))
+                .text_color(th.faint)
+                .child("No earlier notes.")
+                .into_any_element(),
             Item::RefsHeader { title, count } => div()
                 .debug_selector(|| "refs-header".into())
                 .mt_6()
@@ -4404,6 +4456,44 @@ mod tests {
         );
         assert_eq!(loading.request(), None, "one request in flight at a time");
         assert!(!loading.sentinel());
+    }
+
+    /// FR-1.2: the feed is exhausted once the oldest daily page is inside the loaded
+    /// window. `settle` recomputes it from the store on every rebuild, so a page created
+    /// or synced in later re-opens the feed rather than latching it shut.
+    #[test]
+    fn feed_exhausts_at_the_oldest_daily_page() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        let shown = today - chrono::Duration::days(29);
+        let idle = Feed::Idle {
+            shown_through: shown,
+        };
+        // Older pages exist beyond the window: keep the sentinel.
+        let older = idle
+            .clone()
+            .settle(shown, Some(today - chrono::Duration::days(40)));
+        assert_eq!(older, idle);
+        assert!(older.sentinel());
+        // The oldest page is at or inside the window: no older calendar day can hold
+        // anything, so the sentinel goes away.
+        for oldest in [shown, today] {
+            let next = idle.clone().settle(shown, Some(oldest));
+            assert_eq!(
+                next,
+                Feed::Exhausted {
+                    shown_through: shown
+                }
+            );
+            assert!(!next.sentinel());
+            assert_eq!(next.request(), None, "an exhausted feed asks for nothing");
+        }
+        assert_eq!(
+            idle.settle(shown, None),
+            Feed::Exhausted {
+                shown_through: shown
+            },
+            "a graph with no daily page at all is exhausted too"
+        );
     }
 
     /// The loaded window is a range of *calendar* days; the pages in it are fewer because
