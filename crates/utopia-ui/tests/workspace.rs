@@ -3255,6 +3255,32 @@ fn folded_empty_day_opens_on_a_click(cx: &mut TestAppContext) {
     );
 }
 
+/// `docs/state-machines/draft-daily-page.md` issue 5: starting a day writes nothing, so it
+/// must not report a structural change, which forces an index flush and an `IndexUpdated`
+/// cycle for a commit that does not exist (FR-1.2).
+#[gpui::test]
+fn fr_1_2_starting_a_draft_does_not_flush_the_index(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let day = today() - chrono::Duration::days(4);
+    let before = app.read_with(cx, |app, _| app.refs_version);
+    let selector: &'static str =
+        Box::leak(format!("day-folded-{}", utopia_core::date::iso(day)).into_boxed_str());
+    let row = cx.debug_bounds(selector).expect("a folded empty day");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        app.read_with(cx, |app, _| app.store.is_draft(&PageId::for_date(day))),
+        "the click started a draft for the day"
+    );
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "starting a draft queues no write, so the index is not refreshed"
+    );
+}
+
 #[gpui::test]
 fn shortcuts_work_after_scrolling_the_caret_away(cx: &mut TestAppContext) {
     let (_app, ws, cx) = setup(cx);
