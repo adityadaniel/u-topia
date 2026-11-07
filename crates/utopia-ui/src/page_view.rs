@@ -1195,8 +1195,11 @@ impl PageView {
             // The requested window is absolute, so a rebuild never grows it by accident.
             let from = want_through.min(today_date);
             let mut pages = app.store.days_between(from, today_date).unwrap_or_default();
-            // The feed stops at the oldest daily page (FR-1.2). A failed read is reported
-            // and leaves the feed idle rather than claiming there is nothing older.
+            // The feed stops at the oldest daily page (FR-1.2). `oldest_daily` is one seek
+            // on the partial `page_daily_uq` index, not a scan. A failed read is reported
+            // and leaves the feed idle rather than claiming there is nothing older; the
+            // sentinel then re-requests a batch per frame until the store recovers. That is
+            // the chosen degradation: nothing is written and the error is in `last_error`.
             let oldest = app.report(app.store.oldest_daily());
             // Today comes from the caller (its draft), not the index, which may lag.
             pages.insert(today_date, today.clone());
