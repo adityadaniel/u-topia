@@ -203,12 +203,12 @@ pub const TOPICS: &[HelpTopic] = &[
         title: "Changing These Shortcuts",
         summary: "Every shortcut in the app can be rebound.",
         body: &[
-            "The Keybindings tab lists every action. Pick Change, press the combination you \
+            "The Keybindings tab lists every action. Click its key, press the combination you \
              want, and it applies at once and is remembered in `keymap.json` in the config \
              directory.",
             "Only the shortcuts you actually change are written down, so defaults that improve \
-             in a later release still reach you. Reset puts one back; Reset All puts everything \
-             back.",
+             in a later release still reach you. The ↺ beside a changed key puts it back; \
+             Reset All puts everything back.",
             "If two actions end up on the same keys in the same place, the editor says so \
              rather than letting one quietly shadow the other.",
         ],

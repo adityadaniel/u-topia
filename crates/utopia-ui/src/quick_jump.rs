@@ -1339,7 +1339,11 @@ fn highlight_ranges(label: &str, needle: &str) -> Vec<Range<usize>> {
         from = i + 1;
         let r = ranges[owner[i]].clone();
         match out.last_mut() {
-            Some(prev) if prev.end == r.start => prev.end = r.end,
+            // Overlapping as well as adjacent: one source character can lowercase to two
+            // (İ → i + combining dot), so both matched folded characters map back to the
+            // same range. Emitting it twice makes GPUI build a highlight that ends inside
+            // the next character and the text shaper panics on user data.
+            Some(prev) if r.start <= prev.end => prev.end = prev.end.max(r.end),
             _ => out.push(r),
         }
     }
@@ -1367,6 +1371,11 @@ mod tests {
         // Ranges are byte ranges into the label, so a non-ASCII title stays intact.
         assert_eq!(highlight_ranges("Café notes", "é"), vec![3..5]);
         assert_eq!(highlight_ranges("Café notes", "notes"), vec![6..11]);
+        // İ lowercases to two chars, so a fuzzy match can map both of them back to the same
+        // source range. Overlapping ranges merge instead of being marked twice: a duplicate
+        // range makes the highlighter slice inside the next character.
+        assert_eq!(highlight_ranges("İaéx", "İx"), vec![0..2, 5..6]);
+        assert_eq!(highlight_ranges("İx", "i"), vec![0..2]);
     }
 
     /// Case folding can change *where* the byte boundaries are even when the folded text

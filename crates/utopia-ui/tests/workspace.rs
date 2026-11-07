@@ -804,6 +804,48 @@ fn caret_survives_remote_edits(cx: &mut TestAppContext) {
     assert_eq!(rows(&app, &page, cx)[0].0, ">> hello big world");
 }
 
+/// Settings → Sync must describe a sync that exists: a config whose transport cannot be
+/// built (here a folder under a regular file) leaves the pane saying sync is off, while one
+/// that starts publishes the transport. Main used to publish the enabled facts first.
+#[gpui::test]
+fn a_sync_that_cannot_start_does_not_claim_to_be_on(cx: &mut TestAppContext) {
+    use utopia_ui::sync_runner::{self, SyncConfig, SyncTarget};
+    let (_app, ws, cx) = setup(cx);
+    let dir = tempfile::tempdir().unwrap();
+    // Its parent is a regular file, so the folder transport cannot be built.
+    let file = dir.path().join("not-a-folder");
+    std::fs::write(&file, b"x").unwrap();
+    let bad = SyncConfig {
+        target: SyncTarget::Folder(file.join("pages")),
+        graph: "g".into(),
+        passphrase: None,
+    };
+    assert!(!ws.update(cx, |w, cx| w.start_sync(bad, cx)));
+    assert!(
+        !cx.update(|_, cx| sync_runner::facts(cx).is_on()),
+        "a failed start must leave Settings saying sync is off"
+    );
+    assert_eq!(
+        cx.update(|_, cx| sync_runner::facts(cx).graph.clone()),
+        Some("g".to_string()),
+        "the graph is still named"
+    );
+
+    let shared = dir.path().join("shared");
+    let good = SyncConfig {
+        target: SyncTarget::Folder(shared.clone()),
+        graph: "g".into(),
+        passphrase: None,
+    };
+    assert!(ws.update(cx, |w, cx| w.start_sync(good, cx)));
+    let facts = cx.update(|_, cx| sync_runner::facts(cx));
+    assert!(facts.is_on(), "a started sync is reported");
+    assert_eq!(
+        facts.target.as_deref(),
+        Some(format!("Folder · {}", shared.display()).as_str())
+    );
+}
+
 #[gpui::test]
 fn background_sync_imports_and_pushes(cx: &mut TestAppContext) {
     use utopia_sync::relay::{Relay, RelayTransport};
@@ -2100,6 +2142,52 @@ fn graph_panel_sits_beside_the_page(cx: &mut TestAppContext) {
     assert!(ws.update(cx, |w, _| w.graph_view()).is_some());
 }
 
+/// GR-5 review: "Around this page" keeps the graph's own origin. Opening the graph from a
+/// sidebar page's menu and then moving it into the sidebar must stay around that page, not
+/// silently switch to whatever the main pane shows.
+#[gpui::test]
+fn graph_panel_keeps_the_sidebar_pages_origin(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (a, b) = app.update(cx, |app, _| {
+        let a = app.store.create_page("Alpha Page").unwrap();
+        app.store.ensure_first_block(&a).unwrap();
+        let b = app.store.create_page("Beta Page").unwrap();
+        app.store.ensure_first_block(&b).unwrap();
+        (a, b)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(a.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    // Beta beside Alpha, so its own page menu is the one we use.
+    ws.update_in(cx, |w, window, cx| {
+        w.open(b.clone(), None, None, true, window, cx)
+    });
+    cx.run_until_parked();
+    let menu = cx.debug_bounds("page-menu").expect("a page menu");
+    cx.simulate_click(menu.center(), Modifiers::default());
+    cx.run_until_parked();
+    let item = cx.debug_bounds("page-menu-graph").expect("Open in graph");
+    cx.simulate_click(item.center(), Modifiers::default());
+    cx.run_until_parked();
+    let graph = ws.update(cx, |w, _| w.graph_view()).expect("graph shown");
+    assert_eq!(graph.update(cx, |g, _| g.origin()), Some(b.clone()));
+    let local = cx
+        .debug_bounds("graph-local")
+        .expect("Around this page filter")
+        .center();
+    cx.simulate_click(local, Modifiers::default());
+    cx.run_until_parked();
+    let panel = ws.update(cx, |w, _| w.graph_panel()).expect("panel open");
+    assert_eq!(
+        panel.update(cx, |g, _| g.origin()),
+        Some(b),
+        "the panel stays around the page whose graph was opened"
+    );
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(a));
+}
+
 /// GR-5: the panel is a projection of the index, so a new link while it is open must show
 /// up even though the page id did not change.
 #[gpui::test]
@@ -2181,6 +2269,39 @@ fn closing_the_graph_panel_restores_focus(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("jump-palette").is_some(),
         "workspace shortcuts work after closing the panel"
+    );
+}
+
+/// AGENTS.md focus invariant: hiding the right sidebar removes the focused graph panel
+/// from rendering. Focus must come back to the workspace, or every shortcut (including the
+/// one that would reopen the sidebar) stops reaching a handler.
+#[gpui::test]
+fn hiding_the_sidebar_restores_focus_from_the_graph_panel(cx: &mut TestAppContext) {
+    let (_app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let local = cx
+        .debug_bounds("graph-local")
+        .expect("Around this page filter")
+        .center();
+    cx.simulate_click(local, Modifiers::default());
+    cx.run_until_parked();
+    let canvas = cx.debug_bounds("graph-canvas").expect("panel canvas");
+    cx.simulate_click(canvas.origin + point(px(6.), px(6.)), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-shift-\\");
+    cx.run_until_parked();
+    // The panel is still logically open; it is just not drawn any more.
+    assert!(ws.update(cx, |w, _| w.graph_panel()).is_some());
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("jump-palette").is_some(),
+        "workspace shortcuts work after hiding the sidebar"
     );
 }
 

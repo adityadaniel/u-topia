@@ -27,6 +27,48 @@ pub struct SyncConfig {
     pub passphrase: Option<String>,
 }
 
+/// What Settings → Sync can say about the transport in force (§12, ST-5): where it goes and
+/// whether the payloads are encrypted. Built from [`SyncConfig`], with the bearer token left
+/// out on purpose — secrets never reach the UI, `settings.json` or a screenshot (§15.6).
+/// The app installs it once the config is resolved; with no global installed (tests, a
+/// headless run) sync reads as off.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncFacts {
+    /// Human-readable transport, e.g. "Relay · https://relay.example" or "Folder · /…".
+    pub target: Option<String>,
+    /// The graph's id, which the relay uses to find its pages.
+    pub graph: Option<String>,
+    pub encrypted: bool,
+}
+
+impl gpui::Global for SyncFacts {}
+
+impl SyncFacts {
+    pub fn from_config(cfg: &SyncConfig) -> Self {
+        let target = match &cfg.target {
+            SyncTarget::Relay { url, .. } if url == "lan" => {
+                "Relay · LAN, discovered with mDNS".to_string()
+            }
+            SyncTarget::Relay { url, .. } => format!("Relay · {url}"),
+            SyncTarget::Folder(dir) => format!("Folder · {}", dir.display()),
+        };
+        Self {
+            target: Some(target),
+            graph: Some(cfg.graph.clone()),
+            encrypted: cfg.passphrase.is_some(),
+        }
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.target.is_some()
+    }
+}
+
+/// The sync facts in force; sync off when the app has installed none.
+pub fn facts(cx: &gpui::App) -> SyncFacts {
+    cx.try_global::<SyncFacts>().cloned().unwrap_or_default()
+}
+
 pub type BoxTransport = Box<dyn Transport + Send>;
 
 /// Build the transport stack for a config: relay or folder, optionally encrypted.
@@ -188,6 +230,41 @@ pub fn status_line(status: Option<&SyncStatus>, now_ms: i64) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ST-5: Settings → Sync shows where the graph goes, and never the token or the
+    /// passphrase that got it there (§15.6).
+    #[test]
+    fn sync_facts_never_carry_secrets() {
+        let cfg = SyncConfig {
+            target: SyncTarget::Relay {
+                url: "https://relay.example".into(),
+                token: Some("t0ken".into()),
+            },
+            graph: "graph-1".into(),
+            passphrase: Some("p4ssphrase".into()),
+        };
+        let facts = SyncFacts::from_config(&cfg);
+        assert_eq!(
+            facts.target.as_deref(),
+            Some("Relay · https://relay.example")
+        );
+        assert_eq!(facts.graph.as_deref(), Some("graph-1"));
+        assert!(facts.encrypted);
+        let shown = format!("{facts:?}");
+        assert!(!shown.contains("t0ken"), "{shown}");
+        assert!(!shown.contains("p4ssphrase"), "{shown}");
+
+        let folder = SyncConfig {
+            target: SyncTarget::Folder("/tmp/shared notes".into()),
+            graph: "graph-2".into(),
+            passphrase: None,
+        };
+        let facts = SyncFacts::from_config(&folder);
+        assert_eq!(facts.target.as_deref(), Some("Folder · /tmp/shared notes"));
+        assert!(!facts.encrypted);
+
+        assert!(!SyncFacts::default().is_on(), "no config means sync is off");
+    }
 
     #[test]
     fn the_dot_tells_off_synced_syncing_and_error_apart() {

@@ -2795,6 +2795,48 @@ fn reference_children_are_inline_up_to_the_limit(cx: &mut TestAppContext) {
     );
 }
 
+/// Rule 10: opening "+N more" and changing "Children shown in references" load the
+/// children before the frame; the frame itself only reads the cache.
+#[gpui::test]
+fn reference_children_are_prefetched_outside_the_frame(cx: &mut TestAppContext) {
+    let (cx, ws, _, _) = setup_nested_refs(cx);
+    let ix = first_hit_ix(cx);
+    let view = ws.read_with(cx, |w, _| w.main_view());
+    let frame_before = view.read_with(cx, |v, _| v.ref_children_frame_queries());
+    let total_before = view.read_with(cx, |v, _| v.ref_children_queries());
+
+    let more: &'static str = Box::leak(format!("hit-more-{ix}-2").into_boxed_str());
+    let chip = bounds(cx, more);
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let (total, frame) = view.read_with(cx, |v, _| {
+        (v.ref_children_queries(), v.ref_children_frame_queries())
+    });
+    assert!(
+        total > total_before,
+        "opening the chip reads the folded children once"
+    );
+    assert_eq!(
+        frame, frame_before,
+        "the read happens in the handler, not in the frame"
+    );
+
+    // Changing the preference invalidates the cache; that read is prefetched too.
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|_, app| {
+        utopia_ui::appearance::set_ref_children(app, 3, dir.path()).unwrap();
+    });
+    cx.run_until_parked();
+    let (total_after, frame_after) = view.read_with(cx, |v, _| {
+        (v.ref_children_queries(), v.ref_children_frame_queries())
+    });
+    assert!(total_after > total, "the new limit reads the children once");
+    assert_eq!(
+        frame_after, frame_before,
+        "the preference change does not read in a frame"
+    );
+}
+
 /// LR-1: clicking a co-reference chip narrows the references and the choice becomes a filled
 /// chip on the same line; clicking it again widens them back.
 #[gpui::test]
@@ -3057,4 +3099,41 @@ fn graph_legend_and_zoom_controls_sit_at_the_edges(cx: &mut TestAppContext) {
     cx.simulate_click(at, gpui::Modifiers::default());
     cx.run_until_parked();
     assert_eq!(graph.update(cx, |g, _| g.zoom()), 1.);
+}
+
+/// GR-3 review: an index refresh keeps the panel's pan and zoom; only a new origin (or the
+/// Fit control) resets the viewport. Editing prose next to the panel must not throw the
+/// user's graph view away.
+#[gpui::test]
+fn graph_panel_keeps_its_viewport_across_an_index_refresh(cx: &mut TestAppContext) {
+    use utopia_ui::app_state::IndexUpdated;
+    let cx = setup_alias_page(cx);
+    cx.simulate_keystrokes("escape cmd-shift-g");
+    cx.run_until_parked();
+    let local = bounds(cx, "graph-local").center();
+    cx.simulate_click(local, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let panel = ws.update(cx, |w, _| w.graph_panel()).expect("panel open");
+    let at = bounds(cx, "graph-zoom-in").center();
+    cx.simulate_click(at, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let zoomed = panel.update(cx, |g, _| g.zoom());
+    assert!(zoomed > 1., "the control zoomed the panel");
+
+    // What a debounced commit does once the index catches up.
+    let app = ws.read_with(cx, |w, _| w.app().clone());
+    app.update(cx, |app, cx| {
+        app.refs_version += 1;
+        cx.emit(IndexUpdated);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        panel.update(cx, |g, _| g.zoom()),
+        zoomed,
+        "a refresh keeps the viewport"
+    );
 }

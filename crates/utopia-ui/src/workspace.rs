@@ -298,9 +298,16 @@ impl Workspace {
     }
 
     /// Start background sync for `cfg`: relay or folder, optionally end-to-end encrypted,
-    /// with realtime notices from a relay (§12). Local editing never waits on it.
-    pub fn enable_sync(&mut self, cfg: crate::sync_runner::SyncConfig, cx: &mut Context<Self>) {
-        // Say where sync goes without the token or passphrase (never shown, §15.6).
+    /// with realtime notices from a relay (§12). Local editing never waits on it. Returns
+    /// whether a runner was actually started; [Self::start_sync] is what the app uses, so
+    /// Settings → Sync only claims a sync that exists.
+    pub fn enable_sync(
+        &mut self,
+        cfg: crate::sync_runner::SyncConfig,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Say where sync goes without the token or passphrase (never shown, §15.6); the
+        // sidebar names the target even when the transport below cannot be built.
         self.sync_target = Some(match &cfg.target {
             crate::sync_runner::SyncTarget::Relay { url, .. } => format!("Relay · {url}"),
             crate::sync_runner::SyncTarget::Folder(dir) => format!("Folder · {}", dir.display()),
@@ -320,24 +327,49 @@ impl Workspace {
                         nudge.clone(),
                     );
                 }
-                self.enable_sync_with(t, Some(nudge), cx);
+                self.enable_sync_with(t, Some(nudge), cx)
             }
             Err(e) => {
                 eprintln!("utopia: sync disabled: {e}");
                 self.app.update(cx, |app, _| {
                     app.last_error = Some(format!("sync disabled: {e}"))
                 });
+                false
             }
         }
     }
 
+    /// Start sync for `cfg` and publish what Settings → Sync should say (ST-5). The enabled
+    /// facts go out only once a runner exists: a transport that cannot be built, or a LAN
+    /// discovery that finds no relay, leaves the pane saying sync is off rather than
+    /// promising a sync that never started. Returns whether sync is now running.
+    pub fn start_sync(
+        &mut self,
+        cfg: crate::sync_runner::SyncConfig,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let facts = crate::sync_runner::SyncFacts::from_config(&cfg);
+        let started = self.enable_sync(cfg, cx);
+        cx.set_global(if started {
+            facts
+        } else {
+            crate::sync_runner::SyncFacts {
+                target: None,
+                graph: facts.graph,
+                encrypted: false,
+            }
+        });
+        started
+    }
+
     /// Start background sync over an already-built transport (tests, custom transports).
+    /// Returns whether the runner started.
     pub fn enable_sync_with(
         &mut self,
         transport: BoxTransport,
         nudge: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let engine = self
             .app
             .update(cx, |app, _| utopia_sync::SyncEngine::new(&app.store));
@@ -345,7 +377,7 @@ impl Workspace {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("utopia: sync disabled: {e}");
-                return;
+                return false;
             }
         };
         let mut runner = SyncRunner::new(engine, transport);
@@ -440,6 +472,7 @@ impl Workspace {
             }
         }));
         cx.notify();
+        true
     }
 
     /// Split panes (P1): an editable page beside the main one (Cmd+Shift+Click). At most
@@ -797,9 +830,18 @@ impl Workspace {
         cx.notify();
     }
 
-    /// GR-5: "Around this page" in the right sidebar. The main page stays editable.
-    fn open_graph_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(origin) = self.main.read(cx).page.clone() else {
+    /// GR-5: "Around this page" in the right sidebar. The main page stays editable. The
+    /// origin is the graph's own: the control can be pressed on a graph opened from a
+    /// sidebar or split page, and switching to the main pane's page would silently show a
+    /// different neighbourhood than the one it names.
+    fn open_graph_panel(
+        &mut self,
+        origin: Option<PageId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let origin = origin.or_else(|| self.main.read(cx).page.clone());
+        let Some(origin) = origin else {
             return;
         };
         self.editor.update(cx, |e, cx| e.end(cx));
@@ -843,8 +885,9 @@ impl Workspace {
                 }
             }
             GraphEvent::OpenPanel => {
+                let origin = view.read(cx).origin();
                 self.graph = None;
-                self.open_graph_panel(window, cx);
+                self.open_graph_panel(origin, window, cx);
             }
             GraphEvent::Expand => {
                 self.graph_panel = None;
@@ -1136,8 +1179,25 @@ impl Workspace {
         self.open_date(d.succ_opt().unwrap_or(d), false, false, window, cx);
     }
 
-    fn toggle_right(&mut self, _: &ToggleRightSidebar, _: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_right(
+        &mut self,
+        _: &ToggleRightSidebar,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.right_open = !self.right_open;
+        // AGENTS.md focus invariant: hiding the sidebar stops drawing the graph panel. If it
+        // owns focus, hand it back, or every workspace shortcut dies with it (the same rule
+        // `GraphEvent::Close` follows).
+        if !self.right_open {
+            let focused = self
+                .graph_panel
+                .as_ref()
+                .is_some_and(|panel| panel.read(cx).focus_handle(cx).is_focused(window));
+            if focused {
+                window.focus(&self.focus);
+            }
+        }
         cx.notify();
     }
 

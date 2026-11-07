@@ -193,6 +193,518 @@ fn keybindings_scroll_inside_a_short_window(cx: &mut TestAppContext) {
     );
 }
 
+/// ST-1: a pane is one centred 720 px column, one card per category, with the rows of a
+/// card touching so the hairline between them is the only separation.
+#[gpui::test]
+fn keybindings_are_a_readable_column_of_cards(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (_view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+
+    let nav = cx
+        .debug_bounds("settings-card-Navigation")
+        .expect("the Navigation card is drawn");
+    let width = f32::from(nav.size.width);
+    assert!((width - 720.).abs() < 1.5, "the column is 720 px: {nav:?}");
+    // Centred in the pane beside the tab rail, not in the whole window (ST-5).
+    let pane = cx.debug_bounds("settings-pane").unwrap();
+    let left = f32::from(nav.origin.x) - f32::from(pane.origin.x);
+    let right = f32::from(pane.size.width) - left - width;
+    assert!(
+        (left - right).abs() < 2.,
+        "the column is centred in the pane: {left} left, {right} right"
+    );
+    let app = cx
+        .debug_bounds("settings-card-Application")
+        .expect("the Application card is drawn");
+    assert!(
+        (f32::from(app.origin.x) - f32::from(nav.origin.x)).abs() < 1.5
+            && (f32::from(app.size.width) - width).abs() < 1.5,
+        "every category card shares the column: {app:?}"
+    );
+
+    // Rows are stacked flush; the card's hairline separates them (no gap).
+    let today = cx.debug_bounds("settings-row-GoToday").unwrap();
+    let yesterday = cx.debug_bounds("settings-row-GoYesterday").unwrap();
+    assert!(
+        (f32::from(yesterday.origin.y) - f32::from(today.origin.y + today.size.height)).abs() < 1.,
+        "rows touch: {today:?} then {yesterday:?}"
+    );
+}
+
+/// ST-5: the tabs are a list down the left, each with an icon, and picking one swaps the
+/// pane without moving the rail.
+#[gpui::test]
+fn side_tabs_switch_panes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+
+    for key in ["appearance", "keybindings", "shortcuts", "sync", "help"] {
+        assert!(
+            cx.debug_bounds(match key {
+                "appearance" => "settings-nav-appearance",
+                "keybindings" => "settings-nav-keybindings",
+                "shortcuts" => "settings-nav-shortcuts",
+                "sync" => "settings-nav-sync",
+                _ => "settings-nav-help",
+            })
+            .is_some(),
+            "the {key} tab is in the list"
+        );
+    }
+    // The rail fills the left edge and the pane starts where it ends.
+    let first = cx.debug_bounds("settings-nav-appearance").unwrap();
+    assert!(f32::from(first.origin.x) < 30., "{first:?}");
+    let pane = cx.debug_bounds("settings-pane").unwrap();
+    assert!(f32::from(pane.origin.x) < 221., "{pane:?}");
+    assert!(
+        f32::from(pane.size.width) > 800.,
+        "the pane takes the rest of the window: {pane:?}"
+    );
+    // The top tab row is gone (never drawn, so a bounds check is sound).
+    assert!(cx.debug_bounds("settings-tab-Keybindings").is_none());
+
+    let appearance = cx.debug_bounds("settings-nav-appearance").unwrap();
+    cx.simulate_click(appearance.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.tab()), Tab::Appearance);
+    assert!(
+        cx.debug_bounds("settings-card-Font").is_some(),
+        "the Appearance pane is drawn after the click"
+    );
+
+    let sync = cx.debug_bounds("settings-nav-sync").unwrap();
+    cx.simulate_click(sync.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.tab()), Tab::Sync);
+    assert!(
+        cx.debug_bounds("settings-sync").is_some(),
+        "the Sync pane is drawn after the click"
+    );
+}
+
+/// ST-5: the Sync tab reports the transport in force and never a secret. The facts are
+/// built from the config the app resolved at launch, which holds the token and passphrase.
+#[gpui::test]
+fn the_sync_tab_shows_the_transport(cx: &mut TestAppContext) {
+    use utopia_ui::sync_runner::{SyncConfig, SyncFacts, SyncTarget};
+    let cfg = SyncConfig {
+        target: SyncTarget::Relay {
+            url: "https://relay.example".into(),
+            token: Some("s3cret-token".into()),
+        },
+        graph: "graph-123".into(),
+        passphrase: Some("hunter2".into()),
+    };
+    let facts = SyncFacts::from_config(&cfg);
+    // The token and the passphrase are never carried into the view.
+    let shown = format!("{facts:?}");
+    assert!(facts.encrypted);
+    assert!(shown.contains("https://relay.example"), "{shown}");
+    assert!(!shown.contains("s3cret-token") && !shown.contains("hunter2"));
+
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+        cx.set_global(facts.clone());
+    });
+    let path = dir.path().to_path_buf();
+    let (_view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Sync, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("settings-sync").is_some());
+    assert!(
+        cx.debug_bounds("settings-sync-transport").is_some(),
+        "the transport has a row of its own"
+    );
+}
+
+/// ST-5: Help is one readable column now that the topics sit above it instead of in a
+/// second sidebar; the 640 px screenshots fit in the 720 px column.
+#[gpui::test]
+fn help_screenshots_fit_the_column(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (_view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Help, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+    let pane = cx.debug_bounds("settings-pane").unwrap();
+    let shot = cx
+        .debug_bounds("help-shot")
+        .expect("the topic has a screenshot");
+    assert!((f32::from(shot.size.width) - 640.).abs() < 1.5, "{shot:?}");
+    assert!(
+        f32::from(shot.origin.x) >= f32::from(pane.origin.x)
+            && f32::from(shot.origin.x + shot.size.width)
+                <= f32::from(pane.origin.x + pane.size.width),
+        "the screenshot is inside the pane: {shot:?} in {pane:?}"
+    );
+}
+
+/// ST-4: the field at the top narrows the rows by name, description or key, and no match
+/// says so instead of showing an empty pane.
+#[gpui::test]
+fn search_filters_by_name_description_and_key(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+    let all = view.read_with(cx, |v, _| v.visible_actions().len());
+    assert_eq!(all, utopia_ui::actions::CATALOG.len());
+
+    let field = cx
+        .debug_bounds("settings-search")
+        .expect("the filter field");
+    cx.simulate_click(field.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_input("zoom");
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.query().to_string()), "zoom");
+    assert_eq!(
+        view.read_with(cx, |v, _| v.visible_actions()),
+        ["ZoomIn", "ZoomOut"],
+        "by name"
+    );
+
+    // By keys, in the spelling the catalog stores them in.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.visible_actions()).len(),
+        all,
+        "escape clears the filter"
+    );
+    let field = cx
+        .debug_bounds("settings-search")
+        .expect("the filter field");
+    cx.simulate_click(field.center(), gpui::Modifiers::default());
+    cx.simulate_input("cmd-shift-y");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.visible_actions()),
+        ["GoYesterday"],
+        "by key"
+    );
+
+    // By description ("cheat sheet" is in ShowShortcuts' help text).
+    cx.simulate_keystrokes("escape");
+    let field = cx
+        .debug_bounds("settings-search")
+        .expect("the filter field");
+    cx.simulate_click(field.center(), gpui::Modifiers::default());
+    cx.simulate_input("cheat");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.visible_actions()),
+        ["ShowShortcuts"],
+        "by description"
+    );
+
+    // Nothing matches: the pane says so.
+    cx.simulate_keystrokes("escape");
+    let field = cx
+        .debug_bounds("settings-search")
+        .expect("the filter field");
+    cx.simulate_click(field.center(), gpui::Modifiers::default());
+    cx.simulate_input("zzzz");
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, _| v.visible_actions().is_empty()));
+    assert!(
+        cx.debug_bounds("settings-no-match").is_some(),
+        "the empty state is drawn"
+    );
+}
+
+/// ST-2: the key chip is the control. Clicking it records keys, a changed row shows the
+/// small ↺, and the Change button is gone.
+#[gpui::test]
+fn the_key_chip_records_and_resets(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("settings-change-GoToday").is_none(),
+        "no separate Change button (never drawn, so a bounds check is sound)"
+    );
+    assert!(
+        cx.debug_bounds("settings-reset-GoToday").is_none(),
+        "the ↺ only appears once the row changed"
+    );
+
+    let chip = cx
+        .debug_bounds("settings-chip-GoToday")
+        .expect("the key chip is the control");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let today = doc("GoToday").unwrap();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.capturing().map(|d| d.action)),
+        Some("GoToday"),
+        "clicking the chip starts recording"
+    );
+
+    cx.simulate_keystrokes("cmd-alt-t");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(v.capturing().is_none());
+        assert_eq!(v.overrides().keys_for(today), "alt-cmd-t");
+    });
+    assert!(
+        cx.debug_bounds("settings-reset-GoToday").is_some(),
+        "the changed row carries the ↺"
+    );
+
+    // Clicking the ↺ puts the catalog default back.
+    let reset = cx.debug_bounds("settings-reset-GoToday").unwrap();
+    cx.simulate_click(reset.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(v.overrides().0.is_empty());
+        assert_eq!(v.overrides().keys_for(today), platform_keys("cmd-shift-t"));
+    });
+}
+
+/// ST-3: a clash is an amber line under each of the two rows, and its link jumps to the
+/// other row instead of only naming it.
+#[gpui::test]
+fn a_clash_is_shown_inline_and_links_to_the_other_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+
+    let today = doc("GoToday").unwrap();
+    view.update_in(cx, |v, window, cx| v.start_capture(today, window, cx));
+    cx.simulate_keystrokes(&platform_keys("cmd-shift-y"));
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.overrides().conflicts().len()),
+        1
+    );
+
+    let chip = cx
+        .debug_bounds("settings-chip-GoToday")
+        .expect("the rebound row's key chip");
+    let line = cx
+        .debug_bounds("settings-clash-GoToday")
+        .expect("the clash line under the row");
+    assert!(
+        f32::from(line.origin.y) >= f32::from(chip.origin.y + chip.size.height) - 1.,
+        "the line sits under the row's own line: {chip:?} then {line:?}"
+    );
+    // Both rows say who else uses the keys, so whichever one you are looking at, it shows.
+    assert!(
+        cx.debug_bounds("settings-clash-GoYesterday").is_some(),
+        "the other row carries the line too"
+    );
+
+    let link = cx
+        .debug_bounds("settings-clash-link-GoToday-GoYesterday")
+        .expect("the other action is a link");
+    cx.simulate_click(link.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.flashed()),
+        Some("GoYesterday"),
+        "the link jumps to the other row"
+    );
+}
+
+/// ST-3: a clash across categories jumps the list to the other card, so "Also used by
+/// Quit" actually takes you to Quit rather than naming it out of reach.
+#[gpui::test]
+fn a_clash_link_scrolls_to_the_other_card(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = Overrides::default();
+    o.set("GoToday", "cmd-q");
+    std::fs::write(dir.path().join("keymap.json"), o.to_json()).unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.key_list_offset()), 0.);
+
+    let link = cx
+        .debug_bounds("settings-clash-link-GoToday-Quit")
+        .expect("Quit is linked under Today");
+    cx.simulate_click(link.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.flashed()), Some("Quit"));
+    assert!(
+        view.read_with(cx, |v, _| v.key_list_offset()) < -100.,
+        "the list scrolled down to the Application card"
+    );
+}
+
+/// A clash link must reveal the *row* it names, not just its category: "New Block" shares
+/// Cmd+A with "Select All" in the 25-row Editing card, and scrolling only to that card leaves
+/// Select All above the viewport. The window is tall enough for the Outline row to be on
+/// screen so the link can be clicked.
+#[gpui::test]
+fn a_clash_link_reveals_a_row_in_a_tall_category(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = Overrides::default();
+    o.set("Newline", "cmd-a");
+    std::fs::write(dir.path().join("keymap.json"), o.to_json()).unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(1150.)));
+    cx.run_until_parked();
+    let pane = cx.debug_bounds("settings-keys").unwrap();
+    let link = cx
+        .debug_bounds("settings-clash-link-Newline-SelectAll")
+        .expect("the link under New Block");
+    cx.simulate_click(link.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.flashed()), Some("SelectAll"));
+    let row = cx
+        .debug_bounds("settings-row-SelectAll")
+        .expect("the Select All row");
+    assert!(
+        f32::from(row.origin.y) >= f32::from(pane.origin.y) - 1.
+            && f32::from(row.origin.y + row.size.height)
+                <= f32::from(pane.origin.y + pane.size.height) + 1.,
+        "the target row is in the viewport: {row:?} in {pane:?}"
+    );
+}
+
+/// The filter may hide the row a clash link points at; following the link must reveal it
+/// rather than only highlighting a row that is not on screen.
+#[gpui::test]
+fn a_clash_link_reveals_a_row_the_filter_hides(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = Overrides::default();
+    o.set("GoToday", "cmd-q");
+    std::fs::write(dir.path().join("keymap.json"), o.to_json()).unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+    let field = cx.debug_bounds("settings-search").unwrap();
+    cx.simulate_click(field.center(), gpui::Modifiers::default());
+    cx.simulate_input("today");
+    cx.run_until_parked();
+    let filtered = view.read_with(cx, |v, _| v.visible_actions());
+    assert!(filtered.contains(&"GoToday"), "{filtered:?}");
+    assert!(
+        !filtered.contains(&"Quit"),
+        "the target is hidden: {filtered:?}"
+    );
+    let link = cx
+        .debug_bounds("settings-clash-link-GoToday-Quit")
+        .expect("the link under Today");
+    let pane = cx.debug_bounds("settings-keys").unwrap();
+    cx.simulate_click(link.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.flashed()), Some("Quit"));
+    assert_eq!(
+        view.read_with(cx, |v, _| v.query().to_string()),
+        "",
+        "the filter is cleared so the target is really shown"
+    );
+    let row = cx.debug_bounds("settings-row-Quit").expect("the Quit row");
+    assert!(
+        f32::from(row.origin.y) >= f32::from(pane.origin.y) - 1.
+            && f32::from(row.origin.y + row.size.height)
+                <= f32::from(pane.origin.y + pane.size.height) + 1.,
+        "the target row is in the viewport: {row:?} in {pane:?}"
+    );
+}
+
+/// Two rows can link to the same action. Each link is scoped to its own row, so the second
+/// row's link (which shares the target with the first) is still live: GPUI element ids are
+/// nested under the row, not shared across rows.
+#[gpui::test]
+fn the_second_rows_clash_link_is_live(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = Overrides::default();
+    o.set("GoToday", "cmd-q");
+    o.set("GoYesterday", "cmd-q");
+    std::fs::write(dir.path().join("keymap.json"), o.to_json()).unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let path = dir.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| SettingsView::new(path, Tab::Keybindings, window, cx));
+    cx.simulate_resize(size(px(1100.), px(760.)));
+    cx.run_until_parked();
+    // Yesterday's link to Quit is the later of the two rows' "Also used by Quit" links.
+    let link = cx
+        .debug_bounds("settings-clash-link-GoYesterday-Quit")
+        .expect("Yesterday's link to Quit");
+    cx.simulate_click(link.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.flashed()),
+        Some("Quit"),
+        "the second row's link to the same action is live"
+    );
+    // And the first row's link to the same action still exists under its own id.
+    let first = cx
+        .debug_bounds("settings-clash-link-GoToday-Quit")
+        .expect("Today's link to Quit");
+    assert!(first.size.width > px(0.));
+}
+
 /// A `keymap.json` that cannot be read must not take the window down with it (rule 11).
 #[gpui::test]
 fn a_broken_keymap_is_reported_not_fatal(cx: &mut TestAppContext) {
