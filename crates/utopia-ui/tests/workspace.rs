@@ -1593,6 +1593,55 @@ fn a_local_store_error_is_not_reported_as_offline(cx: &mut TestAppContext) {
     );
 }
 
+/// §12.6: a failing round backs off. A prepare failure used to keep the last good round's
+/// cadence, so a persistent local failure polled every 5 s.
+#[gpui::test]
+fn a_failed_round_backs_off(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    let (app, ws, cx) = setup(cx);
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(Box::new(RelayTransport::new(Relay::new(), "g")), None, cx)
+    });
+    // A round with work keeps the fast 5 s cadence.
+    cx.simulate_input("queued words");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    app.update(cx, |app, _| {
+        app.store.conn().execute_batch("DROP TABLE sync_state").unwrap();
+    });
+    // This round fails on the device, so the next attempt is 10 s away, not 5 s.
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    // Make the store usable again; a loop without backoff retries at once (5 s).
+    app.update(cx, |app, _| {
+        app.store
+            .conn()
+            .execute_batch("CREATE TABLE sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert!(
+        !matches!(
+            ws.read_with(cx, |w, _| w.sync_status()),
+            Some(utopia_sync::SyncStatus::Synced { .. })
+        ),
+        "the failed round's 10 s backoff was ignored; it retried after 5 s"
+    );
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert!(
+        matches!(
+            ws.read_with(cx, |w, _| w.sync_status()),
+            Some(utopia_sync::SyncStatus::Synced { .. })
+        ),
+        "the round after the backoff recovers"
+    );
+}
+
 // ---------------------------------------------------------------- v1.1 (P1)
 
 fn kind_of(

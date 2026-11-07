@@ -197,8 +197,10 @@ impl SyncRunner {
         }
     }
 
-    /// The round's store work failed, so nothing left the device: the transport comes home.
+    /// The round's store work failed, so nothing left the device: the transport comes home
+    /// and the next poll backs off like any other failed round (§12.6).
     pub fn round_failed(&mut self, transport: BoxTransport, status: SyncStatus) {
+        self.interval = back_off(self.interval);
         self.last = Some(status);
         self.phase = SyncPhase::Idle { transport };
     }
@@ -230,8 +232,13 @@ impl SyncRunner {
 fn next_interval(current: Duration, result: &Result<SyncReport, SyncError>) -> Duration {
     match result {
         Ok(r) if !r.is_quiet() => FAST,
-        _ => (current * 2).min(SLOW),
+        _ => back_off(current),
     }
+}
+
+/// One step of exponential backoff, capped at [`SLOW`].
+fn back_off(current: Duration) -> Duration {
+    (current * 2).min(SLOW)
 }
 
 /// The background half of a round.
