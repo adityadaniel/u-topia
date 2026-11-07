@@ -2,11 +2,14 @@
 //! headless test platform: keystrokes in, store state out.
 
 use chrono::NaiveDate;
-use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+use gpui::{
+    point, px, size, AppContext as _, Entity, Modifiers, MouseButton, TestAppContext,
+    VisualTestContext,
+};
 use utopia_core::PageId;
 use utopia_store::Store;
 use utopia_ui::actions::install_keymap;
-use utopia_ui::app_state::AppState;
+use utopia_ui::app_state::{AppState, IndexUpdated};
 use utopia_ui::theme::Theme;
 use utopia_ui::workspace::Workspace;
 
@@ -1407,6 +1410,50 @@ fn search_scope_filters_page_titles(cx: &mut TestAppContext) {
     );
 }
 
+/// SR-3: the scope applies before the title limit, so ineligible days cannot crowd an
+/// ordinary page out of the twelve candidates.
+#[gpui::test]
+fn search_pages_scope_applies_before_the_title_limit(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        for day in 1..=12 {
+            let date = NaiveDate::from_ymd_opt(2026, 11, day).unwrap();
+            app.store.ensure_daily_page(date).unwrap();
+        }
+        app.store.create_page("Plans for November").unwrap();
+        app.store.sync_index().unwrap();
+    });
+
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("november");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("search is open");
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.page_titles()).len(),
+        12,
+        "the twelve matching days fill the title limit under All"
+    );
+    assert!(
+        !jump
+            .read_with(cx, |j, _| j.page_titles())
+            .contains(&"Plans for November".to_string()),
+        "the ordinary page is beyond the unfiltered limit"
+    );
+
+    let pages = cx
+        .debug_bounds("search-scope-pages")
+        .expect("the Pages chip");
+    cx.simulate_click(pages.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.page_titles()),
+        vec!["Plans for November".to_string()],
+        "Pages limits eligible titles, not the raw candidates"
+    );
+}
+
 /// SR-5: when page titles fill the results viewport, the block Cmd+Shift+F selects is
 /// scrolled into view; otherwise Enter opens a row the user cannot see.
 #[gpui::test]
@@ -1498,6 +1545,63 @@ fn typing_does_not_requery_reference_children(cx: &mut TestAppContext) {
     assert_eq!(
         after, before,
         "a keystroke rebuild reuses the children for this refs_version"
+    );
+}
+
+/// Rule 10: the IndexUpdated handler loads the reference children before the frame; a
+/// rebuild in `render` only reads that cache.
+#[gpui::test]
+fn index_updates_prefetch_reference_children(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (target, first) = app.update(cx, |app, _| {
+        let target = app.store.create_page("Target").unwrap();
+        let first = app.store.ensure_first_block(&target).unwrap();
+        let source = app.store.create_page("Source").unwrap();
+        let b = app.store.ensure_first_block(&source).unwrap();
+        app.store
+            .set_block_text(&source, &b, "see [[Target]]", None, None)
+            .unwrap();
+        app.store.commit_block(&source, &b).unwrap();
+        let plan =
+            utopia_core::outline::append_block(app.store.page_state(&source).unwrap(), Some(&b));
+        let child = app
+            .store
+            .execute_plan(&source, plan, None)
+            .unwrap()
+            .unwrap()
+            .block;
+        app.store
+            .set_block_text(&source, &child, "a child of the reference", None, None)
+            .unwrap();
+        app.store.commit_block(&source, &child).unwrap();
+        app.store.sync_index().unwrap();
+        (target, first)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, Some(first), false, window, cx)
+    });
+    cx.run_until_parked();
+    let view = ws.read_with(cx, |w, _| w.main_view());
+    let before = view.read_with(cx, |v, _| v.ref_children_queries());
+    assert!(before > 0, "the first build reads the children it shows");
+
+    let frame_before = view.read_with(cx, |v, _| v.ref_children_frame_queries());
+    // What a durable index update does: bump the version and notify listeners.
+    app.update(cx, |app, cx| {
+        app.refs_version += 1;
+        cx.emit(IndexUpdated);
+    });
+    cx.run_until_parked();
+    let (total, frame) = view.read_with(cx, |v, _| {
+        (v.ref_children_queries(), v.ref_children_frame_queries())
+    });
+    assert!(
+        total > before,
+        "the new index version reads the children once"
+    );
+    assert_eq!(
+        frame, frame_before,
+        "the frame only reads the children cache"
     );
 }
 
@@ -1831,6 +1935,337 @@ fn graph_view_lays_out_and_opens_pages(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     assert!(ws.update(cx, |w, _| w.graph_view()).is_none());
+}
+
+/// GR-1: pages grow with their link count, from 6 px to 18 px across.
+#[gpui::test]
+fn graph_sizes_nodes_by_links(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] [[Alpha]] [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let graph = ws.update(cx, |w, _| w.graph_view()).expect("graph shown");
+    let alpha = app.update(cx, |a, _| a.store.find_page("Alpha").unwrap().unwrap());
+    let today = today_page(&app, cx);
+    let nodes = graph.update(cx, |g, _| g.node_count());
+    assert_eq!(nodes, 3);
+    let mut node = |page: &PageId| {
+        (0..nodes)
+            .find(|&i| graph.update(cx, |g, _| g.node_page(i)).as_ref() == Some(page))
+            .unwrap()
+    };
+    let (today_i, alpha_i) = (node(&today), node(&alpha));
+    let (today_r, alpha_r) = graph.update(cx, |g, _| {
+        (
+            g.node_radius(today_i).unwrap(),
+            g.node_radius(alpha_i).unwrap(),
+        )
+    });
+    // Today links to Alpha twice and Beta once, so it has the larger degree.
+    assert!(today_r > alpha_r, "{today_r} > {alpha_r}");
+    assert!(
+        (3. ..=9.).contains(&alpha_r) && (3. ..=9.).contains(&today_r),
+        "diameters stay between 6 and 18 px: {alpha_r} {today_r}"
+    );
+}
+
+/// GR-2: hovering a node floats its card over the canvas without moving the graph.
+#[gpui::test]
+fn graph_hover_shows_a_floating_card(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let graph = ws.update(cx, |w, _| w.graph_view()).expect("graph shown");
+    let alpha = app.update(cx, |a, _| a.store.find_page("Alpha").unwrap().unwrap());
+    let nodes = graph.update(cx, |g, _| g.node_count());
+    let i = (0..nodes)
+        .find(|&i| graph.update(cx, |g, _| g.node_page(i)) == Some(alpha.clone()))
+        .unwrap();
+    let at = graph.update(cx, |g, _| g.node_screen_pos(i)).unwrap();
+    let canvas = cx.debug_bounds("graph-canvas").unwrap();
+    cx.simulate_mouse_move(at, None, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(graph.update(cx, |g, _| g.hovered()), Some(i));
+    let card = cx.debug_bounds("graph-tooltip").expect("hover card");
+    assert!(
+        f32::from(card.size.width) > 100.,
+        "the card has a readable width"
+    );
+    assert_eq!(
+        cx.debug_bounds("graph-canvas").unwrap(),
+        canvas,
+        "the card floats; it does not move the canvas"
+    );
+    // Moving away clears the hover state (the test platform keeps old debug bounds, so
+    // assert on the view, per AGENTS.md).
+    cx.simulate_mouse_move(
+        canvas.origin + point(px(4.), px(4.)),
+        None,
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert_eq!(graph.update(cx, |g, _| g.hovered()), None);
+}
+
+/// GR-2: a plain click opens the page; ⌘-click opens it in a split.
+#[gpui::test]
+fn graph_cmd_click_opens_a_split(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let graph = ws.update(cx, |w, _| w.graph_view()).expect("graph shown");
+    let main = ws.update(cx, |w, cx| w.main_page(cx)).unwrap();
+    let alpha = app.update(cx, |a, _| a.store.find_page("Alpha").unwrap().unwrap());
+    let nodes = graph.update(cx, |g, _| g.node_count());
+    let i = (0..nodes)
+        .find(|&i| graph.update(cx, |g, _| g.node_page(i)) == Some(alpha.clone()))
+        .unwrap();
+    let at = graph.update(cx, |g, _| g.node_screen_pos(i)).unwrap();
+    let cmd = Modifiers {
+        platform: true,
+        ..Default::default()
+    };
+    cx.simulate_click(at, cmd);
+    cx.run_until_parked();
+    assert!(ws.update(cx, |w, _| w.graph_view()).is_none());
+    assert_eq!(ws.update(cx, |w, cx| w.split_pages(cx)), vec![alpha]);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(main),
+        "the main page stays put"
+    );
+}
+
+/// GR-5: "Around this page" is a right-sidebar panel beside the editable page.
+#[gpui::test]
+fn graph_panel_sits_beside_the_page(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let main = ws.update(cx, |w, cx| w.main_page(cx)).unwrap();
+    let local = cx
+        .debug_bounds("graph-local")
+        .expect("Around this page filter")
+        .center();
+    cx.simulate_click(local, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        ws.update(cx, |w, _| w.graph_view()).is_none(),
+        "the full-screen graph gives way to the panel"
+    );
+    let panel = ws.update(cx, |w, _| w.graph_panel()).expect("panel open");
+    assert!(cx.debug_bounds("graph-panel").is_some());
+    assert!(cx.debug_bounds("right-sidebar").is_some());
+    assert_eq!(panel.update(cx, |g, _| g.origin()), Some(main.clone()));
+    assert!(panel.update(cx, |g, _| g.is_laid_out()));
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(main),
+        "the page beside the panel is untouched"
+    );
+
+    // Clicking a page in the panel still edits the main pane, and the panel follows it.
+    let alpha = app.update(cx, |a, _| a.store.find_page("Alpha").unwrap().unwrap());
+    let nodes = panel.update(cx, |g, _| g.node_count());
+    let i = (0..nodes)
+        .find(|&i| panel.update(cx, |g, _| g.node_page(i)) == Some(alpha.clone()))
+        .unwrap();
+    let at = panel.update(cx, |g, _| g.node_screen_pos(i)).unwrap();
+    cx.simulate_click(at, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(alpha.clone()));
+    let panel = ws.update(cx, |w, _| w.graph_panel()).expect("panel stays");
+    assert_eq!(panel.update(cx, |g, _| g.origin()), Some(alpha));
+
+    // "All pages" returns to the full-screen mode.
+    let expand = cx.debug_bounds("graph-expand").unwrap().center();
+    cx.simulate_click(expand, Modifiers::default());
+    cx.run_until_parked();
+    assert!(ws.update(cx, |w, _| w.graph_panel()).is_none());
+    assert!(ws.update(cx, |w, _| w.graph_view()).is_some());
+}
+
+/// GR-5: the panel is a projection of the index, so a new link while it is open must show
+/// up even though the page id did not change.
+#[gpui::test]
+fn graph_panel_refreshes_after_new_links(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let local = cx
+        .debug_bounds("graph-local")
+        .expect("Around this page filter")
+        .center();
+    cx.simulate_click(local, Modifiers::default());
+    cx.run_until_parked();
+    let panel = ws.update(cx, |w, _| w.graph_panel()).expect("panel open");
+    assert_eq!(panel.update(cx, |g, _| g.node_count()), 3);
+    assert_eq!(panel.update(cx, |g, _| g.edge_count()), 2);
+
+    // Add a third link to the page open beside the panel. The page id is unchanged, so an
+    // origin-only refresh would miss it.
+    let today = today_page(&app, cx);
+    let block = app.update(cx, |app, _| {
+        app.store
+            .page_state(&today)
+            .unwrap()
+            .live_roots()
+            .first()
+            .cloned()
+            .unwrap()
+    });
+    app.update(cx, |app, cx| {
+        let r =
+            app.store
+                .set_block_text(&today, &block, "[[Alpha]] [[Beta]] [[Gamma]]", None, None);
+        app.report(r);
+        let r = app.store.commit_block(&today, &block);
+        app.report(r);
+        app.changed(vec![today.clone()], true, cx);
+    });
+    cx.run_until_parked();
+
+    let panel = ws.update(cx, |w, _| w.graph_panel()).expect("panel stays");
+    assert_eq!(
+        panel.update(cx, |g, _| g.node_count()),
+        4,
+        "the panel shows the new page"
+    );
+    assert_eq!(panel.update(cx, |g, _| g.edge_count()), 3);
+}
+
+/// AGENTS.md focus invariant: removing the focused graph must hand focus back, or every
+/// workspace shortcut dies with it.
+#[gpui::test]
+fn closing_the_graph_panel_restores_focus(cx: &mut TestAppContext) {
+    let (_app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let local = cx
+        .debug_bounds("graph-local")
+        .expect("Around this page filter")
+        .center();
+    cx.simulate_click(local, Modifiers::default());
+    cx.run_until_parked();
+    let canvas = cx.debug_bounds("graph-canvas").expect("panel canvas");
+    cx.simulate_click(canvas.origin + point(px(6.), px(6.)), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(ws.update(cx, |w, _| w.graph_panel()).is_none());
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("jump-palette").is_some(),
+        "workspace shortcuts work after closing the panel"
+    );
+}
+
+/// AGENTS.md focus invariant: ⌘-click opens a split, then the full-screen graph that had
+/// focus disappears; focus must not go with it.
+#[gpui::test]
+fn graph_cmd_click_split_restores_focus(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let graph = ws.update(cx, |w, _| w.graph_view()).expect("graph shown");
+    let alpha = app.update(cx, |a, _| a.store.find_page("Alpha").unwrap().unwrap());
+    let nodes = graph.update(cx, |g, _| g.node_count());
+    let i = (0..nodes)
+        .find(|&i| graph.update(cx, |g, _| g.node_page(i)) == Some(alpha.clone()))
+        .unwrap();
+    let at = graph.update(cx, |g, _| g.node_screen_pos(i)).unwrap();
+    let cmd = Modifiers {
+        platform: true,
+        ..Default::default()
+    };
+    cx.simulate_click(at, cmd);
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.split_pages(cx)), vec![alpha]);
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("jump-palette").is_some(),
+        "workspace shortcuts work after the split opens"
+    );
+}
+
+/// GR-3: a zoom control floats over the canvas, so its click must not also activate a node
+/// that happens to be underneath it.
+#[gpui::test]
+fn graph_zoom_control_does_not_click_through(cx: &mut TestAppContext) {
+    let (_app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let graph = ws.update(cx, |w, _| w.graph_view()).expect("graph shown");
+    let plus = cx
+        .debug_bounds("graph-zoom-in")
+        .expect("zoom control")
+        .center();
+    // At the maximum zoom a click on "+" no longer moves the canvas or the nodes.
+    for _ in 0..24 {
+        cx.simulate_click(plus, Modifiers::default());
+        cx.run_until_parked();
+    }
+    assert!(
+        graph.update(cx, |g, _| g.zoom()) > 7.9,
+        "at the zoom ceiling"
+    );
+
+    // Drag a node until it sits exactly under the control.
+    let canvas = cx.debug_bounds("graph-canvas").expect("canvas");
+    let node = graph.update(cx, |g, _| g.node_screen_pos(0)).unwrap();
+    let delta = plus - node;
+    let start = canvas.origin + point(px(6.), px(6.));
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(start + delta, Some(MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(start + delta, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    let under = graph.update(cx, |g, _| g.node_screen_pos(0)).unwrap();
+    assert!(
+        f32::from((under.x - plus.x).abs()) < 3. && f32::from((under.y - plus.y).abs()) < 3.,
+        "node under the control: {under:?} {plus:?}"
+    );
+
+    let main = ws.update(cx, |w, cx| w.main_page(cx));
+    cx.simulate_click(plus, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        ws.update(cx, |w, _| w.graph_view()).is_some(),
+        "the zoom control does not open the node below it"
+    );
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), main);
 }
 
 #[gpui::test]

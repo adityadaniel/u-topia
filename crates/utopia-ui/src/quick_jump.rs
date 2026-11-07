@@ -347,18 +347,16 @@ impl JumpPalette {
     /// Page titles and grouped block hits for a non-empty query (SR-5: pages first).
     fn search_query(&mut self, q: &str, cx: &mut Context<Self>) {
         let store = &self.app.read(cx).store;
-        let all_hits = store.search_titles(q, 12).unwrap_or_default();
+        let all_hits = store
+            .search_titles_scoped(q, self.scope, 12)
+            .unwrap_or_default();
         let key = normalize_title(q);
         let exact = all_hits.iter().any(|h| {
             normalize_title(&h.title) == key
                 || h.alias.as_deref().map(normalize_title) == Some(key.clone())
         }) || store.find_page(q).ok().flatten().is_some();
         // The chips filter title rows as well as block groups (SR-3).
-        let mut results: Vec<QjItem> = all_hits
-            .into_iter()
-            .filter(|h| scope_keeps_page(self.scope, h.daily))
-            .map(QjItem::Page)
-            .collect();
+        let mut results: Vec<QjItem> = all_hits.into_iter().map(QjItem::Page).collect();
         // Block search lists existing blocks; only quick jump creates a page (SR-5).
         // Journal and To-dos cannot create a page, and Pages must not create a daily one.
         let date_like =

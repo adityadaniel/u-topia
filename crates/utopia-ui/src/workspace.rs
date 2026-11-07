@@ -17,7 +17,7 @@ use utopia_core::{BlockId, PageId};
 use utopia_store::{JournalEntry, OutgoingRef, PageRow, RefTarget};
 
 use crate::actions::*;
-use crate::app_state::AppState;
+use crate::app_state::{AppState, IndexUpdated};
 use crate::editor::{BlockEditor, EditorEvent};
 use crate::graph_view::{GraphEvent, GraphView};
 use crate::page_view::{PageView, PageViewEvent};
@@ -112,6 +112,8 @@ pub struct Workspace {
     jump: Option<(Entity<JumpPalette>, JumpMode)>,
     /// The graph view, shown in place of the main page while open (P2).
     graph: Option<Entity<GraphView>>,
+    /// The local graph in the right sidebar, beside the page that stays editable (GR-5).
+    graph_panel: Option<Entity<GraphView>>,
     /// The PDF viewer, shown in place of the main page while open (P2).
     pdf: Option<Entity<PdfView>>,
     sidebar: SidebarData,
@@ -215,6 +217,7 @@ impl Workspace {
             tab: InspectorTab::Incoming,
             jump: None,
             graph: None,
+            graph_panel: None,
             pdf: None,
             sidebar: SidebarData::default(),
             sidebar_seen: None,
@@ -234,6 +237,24 @@ impl Workspace {
             subs,
             _tasks: Vec::new(),
         };
+        // GR-5: the sidebar graph follows the page open beside it, so "around this page"
+        // keeps meaning the page you are reading or editing.
+        let main = me.main.clone();
+        me.subs.push(cx.observe(&main, |this, main, cx| {
+            let page = main.read(cx).page.clone();
+            if let Some(panel) = this.graph_panel.clone() {
+                panel.update(cx, |graph, cx| graph.set_origin(page, cx));
+            }
+        }));
+        // GR-5: the panel is an index projection. In debounced mode links arrive after the
+        // keystroke, so reload when the writer has caught up, not only when the page changes.
+        let app = me.app.clone();
+        me.subs
+            .push(cx.subscribe(&app, |this, _, _: &IndexUpdated, cx| {
+                if let Some(panel) = this.graph_panel.clone() {
+                    panel.update(cx, |graph, cx| graph.refresh(cx));
+                }
+            }));
         me.spawn_timers(cx);
         me
     }
@@ -747,13 +768,17 @@ impl Workspace {
         self.start_jump(JumpMode::Search, window, cx);
     }
 
-    /// Cmd+Shift+G: show or hide the graph view (P2).
+    /// Cmd+Shift+G: show or hide the full-screen graph (P2).
     pub fn show_graph(&mut self, _: &ShowGraph, window: &mut Window, cx: &mut Context<Self>) {
         if self.graph.take().is_some() {
             window.focus(&self.focus);
             cx.notify();
             return;
         }
+        self.open_graph_full(window, cx);
+    }
+
+    fn open_graph_full(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let origin = self.main.read(cx).page.clone();
         self.open_graph(origin, window, cx);
     }
@@ -763,21 +788,76 @@ impl Workspace {
     /// passes the page whose menu it was.
     fn open_graph(&mut self, origin: Option<PageId>, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |e, cx| e.end(cx));
-        let view = cx.new(|cx| GraphView::new(self.app.clone(), origin, cx));
-        self.subs.push(
-            cx.subscribe_in(&view, window, |this, _, e: &GraphEvent, window, cx| {
-                this.graph = None;
-                match e {
-                    GraphEvent::Open { page, sidebar } => {
-                        this.open(page.clone(), None, None, *sidebar, window, cx)
-                    }
-                    GraphEvent::Close => window.focus(&this.focus),
-                }
-                cx.notify();
-            }),
-        );
+        self.graph_panel = None;
+        let view = cx.new(|cx| GraphView::new(self.app.clone(), origin, false, cx));
+        self.subs
+            .push(cx.subscribe_in(&view, window, Self::on_graph_event));
         window.focus(&view.focus_handle(cx));
         self.graph = Some(view);
+        cx.notify();
+    }
+
+    /// GR-5: "Around this page" in the right sidebar. The main page stays editable.
+    fn open_graph_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(origin) = self.main.read(cx).page.clone() else {
+            return;
+        };
+        self.editor.update(cx, |e, cx| e.end(cx));
+        self.graph = None;
+        let view = cx.new(|cx| GraphView::new(self.app.clone(), Some(origin), true, cx));
+        self.subs
+            .push(cx.subscribe_in(&view, window, Self::on_graph_event));
+        self.right_open = true;
+        self.graph_panel = Some(view);
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn on_graph_event(
+        &mut self,
+        view: &Entity<GraphView>,
+        e: &GraphEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let from_panel = self.graph_panel.as_ref() == Some(view);
+        // AGENTS.md focus invariant: a removed element gets no keystrokes. If this graph
+        // owned focus, hand it back; otherwise leave an editor's focus untouched.
+        let had_focus = view.read(cx).focus_handle(cx).is_focused(window);
+        match e {
+            GraphEvent::Open {
+                page,
+                sidebar,
+                split,
+            } => {
+                if !from_panel {
+                    self.graph = None;
+                }
+                if *split {
+                    self.open_split(page.clone(), window, cx);
+                    if had_focus {
+                        window.focus(&self.focus);
+                    }
+                } else {
+                    self.open(page.clone(), None, None, *sidebar, window, cx);
+                }
+            }
+            GraphEvent::OpenPanel => {
+                self.graph = None;
+                self.open_graph_panel(window, cx);
+            }
+            GraphEvent::Expand => {
+                self.graph_panel = None;
+                self.open_graph_full(window, cx);
+            }
+            GraphEvent::Close => {
+                self.graph = None;
+                self.graph_panel = None;
+                if had_focus {
+                    window.focus(&self.focus);
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -874,6 +954,11 @@ impl Workspace {
 
     pub fn graph_view(&self) -> Option<Entity<GraphView>> {
         self.graph.clone()
+    }
+
+    /// The local graph panel in the right sidebar (GR-5).
+    pub fn graph_panel(&self) -> Option<Entity<GraphView>> {
+        self.graph_panel.clone()
     }
 
     /// The open palette, for tests that read the results it is showing.
@@ -2012,6 +2097,18 @@ impl Render for Workspace {
                 .bg(th.surface)
                 .border_l_1()
                 .border_color(th.line);
+            if let Some(panel) = &self.graph_panel {
+                col = col.child(
+                    div()
+                        .debug_selector(|| "graph-panel".into())
+                        .w_full()
+                        .h(px(400.))
+                        .flex_none()
+                        .border_b_1()
+                        .border_color(th.line)
+                        .child(panel.clone()),
+                );
+            }
             if self.panes.is_empty() && !self.inspector_open {
                 col = col.child(
                     div()

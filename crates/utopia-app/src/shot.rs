@@ -11,8 +11,8 @@
 //! - `click <x> <y>` clicks the left button at a point in the window's content, in points
 //!   from its top left (a Retina capture is twice that and includes the 28 pt title bar),
 //!   for controls with no shortcut
-//! - `hover <x> <y>` moves the pointer there without pressing, for states that only show
-//!   on hover (a block's drag handle, PG-4)
+//! - `hover <x> <y>` (or `move <x> <y>`) moves the pointer there without pressing, for
+//!   states that only show on hover (a block's drag handle, PG-4, or a graph node, GR-2)
 //! - `shot <path.png>` captures the window
 //! - `drop <file>` drops a file on the window, as from Finder
 //! - `ws <command> [args…]` runs a workspace command the app exposes for scripts
@@ -34,6 +34,7 @@ pub enum Step {
     Wait(u64),
     Scroll(f32),
     Click(f32, f32),
+    Move(f32, f32),
     Hover(f32, f32),
     Shot(String),
     Drop(String),
@@ -78,6 +79,14 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                     [Ok(x), Ok(y)] if verb == "click" => Ok(Step::Click(x, y)),
                     [Ok(x), Ok(y)] => Ok(Step::Hover(x, y)),
                     _ => Err(format!("bad {verb}: {line}")),
+                },
+                "move" => match rest
+                    .split_whitespace()
+                    .map(str::parse::<f32>)
+                    .collect::<Vec<_>>()[..]
+                {
+                    [Ok(x), Ok(y)] => Ok(Step::Move(x, y)),
+                    _ => Err(format!("bad move: {line}")),
                 },
                 "shot" if !rest.trim().is_empty() => Ok(Step::Shot(rest.trim().to_string())),
                 "drop" if !rest.trim().is_empty() => Ok(Step::Drop(rest.trim().to_string())),
@@ -161,7 +170,7 @@ pub async fn run(
                 }
                 Ok(())
             }
-            Step::Hover(x, y) => {
+            Step::Move(x, y) | Step::Hover(x, y) => {
                 // A pointer move with no button, so a hover state shows in the capture.
                 let target = handle.update(cx, |_, window, _| click_target(window));
                 if let Ok(Some((w, height))) = target {
@@ -496,6 +505,8 @@ mod tests {
         );
         assert!(parse("click 12").is_err());
         assert!(parse("click a b").is_err());
+        assert_eq!(parse("move 12 40.5").unwrap(), vec![Step::Move(12., 40.5)]);
+        assert!(parse("move 12").is_err());
         assert_eq!(
             parse("hover 12 40.5").unwrap(),
             vec![Step::Hover(12., 40.5)]

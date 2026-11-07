@@ -569,6 +569,19 @@ fn tag_classification_is_updated_incrementally() {
     assert_eq!(s.tag_page_full_scans(), full, "no whole-graph scan");
     assert!(s.tag_pages().unwrap().contains(&alpha), "still a tag page");
 
+    // Editing prose inside the tagged block leaves the tag unchanged, so the destination
+    // needs no reclassification; only the page actually written is classified.
+    let classified = s.tag_page_classifications();
+    s.set_block_text(&src, &tag, "see #alpha here, with more prose", None, None)
+        .unwrap();
+    s.commit_block(&src, &tag).unwrap();
+    assert_eq!(
+        s.tag_page_classifications(),
+        classified + 1,
+        "an unchanged tag does not rescan its destination"
+    );
+    assert!(s.tag_pages().unwrap().contains(&alpha), "still a tag page");
+
     // The same block's tag becoming a link takes the page out of the set.
     s.set_block_text(&src, &tag, "see [[alpha]] here", None, None)
         .unwrap();
