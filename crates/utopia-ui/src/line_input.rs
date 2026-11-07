@@ -73,7 +73,14 @@ impl LineInput {
 
     /// Set the whole text (a host-written value, e.g. a `utopia://search` query) and tell
     /// the host, exactly as typing does, so a host mirroring `text()` never lags (§13.5).
+    ///
+    /// Writing the text it already shows is not a change: the reference filter is cleared
+    /// on every page change (`PageView::show`, §13.4), and emitting there would make its
+    /// listener rebuild the item list a second time for nothing (rule 10).
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.field.text == text {
+            return;
+        }
         self.field.set_text(text, text.len());
         self.field.move_to(0);
         self.field.select_to(text.len());
