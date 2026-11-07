@@ -277,6 +277,7 @@ pub fn sync_dot(runner: Option<&SyncRunner>) -> SyncDot {
         None => SyncDot::Syncing,
         Some(SyncStatus::Synced { .. }) => SyncDot::Synced,
         Some(SyncStatus::Offline { .. })
+        | Some(SyncStatus::LocalError { .. })
         | Some(SyncStatus::NeedsAuth)
         | Some(SyncStatus::Unsupported) => SyncDot::Error,
     }
@@ -304,6 +305,9 @@ pub fn status_text(status: Option<&SyncStatus>, now_ms: i64) -> (String, bool) {
         }
         Some(SyncStatus::Offline { queued }) => {
             (format!("● Offline — {queued} changes queued"), true)
+        }
+        Some(SyncStatus::LocalError { message }) => {
+            (format!("● Sync: local error — {message}"), true)
         }
         Some(SyncStatus::NeedsAuth) => ("● Sync: sign-in required".into(), true),
         Some(SyncStatus::Unsupported) => ("● Sync: relay protocol unsupported".into(), true),
@@ -365,6 +369,10 @@ mod tests {
         assert_eq!(sync_dot(Some(&runner)), SyncDot::Synced);
         runner.last = Some(SyncStatus::Offline { queued: 2 });
         assert_eq!(sync_dot(Some(&runner)), SyncDot::Error);
+        runner.last = Some(SyncStatus::LocalError {
+            message: "database: disk I/O error".into(),
+        });
+        assert_eq!(sync_dot(Some(&runner)), SyncDot::Error);
         // A round in flight wins over the last round's status.
         runner.last = Some(SyncStatus::Synced { at_ms: 0 });
         runner.begin_round().expect("the transport is home");
@@ -379,6 +387,13 @@ mod tests {
         );
         let (s, warn) = status_text(Some(&SyncStatus::Offline { queued: 3 }), 0);
         assert_eq!(s, "● Offline — 3 changes queued");
+        assert!(warn);
+        // §12.6: a round that dies in the store is not the relay being offline.
+        let local = SyncStatus::LocalError {
+            message: "database: no such table: sync_state".into(),
+        };
+        let (s, warn) = status_text(Some(&local), 0);
+        assert_eq!(s, "● Sync: local error — database: no such table: sync_state");
         assert!(warn);
     }
 

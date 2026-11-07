@@ -1559,6 +1559,40 @@ fn enabling_sync_twice_keeps_one_poll_loop(cx: &mut TestAppContext) {
     );
 }
 
+/// §12.6: a round that fails on the device (the store, not the relay) must not be reported
+/// as the relay being offline — the network was never tried.
+#[gpui::test]
+fn a_local_store_error_is_not_reported_as_offline(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    use utopia_sync::SyncStatus;
+    let (app, ws, cx) = setup(cx);
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(Box::new(RelayTransport::new(Relay::new(), "g")), None, cx)
+    });
+    cx.simulate_input("local words");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    // `prepare` reads `sync_state`; without it the round dies before the network.
+    app.update(cx, |app, _| {
+        app.store.conn().execute_batch("DROP TABLE sync_state").unwrap();
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    let status = ws.read_with(cx, |w, _| w.sync_status());
+    assert!(
+        !matches!(status, Some(SyncStatus::Offline { .. })),
+        "a local store error is not the relay being offline: {status:?}"
+    );
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Error,
+        "the dot still says something is wrong"
+    );
+}
+
 // ---------------------------------------------------------------- v1.1 (P1)
 
 fn kind_of(

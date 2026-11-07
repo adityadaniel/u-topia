@@ -136,7 +136,12 @@ impl SyncReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncStatus {
     Synced { at_ms: i64 },
+    /// The relay was not reached, or answered with a transport failure: everything is
+    /// still queued locally (§12.6).
     Offline { queued: usize },
+    /// The round failed on this device (the store, a shard, a projection). The network was
+    /// never tried, so saying "offline" would blame the relay for a local fault.
+    LocalError { message: String },
     NeedsAuth,
     Unsupported,
 }
@@ -147,6 +152,9 @@ impl SyncStatus {
             Ok(_) => SyncStatus::Synced { at_ms: store.now() },
             Err(SyncError::Unauthorized) => SyncStatus::NeedsAuth,
             Err(SyncError::ProtocolVersion(_)) => SyncStatus::Unsupported,
+            Err(SyncError::Store(e)) => SyncStatus::LocalError {
+                message: e.to_string(),
+            },
             Err(_) => SyncStatus::Offline {
                 queued: store.outbox_pending(usize::MAX >> 1).map_or(0, |v| v.len()),
             },
