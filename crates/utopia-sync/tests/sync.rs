@@ -209,3 +209,34 @@ fn pushes_are_idempotent() {
         .unwrap();
     assert_eq!((resp.accepted, resp.duplicate), (0, 1));
 }
+
+/// §9.2/§15.1: the offline status shows how many changes are queued, and computing it on
+/// the UI thread must not read the payloads. Counting has to survive a row whose payload
+/// cannot be decoded as bytes; loading the whole outbox does not.
+#[test]
+fn the_offline_status_counts_the_outbox_without_reading_payloads() {
+    let relay = Relay::new();
+    let (mut s, _c) = device(&relay);
+    let p = s.create_page("Queued").unwrap();
+    write(&mut s, &p, "one");
+    write(&mut s, &p, "two");
+    let pending = s.outbox_pending(usize::MAX >> 1).unwrap().len();
+    assert!(pending >= 2, "the edits are queued");
+    let offline =
+        SyncStatus::from_result(&Err(utopia_sync::SyncError::Transport("down".into())), &s);
+    assert_eq!(offline, SyncStatus::Offline { queued: pending });
+    // An undecodable payload is still a queued change; the count must not depend on
+    // deserialising payload bytes (rule 10: no outbox read on the UI thread).
+    s.conn()
+        .execute(
+            "INSERT INTO outbox (page_id, payload, client_seq, created_at) VALUES ('p', 3, 99, 0)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        SyncStatus::from_result(&Err(utopia_sync::SyncError::Transport("down".into())), &s),
+        SyncStatus::Offline {
+            queued: pending + 1
+        }
+    );
+}

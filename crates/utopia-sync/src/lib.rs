@@ -162,7 +162,9 @@ impl SyncStatus {
                 message: e.to_string(),
             },
             Err(_) => SyncStatus::Offline {
-                queued: store.outbox_pending(usize::MAX >> 1).map_or(0, |v| v.len()),
+                // A count, not the rows: this runs on the UI thread on every backoff round
+                // with no network, and payloads can be large (rule 10).
+                queued: store.outbox_count().unwrap_or(0),
             },
         }
     }
