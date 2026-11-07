@@ -654,6 +654,15 @@ impl Store {
 
     // ---------------------------------------------------------------- editing
 
+    /// Drop an in-memory shard a failed command group may have left half-applied. A live
+    /// page reloads from its last durable state. A draft has none, so the day goes back to
+    /// unwritten: its shard and its draft entry are one value and go together (FR-1.2),
+    /// rather than leaving a draft `page_state` cannot find.
+    fn drop_shard(&mut self, page: &PageId) {
+        self.docs.remove(page);
+        self.drafts.remove(page);
+    }
+
     /// Apply commands to one page as a single undo group.
     pub fn execute(
         &mut self,
@@ -687,9 +696,9 @@ impl Store {
                 Err(e) => {
                     // Roll back what this group already applied in memory.
                     for (p, _) in &deltas {
-                        self.docs.remove(p);
+                        self.drop_shard(p);
                     }
-                    self.docs.remove(&page);
+                    self.drop_shard(&page);
                     return Err(e);
                 }
             };

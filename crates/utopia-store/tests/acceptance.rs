@@ -3,9 +3,9 @@
 
 use chrono::NaiveDate;
 use utopia_core::outline::{self, Plan};
-use utopia_core::{BlockId, PageId, PageKind};
+use utopia_core::{BlockId, BlockKind, Command, PageId, PageKind};
 use utopia_doc::Frontier;
-use utopia_store::{BlockRefStatus, RefQuery, RefTarget, Store};
+use utopia_store::{BlockRefStatus, EditOpts, RefQuery, RefTarget, Store, StoreError};
 
 fn date(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -141,6 +141,51 @@ fn fr_1_2_visited_day_is_a_draft_until_written() {
     write(&mut s, &p, "see [[2026-11-03]]");
     assert_eq!(s.find_page("2026-11-03").unwrap(), Some(next.clone()));
     assert!(!s.is_draft(&next));
+    assert_doctor(&mut s);
+}
+
+/// `docs/state-machines/draft-daily-page.md` issue 1: a command that fails on a draft used
+/// to remove its shard but keep the `drafts` entry, so `is_draft` said "draft" while
+/// `page_state` said `NotFound`. A draft and its shard go together (FR-1.2).
+#[test]
+fn fr_1_2_failed_command_leaves_no_ghost_draft() {
+    let mut s = store();
+    let d = date(2026, 11, 2);
+    let draft = s.draft_daily(d).unwrap();
+    assert!(s.is_draft(&draft));
+    // A block id that is already in the shard fails the whole command group (the same
+    // NOOP a racing insert produces), after the earlier commands applied in memory.
+    let taken = s.page_state(&draft).unwrap().live_roots()[0].clone();
+    let failed = s.execute(
+        &draft,
+        vec![Command::InsertBlock {
+            id: taken,
+            parent: None,
+            after: None,
+            text: String::new(),
+            kind: BlockKind::Bullet,
+        }],
+        EditOpts::default(),
+    );
+    assert!(failed.is_err(), "the duplicate block id must fail");
+    assert!(
+        !s.is_draft(&draft),
+        "a draft whose shard is gone must not be reported as a draft"
+    );
+    assert!(
+        s.page_state(&draft).is_err(),
+        "the shard went with the draft entry"
+    );
+    assert!(
+        matches!(s.draft_append_block(&draft), Err(StoreError::Invalid(_))),
+        "typing on it is refused before `load_doc` looks for a draft shard"
+    );
+    // The day is simply unwritten again: visiting it builds a fresh draft under the same
+    // deterministic id.
+    let again = s.draft_daily(d).unwrap();
+    assert_eq!(again, draft, "the date keeps its identity");
+    assert!(s.is_draft(&again));
+    assert_eq!(s.page_state(&again).unwrap().live_count(), 1);
     assert_doctor(&mut s);
 }
 
