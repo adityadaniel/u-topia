@@ -232,7 +232,9 @@ fn ac_12_3_an_unchanged_manifest_is_asked_for_conditionally() {
     let page = a.create_page("Once").unwrap();
     write(&mut a, &page, "hello");
     ca.sync_once(&mut a).unwrap();
-    let rev: u64 = a.sync_get("rev").unwrap().unwrap().parse().unwrap();
+    let rev = utopia_sync::ManifestRev::decode(&a.sync_get("rev").unwrap().unwrap())
+        .expect("the applied rev is tagged with its space")
+        .rev;
 
     let before = asked.lock().unwrap().len();
     ca.sync_once(&mut a).unwrap();
@@ -358,6 +360,34 @@ fn ac_12_6_a_foreign_cursor_cannot_compact_the_relay() {
         relay.log_len("g1", page.as_str()) > 200,
         "the relay log is untouched"
     );
+}
+
+/// §12.3 step 1: the stored manifest rev belongs to the relay that issued it. A second
+/// relay that happens to be at the same revision must not answer 304 and hide its pages.
+#[test]
+fn ac_12_3_switching_relay_at_the_same_revision_still_pulls() {
+    let relay_a = Relay::new();
+    let relay_b = Relay::new();
+    let (mut a, mut ca) = device(&relay_a);
+    let page = a.create_page("Shared").unwrap();
+    write(&mut a, &page, "written while on relay a");
+    ca.sync_once(&mut a).unwrap();
+
+    let (mut b, mut cb) = device(&relay_b);
+    let same = b.create_page("Shared").unwrap();
+    assert_eq!(same, page);
+    write(&mut b, &same, "written on relay b");
+    cb.sync_once(&mut b).unwrap();
+    assert_eq!(
+        relay_a.manifest("g1").rev,
+        relay_b.manifest("g1").rev,
+        "the two relays are at the same revision"
+    );
+
+    let mut ca = SyncClient::new(RelayTransport::new(relay_b.clone(), "g1"), &a).unwrap();
+    ca.sync_once(&mut a).unwrap();
+    let seen = texts(&mut a, &page);
+    assert!(seen.contains(&"written on relay b".to_string()), "{seen:?}");
 }
 
 /// A relay whose pull payloads for one page are corrupt: a shard the relay accepted but

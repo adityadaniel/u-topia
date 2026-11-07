@@ -120,6 +120,63 @@ fn manifest_is_conditional_and_pushes_are_idempotent() {
     assert_eq!((r.accepted, r.duplicate), (0, 1));
 }
 
+/// Serve a relay on an address chosen earlier; the `Arc<Db>` is one store instance.
+fn serve_on(rt: &tokio::runtime::Runtime, addr: std::net::SocketAddr, cfg: Config) -> Arc<Db> {
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let app = router(db.clone(), cfg);
+    let listener = rt.block_on(tokio::net::TcpListener::bind(addr)).unwrap();
+    rt.spawn(async move { axum::serve(listener, app).await.unwrap() });
+    db
+}
+
+/// §12.6: a relay whose database was wiped keeps its URL but not its sequence. The
+/// manifest's instance id is what tells the two apart, so the client pulls again instead
+/// of trusting a cursor from the old store.
+#[test]
+fn ac_12_6_a_wiped_relay_is_a_new_cursor_space() {
+    let mut rt = tokio::runtime::Runtime::new().unwrap();
+    let addr = {
+        let l = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        l.local_addr().unwrap()
+    };
+    let base = format!("http://{addr}");
+    let first = serve_on(&rt, addr, Config::default());
+    let mut a = Store::open_in_memory().unwrap();
+    a.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let mut ca = SyncClient::new(HttpTransport::new(&base, "graph-1", None).unwrap(), &a).unwrap();
+    let page = a.create_page("Shared").unwrap();
+    for i in 0..5 {
+        write(&mut a, &page, &format!("before {i}"));
+    }
+    ca.sync_once(&mut a).unwrap();
+    assert!(!first.manifest("graph-1").unwrap().instance.is_empty());
+    drop(ca);
+    drop(first);
+    drop(rt);
+
+    // The relay's database is wiped and served again on the same address.
+    rt = tokio::runtime::Runtime::new().unwrap();
+    let second = serve_on(&rt, addr, Config::default());
+    let (mut b, mut cb) = {
+        let mut s = Store::open_in_memory().unwrap();
+        let c = SyncClient::new(HttpTransport::new(&base, "graph-1", None).unwrap(), &s).unwrap();
+        s.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+        (s, c)
+    };
+    let same = b.create_page("Shared").unwrap();
+    assert_eq!(same, page);
+    write(&mut b, &same, "after the wipe");
+    cb.sync_once(&mut b).unwrap();
+
+    let mut ca = SyncClient::new(HttpTransport::new(&base, "graph-1", None).unwrap(), &a).unwrap();
+    ca.sync_once(&mut a).unwrap();
+    let seen = texts(&mut a, &page);
+    assert!(seen.contains(&"after the wipe".to_string()), "{seen:?}");
+    assert!(!second.manifest("graph-1").unwrap().instance.is_empty());
+}
+
 #[test]
 fn auth_is_enforced() {
     let server = serve(Config {

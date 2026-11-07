@@ -168,6 +168,26 @@ pub struct Cursor {
     pub pos: u64,
 }
 
+/// The manifest revision last fully applied, tagged with the cursor space that issued it
+/// (§12.3 step 1). A rev from another relay or folder must never answer "not modified":
+/// two relays can be at the same counter while holding different pages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestRev {
+    pub space: CursorSpace,
+    pub rev: u64,
+}
+
+impl ManifestRev {
+    pub fn encode(&self) -> String {
+        // A plain struct of a string, an enum tag and a u64 cannot fail to serialize.
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn decode(raw: &str) -> Option<Self> {
+        serde_json::from_str(raw).ok()
+    }
+}
+
 impl Cursor {
     pub fn encode(&self) -> String {
         // A plain struct of a string, an enum tag and a u64 cannot fail to serialize.
@@ -301,7 +321,8 @@ pub struct Outgoing {
     pub pushes: Vec<(PageId, Vec<i64>, PushRequest)>,
     /// Where each page was pulled to, tagged with the transport that measured it.
     pub cursors: BTreeMap<PageId, Cursor>,
-    pub rev: Option<u64>,
+    /// The last manifest this client fully applied, in the space that issued it.
+    pub rev: Option<ManifestRev>,
     pub snapshots: Vec<(PageId, u64, Vec<u8>)>,
     /// Attachments to upload: `(sha256, bytes)`.
     pub blob_puts: Vec<(String, Vec<u8>)>,
@@ -351,8 +372,12 @@ fn cursor_key(page: &PageId) -> String {
 pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incoming> {
     let mut inc = Incoming::default();
     // The transport's identity can come from its own manifest (a relay store id), so ask
-    // first and take the cursor space afterwards.
-    let first = t.manifest(out.rev)?;
+    // first and take the cursor space afterwards. A conditional request is only safe when
+    // the stored rev belongs to the space this transport already has; otherwise it is
+    // another relay's (or folder's) counter and must not answer 304.
+    let known = t.cursor_space();
+    let if_none_match = out.rev.as_ref().filter(|r| r.space == known).map(|r| r.rev);
+    let first = t.manifest(if_none_match)?;
     if let Some(m) = &first {
         if m.protocol_version != PROTOCOL_VERSION {
             return Err(SyncError::ProtocolVersion(m.protocol_version));
@@ -492,7 +517,9 @@ impl SyncEngine {
     pub fn prepare(&mut self, store: &mut Store) -> Result<Outgoing> {
         store.sync_index()?;
         let mut out = Outgoing {
-            rev: store.sync_get("rev")?.and_then(|r| r.parse().ok()),
+            rev: store
+                .sync_get("rev")?
+                .and_then(|raw| ManifestRev::decode(&raw)),
             snapshots: std::mem::take(&mut self.pending_snapshots),
             ..Default::default()
         };
@@ -636,9 +663,13 @@ impl SyncEngine {
         }
         // Only a manifest whose pulls were all applied may be remembered: with a page
         // still failed, the next round must fetch the manifest again and retry it.
-        if let Some(m) = &inc.manifest {
+        if let (Some(m), Some(space)) = (&inc.manifest, &inc.cursor_space) {
             if report.failed.is_empty() {
-                store.sync_set("rev", &m.rev.to_string())?;
+                let rev = ManifestRev {
+                    space: space.clone(),
+                    rev: m.rev,
+                };
+                store.sync_set("rev", &rev.encode())?;
             }
         }
         store.sync_set("synced_at", &store.now().to_string())?;
