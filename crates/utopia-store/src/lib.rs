@@ -759,6 +759,14 @@ impl Store {
         if deltas.iter().any(|(_, d)| d.structural || d.meta_changed) {
             self.flush()?;
         }
+        // A draft that promotion merged into the day (see `resolve_promotion`) has this
+        // group's commands in the survivor's shard now. Point the undo step there too, or
+        // undo would change the survivor in memory and commit nothing (rule 2).
+        for step in &mut group.steps {
+            if let Some(to) = self.redirect(&step.page) {
+                step.page = to;
+            }
+        }
         if !opts.no_undo {
             self.undo.push(group);
         }

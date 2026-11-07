@@ -346,6 +346,43 @@ fn fr_1_2_typing_after_a_merged_promotion_reaches_the_day() {
     assert!(!s.is_draft(&draft));
 }
 
+/// P3 of the draft-day review: undo after a merged promotion must reach the day's shard.
+/// The undo step used to keep the draft's id, whose shard no longer exists, so undo changed
+/// only the in-memory survivor and the index kept the typed text (rule 2).
+#[test]
+fn fr_1_2_undo_after_a_merged_promotion_reaches_the_day() {
+    let d = date(2026, 11, 2);
+    let mut remote = store();
+    let gone = remote.ensure_daily_page(d).unwrap();
+    remote.delete_page(&gone).unwrap();
+    let live = remote.ensure_daily_page(d).unwrap();
+    write(&mut remote, &live, "remote two");
+    let shard = remote.export_since(&live, &Frontier::default()).unwrap();
+
+    let mut s = store();
+    let draft = s.draft_daily(d).unwrap();
+    s.import_batch(&[(live.clone(), shard)]).unwrap();
+    let block = s.page_state(&draft).unwrap().live_roots()[0].clone();
+    s.set_block_text(&draft, &block, "t", None, None).unwrap();
+    s.undo().unwrap();
+    s.sync_index().unwrap();
+    let texts = live_texts(&mut s, &live);
+    assert!(
+        !texts.iter().any(|(t, _)| t == "t"),
+        "undo reached the day in memory: {texts:?}"
+    );
+    let stored: String = s
+        .conn()
+        .query_row(
+            "SELECT text FROM block WHERE id=?1",
+            [block.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "", "undo reached the day's shard, not a dead id");
+    assert_doctor(&mut s);
+}
+
 #[test]
 fn ac_1_5_deleted_daily_is_recreated_and_recoverable() {
     let mut s = store();
