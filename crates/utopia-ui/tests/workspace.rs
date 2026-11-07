@@ -1482,8 +1482,7 @@ impl utopia_sync::Transport for CountingTransport {
         &mut self,
         if_none_match: Option<u64>,
     ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
-        self.calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.manifest(if_none_match)
     }
 
@@ -1510,6 +1509,47 @@ impl utopia_sync::Transport for CountingTransport {
         payload: Vec<u8>,
     ) -> utopia_sync::Result<()> {
         self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// A transport that refuses every round with a fixed error.
+struct Refusing {
+    err: fn() -> utopia_sync::SyncError,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl utopia_sync::Transport for Refusing {
+    fn manifest(
+        &mut self,
+        _if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err((self.err)())
+    }
+
+    fn push(
+        &mut self,
+        _page: &PageId,
+        _req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        Err((self.err)())
+    }
+
+    fn pull(
+        &mut self,
+        _page: &PageId,
+        _since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        Err((self.err)())
+    }
+
+    fn put_snapshot(
+        &mut self,
+        _page: &PageId,
+        _covers_seq: u64,
+        _payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        Err((self.err)())
     }
 }
 
@@ -1577,7 +1617,10 @@ fn a_local_store_error_is_not_reported_as_offline(cx: &mut TestAppContext) {
     cx.run_until_parked();
     // `prepare` reads `sync_state`; without it the round dies before the network.
     app.update(cx, |app, _| {
-        app.store.conn().execute_batch("DROP TABLE sync_state").unwrap();
+        app.store
+            .conn()
+            .execute_batch("DROP TABLE sync_state")
+            .unwrap();
     });
     cx.executor().advance_clock(Duration::from_secs(6));
     cx.run_until_parked();
@@ -1610,7 +1653,10 @@ fn a_failed_round_backs_off(cx: &mut TestAppContext) {
     cx.executor().advance_clock(Duration::from_secs(6));
     cx.run_until_parked();
     app.update(cx, |app, _| {
-        app.store.conn().execute_batch("DROP TABLE sync_state").unwrap();
+        app.store
+            .conn()
+            .execute_batch("DROP TABLE sync_state")
+            .unwrap();
     });
     // This round fails on the device, so the next attempt is 10 s away, not 5 s.
     cx.executor().advance_clock(Duration::from_secs(6));
@@ -1639,6 +1685,45 @@ fn a_failed_round_backs_off(cx: &mut TestAppContext) {
             Some(utopia_sync::SyncStatus::Synced { .. })
         ),
         "the round after the backoff recovers"
+    );
+}
+
+/// §12.6: 401/403 halts sync instead of retrying. The relay is only retried once it says
+/// something else.
+#[gpui::test]
+fn unauthorized_halts_the_poll_loop(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    let (_app, ws, cx) = setup(cx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(Refusing {
+                err: || utopia_sync::SyncError::Unauthorized,
+                calls: calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one refused round");
+    assert_eq!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(utopia_sync::SyncStatus::NeedsAuth)
+    );
+    cx.executor().advance_clock(Duration::from_secs(120));
+    cx.run_until_parked();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a 401 halts sync (§12.6); it must not keep polling"
+    );
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Error
     );
 }
 

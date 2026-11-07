@@ -24,7 +24,7 @@ use crate::page_view::{PageView, PageViewEvent};
 use crate::pdf_view::{PdfEvent, PdfView};
 use crate::quick_jump::{JumpPalette, PaletteMode, QuickJumpEvent};
 use crate::sync_runner::{
-    exchange_owned, status_line, sync_dot, BoxTransport, SyncDot, SyncRunner,
+    exchange_owned, status_line, sync_dot, BoxTransport, SyncDot, SyncPhase, SyncRunner,
 };
 use crate::theme::{quiet_control, theme};
 
@@ -492,7 +492,12 @@ impl Workspace {
                 this.sync
                     .as_ref()
                     .filter(|s| s.is_generation(generation))
-                    .map(|s| (s.interval, s.nudge.clone()))
+                    .and_then(|s| match s.phase {
+                        // §12.6: a refusal or a protocol mismatch halts sync; the loop ends
+                        // and the dot stays red until sync is started again.
+                        SyncPhase::Halted { .. } => None,
+                        _ => Some((s.interval, s.nudge.clone())),
+                    })
             });
             let Ok(Some((interval, nudge))) = wait else {
                 break;
@@ -522,10 +527,8 @@ impl Workspace {
                         Some((out, transport))
                     }
                     Err(e) => {
-                        let status = utopia_sync::SyncStatus::from_result(
-                            &Err(e),
-                            &app.read(cx).store,
-                        );
+                        let status =
+                            utopia_sync::SyncStatus::from_result(&Err(e), &app.read(cx).store);
                         runner.round_failed(transport, status);
                         None
                     }

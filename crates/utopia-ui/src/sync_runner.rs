@@ -135,6 +135,37 @@ pub enum SyncPhase {
     Exchanging,
     /// The exchange returned; the UI thread holds the transport and imports the result.
     Applying,
+    /// The relay refused this device (401/403) or speaks a protocol this client does not
+    /// (§12.6): sync halts until it is started again. Editing continues locally.
+    Halted { reason: HaltReason },
+}
+
+/// Why sync halted: terminal for this runner, not a backoff (§12.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HaltReason {
+    /// 401/403: sign in again, then start sync.
+    NeedsAuth,
+    /// The relay's `protocol_version` is not the one this client speaks.
+    Unsupported,
+}
+
+impl HaltReason {
+    /// The terminal reason in `error`, if it has one: these are never retried.
+    pub fn of(error: &SyncError) -> Option<Self> {
+        match error {
+            SyncError::Unauthorized => Some(Self::NeedsAuth),
+            SyncError::ProtocolVersion(_) => Some(Self::Unsupported),
+            _ => None,
+        }
+    }
+
+    /// The outcome to show while halted.
+    pub fn status(self) -> SyncStatus {
+        match self {
+            Self::NeedsAuth => SyncStatus::NeedsAuth,
+            Self::Unsupported => SyncStatus::Unsupported,
+        }
+    }
 }
 
 pub struct SyncRunner {
@@ -198,7 +229,8 @@ impl SyncRunner {
     }
 
     /// The round's store work failed, so nothing left the device: the transport comes home
-    /// and the next poll backs off like any other failed round (§12.6).
+    /// and the next poll backs off like any other failed round (§12.6). A local failure is
+    /// never terminal, so this cannot halt.
     pub fn round_failed(&mut self, transport: BoxTransport, status: SyncStatus) {
         self.interval = back_off(self.interval);
         self.last = Some(status);
@@ -215,13 +247,21 @@ impl SyncRunner {
         self.phase = SyncPhase::Applying;
     }
 
-    /// The round is over: remember what to show and how soon to poll again.
+    /// The round is over: remember what to show and how soon to poll again. A refusal or a
+    /// protocol mismatch halts sync instead of backing off (§12.6).
     pub fn end_round(
         &mut self,
         transport: BoxTransport,
         report: &Result<SyncReport, SyncError>,
         status: SyncStatus,
     ) {
+        if let Err(e) = report {
+            if let Some(reason) = HaltReason::of(e) {
+                self.last = Some(reason.status());
+                self.phase = SyncPhase::Halted { reason };
+                return;
+            }
+        }
         self.interval = next_interval(self.interval, report);
         self.last = Some(status);
         self.phase = SyncPhase::Idle { transport };
@@ -277,16 +317,18 @@ pub fn sync_dot(runner: Option<&SyncRunner>) -> SyncDot {
     let Some(runner) = runner else {
         return SyncDot::Off;
     };
-    if !matches!(runner.phase, SyncPhase::Idle { .. }) {
-        return SyncDot::Syncing;
-    }
-    match runner.last {
-        None => SyncDot::Syncing,
-        Some(SyncStatus::Synced { .. }) => SyncDot::Synced,
-        Some(SyncStatus::Offline { .. })
-        | Some(SyncStatus::LocalError { .. })
-        | Some(SyncStatus::NeedsAuth)
-        | Some(SyncStatus::Unsupported) => SyncDot::Error,
+    match &runner.phase {
+        SyncPhase::Halted { .. } => SyncDot::Error,
+        // A round in flight wins over the last round's outcome.
+        SyncPhase::Preparing | SyncPhase::Exchanging | SyncPhase::Applying => SyncDot::Syncing,
+        SyncPhase::Idle { .. } => match runner.last {
+            None => SyncDot::Syncing,
+            Some(SyncStatus::Synced { .. }) => SyncDot::Synced,
+            Some(SyncStatus::Offline { .. })
+            | Some(SyncStatus::LocalError { .. })
+            | Some(SyncStatus::NeedsAuth)
+            | Some(SyncStatus::Unsupported) => SyncDot::Error,
+        },
     }
 }
 
@@ -298,7 +340,9 @@ pub fn status_line(runner: &SyncRunner, now_ms: i64) -> (String, bool) {
         SyncPhase::Preparing | SyncPhase::Exchanging | SyncPhase::Applying => {
             ("Sync: syncing…".into(), false)
         }
-        SyncPhase::Idle { .. } => status_text(runner.last.as_ref(), now_ms),
+        SyncPhase::Idle { .. } | SyncPhase::Halted { .. } => {
+            status_text(runner.last.as_ref(), now_ms)
+        }
     }
 }
 
@@ -407,8 +451,56 @@ mod tests {
             message: "database: no such table: sync_state".into(),
         };
         let (s, warn) = status_text(Some(&local), 0);
-        assert_eq!(s, "● Sync: local error — database: no such table: sync_state");
+        assert_eq!(
+            s,
+            "● Sync: local error — database: no such table: sync_state"
+        );
         assert!(warn);
+    }
+
+    /// §12.6: 401/403 halts sync instead of backing off, and a protocol mismatch does the
+    /// same. The transport is gone, so no round can start again on this runner.
+    #[test]
+    fn a_refusal_halts_instead_of_retrying() {
+        fn store() -> utopia_store::Store {
+            utopia_store::Store::open_in_memory().unwrap()
+        }
+        for (err, status, line) in [
+            (
+                SyncError::Unauthorized,
+                SyncStatus::NeedsAuth,
+                "● Sync: sign-in required",
+            ),
+            (
+                SyncError::ProtocolVersion(99),
+                SyncStatus::Unsupported,
+                "● Sync: relay protocol unsupported",
+            ),
+        ] {
+            let engine = utopia_sync::SyncEngine::new(&store()).expect("engine");
+            let transport: BoxTransport = Box::new(utopia_sync::relay::RelayTransport::new(
+                utopia_sync::relay::Relay::new(),
+                "g",
+            ));
+            let mut runner = SyncRunner::new(engine, transport);
+            let transport = runner.begin_round().expect("a round starts");
+            runner.exchange();
+            runner.exchange_returned();
+            let report: Result<SyncReport, SyncError> = Err(err);
+            runner.end_round(
+                transport,
+                &report,
+                SyncStatus::from_result(&report, &store()),
+            );
+            assert!(matches!(runner.phase, SyncPhase::Halted { .. }));
+            assert_eq!(runner.last, Some(status));
+            assert_eq!(sync_dot(Some(&runner)), SyncDot::Error);
+            assert_eq!(status_line(&runner, 0).0, line);
+            assert!(
+                runner.begin_round().is_none(),
+                "halted sync has no transport to start a round with"
+            );
+        }
     }
 
     /// SB-4: the dot and the line read the same state. During a round the dot is amber, so

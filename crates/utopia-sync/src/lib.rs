@@ -135,13 +135,19 @@ impl SyncReport {
 /// Status shown in the sidebar (§9.2, §9.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncStatus {
-    Synced { at_ms: i64 },
+    Synced {
+        at_ms: i64,
+    },
     /// The relay was not reached, or answered with a transport failure: everything is
     /// still queued locally (§12.6).
-    Offline { queued: usize },
+    Offline {
+        queued: usize,
+    },
     /// The round failed on this device (the store, a shard, a projection). The network was
     /// never tried, so saying "offline" would blame the relay for a local fault.
-    LocalError { message: String },
+    LocalError {
+        message: String,
+    },
     NeedsAuth,
     Unsupported,
 }
