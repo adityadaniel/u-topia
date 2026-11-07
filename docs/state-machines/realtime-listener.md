@@ -36,7 +36,7 @@ The background thread that keeps a WebSocket to the relay's `/events` endpoint a
    `NeedsAuth` and keeps retrying at `SLOW` (`SyncPhase::Refused` in
    `sync-runner-round.md`: one retry a minute, no fast polling), so a relay that starts
    accepting the token again is picked up by polling — while this thread never restarts
-   (`spawn_realtime` is called only from `workspace.rs:420`). The fix belongs here: a restart
+   (`spawn_realtime` is called only from `workspace.rs:421`). The fix belongs here: a restart
    path for the thread, or the read timeout (issue 4) that would let it be stopped and
    started, not a change to polling.
 3. **Orphan thread when the engine fails.** `spawn_realtime` runs at `workspace.rs:421`

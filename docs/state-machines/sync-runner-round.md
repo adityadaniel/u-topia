@@ -74,9 +74,13 @@ now defence in depth, not the mechanism.
 
 Checked by eye as well as by tests: the sidebar sync view mid-round
 (`docs/verification/sync-runner-round/sync-round-in-flight.png`, "Sync: syncing…" with the
-amber dot), after the round (`sync-round-done.png`), and after a 401
-(`sync-halted-needs-auth.png`, "● Sync: sign-in required" with the red dot). The refusal looks
-the same before and after the retry change — only the retry is invisible in a still.
+amber dot), after the round (`sync-round-done.png`), after a 401 (`sync-refused-needs-auth.png`,
+"● Sync: sign-in required" with the red dot), and after the slow retry against a stub relay
+that refuses everything for its first 15 s and then answers: the same window says "Synced just
+now" with no relaunch and no restart (`sync-recovered-after-refusal.png`). The stub's request
+log for that run shows two manifest calls, ~89 s apart — one per slow interval, not one per
+5 s (the app's 250 ms wait steps are coalesced by an idle window, which only makes the retry
+later; the simulated-clock tests pin the intended cadence).
 
 ## What it controls
 
