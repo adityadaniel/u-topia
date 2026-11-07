@@ -1,5 +1,58 @@
 # Draft daily page: a day that is shown but not yet written
 
+## Status
+
+Updated by `fix/draft-daily-page`. The machine is explicit and all five issues below are
+fixed (each fix has a failing-first test; see the commit list).
+
+- **One value, one shard.** `Store.drafts` is `HashMap<PageId, DraftDay>`
+  (`DraftDay { date, entry }`, `crates/utopia-store/src/lib.rs`) and the draft's Loro shard
+  lives inside the entry, not in `docs`. `is_draft`, `draft_page(date)`, `days_between`,
+  `load_doc` and `promote_draft` read that one value, so a draft whose shard is missing cannot
+  be constructed. `promote_draft` (moves the shard into `docs`) is the only Draft → Live
+  transition; promotion of the *identity* still happens in `queue`.
+- **The doc's `DayPage { Live, Draft { id, doc } }` sketch** is what `DraftDay` implements,
+  but it stays inside the store instead of becoming a public `Store::day(date) -> DayPage`.
+  A day lookup returns a *different* id when a remote page owns the date, and the views that
+  hold a `PageId` (editor, feed, sidebar) cannot follow a silently new one; `is_draft(&PageId)`
+  and `draft_page(date)` are the two readers the callers actually need. `promote_draft` returns
+  the draft's date so the store can resolve the collision itself (see 3).
+- **The write guard the sketch asked for** is `resolve_promotion` in
+  `crates/utopia-store/src/pages.rs`: before a promoted draft is committed, the index is asked
+  whether another page already owns its date (a remote copy under a fresh id, rule 4). If so
+  the draft's blocks are merged into that page (§8.6) and the draft's shard is written with the
+  merge tombstone, instead of inserting a second live daily row.
+
+Issues, as numbered below:
+
+1. **Fixed** — a failed command group drops the draft *and* its shard (`Store::drop_shard`), so
+   the day is simply unwritten again; `is_draft`, `page_state` and `draft_append_block` agree.
+2. **Fixed** — `sync_index` clears `docs`/`pending` on a writer failure but no longer `drafts`:
+   a draft has no durable state to reload, so the day the view is showing survives.
+3. **Fixed** — `resolve_promotion` merges instead of colliding (`page_daily_uq`); the typed
+   text lands on the date's page. The draft's id becomes a tombstoned page with `merged_into`,
+   so a later create for the date finds the survivor. Visible change: the draft page a view
+   held can now become a merged page; the day keeps the remote page's id.
+4. **Fixed** — `id_taken` counts a shard only once it is queued or written (`claims_id`), and
+   `create_page`/`ensure_daily_page` build the shard before inserting it (`install_new_page`),
+   so the leak cannot happen either.
+5. **Fixed** — `start_note` reports whether it wrote (`StartedNote`) and `start_day` (and the
+   same pattern in `focus_first`) only calls `AppState::changed` with `structural = true` for a
+   real write; clicking to start a draft no longer forces a flush and an `IndexUpdated` cycle.
+
+Nothing listed here is left open. Not covered (other machines): the writer's own failure
+bookkeeping (`store-commit-pipeline.md`) and the editor's caret when a draft it holds is
+replaced by a merged page.
+
+Tests: `crates/utopia-store/tests/acceptance.rs` (`fr_1_2_failed_command_leaves_no_ghost_draft`,
+`fr_1_2_writer_failure_keeps_the_draft`, `fr_1_2_promoted_draft_merges_into_the_days_page`),
+`crates/utopia-store/src/pages.rs` (`fr_1_2_unwritten_shard_does_not_claim_its_id`) and
+`crates/utopia-ui/tests/workspace.rs` (`fr_1_2_starting_a_draft_does_not_flush_the_index`).
+Screenshots: `docs/verification/draft-daily-page/` — `feed.png` (the feed with mock data;
+the day to click is folded), `day-started.png` (after clicking it: the day opened with the
+caret in its empty block, RECENT DAYS unchanged, so the click wrote nothing) and
+`day-written.png` (after the first keystroke: the day is a page and the sidebar lists it).
+
 ## What it controls
 
 FR-1.2: a day becomes a page on its first write, not on a visit. Until then the day exists
@@ -9,6 +62,12 @@ nothing, and when a draft is promoted or replaced. Identity is rule 4 territory 
 the date, fresh ULID if tombstoned).
 
 ## Where the state lives
+
+The line numbers in this section and below are from the analysis snapshot (`main f5da7d1`);
+the current locations are in **Status** above. In short: the draft map is
+`Store.drafts: HashMap<PageId, DraftDay>` and the draft's shard is `DraftDay.entry`, not a
+`docs` entry; `take_draft` is now `promote_draft` (write) and `discard_draft` (drop), and
+`new_doc` is only used for pages whose shard is about to be written.
 
 | Piece | Location | Set | Cleared |
 |---|---|---|---|
@@ -80,15 +139,17 @@ stateDiagram-v2
     [*] --> NoPage
     NoPage --> Draft : draft_daily (visit) [uuidv5 or fresh if tombstoned]
     Draft --> Draft : draft_append_block (memory only)
-    Draft --> Live : first keystroke -> queue -> take_draft -> flush (whole page, one job)
+    Draft --> Live : promote_draft (first keystroke -> queue -> flush, whole page, one job)
     Draft --> Live : ensure_daily_page (a link to the date)
-    Draft --> NoPage : import_batch brings a remote copy (draft dropped) -> Live(remote)
-    Draft --> Ghost : execute_multi apply error (doc removed, drafts entry kept)
-    Draft --> Ghost : sync_index error (drafts cleared, view keeps id)
-    Ghost --> NoPage : ensure_daily_page for that date
+    Draft --> Live : promote_draft + resolve_promotion [another page owns the date -> §8.6 merge]
+    Draft --> NoPage : command group fails (drop_shard, nothing was written)
+    Draft --> NoPage : import_batch brings a remote shard for that draft id
     Live --> Tombstoned : delete
     Tombstoned --> Draft : draft_daily (fresh ULID)
 ```
+
+The old `Ghost` states are gone: a draft cannot exist without its shard (`DraftDay` owns it),
+and a writer failure no longer clears drafts (they have no durable state to disagree with).
 
 ## Would an explicit state type help?
 
