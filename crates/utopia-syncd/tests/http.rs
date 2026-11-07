@@ -140,6 +140,46 @@ fn auth_is_enforced() {
     assert_eq!(SyncClient::<HttpTransport>::queued(&b).unwrap(), 0);
 }
 
+/// §12.6: a batch the relay stored but whose response was lost is re-pushed. Dedupe runs
+/// before quota, so its own bytes cannot make it a permanent 413.
+#[test]
+fn ac_12_6_a_replayed_batch_is_a_duplicate_even_at_the_quota() {
+    use utopia_sync::{PushRequest, UpdateIn};
+    let db = Db::open_in_memory().unwrap();
+    let req = PushRequest {
+        updates: vec![UpdateIn {
+            id: "client:1".into(),
+            client_seq: 1,
+            frontier: String::new(),
+            payload: vec![7u8; 1000],
+        }],
+    };
+    let first = db
+        .push("graph-1", "page-1", "owner", req.clone(), 1500)
+        .unwrap();
+    assert_eq!(first.accepted, 1);
+    let used = db.graph_bytes("graph-1").unwrap();
+    assert_eq!(used, 1000);
+    // The response was lost: the same batch is pushed again when no new byte fits.
+    let again = db
+        .push("graph-1", "page-1", "owner", req, used)
+        .expect("a duplicate batch needs no new space");
+    assert_eq!((again.accepted, again.duplicate), (0, 1));
+    // Genuinely new bytes are still refused.
+    let new = PushRequest {
+        updates: vec![UpdateIn {
+            id: "client:2".into(),
+            client_seq: 2,
+            frontier: String::new(),
+            payload: vec![7u8; 10],
+        }],
+    };
+    assert!(matches!(
+        db.push("graph-1", "page-1", "owner", new, used),
+        Err(utopia_syncd::ApiError::QuotaExceeded)
+    ));
+}
+
 #[test]
 fn quota_rejects_and_keeps_outbox() {
     let server = serve(Config {

@@ -140,6 +140,10 @@ impl Db {
     /// Bytes stored for a graph (logs + snapshots + attachments), for quota.
     pub fn graph_bytes(&self, gid: &str) -> ApiResult<u64> {
         let conn = self.lock()?;
+        Self::graph_bytes_conn(&conn, gid)
+    }
+
+    fn graph_bytes_conn(conn: &Connection, gid: &str) -> ApiResult<u64> {
         Ok(conn.query_row(
             "SELECT ifnull((SELECT sum(length(payload)) FROM page_log WHERE graph_id=?1), 0)
                   + ifnull((SELECT sum(length(payload)) FROM page_snapshot WHERE graph_id=?1), 0)
@@ -263,10 +267,6 @@ impl Db {
         req: PushRequest,
         quota: u64,
     ) -> ApiResult<PushResponse> {
-        let incoming: u64 = req.updates.iter().map(|u| u.payload.len() as u64).sum();
-        if self.graph_bytes(gid)? + incoming > quota {
-            return Err(ApiError::QuotaExceeded);
-        }
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
@@ -275,6 +275,11 @@ impl Db {
         )?;
         let mut head = Self::head(&tx, gid, pid)?;
         let (mut accepted, mut duplicate) = (0, 0);
+        // Dedupe inside the transaction, before quota: a re-pushed batch whose response
+        // was lost is entirely duplicates, and the bytes it would add are already stored.
+        // Counting them again would refuse it forever (§12.6).
+        let mut new_updates = Vec::new();
+        let mut new_bytes = 0u64;
         for u in req.updates {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM page_log WHERE change_id=?1)",
@@ -285,6 +290,13 @@ impl Db {
                 duplicate += 1;
                 continue;
             }
+            new_bytes += u.payload.len() as u64;
+            new_updates.push(u);
+        }
+        if Self::graph_bytes_conn(&tx, gid)? + new_bytes > quota {
+            return Err(ApiError::QuotaExceeded);
+        }
+        for u in new_updates {
             head += 1;
             let client = u.id.split(':').next().unwrap_or_default().to_string();
             tx.execute(
