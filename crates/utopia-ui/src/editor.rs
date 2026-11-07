@@ -208,6 +208,37 @@ pub fn completion_text(kind: AcKind, item: &AcItem, after_caret: &str) -> (Strin
     }
 }
 
+/// A host request that arrived while the input method owned the field (§13.5). None of
+/// these may run then: finishing the block reads and rewrites the buffer through the
+/// provisional glyphs, and starting another block replaces the buffer outright
+/// (`set_text`). They wait for the input method instead (`after_composition`).
+#[derive(Debug, Clone, PartialEq)]
+enum Deferred {
+    /// Finish the block and carry on editing it; `finished: false` is the idle commit.
+    Commit { finished: bool },
+    /// `end`: finish the block, drop the target and tell the host the editor blurred.
+    End,
+    /// `begin` elsewhere (another block, or another caret in this one).
+    Begin {
+        target: EditTarget,
+        caret: Option<usize>,
+        goal: Option<Goal>,
+    },
+}
+
+impl Deferred {
+    /// A request that goes further replaces one that goes less far, so the idle commit a
+    /// click interrupts cannot displace the click, and neither can outlive an `end`.
+    fn rank(&self) -> u8 {
+        match self {
+            Deferred::Commit { finished: false } => 0,
+            Deferred::Commit { finished: true } => 1,
+            Deferred::End => 2,
+            Deferred::Begin { .. } => 3,
+        }
+    }
+}
+
 pub struct BlockEditor {
     app: Entity<AppState>,
     field: TextField,
@@ -219,6 +250,8 @@ pub struct BlockEditor {
     anchor: Option<utopia_store::DocCursor>,
     idle: Option<Task<()>>,
     edits: u64,
+    /// What a host asked for while the input method was composing (§13.5).
+    deferred: Option<Deferred>,
     _sub: Subscription,
 }
 
@@ -261,6 +294,7 @@ impl BlockEditor {
             anchor: None,
             idle: None,
             edits: 0,
+            deferred: None,
             _sub: sub,
         }
     }
@@ -293,6 +327,16 @@ impl BlockEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.field.composing() {
+            // §13.5: starting somewhere else replaces the buffer with stored text, which
+            // would wipe the input method's live composition while it still addresses it.
+            self.defer(Deferred::Begin {
+                target,
+                caret,
+                goal,
+            });
+            return;
+        }
         if self.target.as_ref() != Some(&target) {
             self.commit(cx);
             let text = self.app.update(cx, |app, _| {
@@ -318,6 +362,11 @@ impl BlockEditor {
     /// Stop editing (Escape, navigation). Commits the block. Emits `Blurred` so the
     /// workspace can take focus back if nothing else claims it.
     pub fn end(&mut self, cx: &mut Context<Self>) {
+        if self.field.composing() {
+            // The IME owns the buffer; finish and blur when it lets go (§13.5).
+            self.defer(Deferred::End);
+            return;
+        }
         self.commit(cx);
         let was_editing = self.target.take().is_some();
         self.ac = None;
@@ -512,13 +561,39 @@ impl BlockEditor {
         true
     }
 
-    fn after_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn after_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.field.composing() {
             return;
         }
         self.persist(cx);
         self.anchor_caret(cx);
         self.refresh_autocomplete(cx);
+        self.after_composition(window, cx);
+    }
+
+    /// Queue a host request that must wait for the input method (§13.5).
+    fn defer(&mut self, next: Deferred) {
+        if self
+            .deferred
+            .as_ref()
+            .is_none_or(|d| next.rank() >= d.rank())
+        {
+            self.deferred = Some(next);
+        }
+    }
+
+    /// The input method let go of the buffer (§13.5): do what a host asked for meanwhile.
+    fn after_composition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.deferred.take() {
+            None => {}
+            Some(Deferred::Commit { finished }) => self.commit_block(finished, cx),
+            Some(Deferred::End) => self.end(cx),
+            Some(Deferred::Begin {
+                target,
+                caret,
+                goal,
+            }) => self.begin(target, caret, goal, window, cx),
+        }
     }
 
     fn persist(&mut self, cx: &mut Context<Self>) {
@@ -580,6 +655,14 @@ impl BlockEditor {
 
     /// `finished: false` is the idle commit, which leaves the link being typed alone.
     fn commit_block(&mut self, finished: bool, cx: &mut Context<Self>) {
+        if self.field.composing() {
+            // §13.5: the buffer holds provisional glyphs, so expanding relative dates or
+            // re-reading the block after the store commit would run through text the
+            // store has never seen, and writing the result back would wipe the
+            // composition. The next commit attempt is the input method letting go.
+            self.defer(Deferred::Commit { finished });
+            return;
+        }
         let Some(t) = self.target.clone() else { return };
         self.idle = None;
         self.expand_relative_dates(&t, finished, cx);
