@@ -123,7 +123,7 @@ impl GraphView {
             focus: cx.focus_handle(),
             _layout: None,
         };
-        v.reload(cx);
+        v.reload(true, cx);
         v
     }
 
@@ -165,12 +165,13 @@ impl GraphView {
             return;
         }
         self.local = local;
-        self.reload(cx);
+        self.reload(true, cx);
     }
 
-    /// Re-read the graph after the index changed while the view stayed open.
+    /// Re-read the graph after the index changed while the view stayed open. The viewport
+    /// (pan and zoom) is the user's: an ordinary commit must not throw it away.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.reload(cx);
+        self.reload(false, cx);
     }
 
     /// Keep the panel around the page that is open beside it (GR-5).
@@ -180,7 +181,7 @@ impl GraphView {
         }
         self.origin = origin;
         if self.local {
-            self.reload(cx);
+            self.reload(true, cx);
         } else {
             cx.notify();
         }
@@ -204,7 +205,9 @@ impl GraphView {
             .map(|n| Self::radius(n.degree, self.max_degree))
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    /// Re-read the graph. `reset_view` is for navigation (a new origin, a different scope):
+    /// a refresh of the same origin keeps the pan and zoom the user set.
+    fn reload(&mut self, reset_view: bool, cx: &mut Context<Self>) {
         let opts = GraphOptions {
             center: self.local.then(|| self.origin.clone()).flatten(),
             depth: 2,
@@ -224,8 +227,10 @@ impl GraphView {
         self.hover = None;
         self.lit = Vec::new();
         self.hover_info = None;
-        self.pan = point(px(0.), px(0.));
-        self.zoom = 1.0;
+        if reset_view {
+            self.pan = point(px(0.), px(0.));
+            self.zoom = 1.0;
+        }
         let task = cx
             .background_executor()
             .spawn(async move { utopia_core::graph::layout(n, &edges, LAYOUT_ITERATIONS, 0x7e11) });
@@ -578,7 +583,7 @@ impl Render for GraphView {
                     self.chip("graph-daily", "Journal", self.include_daily, cx)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.include_daily = !this.include_daily;
-                            this.reload(cx);
+                            this.reload(true, cx);
                         })),
                 )
                 .child(
@@ -611,7 +616,7 @@ impl Render for GraphView {
                     self.chip("graph-daily", "Journal pages", self.include_daily, cx)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.include_daily = !this.include_daily;
-                            this.reload(cx);
+                            this.reload(true, cx);
                         })),
                 )
                 .child(div().flex_1())

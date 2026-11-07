@@ -3100,3 +3100,40 @@ fn graph_legend_and_zoom_controls_sit_at_the_edges(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(graph.update(cx, |g, _| g.zoom()), 1.);
 }
+
+/// GR-3 review: an index refresh keeps the panel's pan and zoom; only a new origin (or the
+/// Fit control) resets the viewport. Editing prose next to the panel must not throw the
+/// user's graph view away.
+#[gpui::test]
+fn graph_panel_keeps_its_viewport_across_an_index_refresh(cx: &mut TestAppContext) {
+    use utopia_ui::app_state::IndexUpdated;
+    let cx = setup_alias_page(cx);
+    cx.simulate_keystrokes("escape cmd-shift-g");
+    cx.run_until_parked();
+    let local = bounds(cx, "graph-local").center();
+    cx.simulate_click(local, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let panel = ws.update(cx, |w, _| w.graph_panel()).expect("panel open");
+    let at = bounds(cx, "graph-zoom-in").center();
+    cx.simulate_click(at, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let zoomed = panel.update(cx, |g, _| g.zoom());
+    assert!(zoomed > 1., "the control zoomed the panel");
+
+    // What a debounced commit does once the index catches up.
+    let app = ws.read_with(cx, |w, _| w.app().clone());
+    app.update(cx, |app, cx| {
+        app.refs_version += 1;
+        cx.emit(IndexUpdated);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        panel.update(cx, |g, _| g.zoom()),
+        zoomed,
+        "a refresh keeps the viewport"
+    );
+}
