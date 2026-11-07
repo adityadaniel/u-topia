@@ -1233,6 +1233,12 @@ impl BlockEditor {
     }
 
     fn mark(&mut self, delim: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // §13.5: reflowing the text around the selection would leave the marked range
+        // pointing at bytes it never covered, and the input method's next update would
+        // rewrite the wrong run. Styling waits until it commits.
+        if self.field.composing() {
+            return;
+        }
         let (text, sel) =
             utopia_core::text::toggle_mark(&self.field.text, self.field.sel.clone(), delim);
         self.field.text = text;
