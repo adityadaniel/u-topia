@@ -622,6 +622,14 @@ impl Workspace {
         self.sync.as_ref().and_then(|s| s.last.clone())
     }
 
+    /// The round's phase, if sync is enabled: which half of a round is running and where the
+    /// transport is. The dot is derived from the same field (`sync_dot`), but the dot alone
+    /// cannot tell "connecting" from "an exchange in flight" (both are amber); tests that
+    /// need that distinction read the phase.
+    pub fn sync_phase(&self) -> Option<&SyncPhase> {
+        self.sync.as_ref().map(|s| &s.phase)
+    }
+
     /// The shared block editor (startup/latency probe).
     pub fn editor(&self) -> Entity<BlockEditor> {
         self.editor.clone()

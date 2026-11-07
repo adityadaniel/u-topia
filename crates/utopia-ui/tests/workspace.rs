@@ -1748,57 +1748,6 @@ fn a_failed_round_backs_off(cx: &mut TestAppContext) {
     );
 }
 
-/// A relay transport whose first round blocks until the test opens the gate, so the runner
-/// can be replaced while that exchange is in flight.
-struct GatedTransport {
-    gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
-    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    inner: utopia_sync::relay::RelayTransport,
-}
-
-impl utopia_sync::Transport for GatedTransport {
-    fn cursor_space(&self) -> utopia_sync::CursorSpace {
-        self.inner.cursor_space()
-    }
-
-    fn manifest(
-        &mut self,
-        if_none_match: Option<u64>,
-    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let gate = self.gate.lock().unwrap().take();
-        if let Some(rx) = gate {
-            let _ = rx.recv();
-        }
-        self.inner.manifest(if_none_match)
-    }
-
-    fn push(
-        &mut self,
-        page: &PageId,
-        req: utopia_sync::PushRequest,
-    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
-        self.inner.push(page, req)
-    }
-
-    fn pull(
-        &mut self,
-        page: &PageId,
-        since_seq: u64,
-    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
-        self.inner.pull(page, since_seq)
-    }
-
-    fn put_snapshot(
-        &mut self,
-        page: &PageId,
-        covers_seq: u64,
-        payload: Vec<u8>,
-    ) -> utopia_sync::Result<()> {
-        self.inner.put_snapshot(page, covers_seq, payload)
-    }
-}
-
 /// A relay that advertises one page and then hands back an update the store cannot import:
 /// the round fails after the network was reached.
 struct BadPull {
@@ -1871,34 +1820,51 @@ impl utopia_sync::Transport for BadPull {
 
 /// §13.3: replacing the runner while its round is in the background must not hand that
 /// round's result (or its transport) to the new runner. The old loop owns the exchange, so
-/// replacing the runner cancels it; it never reaches the relay and the new runner starts
-/// from `Idle` with no outcome of its own.
+/// replacing the runner cancels it: it never reaches the relay, and what it would have
+/// imported never reaches the store; the new runner starts from `Idle` with no outcome of
+/// its own.
 #[gpui::test]
 fn replacing_the_runner_mid_exchange_discards_the_old_round(cx: &mut TestAppContext) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
     use utopia_sync::relay::{Relay, RelayTransport};
-    let (_app, ws, cx) = setup(cx);
+    use utopia_sync::{SyncClient, SyncStatus};
+    use utopia_ui::sync_runner::SyncPhase;
+    let (app, ws, cx) = setup(cx);
     let relay = Relay::new();
-    let (_gate, gated) = std::sync::mpsc::channel::<()>();
     let old_calls = Arc::new(AtomicUsize::new(0));
     ws.update(cx, |w, cx| {
         w.enable_sync_with(
-            Box::new(GatedTransport {
-                gate: std::sync::Mutex::new(Some(gated)),
-                calls: old_calls.clone(),
+            Box::new(CountingTransport {
                 inner: RelayTransport::new(relay.clone(), "g"),
+                calls: old_calls.clone(),
             }),
             None,
             cx,
         )
     });
-    // Step to the moment the old loop has handed its transport to the background exchange;
-    // the exchange itself is only queued, so it has not run yet.
+    // One round must finish first: `sync_dot` is amber both while connecting and while an
+    // exchange is in flight, so the dot cannot name the moment on its own.
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert_eq!(old_calls.load(Ordering::SeqCst), 1, "one round ran");
+    assert!(matches!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(SyncStatus::Synced { .. })
+    ));
+    // Something the next round would import if its result were applied.
+    let mut other = Store::open_in_memory().unwrap();
+    let mut oc = SyncClient::new(RelayTransport::new(relay.clone(), "g"), &other).unwrap();
+    other.create_page("From the abandoned round").unwrap();
+    oc.sync_once(&mut other).unwrap();
+    // Step one task at a time until the runner is really `Exchanging`, i.e. the transport has
+    // been handed to the background exchange. (The exchange task itself is only queued.)
     let mut started = false;
     for _ in 0..500 {
-        if ws.update(cx, |w, _| w.sync_dot()) == utopia_ui::sync_runner::SyncDot::Syncing {
+        if ws.read_with(cx, |w, _| {
+            matches!(w.sync_phase(), Some(SyncPhase::Exchanging))
+        }) {
             started = true;
             break;
         }
@@ -1907,13 +1873,19 @@ fn replacing_the_runner_mid_exchange_discards_the_old_round(cx: &mut TestAppCont
             break;
         }
     }
-    assert!(started, "the first exchange never started");
-    // Replace the runner while the old exchange is blocked inside `manifest`.
+    assert!(started, "no round ever reached the exchange");
+    assert_eq!(
+        old_calls.load(Ordering::SeqCst),
+        1,
+        "the transport is handed over but the exchange has not run: the round is in flight"
+    );
+    // Replace the runner while that exchange is in flight, pointing it at another relay so
+    // anything the abandoned round pulled would be visible as a page only it could import.
     let calls = Arc::new(AtomicUsize::new(0));
     ws.update(cx, |w, cx| {
         w.enable_sync_with(
             Box::new(CountingTransport {
-                inner: RelayTransport::new(relay.clone(), "g"),
+                inner: RelayTransport::new(Relay::new(), "g"),
                 calls: calls.clone(),
             }),
             None,
@@ -1923,26 +1895,33 @@ fn replacing_the_runner_mid_exchange_discards_the_old_round(cx: &mut TestAppCont
     assert_eq!(
         ws.read_with(cx, |w, _| w.sync_status()),
         None,
-        "the new runner has not finished a round of its own"
+        "the new runner has no round of its own yet"
     );
-    // Pumping afterwards must not resurrect the abandoned round or feed it to the new one.
     for _ in 0..4 {
         cx.executor().advance_clock(Duration::from_secs(5));
         cx.run_until_parked();
     }
     assert_eq!(
         old_calls.load(Ordering::SeqCst),
-        0,
-        "the abandoned round was cancelled with its loop and never reached the relay"
+        1,
+        "the in-flight round was cancelled with its loop and never reached the relay"
     );
     assert!(calls.load(Ordering::SeqCst) >= 1, "the new runner polls");
     assert!(matches!(
         ws.read_with(cx, |w, _| w.sync_status()),
-        Some(utopia_sync::SyncStatus::Synced { .. })
+        Some(SyncStatus::Synced { .. })
     ));
     assert_eq!(
         ws.update(cx, |w, _| w.sync_dot()),
         utopia_ui::sync_runner::SyncDot::Synced
+    );
+    assert!(
+        app.update(cx, |app, _| app
+            .store
+            .find_page("From the abandoned round")
+            .unwrap()
+            .is_none()),
+        "the abandoned round's result must not be applied"
     );
 }
 
