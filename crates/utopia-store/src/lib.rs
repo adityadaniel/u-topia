@@ -413,6 +413,16 @@ impl Store {
         };
         for (page, frontier, snapshot, update, enqueue) in bookkeeping {
             if let Some(entry) = self.docs.get_mut(&page) {
+                // `reconcile_writer` promoted every confirmed job at the top of this flush.
+                // A job still in flight below will also append its update row before this
+                // one, so count it now: overwriting `in_flight` must not lose it.
+                if let Some(prev) = entry.in_flight.take() {
+                    if prev.snapshot {
+                        entry.pending_updates = 0;
+                    } else if prev.update && !snapshot {
+                        entry.pending_updates += 1;
+                    }
+                }
                 entry.in_flight = Some(InFlight {
                     seq,
                     frontier,
@@ -1163,5 +1173,50 @@ impl Drop for Store {
         self.persister.stop();
         self.persister = Persister::inline();
         let _ = self.compact();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    /// Review P3: with a slow writer two jobs for one page can be in flight at once. Each
+    /// appends a `page_update` row, but the second `flush` replaces `in_flight`; the count
+    /// that drives `COMPACT_AFTER` must keep both or compaction drifts.
+    #[test]
+    fn overlapping_jobs_keep_the_update_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path().join("g.utopia")).unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        s.set_today(Some(day));
+        let (page, block) = s.open_daily(day).unwrap();
+        s.set_block_text(&page, &block, "a", None, None).unwrap();
+        s.sync_index().unwrap();
+        s.set_debounced(true).unwrap();
+        let before = s.docs[&page].pending_updates;
+
+        // Hold the write lock so both flushes queue while the first job is blocked.
+        s.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        s.set_block_text(&page, &block, "ab", None, None).unwrap();
+        s.flush().unwrap();
+        s.set_block_text(&page, &block, "abc", None, None).unwrap();
+        s.flush().unwrap();
+        s.conn().execute_batch("ROLLBACK").unwrap();
+        s.sync_index().unwrap();
+
+        let rows: i64 = s
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM page_update WHERE page_id=?1",
+                [page.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            s.docs[&page].pending_updates, rows,
+            "the compaction count matches the rows that landed"
+        );
+        assert_eq!(rows, before + 2, "both jobs appended an update row");
     }
 }
