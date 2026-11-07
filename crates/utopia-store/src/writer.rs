@@ -115,6 +115,12 @@ struct Progress {
     /// Highest job sequence whose transaction committed. Never advances on failure, so a
     /// ticket that asks for an uncommitted job cannot mistake it for durable.
     completed: u64,
+    /// Highest job sequence the writer has accounted for (committed, failed or dropped).
+    /// Tickets wait on this: a job dropped after a failure must not leave a waiter hanging.
+    processed: u64,
+    /// Jobs at or below this sequence were submitted before a repair and are never written
+    /// (their base may be the job that failed).
+    stale_through: u64,
     state: WriterState,
 }
 
@@ -122,6 +128,8 @@ impl Default for Progress {
     fn default() -> Self {
         Self {
             completed: 0,
+            processed: 0,
+            stale_through: 0,
             state: WriterState::Healthy,
         }
     }
@@ -168,13 +176,37 @@ impl Shared {
     fn commit(&self, seq: u64) {
         if let Ok(mut p) = self.progress.lock() {
             p.completed = seq;
+            p.processed = p.processed.max(seq);
         }
         self.cv.notify_all();
     }
 
-    fn clear_failure(&self) {
+    /// Decide one dequeued job: `true` means drop it unwritten. Jobs submitted before the
+    /// last repair are stale by sequence; so is everything while the writer is failed.
+    /// Either way the job counts as processed, so nobody waits for it forever.
+    fn skip(&self, seq: u64) -> bool {
+        let mut skipped = true;
+        if let Ok(mut p) = self.progress.lock() {
+            skipped = p.stale_through >= seq || matches!(p.state, WriterState::Failed { .. });
+            if skipped {
+                p.processed = p.processed.max(seq);
+            }
+        }
+        if skipped {
+            self.cv.notify_all();
+        }
+        skipped
+    }
+
+    /// Mark the writer healthy again after `Store` requeued the shards as snapshots.
+    /// Everything submitted up to `through` is stale and must not be written: its base may
+    /// be the job that failed. `processed` jumps to `through` so a repair that has nothing
+    /// to requeue cannot leave a ticket waiting on a job that will never run.
+    fn clear_failure(&self, through: u64) {
         if let Ok(mut p) = self.progress.lock() {
             p.state = WriterState::Healthy;
+            p.stale_through = p.stale_through.max(through);
+            p.processed = p.processed.max(through);
         }
         self.cv.notify_all();
     }
@@ -262,7 +294,7 @@ impl WriteTicket {
             if let WriterState::Failed { error } = &p.state {
                 return Err(StoreError::Writer(error.clone()));
             }
-            if p.completed >= self.target {
+            if p.processed >= self.target {
                 return Ok(());
             }
             p =
@@ -314,10 +346,12 @@ impl Persister {
                 for msg in rx {
                     match msg {
                         Msg::Job(seq, job) => {
-                            // A failed writer must not process later jobs: their updates
-                            // build on a snapshot that never landed (issue 8). They are
-                            // dropped; `Store::sync_index` rewrites the shards whole.
-                            if s2.failure().is_some() {
+                            // A failed writer must not process later jobs (issue 8), and
+                            // jobs submitted before a repair are stale even after it clears
+                            // the failure: their update builds on a snapshot that never
+                            // landed. They are dropped; `Store::sync_index` rewrites the
+                            // shards whole.
+                            if s2.skip(seq) {
                                 continue;
                             }
                             let r = write_job(&mut conn, &job);
@@ -406,9 +440,12 @@ impl Persister {
 
     /// Mark the writer healthy again, after `Store` has queued a full rewrite of every
     /// shard whose durable copy lagged. Nothing submitted before this point will be
-    /// written (it was dropped), so the requeued snapshots are the source of truth.
+    /// written, so the requeued snapshots are the source of truth.
     pub fn clear_failure(&self) {
-        self.shared().clear_failure();
+        let through = match self {
+            Persister::Inline { submitted, .. } | Persister::Thread { submitted, .. } => *submitted,
+        };
+        self.shared().clear_failure(through);
     }
 
     /// The tag-page classification published by the last commit, if any (SB-2).
@@ -455,5 +492,37 @@ impl Persister {
                 let _ = h.join();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review P2: a job submitted before the repair (while `submit` still saw a healthy
+    /// writer) must not run after `clear_failure`; only jobs submitted after it may.
+    #[test]
+    fn jobs_submitted_before_a_repair_are_stale() {
+        let shared = Arc::new(Shared::default());
+        shared.fail("boom".into());
+        assert!(shared.skip(1), "a failed writer drops queued jobs");
+        assert_eq!(shared.completed(), 0, "a dropped job is not durable");
+
+        let ticket = WriteTicket {
+            shared: Some(shared.clone()),
+            target: 2,
+        };
+        assert!(ticket.wait().is_err(), "a failed writer reports the error");
+
+        shared.clear_failure(2);
+        assert_eq!(shared.failure(), None);
+        assert!(shared.skip(2), "submitted before the repair: stale");
+        assert!(!shared.skip(3), "the repair job itself is written");
+        // Nothing was written for job 2, but the writer has accounted for it; a waiter on
+        // the pre-repair target must not hang.
+        ticket.wait().expect("a processed job releases its ticket");
+
+        shared.commit(3);
+        assert_eq!(shared.completed(), 3);
     }
 }
