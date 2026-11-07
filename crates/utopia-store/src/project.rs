@@ -448,13 +448,25 @@ impl Projector<'_> {
                         || o.block_type != new.block_type
                 });
                 if reparse {
-                    // The block is about to lose its old ref edges; remember the pages they
-                    // reached before `index_block` deletes them, and the ones the new text
-                    // reaches (SB-2).
-                    let before = self.dst_pages_of_block(id)?;
+                    // Compare what each destination's references look like before and after
+                    // (SB-2). Only a page whose tag/link class changed needs reclassifying;
+                    // ordinary prose edits would otherwise rescan every tag it mentions.
+                    let before = match old {
+                        Some(o) => self.page_ref_classes(o)?,
+                        None => HashMap::new(),
+                    };
                     self.index_block(id, new)?;
-                    work.changed.extend(before);
-                    work.changed.extend(self.dst_pages_of_block(id)?);
+                    let after = self.page_ref_classes(new)?;
+                    for (page, all_tags) in &before {
+                        if after.get(page) != Some(all_tags) {
+                            work.changed.insert(page.clone());
+                        }
+                    }
+                    for page in after.keys() {
+                        if !before.contains_key(page) {
+                            work.changed.insert(page.clone());
+                        }
+                    }
                 } else if old.is_some_and(|o| o.page_id != new.page_id) {
                     // Moved to another page unchanged (merge): re-home its ref rows (the FTS row is
                     // keyed by rowid and carries no page).
@@ -468,6 +480,28 @@ impl Projector<'_> {
                 Ok(())
             }
         }
+    }
+
+    /// Page destinations of `row`'s text, mapped to whether every reference from this block
+    /// to that page is a hashtag (SB-2). Used to tell a tag-to-link change from a prose edit.
+    fn page_ref_classes(&self, row: &Row) -> Result<HashMap<PageId, bool>> {
+        let mut classes: HashMap<PageId, bool> = HashMap::new();
+        if row.deleted_at.is_some() || row.block_type == BlockKind::Code.type_str() {
+            return Ok(classes);
+        }
+        for r in extract_refs(&row.text) {
+            if !matches!(r.kind, RefKind::Page | RefKind::Tag) {
+                continue;
+            }
+            let key = normalize_title(&r.target);
+            if let Some(page) = resolve_page_key(self.conn, &key, self.fmt)? {
+                let all_tags = classes.entry(page).or_insert(true);
+                if r.kind == RefKind::Page {
+                    *all_tags = false;
+                }
+            }
+        }
+        Ok(classes)
     }
 
     /// The page destinations this block currently references, if any.
