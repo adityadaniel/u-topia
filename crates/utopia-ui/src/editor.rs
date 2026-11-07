@@ -479,7 +479,7 @@ impl BlockEditor {
 
     /// Type `text` at the caret (replacing any selection). `false` when not editing.
     pub fn insert_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.target.is_none() {
+        if self.target.is_none() || self.field.composing() {
             return false;
         }
         let sel = self.field.sel.clone();
@@ -833,6 +833,11 @@ impl BlockEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.field.composing() {
+            // §13.5: the text is the input method's until it commits; taking a suggestion
+            // now would replace a range of its provisional glyphs.
+            return;
+        }
         let Some(ac) = self.ac.take() else { return };
         let item = if create {
             if ac.kind == AcKind::Block || ac.query.trim().is_empty() {
@@ -970,6 +975,10 @@ impl BlockEditor {
     // ---------------------------------------------------------------- actions
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.field.composing() {
+            // §13.5: Enter confirms a candidate in the input method; it never splits here.
+            return;
+        }
         if self.ac.as_ref().is_some_and(|a| !a.items.is_empty()) {
             return self.accept(false, None, window, cx);
         }
@@ -1004,6 +1013,9 @@ impl BlockEditor {
     }
 
     fn soft_break(&mut self, _: &SoftBreak, window: &mut Window, cx: &mut Context<Self>) {
+        if self.field.composing() {
+            return;
+        }
         let sel = self.field.sel.clone();
         self.field.replace(sel, "\n");
         self.after_edit(window, cx);
@@ -1021,15 +1033,18 @@ impl BlockEditor {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        // §13.5: Backspace belongs to the input method while it composes (it backs through
+        // the candidate); deleting here would remove glyphs it still addresses by offset.
+        if self.field.composing() {
+            return;
+        }
         if self.field.sel.is_empty() {
             if self.field.cursor() == 0 {
                 self.ac = None;
                 return self.emit_after_commit(EditorEvent::MergeBackward, cx);
             }
             // `(|)` → `|`: the closer was put there by the opener, so it goes with it.
-            let pair = (!self.field.composing())
-                .then(|| utopia_core::text::empty_pair_at(&self.field.text, self.field.cursor()))
-                .flatten();
+            let pair = utopia_core::text::empty_pair_at(&self.field.text, self.field.cursor());
             match pair {
                 Some(r) => {
                     self.field.move_to(r.start);
@@ -1048,6 +1063,10 @@ impl BlockEditor {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        // §13.5: see `backspace`.
+        if self.field.composing() {
+            return;
+        }
         if self.field.sel.is_empty() {
             let to = self.field.next_boundary();
             self.field.select_to(to);
@@ -1264,6 +1283,11 @@ impl BlockEditor {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        // §13.5: cutting the composition would take the input method's own text; copy
+        // still works, the delete waits for it to commit.
+        if self.field.composing() {
+            return;
+        }
         if self.copy_text(cx) {
             let sel = self.field.sel.clone();
             self.field.replace(sel, "");
@@ -1275,6 +1299,10 @@ impl BlockEditor {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        // §13.5: the caret and selection belong to the input method while it composes.
+        if self.field.composing() {
+            return;
+        }
         let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) else {
             return;
         };
