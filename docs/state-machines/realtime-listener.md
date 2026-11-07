@@ -1,0 +1,70 @@
+# Realtime WebSocket listener: connect, sleep, give up
+
+## What it controls
+
+The background thread that keeps a WebSocket to the relay's `/events` endpoint and raises
+`nudge` so the poll loop syncs immediately (PRD `§12.3` "Realtime").
+`crates/utopia-ui/src/sync_runner.rs:101-123` and `crates/utopia-sync/src/realtime.rs`.
+
+## Where the state lives
+
+| Piece | Location | Set | Cleared |
+|---|---|---|---|
+| Backoff | `sync_runner.rs:110` `backoff: Duration` (local) | init 2 s; `:120` `(backoff * 2).min(SLOW)` | **never reset** |
+| Thread alive | result of `std::thread::Builder::spawn` discarded (`:107`); no handle, no stop flag | – | `return` on `Unauthorized` (`:116-118`) |
+| Connected | inside `listen` (`realtime.rs:32-71`): blocks on `socket.read()` | `connect` ok | `Message::Close` → `Ok(())`; read error → `Err(Transport)` |
+| Nudge | `Arc<AtomicBool>` set at `:113` | – | consumed by the poll loop |
+| Server side | `syncd/lib.rs:425` `Events = HashMap<String, broadcast::Sender>` | created on demand `:437-439` | never removed |
+
+## States
+
+**Connecting** → **Connected** → **Sleeping(backoff)** → Connecting … or **Given up**
+(thread returned).
+
+## Events and transitions
+
+- notice received → `nudge = true`, keep listening (`:113-114`, closure always returns true).
+- socket closed or read error → sleep `backoff`, double it, reconnect (`:119-121`).
+- 401/403 on connect → `Unauthorized` → thread exits for good (`:116-118`).
+
+## Impossible or unhandled combinations (evidence)
+
+1. **Backoff only grows.** The only writes are `:110` and `:120`. After five disconnects over
+   a session — even hours apart, each following a healthy connection — every reconnect waits
+   60 s. A graceful server `Close` (`realtime.rs:67` → `Ok`) is treated the same as a failure.
+2. **401 is terminal here but not for polling.** The poll loop maps `Unauthorized` to
+   `NeedsAuth` and keeps polling at `SLOW` (`sync-runner-round.md`); the realtime thread
+   never restarts (`spawn_realtime` is called only from `workspace.rs:421`). If the relay
+   later accepts the token, polling recovers but notices never return.
+3. **Orphan thread when the engine fails.** `spawn_realtime` runs at `workspace.rs:421`
+   before `enable_sync_with` at `:428`; if the latter returns false (`:474-479`) the thread
+   loops forever setting a `nudge` nobody reads.
+4. **No read timeout / ping.** `socket.read()` (`realtime.rs:54`) has no timeout; a half-open
+   TCP connection could block the thread indefinitely. Uncertain (OS keepalive).
+5. **No jitter**; thundering herd on relay restart (PRD §12.6 asks for jitter on 5xx).
+6. **Server-side event map grows without bound**: any authenticated caller creates one entry
+   per distinct valid id via `GET /events` or a push (`syncd:437-439`); `forward :542-555`
+   only notices a dead client when `send` fails because the socket is never read.
+
+## Diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> Connecting
+    Connecting --> Connected : ws connect ok
+    Connecting --> GivenUp : 401/403 (thread returns; polling continues)
+    Connecting --> Sleeping : connect error
+    Connected --> Connected : notice -> nudge = true
+    Connected --> Sleeping : Close | read error
+    Sleeping --> Connecting : after backoff (then backoff = min(2x, 60s), never reset)
+```
+
+## Would an explicit state type help?
+
+Yes, a small one with a reset on success and a restart path:
+
+```rust
+enum Realtime { Connecting { attempt: u32 }, Connected { since: Instant }, Sleeping { until: Instant, attempt: u32 }, Halted(SyncError) }
+// Connected -> Sleeping: attempt = 0 if the connection lasted > 30 s; sleep = 2s << attempt, capped, with jitter
+// Halted is visible to the runner, which can restart the thread when the token changes
+```
