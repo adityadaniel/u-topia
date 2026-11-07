@@ -11,8 +11,8 @@
 //! - `click <x> <y>` clicks the left button at a point in the window's content, in points
 //!   from its top left (a Retina capture is twice that and includes the 28 pt title bar),
 //!   for controls with no shortcut
-//! - `move <x> <y>` moves the pointer to that point, for hover states (a click sends a
-//!   move first, but it also presses and releases)
+//! - `hover <x> <y>` (or `move <x> <y>`) moves the pointer there without pressing, for
+//!   states that only show on hover (a block's drag handle, PG-4, or a graph node, GR-2)
 //! - `shot <path.png>` captures the window
 //! - `drop <file>` drops a file on the window, as from Finder
 //! - `ws <command> [args…]` runs a workspace command the app exposes for scripts
@@ -35,6 +35,7 @@ pub enum Step {
     Scroll(f32),
     Click(f32, f32),
     Move(f32, f32),
+    Hover(f32, f32),
     Shot(String),
     Drop(String),
     Ws(Vec<String>),
@@ -70,13 +71,14 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                     .parse()
                     .map(Step::Scroll)
                     .map_err(|_| format!("bad scroll: {line}")),
-                "click" => match rest
+                "click" | "hover" => match rest
                     .split_whitespace()
                     .map(str::parse::<f32>)
                     .collect::<Vec<_>>()[..]
                 {
-                    [Ok(x), Ok(y)] => Ok(Step::Click(x, y)),
-                    _ => Err(format!("bad click: {line}")),
+                    [Ok(x), Ok(y)] if verb == "click" => Ok(Step::Click(x, y)),
+                    [Ok(x), Ok(y)] => Ok(Step::Hover(x, y)),
+                    _ => Err(format!("bad {verb}: {line}")),
                 },
                 "move" => match rest
                     .split_whitespace()
@@ -168,10 +170,11 @@ pub async fn run(
                 }
                 Ok(())
             }
-            Step::Move(x, y) => {
+            Step::Move(x, y) | Step::Hover(x, y) => {
+                // A pointer move with no button, so a hover state shows in the capture.
                 let target = handle.update(cx, |_, window, _| click_target(window));
                 if let Ok(Some((w, height))) = target {
-                    move_mouse(w, (f64::from(x), height - f64::from(y)));
+                    hover(w, (f64::from(x), height - f64::from(y)));
                 }
                 Ok(())
             }
@@ -371,10 +374,33 @@ fn click_target(_: &Window) -> Option<(usize, f64)> {
     None
 }
 
-/// Send one AppKit mouse event of `kind` at `at`, in the window's own coordinates.
+/// Move the pointer to `at` without pressing, in the window's own coordinates.
+#[cfg(target_os = "macos")]
+fn hover(window: usize, at: (f64, f64)) {
+    // NSEventTypeMouseMoved = 5.
+    mouse(window, 5, at);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hover(_: usize, _: (f64, f64)) {}
+
+/// Move to, press and release the left button at `at`, in the window's own coordinates.
+#[cfg(target_os = "macos")]
+fn click(window: usize, at: (f64, f64)) {
+    // NSEventType: MouseMoved = 5, LeftMouseDown = 1, LeftMouseUp = 2. The move first, so
+    // a hover state fires before the press, as it would for a person.
+    for kind in [5u64, 1, 2] {
+        mouse(window, kind, at);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn click(_: usize, _: (f64, f64)) {}
+
+/// Send one mouse event of `kind` at `at`, in the window's own coordinates.
 #[cfg(target_os = "macos")]
 #[allow(unexpected_cfgs)]
-fn send_mouse(window: usize, at: (f64, f64), kind: u64) {
+fn mouse(window: usize, kind: u64, at: (f64, f64)) {
     use core_graphics::geometry::CGPoint;
     use objc::{class, msg_send, runtime::Object, sel, sel_impl};
     // SAFETY: `window` is this app's live NSWindow; the event is autoreleased by AppKit
@@ -396,29 +422,6 @@ fn send_mouse(window: usize, at: (f64, f64), kind: u64) {
         }
     }
 }
-
-/// Move to, press and release the left button at `at`.
-#[cfg(target_os = "macos")]
-#[allow(unexpected_cfgs)]
-fn click(window: usize, at: (f64, f64)) {
-    // NSEventType: MouseMoved = 5, LeftMouseDown = 1, LeftMouseUp = 2.
-    for kind in [5u64, 1, 2] {
-        send_mouse(window, at, kind);
-    }
-}
-
-/// Move the pointer to `at` without pressing.
-#[cfg(target_os = "macos")]
-#[allow(unexpected_cfgs)]
-fn move_mouse(window: usize, at: (f64, f64)) {
-    send_mouse(window, at, 5);
-}
-
-#[cfg(not(target_os = "macos"))]
-fn click(_: usize, _: (f64, f64)) {}
-
-#[cfg(not(target_os = "macos"))]
-fn move_mouse(_: usize, _: (f64, f64)) {}
 
 #[cfg(target_os = "macos")]
 // objc 0.2's `msg_send!` checks a cfg this crate does not declare.
@@ -504,6 +507,11 @@ mod tests {
         assert!(parse("click a b").is_err());
         assert_eq!(parse("move 12 40.5").unwrap(), vec![Step::Move(12., 40.5)]);
         assert!(parse("move 12").is_err());
+        assert_eq!(
+            parse("hover 12 40.5").unwrap(),
+            vec![Step::Hover(12., 40.5)]
+        );
+        assert!(parse("hover 12").is_err());
         assert_eq!(
             parse("ws open-pdf").unwrap(),
             vec![Step::Ws(vec!["open-pdf".into()])]

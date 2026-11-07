@@ -3,8 +3,9 @@
 
 use chrono::NaiveDate;
 use gpui::{px, size, AppContext as _, Bounds, Entity, Pixels, TestAppContext, VisualTestContext};
-use utopia_core::PageId;
-use utopia_store::Store;
+use utopia_core::outline;
+use utopia_core::{BlockId, BlockKind, Command, PageId};
+use utopia_store::{EditOpts, Store};
 use utopia_ui::actions::install_keymap;
 use utopia_ui::app_state::AppState;
 use utopia_ui::theme::{Theme, INDENT};
@@ -13,19 +14,59 @@ use utopia_ui::workspace::Workspace;
 const W: f32 = 1280.;
 const H: f32 = 820.;
 
+fn today() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()
+}
+
 fn setup(cx: &mut TestAppContext) -> &mut VisualTestContext {
+    setup_seeded(cx, |_| {})
+}
+
+/// The workspace over a store seeded directly (never through keystrokes): deterministic
+/// content for the sidebar, and no race with the UI's debounce.
+fn setup_seeded(cx: &mut TestAppContext, seed: impl FnOnce(&mut Store)) -> &mut VisualTestContext {
     cx.update(|cx| {
         cx.set_global(Theme::light());
         install_keymap(cx, None);
     });
     let mut store = Store::open_in_memory().unwrap();
-    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    store.set_today(Some(today()));
+    seed(&mut store);
+    store.sync_index().unwrap();
     let app = cx.new(|_| AppState::new(store));
     let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
     cx.simulate_resize(size(px(W), px(H)));
     ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
     cx.run_until_parked();
     cx
+}
+
+/// Like [`setup`], but the graph already holds `titles` (Quick jump result rows).
+fn setup_titles<'a>(cx: &'a mut TestAppContext, titles: &[&str]) -> &'a mut VisualTestContext {
+    setup_seeded(cx, |store| {
+        for t in titles {
+            store.create_page(t).unwrap();
+        }
+    })
+}
+
+/// `n` days of history, two blocks each, so the old two-line preview would have shown
+/// both (SB-1).
+fn seed_days(store: &mut Store, n: usize) {
+    for i in 0..n {
+        let d = today() - chrono::Duration::days(i as i64);
+        let (p, b) = store.open_daily(d).unwrap();
+        store
+            .set_block_text(&p, &b, &format!("Day {i} first block"), None, None)
+            .unwrap();
+        store.commit_block(&p, &b).unwrap();
+        let plan = outline::append_block(store.page_state(&p).unwrap(), None);
+        let second = store.execute_plan(&p, plan, None).unwrap().unwrap().block;
+        store
+            .set_block_text(&p, &second, &format!("Day {i} second block"), None, None)
+            .unwrap();
+        store.commit_block(&p, &second).unwrap();
+    }
 }
 
 /// Today's page on its own (the calendar's "Today"), not the Daily Notes feed.
@@ -50,6 +91,13 @@ fn setup_page(cx: &mut TestAppContext) -> &mut VisualTestContext {
 }
 
 fn bounds(cx: &mut VisualTestContext, sel: &'static str) -> Bounds<Pixels> {
+    bounds_of(cx, sel.to_string())
+}
+
+/// `debug_bounds` only takes a `&'static str`; a test-built selector is leaked for the
+/// duration of the process (a handful of short strings).
+fn bounds_of(cx: &mut VisualTestContext, sel: String) -> Bounds<Pixels> {
+    let sel: &'static str = Box::leak(sel.into_boxed_str());
     cx.run_until_parked();
     cx.debug_bounds(sel)
         .unwrap_or_else(|| panic!("{sel} was not rendered"))
@@ -182,6 +230,7 @@ fn quick_jump_is_centered(cx: &mut TestAppContext) {
     let cx = setup(cx);
     cx.simulate_keystrokes("escape cmd-k");
     let p = bounds(cx, "jump-palette");
+    // Page mode keeps the compact quick-jump width; search widens for its preview.
     assert!(approx(p.size.width, 520.));
     let center = f32::from(p.origin.x) + 260.;
     assert!((center - W / 2.).abs() < 2., "centered horizontally: {p:?}");
@@ -189,6 +238,369 @@ fn quick_jump_is_centered(cx: &mut TestAppContext) {
         p.origin.y > px(60.) && p.origin.y < px(H / 2.),
         "in the upper half: {p:?}"
     );
+}
+
+/// SR-4: search widens to 860 px and the preview fills the right half, beside the list
+/// rather than over it.
+#[gpui::test]
+fn search_preview_sits_in_the_right_half(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_input("zebra crossing");
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("zebra");
+    let palette = bounds(cx, "jump-palette");
+    assert!(
+        approx(palette.size.width, 860.),
+        "the search dialog is about 860 px wide: {palette:?}"
+    );
+    let results = bounds(cx, "jump-results");
+    let preview = bounds(cx, "search-preview");
+    assert!(
+        f32::from(preview.origin.x) >= f32::from(palette.origin.x) + 430.,
+        "the preview starts in the right half: {preview:?} {palette:?}"
+    );
+    assert!(
+        preview.origin.x >= results.origin.x + results.size.width - px(0.5),
+        "the list ends before the preview: {results:?} {preview:?}"
+    );
+    assert!(
+        preview.right() <= palette.right() + px(0.5),
+        "the preview stays inside the dialog: {preview:?} {palette:?}"
+    );
+    assert!(
+        results.size.width >= px(300.),
+        "the list keeps usable width: {results:?}"
+    );
+}
+
+/// SR-4/SR-5: the 720 px minimum window must contain the widened palette, input, chips,
+/// list and preview. A fixed 860 px dialog hung off both sides.
+#[gpui::test]
+fn search_palette_fits_the_minimum_window(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_input("zebra crossing");
+    cx.simulate_keystrokes("escape");
+    cx.simulate_resize(size(px(720.), px(480.)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-shift-f");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let palette = bounds(cx, "jump-palette");
+    assert!(
+        palette.origin.x >= px(0.) && palette.right() <= px(720.) + px(0.5),
+        "the palette stays in the window horizontally: {palette:?}"
+    );
+    assert!(
+        palette.origin.y >= px(0.) && palette.bottom() <= px(480.) + px(0.5),
+        "and vertically: {palette:?}"
+    );
+    let input = bounds(cx, "search-input");
+    let scopes = bounds(cx, "search-scopes");
+    for b in [input, scopes] {
+        assert!(
+            b.origin.x >= palette.origin.x && b.right() <= palette.right() + px(0.5),
+            "controls stay inside the palette: {b:?} {palette:?}"
+        );
+    }
+    let results = bounds(cx, "jump-results");
+    let preview = bounds(cx, "search-preview");
+    assert!(
+        preview.right() <= palette.right() + px(0.5),
+        "the preview fits: {preview:?} {palette:?}"
+    );
+    assert!(
+        results.right() <= preview.origin.x + px(0.5),
+        "the list ends before the narrow preview: {results:?} {preview:?}"
+    );
+    assert!(
+        preview.size.width >= px(240.),
+        "the preview keeps a readable width: {preview:?}"
+    );
+}
+
+/// SR-3: the scope chips sit under the field inside the palette, and the "Any time" menu
+/// floats over the results without moving them (deferred + anchored, like the page menu).
+#[gpui::test]
+fn search_scope_row_and_age_menu(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    let palette = bounds(cx, "jump-palette");
+    let scopes = bounds(cx, "search-scopes");
+    assert!(
+        scopes.origin.y > palette.origin.y + px(60.),
+        "under the field: {scopes:?} {palette:?}"
+    );
+    assert!(
+        scopes.origin.x >= palette.origin.x && scopes.right() <= palette.right() + px(0.5),
+        "inside the palette: {scopes:?} {palette:?}"
+    );
+    let age = bounds(cx, "search-age");
+    assert!(
+        age.right() <= palette.right() + px(0.5),
+        "the age control stays inside: {age:?}"
+    );
+    cx.simulate_click(age.center(), gpui::Modifiers::default());
+    let popup = bounds(cx, "search-age-popup");
+    assert!(
+        popup.origin.y >= age.origin.y + age.size.height - px(1.),
+        "the menu opens below its control: {popup:?} {age:?}"
+    );
+    assert!(
+        popup.origin.x >= palette.origin.x
+            && popup.right() <= px(W)
+            && popup.origin.y + popup.size.height <= px(H),
+        "the menu stays in the window: {popup:?}"
+    );
+    let after = bounds(cx, "search-scopes");
+    assert_eq!(scopes, after, "opening the menu does not move the chips");
+}
+
+/// QJ-1: with nothing typed the palette offers today and yesterday, in that order, and no
+/// "Create" row — there is no query to create from.
+#[gpui::test]
+fn quick_jump_empty_state_lists_today_and_yesterday(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape cmd-k");
+    let palette = bounds(cx, "jump-palette");
+    let today = bounds(cx, "qj-row-0");
+    let yesterday = bounds(cx, "qj-row-1");
+    assert!(
+        cx.debug_bounds("qj-icon-0-day").is_some(),
+        "today is a day row"
+    );
+    assert!(
+        cx.debug_bounds("qj-icon-1-day").is_some(),
+        "yesterday is a day row"
+    );
+    assert!(yesterday.origin.y > today.origin.y, "today comes first");
+    assert!(
+        today.origin.y >= palette.origin.y
+            && yesterday.origin.y + yesterday.size.height
+                <= palette.origin.y + palette.size.height + px(0.5),
+        "both rows sit inside the palette: {today:?} {yesterday:?} {palette:?}"
+    );
+    assert!(
+        cx.debug_bounds("jump-create").is_none(),
+        "no create row before anything is typed"
+    );
+}
+
+/// QJ-3: the key hints are a footer under the results, with a hairline above them.
+#[gpui::test]
+fn quick_jump_footer_sits_under_the_results(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape cmd-k");
+    let palette = bounds(cx, "jump-palette");
+    let footer = bounds(cx, "jump-footer");
+    let last_row = bounds(cx, "qj-row-1");
+    let results = bounds(cx, "jump-results");
+    assert!(
+        footer.origin.y >= results.origin.y + results.size.height - px(0.5),
+        "the footer follows the list: {footer:?} {results:?}"
+    );
+    assert!(
+        footer.origin.y >= last_row.origin.y + last_row.size.height - px(0.5),
+        "and the last row: {footer:?} {last_row:?}"
+    );
+    assert!(
+        footer.origin.y + footer.size.height <= palette.origin.y + palette.size.height + px(0.5),
+        "the footer is inside the palette: {footer:?} {palette:?}"
+    );
+    assert!(approx(footer.size.width, 520. - 18.), "{footer:?}");
+}
+
+/// QJ-2: "Create page" is the last row, below a hairline of its own.
+#[gpui::test]
+fn quick_jump_create_row_is_last(cx: &mut TestAppContext) {
+    let cx = setup_titles(cx, &["Brand new page"]);
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input("Brand");
+    let palette = bounds(cx, "jump-palette");
+    let result = bounds(cx, "qj-row-0");
+    let create = bounds(cx, "qj-row-1");
+    assert!(cx.debug_bounds("qj-icon-0-page").is_some(), "a page row");
+    assert!(
+        cx.debug_bounds("qj-icon-1-create").is_some(),
+        "the create row is last"
+    );
+    let hairline = bounds(cx, "jump-create");
+    assert!(
+        hairline.origin.y >= result.origin.y + result.size.height - px(0.5),
+        "the create row sits under its hairline, under the results: {hairline:?} {result:?}"
+    );
+    assert!(create.origin.y > result.origin.y, "{create:?} {result:?}");
+    assert!(
+        create.origin.y + create.size.height <= palette.origin.y + palette.size.height + px(0.5),
+        "inside the palette: {create:?} {palette:?}"
+    );
+}
+
+/// Opening the palette is an overlay: the page underneath does not move.
+#[gpui::test]
+fn quick_jump_does_not_move_the_page(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    let before = bounds(cx, "main-pane");
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input("Brand new page");
+    let after = bounds(cx, "main-pane");
+    assert_eq!(before, after, "the palette floats over the page");
+}
+
+/// QJ-2: every row is icon | label | type label, so the icons line up in one gutter and
+/// the type labels share a right edge.
+#[gpui::test]
+fn quick_jump_rows_line_up(cx: &mut TestAppContext) {
+    let cx = setup_titles(cx, &["Atlas Launch", "Ana Lovelace"]);
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input("a");
+    let first = bounds(cx, "qj-row-0");
+    let second = bounds(cx, "qj-row-1");
+    assert!(
+        approx(first.size.height, f32::from(second.size.height)),
+        "{first:?}"
+    );
+    let icon0 = bounds(cx, "qj-icon-0-page");
+    let icon1 = bounds(cx, "qj-icon-1-page");
+    assert!(
+        approx(icon0.origin.x, f32::from(icon1.origin.x)),
+        "one gutter"
+    );
+    assert!(
+        icon0.origin.x > first.origin.x
+            && icon0.origin.x + icon0.size.width < first.origin.x + first.size.width,
+        "the icon leads the row: {icon0:?} {first:?}"
+    );
+    let label0 = bounds(cx, "qj-label-0");
+    let label1 = bounds(cx, "qj-label-1");
+    assert!(
+        approx(label0.origin.x, f32::from(label1.origin.x)),
+        "labels line up"
+    );
+    assert!(
+        label0.origin.x >= icon0.origin.x + icon0.size.width,
+        "the label follows the icon: {label0:?} {icon0:?}"
+    );
+    let detail0 = bounds(cx, "qj-detail-0");
+    let detail1 = bounds(cx, "qj-detail-1");
+    assert!(
+        detail0.origin.x + detail0.size.width <= first.origin.x + first.size.width,
+        "the type label stays inside the row: {detail0:?} {first:?}"
+    );
+    assert!(
+        approx(
+            detail0.origin.x + detail0.size.width,
+            f32::from(detail1.origin.x + detail1.size.width)
+        ),
+        "type labels are right-aligned: {detail0:?} {detail1:?}"
+    );
+}
+
+/// QJ-1/QJ-3: ten rows (today, yesterday and eight recent pages) keep the palette under
+/// its height cap, so the footer stays visible while the list scrolls.
+#[gpui::test]
+fn quick_jump_caps_its_height(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let mut ids = Vec::new();
+    for t in [
+        "Atlas Launch",
+        "Ana Lovelace",
+        "Library",
+        "Operations",
+        "Reading log",
+        "Trips",
+        "Recipes",
+        "Garden",
+        "Budget",
+        "Inbox",
+    ] {
+        ids.push(store.create_page(t).unwrap());
+    }
+    // Most recently opened first, as the workspace writes it (rule 9).
+    let keyed = ids
+        .iter()
+        .rev()
+        .map(|p| p.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    store.local_set("recent_pages", &keyed).unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape cmd-k");
+    let palette = bounds(cx, "jump-palette");
+    assert!(
+        palette.size.height <= px(440.) + px(0.5),
+        "the palette caps its height: {palette:?}"
+    );
+    let footer = bounds(cx, "jump-footer");
+    assert!(
+        footer.origin.y + footer.size.height <= palette.origin.y + palette.size.height + px(0.5),
+        "the footer stays inside: {footer:?} {palette:?}"
+    );
+    assert!(
+        cx.debug_bounds("qj-row-9").is_some(),
+        "all ten rows are offered, and the list scrolls"
+    );
+}
+
+/// ALL-5: Compact density does not break the palette — the rows still fit, in order.
+#[gpui::test]
+fn quick_jump_works_at_compact_density(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|_window, cx| {
+        utopia_ui::appearance::set_density(cx, utopia_ui::appearance::Density::Compact, dir.path())
+            .unwrap();
+    });
+    cx.simulate_keystrokes("escape cmd-k");
+    let palette = bounds(cx, "jump-palette");
+    let today = bounds(cx, "qj-row-0");
+    let yesterday = bounds(cx, "qj-row-1");
+    assert!(
+        yesterday.origin.y > today.origin.y,
+        "{today:?} {yesterday:?}"
+    );
+    let footer = bounds(cx, "jump-footer");
+    assert!(
+        footer.origin.y + footer.size.height <= palette.origin.y + palette.size.height + px(0.5),
+        "Compact keeps the footer inside: {footer:?} {palette:?}"
+    );
+}
+
+/// QJ-3/QJ-5: ↑/↓ move through the whole command catalog, so the list has to follow the
+/// selection — otherwise Enter runs a command nobody can see.
+#[gpui::test]
+fn quick_jump_scrolls_the_selection_into_view(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input(">");
+    cx.run_until_parked();
+    let last = utopia_ui::actions::CATALOG.len() - 1;
+    let visible = |cx: &mut VisualTestContext, i: usize| {
+        let row = bounds_of(cx, format!("qj-row-{i}"));
+        let results = bounds(cx, "jump-results");
+        row.origin.y >= results.origin.y - px(1.)
+            && row.origin.y + row.size.height <= results.origin.y + results.size.height + px(1.)
+    };
+    // Up from the first row wraps to the last: the list scrolls down to show it.
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert!(visible(cx, last), "the selected last command is in view");
+    // Down from there wraps back to the top, which scrolls the list up again.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert!(visible(cx, 0), "the first command is in view again");
+    // And walking down past the viewport keeps the selection in view.
+    cx.simulate_keystrokes("down down down down down down down down down down down down");
+    cx.run_until_parked();
+    assert!(visible(cx, 12), "the selection follows the list");
 }
 
 #[gpui::test]
@@ -216,9 +628,276 @@ fn daily_notes_feed_stacks_days(cx: &mut TestAppContext) {
     let older = bounds(cx, "day-title");
     assert!(older.origin.y > row.origin.y, "older days follow today");
     assert!(title.origin.y + title.size.height <= row.origin.y + px(0.5));
+    // DN-2: the weekday caption sits above the date, on today and on older open days,
+    // and is smaller than the date it captions.
+    let today_caption = bounds(cx, "day-caption-2026-11-02");
+    let today_date = bounds(cx, "day-date-2026-11-02");
+    let older_caption = bounds(cx, "day-caption-2026-11-01");
+    let older_date = bounds(cx, "day-date-2026-11-01");
+    for (caption, date) in [(today_caption, today_date), (older_caption, older_date)] {
+        assert!(
+            caption.origin.y + caption.size.height <= date.origin.y + px(0.5),
+            "the caption is above its date: {caption:?} {date:?}"
+        );
+        assert!(
+            caption.size.height < date.size.height,
+            "a caption, not a second title: {caption:?} {date:?}"
+        );
+    }
     assert!(
         cx.debug_bounds("refs-header").is_none(),
         "no references inside the feed"
+    );
+}
+
+/// DN-1: after today and yesterday (which always stay open), an empty day is one 36 px
+/// row, and those rows stack.
+#[gpui::test]
+fn feed_folds_empty_days_to_one_row(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape");
+    // Yesterday is empty but open (DN-1).
+    let yesterday = bounds(cx, "day-title");
+    assert!(
+        cx.debug_bounds("day-empty").is_some(),
+        "yesterday's hint row"
+    );
+    // Two days back is the first folded row: one 36 px row per empty day.
+    let folded = bounds(cx, "day-folded-2026-10-31");
+    let next = bounds(cx, "day-folded-2026-10-30");
+    assert!(approx(folded.size.height, 36.), "one row: {folded:?}");
+    assert!(
+        folded.origin.y > yesterday.origin.y,
+        "{folded:?} {yesterday:?}"
+    );
+    assert!(
+        approx(next.origin.y - folded.origin.y, 36.),
+        "folded days stack: {folded:?} {next:?}"
+    );
+    // The row stays inside the readable column, like the days above it.
+    let (left, right) = column(cx);
+    let (x0, x1) = (
+        f32::from(folded.origin.x),
+        f32::from(folded.origin.x + folded.size.width),
+    );
+    assert!(x0 >= left && x1 <= right + 0.5, "{folded:?}");
+}
+
+/// A feed whose days hold `blocks` blocks each (`(days ago, blocks)`), in a window `h`
+/// tall; every other day is left unwritten so the feed folds it (DN-1).
+fn setup_feed<'a>(
+    cx: &'a mut TestAppContext,
+    blocks: &[(i64, usize)],
+    h: f32,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let today = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(today));
+    for &(back, n) in blocks {
+        let date = today - chrono::Duration::days(back);
+        let page = store.draft_daily(date).unwrap();
+        let mut after = store.page_state(&page).unwrap().last_child(None, false);
+        let mut cmds = Vec::new();
+        for i in 0..n {
+            let id = BlockId::new();
+            cmds.push(Command::InsertBlock {
+                id: id.clone(),
+                parent: None,
+                after: after.clone(),
+                text: format!("note {i}"),
+                kind: BlockKind::Bullet,
+            });
+            after = Some(id);
+        }
+        store
+            .execute(
+                &page,
+                cmds,
+                EditOpts {
+                    no_undo: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(h)));
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    (ws, cx)
+}
+
+/// Scroll the main pane by `dy` pixels (negative scrolls down).
+fn scroll_main(cx: &mut VisualTestContext, dy: f32) {
+    let main = bounds(cx, "main-pane");
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: main.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(dy))),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+}
+
+/// DN-3: while a long day scrolls, its date stays at the top of the column, with a
+/// hairline under it; at the top of the feed nothing is pinned.
+#[gpui::test]
+fn long_day_keeps_its_date_at_the_top(cx: &mut TestAppContext) {
+    let (ws, cx) = setup_feed(cx, &[(0, 40)], H);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_sticky_day(cx)),
+        None,
+        "the day is at the top of the feed: nothing is pinned"
+    );
+    let main = bounds(cx, "main-pane");
+    scroll_main(cx, -600.);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_sticky_day(cx)),
+        Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()),
+        "the day being scrolled keeps its heading"
+    );
+    let pin = bounds(cx, "sticky-day");
+    assert!(
+        approx(pin.origin.y, f32::from(main.origin.y)),
+        "pinned to the top of the column: {pin:?} {main:?}"
+    );
+    assert!(pin.size.height >= px(30.), "a readable heading: {pin:?}");
+    let (left, right) = column(cx);
+    let (x0, x1) = (
+        f32::from(pin.origin.x),
+        f32::from(pin.origin.x + pin.size.width),
+    );
+    assert!(
+        x0 >= left && x1 <= right + 0.5,
+        "inside the column: {pin:?}"
+    );
+}
+
+/// DN-3: a row that the list reveals at its top edge (arrowing past the viewport) must
+/// sit below the pinned date, so the caret is never hidden under it while typing.
+#[gpui::test]
+fn revealing_a_row_keeps_the_caret_below_the_pinned_date(cx: &mut TestAppContext) {
+    let (ws, cx) = setup_feed(cx, &[(0, 80)], H);
+    // `setup_feed` leaves editing; open the feed again with the caret in the first block.
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    for _ in 0..30 {
+        cx.simulate_keystrokes("down");
+    }
+    cx.run_until_parked();
+    // Scroll the day far past the block being edited: the next Down moves to a block above
+    // the viewport, which the list reveals at its top edge, where the pinned date is drawn.
+    // Each wheel step only reaches what the list has measured so far, so repeat.
+    for _ in 0..10 {
+        scroll_main(cx, -600.);
+    }
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    // The 31st block (item 32, after the day's heading) is the one now being edited.
+    assert_eq!(
+        ws.update(cx, |w, cx| w.editor().read(cx).field_text().to_string()),
+        "note 30"
+    );
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_sticky_day(cx)),
+        Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()),
+        "the day's date is still pinned"
+    );
+    let pin = bounds(cx, "sticky-day");
+    let row = bounds(cx, "content-32");
+    assert!(
+        row.origin.y >= pin.origin.y + pin.size.height - px(0.5),
+        "the row being edited stays below the pinned date: row {row:?}, pin {pin:?}"
+    );
+}
+
+/// DN-3: a row that the list considers visible can still be drawn *under* the pinned
+/// date (its heading is 63 px tall). Navigating up to such a row must move it below the
+/// heading, or the caret and the text being edited disappear behind it.
+#[gpui::test]
+fn a_row_under_the_pinned_date_is_moved_below_it(cx: &mut TestAppContext) {
+    let (ws, cx) = setup_feed(cx, &[(0, 80)], H);
+    // Open the feed with the caret in the first block, then move it down a page's worth.
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    for _ in 0..23 {
+        cx.simulate_keystrokes("down");
+    }
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.editor().read(cx).field_text().to_string()),
+        "note 22",
+        "the caret is on note 22 (item 23)"
+    );
+    let main = bounds(cx, "main-pane");
+    // Put note 20 (item 21) at the top of the list, so note 21 (item 22) — the row an Up
+    // lands on — is the second visible row, inside the 63 px the pinned date covers.
+    // A wheel event only reaches what the list has measured so far, so repeat.
+    for _ in 0..8 {
+        let delta = f32::from(bounds(cx, "content-21").origin.y - main.origin.y);
+        if delta.abs() <= 1. {
+            break;
+        }
+        scroll_main(cx, -delta);
+    }
+    assert!(
+        approx(bounds(cx, "content-21").origin.y, f32::from(main.origin.y)),
+        "note 20 sits at the top of the list"
+    );
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_sticky_day(cx)),
+        Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()),
+        "the day's date is pinned over the top of the column"
+    );
+    let pin = bounds(cx, "sticky-day");
+    let hidden = bounds(cx, "content-22");
+    assert!(
+        hidden.origin.y < pin.origin.y + pin.size.height - px(0.5),
+        "the row above the caret really is under the heading: {hidden:?} {pin:?}"
+    );
+
+    // Up from note 22 lands on note 21, which the list thinks is visible.
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.editor().read(cx).field_text().to_string()),
+        "note 21"
+    );
+    let row = bounds(cx, "content-22");
+    assert!(
+        row.origin.y >= pin.origin.y + pin.size.height - px(0.5),
+        "the row being edited stays below the pinned date: row {row:?}, pin {pin:?}"
+    );
+}
+
+/// DN-3 with DN-1: a folded day carries its own date in its 36 px row, so the previous
+/// day's heading is not pinned over it.
+#[gpui::test]
+fn a_folded_day_does_not_keep_the_previous_day_pinned(cx: &mut TestAppContext) {
+    // A short window, so the feed can scroll down to the folded days.
+    let (ws, cx) = setup_feed(cx, &[(0, 1), (1, 1), (4, 12)], 400.);
+    assert_eq!(ws.update(cx, |w, cx| w.main_sticky_day(cx)), None);
+    let main = bounds(cx, "main-pane");
+    let folded = bounds(cx, "day-folded-2026-10-31");
+    // Slide the first folded row to the top of the column, a few pixels past its edge.
+    let delta = f32::from(folded.origin.y - main.origin.y) + 4.;
+    assert!(delta > 0.);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_sticky_day(cx)),
+        None,
+        "still at the top of the feed"
+    );
+    scroll_main(cx, -delta);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_sticky_day(cx)),
+        None,
+        "a folded day's own row is its heading: nothing is pinned above it"
     );
 }
 
@@ -260,6 +939,17 @@ fn setup_refs(
     cx.run_until_parked();
     cx.simulate_keystrokes("escape");
     (cx, ws, target)
+}
+
+/// The list index of the first Linked References hit drawn.
+fn first_hit_ix(cx: &mut VisualTestContext) -> usize {
+    cx.run_until_parked();
+    (0..40)
+        .find(|ix| {
+            let sel: &'static str = Box::leak(format!("hit-{ix}").into_boxed_str());
+            cx.debug_bounds(sel).is_some()
+        })
+        .expect("a linked reference was rendered")
 }
 
 /// The first Linked References hit drawn (its list index depends on what sits above it).
@@ -560,6 +1250,1764 @@ fn opening_the_page_menu_does_not_move_the_title(cx: &mut TestAppContext) {
     assert_eq!(
         closed, open,
         "the title keeps its bounds when the menu opens"
+    );
+}
+
+/// SB-1: ten days are ten one-line rows, each with a muted block count. At the old
+/// two-preview height three days took half the sidebar; these ten fit without scrolling.
+#[gpui::test]
+fn recent_days_are_one_line_each(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| seed_days(s, 10));
+    cx.simulate_keystrokes("escape");
+    let sidebar = bounds(cx, "left-sidebar");
+    let mut previous: Option<Bounds<Pixels>> = None;
+    for i in 0..10 {
+        let row = bounds_of(cx, format!("recent-day-{i}"));
+        assert!(
+            row.size.height <= px(22.),
+            "row {i} is one line, not a preview block: {row:?}"
+        );
+        let count = bounds_of(cx, format!("recent-day-count-{i}"));
+        assert!(
+            count.origin.x > row.origin.x + row.size.width / 2.
+                && count.origin.x + count.size.width <= row.origin.x + row.size.width + px(0.5),
+            "the count sits at the right edge of row {i}: {count:?} {row:?}"
+        );
+        if let Some(p) = previous {
+            assert!(
+                row.origin.y >= p.origin.y + p.size.height - px(1.),
+                "rows stack: {p:?} {row:?}"
+            );
+        }
+        previous = Some(row);
+    }
+    let last = previous.expect("ten rows");
+    assert!(
+        last.origin.y + last.size.height <= sidebar.origin.y + sidebar.size.height,
+        "ten compact days fit in the sidebar without scrolling: {last:?} {sidebar:?}"
+    );
+}
+
+/// SB-1: a compact row keeps the day's first block one hover away.
+#[gpui::test]
+fn recent_day_hover_shows_its_first_block(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| seed_days(s, 3));
+    cx.simulate_keystrokes("escape");
+    let row = bounds_of(cx, "recent-day-0".into());
+    cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    // gpui waits 500 ms before showing a tooltip.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(700));
+    cx.run_until_parked();
+    let tip = bounds_of(cx, "recent-day-preview".into());
+    assert!(
+        tip.size.width > px(40.) && tip.size.height >= px(12.),
+        "the first block is drawn as a tooltip: {tip:?}"
+    );
+}
+
+/// SB-2: a page that only exists because of a `#tag` gets a `#` in the tag colour;
+/// a page reached through a `[[link]]` does not. One list, display only (FR-2.15).
+#[gpui::test]
+fn tag_pages_get_a_hash_glyph(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| {
+        let (p, b) = s.open_daily(today()).unwrap();
+        s.set_block_text(&p, &b, "#atlas and [[Atlas Launch]]", None, None)
+            .unwrap();
+        s.commit_block(&p, &b).unwrap();
+    });
+    cx.simulate_keystrokes("escape");
+    let glyph = bounds_of(cx, "tag-glyph-atlas".into());
+    let row = bounds_of(cx, "page-row-0".into());
+    assert!(
+        glyph.origin.x >= row.origin.x
+            && glyph.origin.x + glyph.size.width <= row.origin.x + row.size.width + px(0.5),
+        "the glyph sits inside the page row: {glyph:?} {row:?}"
+    );
+    assert!(
+        cx.debug_bounds("tag-glyph-atlas launch").is_none(),
+        "a [[link]] page is not marked as a tag page"
+    );
+}
+
+/// SB-3: a page pinned from its "···" menu sits in a Pinned group above Pages, the pin is
+/// written to settings.json as local state (rule 9), and the row's ✕ unpins it without
+/// opening the page behind the click.
+#[gpui::test]
+fn pinned_pages_sit_above_pages_and_are_local(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| {
+        s.create_page("Alpha").unwrap();
+        s.create_page("Beta").unwrap();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|_, cx| utopia_ui::appearance::install(cx, dir.path()));
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let alpha = PageId::for_title_key("alpha");
+    let beta = PageId::for_title_key("beta");
+    cx.update(|window, cx| {
+        ws.update(cx, |w, cx| {
+            w.open(alpha.clone(), None, None, false, window, cx)
+        })
+    });
+    cx.run_until_parked();
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    let pin = bounds(cx, "page-menu-pin");
+    cx.simulate_click(pin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let pinned_header = bounds(cx, "pinned-header");
+    let pages_header = bounds(cx, "pages-header");
+    let row = bounds_of(cx, "pinned-row-0".into());
+    assert!(
+        pinned_header.origin.y < pages_header.origin.y,
+        "the Pinned group is above Pages: {pinned_header:?} {pages_header:?}"
+    );
+    assert!(
+        row.origin.y >= pinned_header.origin.y
+            && row.origin.y + row.size.height <= pages_header.origin.y + px(0.5),
+        "the pinned row sits between the two headers: {row:?}"
+    );
+    let saved = || -> serde_json::Value {
+        let s = std::fs::read_to_string(dir.path().join("settings.json")).expect("settings.json");
+        serde_json::from_str(&s).expect("settings.json is JSON")
+    };
+    assert_eq!(saved()["pinned"], serde_json::json!([alpha.as_str()]));
+    assert!(
+        !dir.path().join("keymap.json").exists(),
+        "a pin is not a keybinding"
+    );
+    // A new launch reads the pin back from the file.
+    cx.update(|_, cx| {
+        utopia_ui::appearance::install(cx, dir.path());
+        assert_eq!(
+            utopia_ui::appearance::pinned(cx),
+            std::slice::from_ref(&alpha)
+        );
+    });
+
+    // Show another page, then unpin Alpha with the row's ✕. The click must not open Alpha.
+    cx.update(|window, cx| {
+        ws.update(cx, |w, cx| {
+            w.open(beta.clone(), None, None, false, window, cx)
+        })
+    });
+    cx.run_until_parked();
+    let before = pages_header.origin.y;
+    let unpin = bounds_of(cx, "unpin-0".into());
+    cx.simulate_click(unpin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(beta),
+        "unpinning does not follow the row's link"
+    );
+    assert_eq!(saved()["pinned"], serde_json::json!([]));
+    let pages_header = bounds(cx, "pages-header");
+    assert!(
+        pages_header.origin.y < before,
+        "Pages moves up once the Pinned group is gone: {pages_header:?}"
+    );
+}
+
+/// SB-4: the footer is one row — the graph chip, the sync dot and (for an encrypted graph)
+/// a lock — at the bottom of the sidebar. Clicking it opens the sync view as an overlay
+/// above the footer; nothing in the page moves.
+#[gpui::test]
+fn footer_opens_the_sync_view_without_moving_the_page(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape");
+    let sidebar = bounds(cx, "left-sidebar");
+    let footer = bounds(cx, "sidebar-footer");
+    let chip = bounds(cx, "graph-chip");
+    let dot = bounds(cx, "sync-dot-off");
+    assert!(
+        footer.origin.y + footer.size.height <= sidebar.origin.y + sidebar.size.height + px(0.5),
+        "the footer is inside the sidebar: {footer:?} {sidebar:?}"
+    );
+    assert!(
+        footer.origin.y > sidebar.origin.y + sidebar.size.height / 2.,
+        "the footer sits at the bottom: {footer:?} {sidebar:?}"
+    );
+    // One row: the chip and the dot share a centre line.
+    let chip_mid = f32::from(chip.origin.y) + f32::from(chip.size.height) / 2.;
+    let dot_mid = f32::from(dot.origin.y) + f32::from(dot.size.height) / 2.;
+    assert!(
+        (chip_mid - dot_mid).abs() <= 2.,
+        "the chip and the dot are on one row: {chip:?} {dot:?}"
+    );
+    assert!(
+        approx(chip.origin.x, f32::from(footer.origin.x))
+            && f32::from(dot.origin.x + dot.size.width) <= f32::from(footer.right()),
+        "chip left, dot right, both inside the row: {chip:?} {dot:?} {footer:?}"
+    );
+    assert!(
+        cx.debug_bounds("encryption-lock").is_none(),
+        "an in-memory graph is not encrypted"
+    );
+
+    let main = bounds(cx, "main-pane");
+    cx.simulate_click(footer.center(), gpui::Modifiers::default());
+    let popover = bounds(cx, "sync-popover");
+    assert!(
+        f32::from(popover.origin.x) >= f32::from(sidebar.origin.x)
+            && f32::from(popover.right()) <= f32::from(sidebar.right()) + 0.5,
+        "the sync view stays inside the sidebar: {popover:?} {sidebar:?}"
+    );
+    assert!(
+        f32::from(popover.bottom()) <= f32::from(footer.origin.y) + 0.5,
+        "the sync view floats above the footer: {popover:?} {footer:?}"
+    );
+    let after = bounds(cx, "main-pane");
+    assert!(
+        approx(after.origin.x, f32::from(main.origin.x))
+            && approx(after.size.width, f32::from(main.size.width)),
+        "opening the sync view does not move the page: {main:?} {after:?}"
+    );
+
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    assert!(ws.update(cx, |w, _| w.sync_view_open()));
+    cx.simulate_click(footer.center(), gpui::Modifiers::default());
+    assert!(
+        !ws.update(cx, |w, _| w.sync_view_open()),
+        "clicking the footer again closes the sync view"
+    );
+}
+
+/// SB-5: under Journal, a quiet 7-column month strip. Days with an entry get a dot, today
+/// is drawn in the accent, a day click opens that day, and the month name folds the grid.
+#[gpui::test]
+fn month_strip_is_a_quiet_seven_column_grid(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| seed_days(s, 3));
+    cx.simulate_keystrokes("escape");
+    assert!(
+        cx.debug_bounds("left-calendar").is_none(),
+        "the strip starts folded, as the calendar did"
+    );
+    let strip = bounds(cx, "toggle-calendar");
+    cx.simulate_click(strip.center(), gpui::Modifiers::default());
+    let grid = bounds(cx, "left-calendar");
+    assert!(
+        grid.origin.y >= strip.origin.y + strip.size.height - px(0.5),
+        "the grid is under the month name: {grid:?} {strip:?}"
+    );
+
+    // November 2026 starts on a Sunday, so the first Monday-first row is Oct 26–Nov 1.
+    let row = [
+        "2026-10-26",
+        "2026-10-27",
+        "2026-10-28",
+        "2026-10-29",
+        "2026-10-30",
+        "2026-10-31",
+        "2026-11-01",
+    ];
+    let cells: Vec<Bounds<Pixels>> = row
+        .iter()
+        .map(|iso| bounds_of(cx, format!("cal-{iso}")))
+        .collect();
+    for (i, cell) in cells.iter().enumerate() {
+        assert!(
+            approx(cell.origin.y, f32::from(cells[0].origin.y)),
+            "seven columns share a line: {cell:?}"
+        );
+        assert!(
+            approx(cell.size.width, f32::from(cells[0].size.width)),
+            "columns are equally wide: {cell:?}"
+        );
+        if i > 0 {
+            assert!(
+                cell.origin.x > cells[i - 1].origin.x,
+                "columns go left to right: {cell:?}"
+            );
+        }
+        assert!(
+            cell.origin.x >= grid.origin.x
+                && cell.origin.x + cell.size.width <= grid.origin.x + grid.size.width + px(0.5),
+            "cell {i} stays inside the grid: {cell:?} {grid:?}"
+        );
+    }
+
+    // Seeded days (Nov 2, Nov 1, Oct 31) have dots; an untouched day in the month does not.
+    for iso in ["2026-11-02", "2026-11-01", "2026-10-31"] {
+        bounds_of(cx, format!("cal-dot-{iso}"));
+    }
+    assert!(
+        cx.debug_bounds("cal-dot-2026-11-15").is_none(),
+        "a day with no entry has no dot"
+    );
+    // Today is inside the grid it belongs to.
+    let today = bounds_of(cx, "cal-2026-11-02".into());
+    assert!(
+        today.origin.x >= grid.origin.x && today.right() <= grid.right() + px(0.5),
+        "today's cell is in the strip: {today:?} {grid:?}"
+    );
+
+    // Folding and unfolding is one click on the month name; the list below moves with it.
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let recent_before = bounds(cx, "recent-days-header");
+    cx.simulate_click(strip.center(), gpui::Modifiers::default());
+    assert!(!ws.update(cx, |w, _| w.calendar_open()));
+    let recent = bounds(cx, "recent-days-header");
+    assert!(
+        recent.origin.y < recent_before.origin.y,
+        "the folded month gives the list its room back: {recent:?} {recent_before:?}"
+    );
+    cx.simulate_click(strip.center(), gpui::Modifiers::default());
+    assert!(ws.update(cx, |w, _| w.calendar_open()));
+
+    // A day cell opens that day (a draft until written, FR-1.2).
+    let cell = bounds_of(cx, "cal-2026-10-30".into());
+    cx.simulate_click(cell.center(), gpui::Modifiers::default());
+    let day = NaiveDate::from_ymd_opt(2026, 10, 30).unwrap();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(PageId::for_date(day))
+    );
+}
+
+/// ALL-5 in the sidebar: Compact density tightens the journal and page rows too, so the
+/// redesign does not leave one list at the comfortable size.
+#[gpui::test]
+fn compact_density_tightens_sidebar_rows(cx: &mut TestAppContext) {
+    let cx = setup_seeded(cx, |s| {
+        s.create_page("Alpha").unwrap();
+    });
+    cx.simulate_keystrokes("escape");
+    let before = bounds_of(cx, "page-row-0".into());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("settings.json"),
+        r#"{"version": 1, "density": "compact"}"#,
+    )
+    .unwrap();
+    cx.update(|_, cx| {
+        utopia_ui::appearance::install(cx, dir.path());
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("ui-density-compact").is_some(),
+        "the workspace was drawn again in Compact"
+    );
+    let after = bounds_of(cx, "page-row-0".into());
+    assert!(
+        after.size.height < before.size.height,
+        "a page row is shorter in Compact: {before:?} {after:?}"
+    );
+}
+
+/// SB-3: a written daily note is a page too (§5.5), so it can be pinned. Pins resolve
+/// against every live page, not only the ordinary Pages list (which excludes daily pages).
+#[gpui::test]
+fn pinned_daily_pages_show_above_pages(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    // The page menu is only offered on a live page (a draft day has none).
+    cx.simulate_input("note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    let pin = bounds(cx, "page-menu-pin");
+    cx.simulate_click(pin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let header = bounds(cx, "pinned-header");
+    let row = bounds_of(cx, "pinned-row-0".into());
+    let pages = bounds(cx, "pages-header");
+    assert!(
+        header.origin.y < row.origin.y && row.origin.y + row.size.height <= pages.origin.y,
+        "the pinned day sits in the Pinned group above Pages: {header:?} {row:?} {pages:?}"
+    );
+}
+
+/// A page whose outline holds a quote, then a code block that names its language (PG-5):
+/// items are 0 header, 1 quote, 2 code.
+fn setup_quote_and_code(
+    cx: &mut TestAppContext,
+) -> (&mut VisualTestContext, Vec<utopia_core::BlockId>) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    use utopia_store::EditOpts;
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = store.create_page("Types").unwrap();
+    // A quote, a code block that names its language, and a plain bullet to measure against.
+    let rows = [
+        (BlockKind::Quote, "Ship the small thing that works."),
+        (BlockKind::Code, "rust\nfn main() {}"),
+        (BlockKind::Bullet, "plain"),
+    ];
+    let mut ids = Vec::new();
+    let mut cmds = Vec::new();
+    let mut prev: Option<BlockId> = None;
+    for (kind, text) in rows {
+        let id = BlockId::new();
+        cmds.push(Command::InsertBlock {
+            id: id.clone(),
+            parent: None,
+            after: prev.clone(),
+            text: text.to_string(),
+            kind,
+        });
+        prev = Some(id.clone());
+        ids.push(id);
+    }
+    store
+        .execute(
+            &page,
+            cmds,
+            EditOpts {
+                no_undo: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    (cx, ids)
+}
+
+/// PG-5: a quote is set off from the outline by its bar and padding, and a code block's
+/// language sits at the top right of its card, above the code, not as a line of code.
+#[gpui::test]
+fn quote_is_indented_and_code_names_its_language(cx: &mut TestAppContext) {
+    let (cx, ids) = setup_quote_and_code(cx);
+    let text = |cx: &mut VisualTestContext, block: &utopia_core::BlockId| {
+        // `debug_bounds` takes a `&'static str`; leaking a few test selectors is fine.
+        let sel: &'static str = Box::leak(format!("text-{}", block.0).into_boxed_str());
+        bounds(cx, sel)
+    };
+    let quote = text(cx, &ids[0]);
+    let code = text(cx, &ids[1]);
+    let bullet = text(cx, &ids[2]);
+    let card = bounds(cx, "content-2");
+    let lang = bounds(cx, "code-language-2");
+    let row = bounds(cx, "row-2");
+    // 2 px bar plus 8 px padding for the quote, the card's 8 px padding for the code.
+    assert!(
+        approx(quote.origin.x - bullet.origin.x, 10.),
+        "the quote's bar and padding inset its text: {quote:?} {bullet:?}"
+    );
+    assert!(
+        approx(code.origin.x - bullet.origin.x, 8.),
+        "the code sits inside its card: {code:?} {bullet:?}"
+    );
+    assert!(
+        lang.origin.y < code.origin.y,
+        "the label is above the first line of code: {lang:?} {code:?}"
+    );
+    assert!(
+        lang.origin.x + lang.size.width <= card.right() + px(1.),
+        "the label stays inside the card: {lang:?} {card:?}"
+    );
+    assert!(
+        card.right() - (lang.origin.x + lang.size.width) < px(12.),
+        "the label is right-aligned in the card: {lang:?} {card:?}"
+    );
+    assert!(
+        row.size.height >= card.size.height,
+        "the card takes its own room in the outline: {row:?} {card:?}"
+    );
+}
+
+/// PG-4: the bullet reads as a drag handle only under the pointer, and a parent's collapse
+/// arrow appears with it — but only for the row being hovered.
+#[gpui::test]
+fn block_affordances_appear_on_hover(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    cx.simulate_input("parent");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("child");
+    cx.simulate_keystrokes("tab escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("grip-1").is_none(),
+        "a row shows no drag handle until the pointer is over it"
+    );
+    assert!(
+        cx.debug_bounds("arrow-1").is_none(),
+        "an expanded parent's arrow is quiet at rest"
+    );
+
+    let child = bounds(cx, "row-2");
+    cx.simulate_mouse_move(child.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("grip-2").is_some(),
+        "the hovered row shows its drag handle"
+    );
+    assert!(
+        cx.debug_bounds("arrow-1").is_none(),
+        "hovering one row does not reveal another row's arrow"
+    );
+
+    let parent = bounds(cx, "row-1");
+    cx.simulate_mouse_move(parent.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let grip = bounds(cx, "grip-1");
+    let arrow = bounds(cx, "arrow-1");
+    let content = bounds(cx, "content-1");
+    assert!(
+        arrow.origin.x < grip.origin.x && grip.origin.x < content.origin.x,
+        "arrow, then the handle, then the text: {arrow:?} {grip:?} {content:?}"
+    );
+    assert!(
+        grip.size.height > px(4.) && grip.size.height < px(14.),
+        "the grip is a small drawn handle: {grip:?}"
+    );
+}
+
+/// PG-4: the to-do box is a drawn 3 px-cornered control, and clicking it checks the to-do
+/// (the box, not the font's ☐ glyph, is the target).
+#[gpui::test]
+fn todo_box_is_a_drawn_control(cx: &mut TestAppContext) {
+    let cx = setup_page(cx);
+    cx.simulate_input("milk");
+    cx.simulate_keystrokes("alt-enter escape");
+    cx.run_until_parked();
+    let boxed = bounds(cx, "todo-1");
+    let content = bounds(cx, "content-1");
+    assert!(
+        approx(boxed.size.width, 13.) && approx(boxed.size.height, 13.),
+        "a 13 px box: {boxed:?}"
+    );
+    assert!(
+        boxed.origin.x < content.origin.x,
+        "the box sits left of the text: {boxed:?} {content:?}"
+    );
+    cx.simulate_click(boxed.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let app = ws.update(cx, |w, _| w.app().clone());
+    let page = ws.update(cx, |w, cx| w.main_page(cx)).expect("a page");
+    app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).expect("page state");
+        let first = st.live_roots().first().cloned().expect("one block");
+        let b = st.block(&first).expect("the block");
+        assert_eq!(b.kind, utopia_core::BlockKind::Todo, "still a to-do");
+        assert!(b.checked, "clicking the box checked it");
+    });
+}
+
+/// A page with one alias, opened on its own, for the header toolbar (PG-2).
+fn setup_alias_page(cx: &mut TestAppContext) -> &mut VisualTestContext {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = store.create_page("Trellis").unwrap();
+    store.add_alias(&page, "the board").unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    cx
+}
+
+/// PG-2: under the title sits one toolbar — alias chips, "+ alias", then the "···" menu —
+/// and the menu's items run Open in graph, Export, Rename, Delete page last.
+#[gpui::test]
+fn page_toolbar_sits_under_the_title(cx: &mut TestAppContext) {
+    let cx = setup_alias_page(cx);
+    let title = bounds(cx, "page-title");
+    let toolbar = bounds(cx, "page-toolbar");
+    let alias = bounds(cx, "alias-0");
+    let add = bounds(cx, "add-alias");
+    let menu = bounds(cx, "page-menu");
+    assert!(
+        toolbar.origin.y >= title.origin.y + title.size.height - px(1.),
+        "the toolbar follows the title: {title:?} {toolbar:?}"
+    );
+    assert!(
+        alias.origin.x < add.origin.x && add.origin.x < menu.origin.x,
+        "chips, then + alias, then the menu: {alias:?} {add:?} {menu:?}"
+    );
+    for (what, b) in [("alias", alias), ("+ alias", add), ("menu", menu)] {
+        assert!(
+            b.origin.y >= toolbar.origin.y - px(1.)
+                && b.origin.y + b.size.height <= toolbar.bottom() + px(1.),
+            "{what} sits in the toolbar row: {b:?} {toolbar:?}"
+        );
+    }
+
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let opened = bounds(cx, "page-toolbar");
+    assert_eq!(
+        toolbar, opened,
+        "opening the menu floats over the page; the toolbar stays put"
+    );
+    let graph = bounds(cx, "page-menu-graph");
+    let export = bounds(cx, "page-menu-export");
+    let rename = bounds(cx, "page-menu-rename");
+    let delete = bounds(cx, "page-menu-delete");
+    assert!(
+        graph.origin.y < export.origin.y
+            && export.origin.y < rename.origin.y
+            && rename.origin.y < delete.origin.y,
+        "menu order: {graph:?} {export:?} {rename:?} {delete:?}"
+    );
+    assert!(
+        delete.origin.y > rename.origin.y + rename.size.height,
+        "a hairline sets the danger item apart, last: {rename:?} {delete:?}"
+    );
+}
+
+/// PG-2: "Open in graph" in the page menu shows the graph view with the page highlighted,
+/// the same view Cmd+Shift+G opens.
+#[gpui::test]
+fn page_menu_opens_the_graph(cx: &mut TestAppContext) {
+    let cx = setup_alias_page(cx);
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let item = bounds(cx, "page-menu-graph");
+    cx.simulate_click(item.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    assert!(
+        ws.update(cx, |w, _| w.graph_view()).is_some(),
+        "the graph view is showing"
+    );
+    assert!(
+        cx.debug_bounds("graph-view").is_some(),
+        "and it is drawn over the page"
+    );
+}
+
+/// A page with two `key:: value` root blocks and one ordinary block (PG-1), with
+/// `settings.json` living in `dir` so a toggle can be checked on disk.
+fn setup_attribute_page<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &std::path::Path,
+) -> &'a mut VisualTestContext {
+    use utopia_core::{BlockId, BlockKind, Command};
+    use utopia_store::EditOpts;
+    let path = dir.to_path_buf();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+        utopia_ui::appearance::install(cx, &path);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = store.create_page("Trellis").unwrap();
+    let mut prev: Option<BlockId> = None;
+    let mut cmds = Vec::new();
+    for (kind, text) in [
+        (BlockKind::Bullet, "status:: dogfooding"),
+        (BlockKind::Bullet, "owner:: Ana"),
+        (BlockKind::Bullet, "An ordinary note"),
+    ] {
+        let id = BlockId::new();
+        cmds.push(Command::InsertBlock {
+            id: id.clone(),
+            parent: None,
+            after: prev.clone(),
+            text: text.to_string(),
+            kind,
+        });
+        prev = Some(id);
+    }
+    store
+        .execute(
+            &page,
+            cmds,
+            EditOpts {
+                no_undo: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    cx
+}
+
+/// PG-1: an attribute block is one compact muted row, not a second full block under the
+/// metadata header; the blocks themselves are not drawn until they are asked for.
+#[gpui::test]
+fn attributes_are_shown_once_as_compact_rows(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let cx = setup_attribute_page(cx, dir.path());
+    let first = bounds(cx, "attr-1");
+    let second = bounds(cx, "attr-2");
+    let note = bounds(cx, "content-3");
+    assert!(
+        first.origin.y < second.origin.y && second.origin.y < note.origin.y,
+        "the attributes read as a compact list above the notes: {first:?} {second:?} {note:?}"
+    );
+    assert!(
+        cx.debug_bounds("content-1").is_none(),
+        "the attribute block is not also drawn as a full block"
+    );
+    assert!(
+        first.size.height < px(24.),
+        "a compact row, less than a full block line: {first:?}"
+    );
+    let toggle = bounds(cx, "attribute-blocks-toggle");
+    let title = bounds(cx, "page-title");
+    assert!(
+        toggle.origin.y > title.origin.y + title.size.height,
+        "the toggle belongs to the metadata header, under the title: {toggle:?} {title:?}"
+    );
+}
+
+/// PG-1: the "Show as blocks" toggle brings the blocks back — it switches the preference,
+/// applies at once and is written to settings.json (never into the graph, rule 9).
+#[gpui::test]
+fn show_as_blocks_reveals_the_blocks_and_is_saved(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let cx = setup_attribute_page(cx, dir.path());
+    assert!(
+        cx.update(|_, cx| utopia_ui::appearance::attribute_blocks(cx))
+            == utopia_ui::appearance::AttributeBlocks::Compact,
+        "the default keeps each attribute to one row"
+    );
+    let toggle = bounds(cx, "attribute-blocks-toggle");
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| utopia_ui::appearance::attribute_blocks(cx)),
+        utopia_ui::appearance::AttributeBlocks::Blocks
+    );
+    let block = bounds(cx, "content-1");
+    assert!(
+        block.size.height >= px(20.),
+        "the attribute's block is drawn in full again: {block:?}"
+    );
+    let saved = std::fs::read_to_string(dir.path().join("settings.json")).expect("saved");
+    let v: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(v["attribute-blocks"], "blocks", "{saved}");
+}
+
+/// PG-1: a compact attribute row is a way into its block, not a dead end — clicking it
+/// shows the blocks and puts the caret in the block, where keystrokes land.
+#[gpui::test]
+fn a_compact_attribute_row_opens_the_block_for_editing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let cx = setup_attribute_page(cx, dir.path());
+    let attr = bounds(cx, "attr-1");
+    cx.simulate_click(attr.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_, cx| utopia_ui::appearance::attribute_blocks(cx))
+            == utopia_ui::appearance::AttributeBlocks::Blocks
+    );
+    assert!(
+        cx.debug_bounds("focus-bar-1").is_some(),
+        "the block's editor is in its row"
+    );
+    cx.simulate_input("!");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let app = ws.update(cx, |w, _| w.app().clone());
+    let page = ws.update(cx, |w, cx| w.main_page(cx)).expect("a page");
+    app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).expect("page state");
+        let first = st.live_roots().first().cloned().expect("one block");
+        assert_eq!(
+            st.block(&first).expect("the block").text,
+            "!status:: dogfooding",
+            "typing went into the attribute's own block"
+        );
+    });
+}
+
+/// A page whose first root is an attribute with one child, followed by an ordinary note.
+/// In Compact (the default) the attribute is one row and its child is hidden with it.
+fn setup_attribute_tree<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &std::path::Path,
+    pref: utopia_ui::appearance::AttributeBlocks,
+) -> (&'a mut VisualTestContext, Vec<utopia_core::BlockId>) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    use utopia_store::EditOpts;
+    let path = dir.to_path_buf();
+    let key = pref.key();
+    std::fs::write(
+        dir.join("settings.json"),
+        format!("{{\"version\": 1, \"attribute-blocks\": \"{key}\"}}\n"),
+    )
+    .unwrap();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+        utopia_ui::appearance::install(cx, &path);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = store.create_page("Trellis").unwrap();
+    let attr = BlockId::new();
+    let child = BlockId::new();
+    let note = BlockId::new();
+    store
+        .execute(
+            &page,
+            vec![
+                Command::InsertBlock {
+                    id: attr.clone(),
+                    parent: None,
+                    after: None,
+                    text: "status:: x".into(),
+                    kind: BlockKind::Bullet,
+                },
+                Command::InsertBlock {
+                    id: child.clone(),
+                    parent: Some(attr.clone()),
+                    after: None,
+                    text: "hidden child".into(),
+                    kind: BlockKind::Bullet,
+                },
+                Command::InsertBlock {
+                    id: note.clone(),
+                    parent: None,
+                    after: Some(attr.clone()),
+                    text: "note".into(),
+                    kind: BlockKind::Bullet,
+                },
+            ],
+            EditOpts {
+                no_undo: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    (cx, vec![attr, child, note])
+}
+
+/// The texts of a page's live root blocks, in order.
+fn root_texts(cx: &mut VisualTestContext) -> Vec<String> {
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let app = ws.update(cx, |w, _| w.app().clone());
+    let page = ws.update(cx, |w, cx| w.main_page(cx)).expect("a page");
+    app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).expect("page state");
+        st.live_roots()
+            .iter()
+            .map(|b| st.block(b).expect("block").text.clone())
+            .collect()
+    })
+}
+
+/// A page's block text by id (any depth).
+fn block_text(cx: &mut VisualTestContext, block: &utopia_core::BlockId) -> String {
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let app = ws.update(cx, |w, _| w.app().clone());
+    let page = ws.update(cx, |w, cx| w.main_page(cx)).expect("a page");
+    app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).expect("page state");
+        st.block(block).map(|b| b.text.clone()).unwrap_or_default()
+    })
+}
+
+/// Finding 1: switching to Compact rows while a descendant of an attribute is being edited
+/// must keep that whole ancestor path drawn, or the editor loses its row and its keystrokes.
+#[gpui::test]
+fn switching_to_compact_keeps_the_edited_descendant_rendered(cx: &mut TestAppContext) {
+    use utopia_ui::appearance::{self, AttributeBlocks};
+    let dir = tempfile::tempdir().unwrap();
+    let (cx, ids) = setup_attribute_tree(cx, dir.path(), AttributeBlocks::Blocks);
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(
+            w.main_page(cx).expect("a page"),
+            None,
+            Some(ids[1].clone()),
+            false,
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.simulate_input(">");
+    assert_eq!(block_text(cx, &ids[1]), "hidden child>", "the editor works");
+
+    // Settings → Appearance → Compact rows, while the child is still being edited.
+    cx.update(|_, cx| {
+        appearance::set_attribute_blocks(cx, AttributeBlocks::Compact).unwrap();
+    });
+    cx.run_until_parked();
+
+    cx.simulate_input("!");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        block_text(cx, &ids[1]),
+        "hidden child>!",
+        "keystrokes still reach the edited block after the switch"
+    );
+    assert_eq!(
+        block_text(cx, &ids[2]),
+        "note",
+        "and they went into the block being edited, not another"
+    );
+}
+
+/// Finding 2: Backspace at the start of the block after a folded attribute merges into the
+/// previous *displayed* row (the attribute), not into its hidden child (FR-2.5).
+#[gpui::test]
+fn backspace_merges_into_the_previous_visible_row(cx: &mut TestAppContext) {
+    use utopia_ui::appearance::AttributeBlocks;
+    let dir = tempfile::tempdir().unwrap();
+    let (cx, ids) = setup_attribute_tree(cx, dir.path(), AttributeBlocks::Compact);
+    let attr = bounds(cx, "attr-1");
+    assert!(attr.size.height > px(0.));
+    let note = bounds(cx, "content-2");
+    // The caret at the start of "note": click just inside its left edge.
+    cx.simulate_click(
+        gpui::point(note.origin.x + px(1.), note.origin.y + px(8.)),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert_eq!(
+        block_text(cx, &ids[0]),
+        "status:: xnote",
+        "the note joined the previous visible row"
+    );
+    assert_eq!(
+        block_text(cx, &ids[1]),
+        "hidden child",
+        "the hidden child under the attribute is untouched"
+    );
+}
+
+/// Finding 3: opening a block through the public focus path (search, query, backlink) works
+/// for a root attribute that Compact draws as one row.
+#[gpui::test]
+fn opening_a_compact_attribute_target_focuses_it(cx: &mut TestAppContext) {
+    use utopia_ui::appearance::AttributeBlocks;
+    let dir = tempfile::tempdir().unwrap();
+    let (cx, ids) = setup_attribute_tree(cx, dir.path(), AttributeBlocks::Compact);
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(
+            w.main_page(cx).expect("a page"),
+            None,
+            Some(ids[0].clone()),
+            false,
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.simulate_input("!");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        block_text(cx, &ids[0]),
+        "status:: x!",
+        "the attribute block was focused and took the keystroke"
+    );
+}
+
+/// Finding 3, the hidden case: a descendant of a compact attribute is revealed with it.
+#[gpui::test]
+fn opening_a_hidden_descendant_reveals_and_focuses_it(cx: &mut TestAppContext) {
+    use utopia_ui::appearance::AttributeBlocks;
+    let dir = tempfile::tempdir().unwrap();
+    let (cx, ids) = setup_attribute_tree(cx, dir.path(), AttributeBlocks::Compact);
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(
+            w.main_page(cx).expect("a page"),
+            None,
+            Some(ids[1].clone()),
+            false,
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.simulate_input(">");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        block_text(cx, &ids[1]),
+        "hidden child>",
+        "the descendant under a compact attribute is reachable"
+    );
+}
+
+/// Finding 4: on a page whose only block is a compact attribute, "Click to start writing"
+/// must add a note, not type into the attribute's key.
+#[gpui::test]
+fn starting_a_note_on_an_attribute_only_page_appends_a_block(cx: &mut TestAppContext) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    use utopia_store::EditOpts;
+    use utopia_ui::appearance::AttributeBlocks;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("settings.json"),
+        "{\"version\": 1, \"attribute-blocks\": \"compact\"}\n",
+    )
+    .unwrap();
+    let path = dir.path().to_path_buf();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+        utopia_ui::appearance::install(cx, &path);
+    });
+    assert_eq!(
+        cx.update(|cx| utopia_ui::appearance::attribute_blocks(cx)),
+        AttributeBlocks::Compact
+    );
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = store.create_page("Trellis").unwrap();
+    let attr = BlockId::new();
+    store
+        .execute(
+            &page,
+            vec![Command::InsertBlock {
+                id: attr.clone(),
+                parent: None,
+                after: None,
+                text: "status:: x".into(),
+                kind: BlockKind::Bullet,
+            }],
+            EditOpts {
+                no_undo: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    let prompt = bounds(cx, "empty");
+    cx.simulate_click(prompt.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_input("note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        root_texts(cx),
+        vec!["status:: x".to_string(), "note".to_string()],
+        "a new block holds the note; the attribute is untouched"
+    );
+}
+
+/// Finding 4, the feed: an attribute-only day's "Click to start writing" adds a block too.
+#[gpui::test]
+fn starting_a_note_on_an_attribute_only_day_appends_a_block(cx: &mut TestAppContext) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    use utopia_store::EditOpts;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+        utopia_ui::appearance::install(cx, &path);
+    });
+    let today = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(today));
+    // Yesterday: one attribute only. Every other day of the feed has a note, so yesterday's
+    // prompt is the only "Click to start writing" in the feed.
+    let page = store
+        .ensure_daily_page(today - chrono::Duration::days(1))
+        .unwrap();
+    store
+        .execute(
+            &page,
+            vec![Command::InsertBlock {
+                id: BlockId::new(),
+                parent: None,
+                after: None,
+                text: "status:: x".into(),
+                kind: BlockKind::Bullet,
+            }],
+            EditOpts {
+                no_undo: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    for back in 0..10 {
+        if back == 1 {
+            continue;
+        }
+        let day = store
+            .ensure_daily_page(today - chrono::Duration::days(back))
+            .unwrap();
+        let b = store.ensure_first_block(&day).unwrap();
+        store
+            .set_block_text(&day, &b, &format!("note {back}"), None, None)
+            .unwrap();
+        store.commit_block(&day, &b).unwrap();
+    }
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    let prompt = bounds(cx, "day-empty");
+    cx.simulate_click(prompt.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_input("note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let ws = cx
+        .update(|window, _| window.root::<Workspace>())
+        .flatten()
+        .expect("workspace root");
+    let app = ws.update(cx, |w, _| w.app().clone());
+    app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).expect("page state");
+        let texts: Vec<String> = st
+            .live_roots()
+            .iter()
+            .map(|b| st.block(b).expect("block").text.clone())
+            .collect();
+        assert_eq!(texts, vec!["status:: x".to_string(), "note".to_string()]);
+    });
+}
+
+/// A graph whose "Target" page has two referencing blocks, one of them also mentioning "Ana
+/// Lovelace", so the reference controls offer a co-reference chip with a count (LR-1).
+fn setup_ref_controls(
+    cx: &mut TestAppContext,
+) -> (&mut VisualTestContext, Entity<Workspace>, PageId) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let target = store.create_page("Target").unwrap();
+    store.create_page("Ana Lovelace").unwrap();
+    let src = store.create_page("Source").unwrap();
+    let b = store.ensure_first_block(&src).unwrap();
+    store
+        .set_block_text(
+            &src,
+            &b,
+            "A note about [[Target]] with [[Ana Lovelace]]",
+            None,
+            None,
+        )
+        .unwrap();
+    store.commit_block(&src, &b).unwrap();
+    let plan = utopia_core::outline::append_block(store.page_state(&src).unwrap(), None);
+    let b2 = store.execute_plan(&src, plan, None).unwrap().unwrap().block;
+    store
+        .set_block_text(&src, &b2, "Another note about [[Target]] alone", None, None)
+        .unwrap();
+    store.commit_block(&src, &b2).unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    (cx, ws, target)
+}
+
+/// LR-1: one control row — a 240 px filter field, then the date and sort menus as buttons —
+/// and the co-reference chips (with their counts) wrapping on the line below it.
+#[gpui::test]
+fn reference_controls_are_one_row_with_chips_below(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_controls(cx);
+    let filter = bounds(cx, "refs-filter");
+    let row = bounds(cx, "refs-control-row");
+    let date = bounds(cx, "refs-date-menu-any-time");
+    let sort = bounds(cx, "refs-sort-menu-title");
+    assert!(
+        approx(filter.size.width, 240.),
+        "a 240 px field: {filter:?}"
+    );
+    assert!(
+        approx(
+            date.origin.y + date.size.height / 2.,
+            f32::from(row.origin.y) + f32::from(row.size.height) / 2.
+        ),
+        "the date menu sits on the same row as the field: {date:?} {row:?}"
+    );
+    assert!(
+        date.origin.x >= filter.origin.x + filter.size.width,
+        "after the field: {date:?} {filter:?}"
+    );
+    assert!(sort.origin.x >= date.origin.x + date.size.width, "{sort:?}");
+    // Both are quiet control buttons (ALL-3): the same compact height, not a form field.
+    assert!(
+        approx(sort.size.height, f32::from(date.size.height)) && sort.size.height <= px(34.),
+        "compact menu buttons: {sort:?} {date:?}"
+    );
+    let chips = bounds(cx, "refs-chips");
+    let chip = bounds(cx, "suggest-chip-0");
+    assert!(
+        chips.origin.y >= row.origin.y + row.size.height - px(0.5),
+        "co-reference chips wrap onto the next line: {chips:?} {row:?}"
+    );
+    assert!(
+        chip.origin.y >= row.origin.y + row.size.height - px(0.5),
+        "a chip is below the control row: {chip:?}"
+    );
+}
+
+/// ALL-3/LR-1: the filter menus float over the page. Opening one must not move the controls
+/// or the references under them.
+#[gpui::test]
+fn a_reference_menu_floats_without_moving_the_layout(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_controls(cx);
+    let row_before = bounds(cx, "refs-control-row");
+    let hit_before = first_hit(cx);
+    assert!(
+        cx.debug_bounds("refs-menu-popup").is_none(),
+        "no menu until the control is clicked"
+    );
+    let date = bounds(cx, "refs-date-menu-any-time");
+    cx.simulate_click(date.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let popup = bounds(cx, "refs-menu-popup");
+    assert!(
+        popup.origin.y >= date.origin.y + date.size.height - px(1.),
+        "the menu opens below its control: {popup:?} {date:?}"
+    );
+    assert!(
+        approx(
+            row_before.origin.y,
+            f32::from(bounds(cx, "refs-control-row").origin.y)
+        ) && approx(hit_before.origin.y, f32::from(first_hit(cx).origin.y)),
+        "opening the menu takes no space in the column"
+    );
+    // Picking a choice applies it (the label and its state change) and closes the menu.
+    let option = bounds(cx, "refs-date-option-last-7-days");
+    cx.simulate_click(option.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    bounds(cx, "refs-date-menu-last-7-days");
+    let sort = bounds(cx, "refs-sort-menu-title");
+    cx.simulate_click(sort.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let recent = bounds(cx, "refs-sort-option-recent");
+    cx.simulate_click(recent.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    bounds(cx, "refs-sort-menu-recent");
+}
+/// ALL-3 follow-up: the page menu is drawn over the page, so it must also take the clicks
+/// meant for it. Without `occlude` the "Delete page" item is visible but never fires (found
+/// while building the reference menus).
+#[gpui::test]
+fn page_menu_items_take_their_clicks(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_refs(cx, false);
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    let menu = bounds(cx, "page-menu");
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let delete = bounds(cx, "page-menu-delete");
+    cx.simulate_click(delete.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let app = ws.update(cx, |w, _| w.app().clone());
+    let deleted = app.update(cx, |app, _| {
+        app.store
+            .page_row(&target)
+            .unwrap()
+            .is_some_and(|r| r.deleted_at.is_some())
+    });
+    assert!(deleted, "the danger item deleted the page it belongs to");
+}
+
+/// The first `group-title-{ix}` and its count chip, by trying list indices.
+fn first_group(cx: &mut VisualTestContext) -> (Bounds<Pixels>, Bounds<Pixels>) {
+    cx.run_until_parked();
+    (0..40)
+        .find_map(|ix| {
+            let title: &'static str = Box::leak(format!("group-title-{ix}").into_boxed_str());
+            let title = cx.debug_bounds(title)?;
+            // The count is in the selector, so try the counts a small graph can have.
+            (1..=9).find_map(|n| {
+                let count: &'static str =
+                    Box::leak(format!("group-count-{ix}-{n}").into_boxed_str());
+                Some((title, cx.debug_bounds(count)?))
+            })
+        })
+        .expect("a referencing group was rendered")
+}
+
+/// LR-2: the count is a small chip right after the page or day name, not a number pushed to
+/// the far edge of the row.
+#[gpui::test]
+fn reference_counts_sit_next_to_the_name(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_controls(cx);
+    let title = bounds(cx, "refs-title");
+    let count = bounds(cx, "refs-count-2");
+    let header = bounds(cx, "refs-header");
+    assert!(
+        count.origin.x >= title.origin.x + title.size.width - px(1.),
+        "the count follows the title: {count:?} {title:?}"
+    );
+    assert!(
+        count.origin.x - (title.origin.x + title.size.width) < px(16.),
+        "and sits right next to it: {count:?} {title:?}"
+    );
+    assert!(
+        approx(
+            count.origin.y + count.size.height / 2.,
+            f32::from(title.origin.y) + f32::from(title.size.height) / 2.
+        ),
+        "on the same line: {count:?} {title:?}"
+    );
+    assert!(
+        count.origin.x + count.size.width < header.origin.x + header.size.width - px(200.),
+        "not at the far edge: {count:?} {header:?}"
+    );
+
+    let (group, group_count) = first_group(cx);
+    assert!(
+        group_count.origin.x >= group.origin.x + group.size.width - px(1.),
+        "the group's count follows its name: {group_count:?} {group:?}"
+    );
+    assert!(
+        group_count.origin.x - (group.origin.x + group.size.width) < px(16.),
+        "right next to it: {group_count:?} {group:?}"
+    );
+}
+
+/// "Atlas Launch" → heading "Risks" → a block that links to "Target", so the reference has a
+/// path above it.
+fn setup_nested_refs(
+    cx: &mut TestAppContext,
+) -> (
+    &mut VisualTestContext,
+    Entity<Workspace>,
+    PageId,
+    Vec<utopia_core::BlockId>,
+) {
+    use utopia_core::{BlockKind, Command};
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let target = store.create_page("Target").unwrap();
+    let atlas = store.create_page("Atlas Launch").unwrap();
+    let risks = utopia_core::BlockId::new();
+    let risky = utopia_core::BlockId::new();
+    let mut cmds = vec![
+        Command::InsertBlock {
+            id: risks.clone(),
+            parent: None,
+            after: None,
+            text: "Risks".into(),
+            kind: BlockKind::Heading(2),
+        },
+        Command::InsertBlock {
+            id: risky.clone(),
+            parent: Some(risks.clone()),
+            after: None,
+            text: "The beta date depends on [[Target]]".into(),
+            kind: BlockKind::Bullet,
+        },
+    ];
+    // Four children under the referencing block, for the inline-children limit (LR-4).
+    let mut after = None;
+    for n in 1..=4 {
+        let id = utopia_core::BlockId::new();
+        cmds.push(Command::InsertBlock {
+            id: id.clone(),
+            parent: Some(risky.clone()),
+            after: after.clone(),
+            text: format!("Reason {n}"),
+            kind: BlockKind::Bullet,
+        });
+        after = Some(id);
+    }
+    store.execute(&atlas, cmds, Default::default()).unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    (cx, ws, target, vec![risks, risky])
+}
+
+/// LR-3: a referencing block nested under "Risks" shows "Atlas Launch › Risks" as one caption
+/// line above it, and each part is its own click target.
+#[gpui::test]
+fn reference_shows_the_full_path_above_the_block(cx: &mut TestAppContext) {
+    let (cx, _, _, _) = setup_nested_refs(cx);
+    let hit = first_hit(cx);
+    cx.run_until_parked();
+    let (page, ancestor) = (0..40)
+        .find_map(|ix| {
+            let page: &'static str = Box::leak(format!("hit-path-part-{ix}-0").into_boxed_str());
+            let ancestor: &'static str =
+                Box::leak(format!("hit-path-part-{ix}-1").into_boxed_str());
+            Some((cx.debug_bounds(page)?, cx.debug_bounds(ancestor)?))
+        })
+        .expect("a path above the reference");
+    let path = cx
+        .debug_bounds("hit-path-7")
+        .or_else(|| {
+            (0..40).find_map(|ix| {
+                let sel: &'static str = Box::leak(format!("hit-path-{ix}").into_boxed_str());
+                cx.debug_bounds(sel)
+            })
+        })
+        .expect("a path line was rendered");
+    assert!(
+        path.origin.y + path.size.height <= hit.origin.y + px(0.5),
+        "the path sits above the block: {path:?} {hit:?}"
+    );
+    assert!(
+        path.size.height <= px(24.),
+        "one 12.5 px line, not a stacked crumb list: {path:?}"
+    );
+    assert!(
+        ancestor.origin.x >= page.origin.x + page.size.width - px(1.),
+        "the ancestor follows the page name: {ancestor:?} {page:?}"
+    );
+    assert!(
+        approx(page.origin.y, f32::from(ancestor.origin.y)),
+        "both parts on the same line: {page:?} {ancestor:?}"
+    );
+    let (left, right) = column(cx);
+    assert!(
+        f32::from(page.origin.x) >= left
+            && f32::from(ancestor.origin.x + ancestor.size.width) <= right + 0.5,
+        "the path stays inside the column: {path:?} ({left}, {right})"
+    );
+}
+
+/// LR-4: a reference shows the first two children inline and folds the rest behind a
+/// "+N more" chip, which opens them. The numbers come from the index, not the paint.
+#[gpui::test]
+fn reference_children_are_inline_up_to_the_limit(cx: &mut TestAppContext) {
+    let (cx, _, _, _) = setup_nested_refs(cx);
+    let ix = first_hit_ix(cx);
+    let first: &'static str = Box::leak(format!("hit-child-{ix}-0").into_boxed_str());
+    let second: &'static str = Box::leak(format!("hit-child-{ix}-1").into_boxed_str());
+    let third: &'static str = Box::leak(format!("hit-child-{ix}-2").into_boxed_str());
+    let hit = first_hit(cx);
+    let first = bounds(cx, first);
+    let second = bounds(cx, second);
+    assert!(
+        first.origin.y >= hit.origin.y + hit.size.height - px(0.5),
+        "children sit under their block: {first:?} {hit:?}"
+    );
+    assert!(
+        second.origin.y > first.origin.y,
+        "and stack in outline order: {first:?} {second:?}"
+    );
+    assert!(
+        first.origin.x >= hit.origin.x - px(0.5) && first.origin.x <= hit.origin.x + px(20.),
+        "children line up under the block's text, not its bullet: {first:?} {hit:?}"
+    );
+    assert!(
+        cx.debug_bounds(third).is_none(),
+        "only two are shown by default"
+    );
+    let more: &'static str = Box::leak(format!("hit-more-{ix}-2").into_boxed_str());
+    let chip = bounds(cx, more);
+    assert!(
+        chip.origin.y >= second.origin.y + second.size.height - px(0.5),
+        "the chip follows the shown children: {chip:?} {second:?}"
+    );
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let third = bounds(cx, third);
+    assert!(
+        third.origin.y >= second.origin.y + second.size.height - px(0.5),
+        "the chip opened the rest, in order: {third:?} {second:?}"
+    );
+}
+
+/// LR-1: clicking a co-reference chip narrows the references and the choice becomes a filled
+/// chip on the same line; clicking it again widens them back.
+#[gpui::test]
+fn selecting_a_co_reference_chip_filters_and_fills(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_controls(cx);
+    assert!(
+        cx.debug_bounds("filter-chip-0").is_none(),
+        "nothing is selected yet"
+    );
+    let chip = bounds(cx, "suggest-chip-0");
+    let chips = bounds(cx, "refs-chips");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let selected = bounds(cx, "filter-chip-0");
+    assert!(
+        selected.origin.y >= chips.origin.y - px(0.5),
+        "the selected chip joins the chips line: {selected:?} {chips:?}"
+    );
+    // One of the two references also mentions Ana, so the list narrowed to one.
+    bounds(cx, "refs-count-1");
+    let selected = bounds(cx, "filter-chip-0");
+    cx.simulate_click(selected.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    bounds(cx, "refs-count-2");
+}
+
+/// LR-1 review fix: the reference controls also render in the 380 px right sidebar. The
+/// filter field keeps 240 px as its preferred width but must give way instead of pushing
+/// the menu buttons past the pane.
+#[gpui::test]
+fn reference_controls_fit_the_sidebar_pane(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_ref_controls(cx);
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, None, true, window, cx)
+    });
+    let side = bounds(cx, "right-sidebar");
+    let row = bounds(cx, "refs-control-row");
+    assert!(
+        row.origin.x >= side.origin.x && row.origin.x + row.size.width <= side.right() + px(0.5),
+        "the control row stays inside the sidebar: {row:?} {side:?}"
+    );
+    let sort = bounds(cx, "refs-sort-menu-title");
+    assert!(
+        sort.origin.x + sort.size.width <= side.right() + px(0.5),
+        "the sort menu is still reachable: {sort:?} {side:?}"
+    );
+    assert!(
+        approx(
+            row.size.height,
+            f32::from(bounds(cx, "refs-date-menu-any-time").size.height)
+        ),
+        "the controls stay on one line instead of wrapping: {row:?}"
+    );
+}
+
+/// LR-1 review fix: a split pane can be narrower than the sidebar. The row must fit there
+/// too, with all three controls still on it.
+#[gpui::test]
+fn reference_controls_fit_a_narrow_split_pane(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_ref_controls(cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    ws.update_in(cx, |w, window, cx| w.open_split(target, window, cx));
+    cx.simulate_resize(size(px(900.), px(700.)));
+    cx.run_until_parked();
+    let split = bounds(cx, "split-0");
+    let row = bounds(cx, "refs-control-row");
+    assert!(
+        row.origin.x >= split.origin.x && row.origin.x + row.size.width <= split.right() + px(0.5),
+        "the control row stays inside the split: {row:?} {split:?}"
+    );
+    let filter = bounds(cx, "refs-filter");
+    assert!(
+        filter.size.width < px(240.),
+        "the field shrank to make room: {filter:?} {split:?}"
+    );
+    let sort = bounds(cx, "refs-sort-menu-title");
+    assert!(
+        sort.origin.x + sort.size.width <= split.right() + px(0.5),
+        "{sort:?} {split:?}"
+    );
+}
+
+/// A graph where one hit mentions "Ana Lovelace" twice and another once: the co-reference
+/// chip must count the two hits it selects, not the three occurrences of the link (LR-1).
+fn setup_ref_token_counts(
+    cx: &mut TestAppContext,
+) -> (&mut VisualTestContext, Entity<Workspace>, PageId) {
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let target = store.create_page("Target").unwrap();
+    store.create_page("Ana Lovelace").unwrap();
+    let src = store.create_page("Source").unwrap();
+    let b = store.ensure_first_block(&src).unwrap();
+    store
+        .set_block_text(
+            &src,
+            &b,
+            "[[Target]] with [[Ana Lovelace]] and [[Ana Lovelace]] again",
+            None,
+            None,
+        )
+        .unwrap();
+    store.commit_block(&src, &b).unwrap();
+    let plan = utopia_core::outline::append_block(store.page_state(&src).unwrap(), None);
+    let b2 = store.execute_plan(&src, plan, None).unwrap().unwrap().block;
+    store
+        .set_block_text(
+            &src,
+            &b2,
+            "another [[Target]] with [[Ana Lovelace]]",
+            None,
+            None,
+        )
+        .unwrap();
+    store.commit_block(&src, &b2).unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| w.open_launch_page(window, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target.clone(), None, None, false, window, cx)
+    });
+    (cx, ws, target)
+}
+
+/// LR-1 review fix: a co-reference chip counts the distinct hits it would leave, exactly
+/// like the filter it applies, instead of every occurrence of the link in the text.
+#[gpui::test]
+fn co_reference_counts_match_the_hits_they_select(cx: &mut TestAppContext) {
+    let (cx, _, _) = setup_ref_token_counts(cx);
+    // Two hits mention Ana; one of them mentions her twice. The chip says 2, not 3.
+    bounds(cx, "suggest-count-0-2");
+    let chip = bounds(cx, "suggest-chip-0");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    bounds(cx, "refs-count-2");
+}
+
+/// PG-1 review fix: a root code block that happens to contain `::` (C++'s `std::cout`) is a
+/// code block, not page metadata. The projector never indexes code as an attribute, so the
+/// outline and the metadata header must not either.
+#[gpui::test]
+fn code_blocks_are_not_folded_as_attributes(cx: &mut TestAppContext) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    use utopia_store::EditOpts;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    cx.update(|cx| {
+        cx.set_global(Theme::light());
+        install_keymap(cx, None);
+        utopia_ui::appearance::install(cx, &path);
+    });
+    let mut store = Store::open_in_memory().unwrap();
+    store.set_today(Some(today()));
+    let page = store.create_page("Cxx").unwrap();
+    let mut prev: Option<BlockId> = None;
+    let mut cmds = Vec::new();
+    for (kind, text) in [
+        (BlockKind::Bullet, "status:: dogfooding"),
+        (BlockKind::Code, "std::cout << \"hello\";"),
+        (BlockKind::Bullet, "An ordinary note"),
+    ] {
+        let id = BlockId::new();
+        cmds.push(Command::InsertBlock {
+            id: id.clone(),
+            parent: None,
+            after: prev.clone(),
+            text: text.to_string(),
+            kind,
+        });
+        prev = Some(id);
+    }
+    store
+        .execute(
+            &page,
+            cmds,
+            EditOpts {
+                no_undo: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store.sync_index().unwrap();
+    let app = cx.new(|_| AppState::new(store));
+    let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+    cx.simulate_resize(size(px(W), px(H)));
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    // The real attribute still folds; the code block keeps its own row right after it.
+    bounds(cx, "attr-1");
+    assert!(
+        cx.debug_bounds("content-1").is_none(),
+        "the attribute block is folded away"
+    );
+    bounds(cx, "content-2");
+    assert!(
+        cx.debug_bounds("attr-2").is_none(),
+        "the code block is not an attribute row"
+    );
+    // And the metadata header does not list `std` as a key either.
+    bounds(cx, "meta-status");
+    assert!(
+        cx.debug_bounds("meta-std").is_none(),
+        "a code block is not page metadata"
     );
 }
 
