@@ -99,6 +99,35 @@ impl Failure {
             kind: FailureKind::of(e),
         }
     }
+
+    pub fn object(e: &SyncError) -> Self {
+        Self {
+            page: None,
+            kind: FailureKind::of(e),
+        }
+    }
+
+    /// Bad credentials and an unsupported protocol will fail every later call too, so the
+    /// round stops instead of marking the rest of the pages failed (§12.6).
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.kind,
+            FailureKind::Unauthorized | FailureKind::ProtocolVersion(_)
+        )
+    }
+
+    /// The failure as an error, for callers that need a round's error: a round that moved
+    /// nothing is still an [`Err`] (Offline, NeedsAuth, …) even when it was per page.
+    pub fn to_error(&self) -> SyncError {
+        match &self.kind {
+            FailureKind::Unauthorized => SyncError::Unauthorized,
+            FailureKind::ProtocolVersion(v) => SyncError::ProtocolVersion(*v),
+            FailureKind::Transport(m) => SyncError::Transport(m.clone()),
+            // A store failure is local, but it is still retryable and still leaves the
+            // outbox queued; the message says where it came from.
+            FailureKind::Store(m) => SyncError::Transport(format!("store: {m}")),
+        }
+    }
 }
 
 /// How a transport's `head_seq` values are compared with a stored [`Cursor`]
@@ -253,10 +282,12 @@ pub enum SyncStatus {
 impl SyncStatus {
     pub fn from_result(r: &Result<SyncReport>, store: &Store) -> Self {
         match r {
-            Ok(_) => SyncStatus::Synced { at_ms: store.now() },
+            Ok(r) if r.failed.is_empty() => SyncStatus::Synced { at_ms: store.now() },
             Err(SyncError::Unauthorized) => SyncStatus::NeedsAuth,
             Err(SyncError::ProtocolVersion(_)) => SyncStatus::Unsupported,
-            Err(_) => SyncStatus::Offline {
+            // A round can import some pages and fail others: it is not "Synced", the
+            // remaining outbox rows are still waiting.
+            Ok(_) | Err(_) => SyncStatus::Offline {
                 queued: store.outbox_pending(usize::MAX >> 1).map_or(0, |v| v.len()),
             },
         }
@@ -305,6 +336,10 @@ pub struct Incoming {
     pub blobs_put: Vec<String>,
     /// Downloaded attachments, not yet verified.
     pub blobs_got: Vec<(String, Vec<u8>)>,
+    /// Retryable failures that did not stop the round (one page, or one attachment).
+    /// Their outbox rows and cursors are left untouched, so the next round retries only
+    /// them.
+    pub failed: Vec<Failure>,
 }
 
 fn seq_key(page: &PageId) -> String {
@@ -322,25 +357,61 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
         }
     }
     for (page, seqs, req) in out.pushes {
-        let resp = t.push(&page, req)?;
-        // Duplicates are success: the relay already has them (§12.6, 409).
-        let done = inc.pages.entry(page).or_default();
-        done.sent.extend(seqs);
-        done.accepted += resp.accepted;
-        done.duplicates += resp.duplicate;
+        match t.push(&page, req) {
+            Ok(resp) => {
+                // Duplicates are success: the relay already has them (§12.6, 409).
+                let done = inc.pages.entry(page).or_default();
+                done.sent.extend(seqs);
+                done.accepted += resp.accepted;
+                done.duplicates += resp.duplicate;
+            }
+            Err(e) => {
+                // One page the relay refuses must not cost the other pages their acks, nor
+                // the pulls below their chance to run (§12.3).
+                let f = Failure::page(&page, &e);
+                if f.is_terminal() {
+                    return Err(e);
+                }
+                inc.failed.push(f);
+            }
+        }
     }
     for (page, covers, payload) in out.snapshots {
-        t.put_snapshot(&page, covers, payload)?;
-        inc.snapshots_sent += 1;
+        match t.put_snapshot(&page, covers, payload) {
+            Ok(()) => inc.snapshots_sent += 1,
+            Err(e) => {
+                let f = Failure::page(&page, &e);
+                if f.is_terminal() {
+                    return Err(e);
+                }
+                inc.failed.push(f);
+            }
+        }
     }
     for (hash, bytes) in out.blob_puts {
-        if t.put_blob(&hash, bytes)? {
-            inc.blobs_put.push(hash);
+        match t.put_blob(&hash, bytes) {
+            Ok(true) => inc.blobs_put.push(hash),
+            Ok(false) => {}
+            Err(e) => {
+                let f = Failure::object(&e);
+                if f.is_terminal() {
+                    return Err(e);
+                }
+                inc.failed.push(f);
+            }
         }
     }
     for hash in out.blob_wants {
-        if let Some(bytes) = t.get_blob(&hash)? {
-            inc.blobs_got.push((hash, bytes));
+        match t.get_blob(&hash) {
+            Ok(Some(bytes)) => inc.blobs_got.push((hash, bytes)),
+            Ok(None) => {}
+            Err(e) => {
+                let f = Failure::object(&e);
+                if f.is_terminal() {
+                    return Err(e);
+                }
+                inc.failed.push(f);
+            }
         }
     }
     let manifest = if inc.pages.values().all(|p| p.sent.is_empty()) && inc.snapshots_sent == 0 {
@@ -476,6 +547,7 @@ impl SyncEngine {
             pulled_pages: inc.pages.values().filter(|p| p.pull.is_some()).count(),
             blobs_up: inc.blobs_put.len(),
             blobs_down: blobs_in,
+            failed: inc.failed,
             ..Default::default()
         };
         let mut batch: Vec<(PageId, Vec<u8>)> = Vec::new();
@@ -516,6 +588,10 @@ impl SyncEngine {
 
     /// Prepare → exchange → apply until nothing moves (imports may create local ops,
     /// e.g. re-merges, which must be pushed in turn).
+    ///
+    /// A retryable failure on one page does not fail the round: its rows stay queued and
+    /// the rest of the round is applied. A round in which nothing at all moved is still an
+    /// [`Err`], so "offline" keeps meaning offline (§12.6).
     pub fn sync_once<T: Transport + ?Sized>(
         &mut self,
         store: &mut Store,
@@ -526,6 +602,7 @@ impl SyncEngine {
             let out = self.prepare(store)?;
             let had_work = !out.pushes.is_empty() || !out.snapshots.is_empty();
             let inc = exchange(t, out)?;
+            let failed = !inc.failed.is_empty();
             let pass = self.apply(store, inc)?;
             let quiet = pass.imported.is_empty()
                 && !had_work
@@ -533,8 +610,19 @@ impl SyncEngine {
                 && pass.blobs_up == 0
                 && pass.blobs_down == 0;
             report.absorb(pass);
-            if quiet {
+            // Retrying a page that just failed inside the same round only re-spends the
+            // same bandwidth; the next round owns it.
+            if quiet || failed {
                 break;
+            }
+        }
+        if let Some(f) = report.failed.first() {
+            let moved = report.pushed + report.duplicates > 0
+                || !report.imported.is_empty()
+                || report.snapshots > 0
+                || report.blobs_up + report.blobs_down > 0;
+            if !moved {
+                return Err(f.to_error());
             }
         }
         Ok(report)

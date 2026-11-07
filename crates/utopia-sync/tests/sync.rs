@@ -46,6 +46,97 @@ fn settle(devs: &mut [(&mut Store, &mut SyncClient<RelayTransport>)]) {
     }
 }
 
+/// A relay that refuses one page (a 413, a poison batch) and serves every other page.
+struct Flaky {
+    inner: RelayTransport,
+    refuse: PageId,
+}
+
+impl utopia_sync::Transport for Flaky {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.inner.manifest(if_none_match)
+    }
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        if page == &self.refuse {
+            return Err(utopia_sync::SyncError::Transport(
+                "HTTP 413: quota exceeded".into(),
+            ));
+        }
+        self.inner.push(page, req)
+    }
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.inner.pull(page, since_seq)
+    }
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// §12.3 steps 2–5: a page the relay refuses must not cost the other pages their acks,
+/// nor stop the pull of what the relay does have.
+#[test]
+fn ac_12_3_a_refused_page_keeps_the_other_acks_and_the_pulls() {
+    let relay = Relay::new();
+    let (mut a, _) = device(&relay);
+    let (mut b, mut cb) = device(&relay);
+    let refused = a.create_page("Refused").unwrap();
+    let accepted = a.create_page("Accepted").unwrap();
+    write(&mut a, &refused, "this batch is too big");
+    write(&mut a, &accepted, "this one fits");
+    let remote = b.create_page("Remote").unwrap();
+    write(&mut b, &remote, "written on b");
+    cb.sync_once(&mut b).unwrap();
+
+    let mut ca = SyncClient::new(
+        Flaky {
+            inner: RelayTransport::new(relay.clone(), "g1"),
+            refuse: refused.clone(),
+        },
+        &a,
+    )
+    .unwrap();
+    let report = ca
+        .sync_once(&mut a)
+        .expect("the round carries on past the refused page");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(report.failed[0].page.as_ref(), Some(&refused));
+    assert!(
+        report.pushed > 0,
+        "the other page was acknowledged: {report:?}"
+    );
+    assert_eq!(
+        texts(&mut a, &remote),
+        vec!["written on b"],
+        "the pull still ran"
+    );
+    // The accepted page's outbox rows are marked sent; only the refused page's remain.
+    let queued = a.outbox_pending(100).unwrap();
+    assert!(!queued.is_empty());
+    assert!(
+        queued.iter().all(|(_, p, _, _)| p == &refused),
+        "only the refused page is queued: {queued:?}"
+    );
+}
+
 #[test]
 fn two_devices_converge_on_different_blocks_and_same_block() {
     let relay = Relay::new();

@@ -146,10 +146,11 @@ impl SyncRunner {
         }
     }
 
-    /// Next poll interval after a round.
+    /// Next poll interval after a round. A round that moved something but left a page
+    /// failed backs off like a failure: the failed page is retried, not spun on.
     pub fn next_interval(&self, result: &Result<SyncReport, SyncError>) -> Duration {
         match result {
-            Ok(r) if !r.is_quiet() => FAST,
+            Ok(r) if !r.is_quiet() && r.failed.is_empty() => FAST,
             _ => (self.interval * 2).min(SLOW),
         }
     }
@@ -286,6 +287,32 @@ mod tests {
         runner.status = Some(SyncStatus::Synced { at_ms: 0 });
         runner.transport = None;
         assert_eq!(sync_dot(Some(&runner)), SyncDot::Syncing);
+    }
+
+    #[test]
+    fn a_round_that_left_a_page_failed_backs_off() {
+        let engine = utopia_sync::SyncEngine::new(&utopia_store::Store::open_in_memory().unwrap())
+            .expect("engine");
+        let transport: BoxTransport = Box::new(utopia_sync::relay::RelayTransport::new(
+            utopia_sync::relay::Relay::new(),
+            "g",
+        ));
+        let runner = SyncRunner::new(engine, transport);
+        let report = SyncReport {
+            pushed: 1,
+            ..Default::default()
+        };
+        assert_eq!(runner.next_interval(&Ok(report.clone())), FAST);
+        let mut report = report;
+        report.failed.push(utopia_sync::Failure {
+            page: None,
+            kind: utopia_sync::FailureKind::Transport("HTTP 413".into()),
+        });
+        assert_ne!(
+            runner.next_interval(&Ok(report)),
+            FAST,
+            "a failed page is retried on the backoff, not spun on"
+        );
     }
 
     #[test]
