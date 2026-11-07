@@ -14,6 +14,9 @@ use utopia_store::Store;
 
 const IDLE_FLUSH: Duration = Duration::from_millis(250);
 const MAX_FLUSH_DELAY: Duration = Duration::from_secs(1);
+/// A failed repair is not retried on every keystroke (it snapshots and waits on disk);
+/// wait this long before trying again.
+const REPAIR_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Emitted after every mutation so views refresh only what they show.
 #[derive(Debug, Clone)]
@@ -45,6 +48,9 @@ pub struct AppState {
     dirty_since: Option<Instant>,
     flush_task: Option<Task<()>>,
     wait_task: Option<Task<()>>,
+    /// When a failed writer may be repaired again (backoff, review P3).
+    repair_at: Option<Instant>,
+    repair_task: Option<Task<()>>,
     _quit: Option<Subscription>,
 }
 
@@ -70,6 +76,8 @@ impl AppState {
             dirty_since: None,
             flush_task: None,
             wait_task: None,
+            repair_at: None,
+            repair_task: None,
             _quit: None,
         }
     }
@@ -123,18 +131,33 @@ impl AppState {
             // A failed writer is a state: report it, repair from the retained shards once,
             // and only claim the index moved when the repaired commit actually landed.
             self.report::<()>(Err(e));
+            if self.repair_at.is_some_and(|at| Instant::now() < at) {
+                // A repair is already backing off: do not snapshot and wait on disk again
+                // from the keystroke path (rule 10, review P3).
+                cx.notify();
+                return;
+            }
             let _ = self.store.sync_index();
             // The repair's retry takes `pending` even when it fails, so an empty queue
             // does not mean the index moved: ask the writer's ticket instead.
             match self.store.write_ticket().wait() {
-                Ok(()) => self.index_updated(cx),
+                Ok(()) => {
+                    self.repair_at = None;
+                    self.repair_task = None;
+                    self.index_updated(cx);
+                }
                 Err(e) => {
                     self.report::<()>(Err(e));
+                    self.repair_at = Some(Instant::now() + REPAIR_BACKOFF);
+                    self.schedule_repair(cx);
                     cx.notify();
                 }
             }
             return;
         }
+        // The writer is healthy enough to take this edit; a scheduled repair is moot.
+        self.repair_at = None;
+        self.repair_task = None;
         let ticket = self.store.write_ticket();
         if ticket.is_done() {
             match ticket.wait() {
@@ -159,6 +182,17 @@ impl AppState {
                     app.report::<()>(Err(e));
                     cx.notify();
                 }
+            });
+        }));
+    }
+
+    /// Retry a failed repair after the backoff, without blocking the keystroke path.
+    fn schedule_repair(&mut self, cx: &mut Context<Self>) {
+        self.repair_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(REPAIR_BACKOFF).await;
+            let _ = this.update(cx, |app, cx| {
+                app.repair_task = None;
+                app.flush_now(cx);
             });
         }));
     }
@@ -244,6 +278,41 @@ mod tests {
 
     const FAIL_COMMIT: &str = "CREATE TRIGGER fail_commit BEFORE INSERT ON outbox
          BEGIN SELECT RAISE(ABORT, 'injected commit failure'); END";
+
+    /// Review P3: a persistent failure must not make every keystroke snapshot and block the
+    /// UI thread. The repair backs off; the edit stays queued for the retry.
+    #[gpui::test]
+    fn a_failed_repair_backs_off_before_retrying(cx: &mut TestAppContext) {
+        let (store, page, block) = store();
+        store.conn().execute_batch(FAIL_COMMIT).unwrap();
+        let app = cx.new(|_| AppState::new(store));
+        app.update(cx, |app, cx| {
+            app.store
+                .set_block_text(&page, &block, "ab", None, None)
+                .unwrap();
+            app.flush_now(cx);
+            assert!(app.last_error.is_some(), "the failure is reported");
+            assert!(app.store.has_pending(), "the edit is kept for the repair");
+        });
+        // The disk recovers, but the next keystroke arrives inside the backoff window.
+        app.update(cx, |app, _| {
+            app.store
+                .conn()
+                .execute_batch("DROP TRIGGER fail_commit")
+                .unwrap();
+        });
+        app.update(cx, |app, cx| {
+            app.store
+                .set_block_text(&page, &block, "abc", None, None)
+                .unwrap();
+            app.flush_now(cx);
+            assert!(
+                app.store.has_pending(),
+                "no synchronous repair inside the backoff window"
+            );
+            assert_eq!(app.refs_version, 0, "the index did not move");
+        });
+    }
 
     /// Review P1: with the thread persister the repair's retry takes `pending` even when it
     /// fails, so an empty queue does not mean the index moved. Key off the writer instead.
