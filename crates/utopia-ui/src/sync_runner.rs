@@ -149,10 +149,18 @@ pub struct SyncRunner {
     pub notice: Option<(String, i64)>,
     /// Raised by the realtime listener to sync now instead of at the next poll.
     pub nudge: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// This runner's identity. A loop may only drive the runner it was started for, so a
+    /// superseded loop cannot write into its replacement (nothing else has this number).
+    pub generation: u64,
+    /// The loop driving this runner. Kept here so that replacing the runner drops (and so
+    /// cancels) the previous loop: it is replaced, never accumulated (`_tasks` would only
+    /// release it with the workspace).
+    pub loop_task: Option<gpui::Task<()>>,
 }
 
 impl SyncRunner {
     pub fn new(engine: SyncEngine, transport: BoxTransport) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             engine,
             phase: SyncPhase::Idle { transport },
@@ -160,7 +168,14 @@ impl SyncRunner {
             interval: FAST,
             notice: None,
             nudge: Default::default(),
+            generation: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            loop_task: None,
         }
+    }
+
+    /// Whether `generation` is this runner's token; false once sync was restarted.
+    pub fn is_generation(&self, generation: u64) -> bool {
+        self.generation == generation
     }
 
     /// Start a round: take the transport out of [`SyncPhase::Idle`]. `None` when a round is

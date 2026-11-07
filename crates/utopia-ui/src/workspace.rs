@@ -482,10 +482,17 @@ impl Workspace {
         if let Some(n) = nudge {
             runner.nudge = n;
         }
+        let generation = runner.generation;
+        // Installing the runner drops the previous one, and with it the previous loop's
+        // task: one runner, one loop. The generation below is the second guard, for a loop
+        // that is already past an await when this new runner arrives.
         self.sync = Some(runner);
-        self._tasks.push(cx.spawn(async move |this, cx| loop {
+        let task = cx.spawn(async move |this, cx| loop {
             let wait = this.update(cx, |this, _| {
-                this.sync.as_ref().map(|s| (s.interval, s.nudge.clone()))
+                this.sync
+                    .as_ref()
+                    .filter(|s| s.is_generation(generation))
+                    .map(|s| (s.interval, s.nudge.clone()))
             });
             let Ok(Some((interval, nudge))) = wait else {
                 break;
@@ -503,7 +510,7 @@ impl Workspace {
             // 1. Gather pushes on the UI thread (short store reads).
             let prepared = this.update(cx, |this, cx| {
                 let Workspace { app, sync, .. } = this;
-                let runner = sync.as_mut()?;
+                let runner = sync.as_mut().filter(|r| r.is_generation(generation))?;
                 let transport = runner.begin_round()?;
                 // The footer's dot says "syncing" from now until the exchange returns; ask
                 // for the frame now, or an idle window keeps last round's green (SB-4).
@@ -536,7 +543,9 @@ impl Workspace {
             // 3. Import on the UI thread and announce merges.
             let applied = this.update(cx, |this, cx| {
                 let Workspace { app, sync, .. } = this;
-                let Some(runner) = sync.as_mut() else { return };
+                let Some(runner) = sync.as_mut().filter(|r| r.is_generation(generation)) else {
+                    return;
+                };
                 runner.exchange_returned();
                 let report = match result {
                     Ok(inc) => app.update(cx, |app, cx| {
@@ -568,7 +577,12 @@ impl Workspace {
             if applied.is_err() {
                 break;
             }
-        }));
+        });
+        if let Some(runner) = self.sync.as_mut() {
+            if runner.is_generation(generation) {
+                runner.loop_task = Some(task);
+            }
+        }
         cx.notify();
         true
     }

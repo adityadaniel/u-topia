@@ -1470,6 +1470,95 @@ fn background_sync_imports_and_pushes(cx: &mut TestAppContext) {
     assert_eq!(st.block(&st.live_roots()[0]).unwrap().text, "local words");
 }
 
+/// A transport that counts how many rounds reached the network, so a test can tell one
+/// polling loop from two (§12.3).
+struct CountingTransport {
+    inner: utopia_sync::relay::RelayTransport,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl utopia_sync::Transport for CountingTransport {
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.manifest(if_none_match)
+    }
+
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        self.inner.push(page, req)
+    }
+
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.inner.pull(page, since_seq)
+    }
+
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// §12.3, §13.3: one `SyncRunner` must have one polling loop. A second `enable_sync_with`
+/// replaces the runner; it must also retire the loop the previous runner started, or both
+/// loops poll the new runner (and the old loop writes its transport into it).
+#[gpui::test]
+fn enabling_sync_twice_keeps_one_poll_loop(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    let (_app, ws, cx) = setup(cx);
+    let relay = Relay::new();
+    let first = Arc::new(AtomicUsize::new(0));
+    let second = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(relay.clone(), "g"),
+                calls: first.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    // Replace the runner while the first loop is asleep.
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(relay.clone(), "g"),
+                calls: second.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    for _ in 0..4 {
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        first.load(Ordering::SeqCst) + second.load(Ordering::SeqCst),
+        2,
+        "one loop rounds at 5 s and 15 s in 20 s (5 s then a 10 s idle backoff); a second \
+         loop adds rounds"
+    );
+}
+
 // ---------------------------------------------------------------- v1.1 (P1)
 
 fn kind_of(
