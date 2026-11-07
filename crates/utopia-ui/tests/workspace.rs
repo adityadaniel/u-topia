@@ -3837,7 +3837,17 @@ fn ac_13_5_host_commit_waits_for_the_ime(cx: &mut TestAppContext) {
         "abにほ",
         "the provisional glyphs are shown"
     );
-    // The host finishes the block (what Escape, a click elsewhere or the idle timer does).
+    // The idle timer (300 ms after the last keystroke) fires mid-composition.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    assert_eq!(
+        text_and_caret(&ws, cx).0,
+        "abにほ",
+        "the idle commit waits for the input method too"
+    );
+    assert_eq!(rows(&app, &page, cx)[0].0, "ab");
+    // The host finishes the block (what Escape, a click elsewhere or navigation does).
     editor.update(cx, |e, cx| e.end(cx));
     cx.run_until_parked();
     assert_eq!(
