@@ -98,6 +98,10 @@ impl AppState {
 
     fn schedule_flush(&mut self, cx: &mut Context<Self>) {
         if !self.store.has_pending() {
+            // Nothing to flush: drop the timer *and* the clock that caps it. Keeping the
+            // old `dirty_since` would make the next keystroke flush at once (issue 4).
+            self.flush_task = None;
+            self.dirty_since = None;
             return;
         }
         let now = Instant::now();
@@ -123,7 +127,8 @@ impl AppState {
             return;
         }
         self.wait_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
+            let _ = cx
+                .background_executor()
                 .spawn(async move { ticket.wait() })
                 .await;
             let _ = this.update(cx, |app, cx| app.index_updated(cx));
@@ -167,5 +172,33 @@ impl AppState {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use gpui::{AppContext as _, TestAppContext};
+
+    /// Issue 4: a change with nothing pending returned early and left `dirty_since` from an
+    /// earlier edit, so the next keystroke could flush immediately instead of debouncing.
+    #[gpui::test]
+    fn a_change_with_nothing_pending_forgets_the_dirty_clock(cx: &mut TestAppContext) {
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+        store
+            .open_daily(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap())
+            .unwrap();
+        let app = cx.new(|_| AppState::new(store));
+        app.update(cx, |app, cx| {
+            // A local-only change (no store write) after the timer was armed elsewhere.
+            app.dirty_since = Some(Instant::now() - Duration::from_secs(2));
+            app.changed(Vec::new(), false, cx);
+            assert!(
+                app.dirty_since.is_none(),
+                "the dirty clock follows the pending set"
+            );
+        });
     }
 }
