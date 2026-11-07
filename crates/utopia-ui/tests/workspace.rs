@@ -3190,6 +3190,183 @@ fn daily_notes_feed_scrolls_into_older_days(cx: &mut TestAppContext) {
     assert_eq!(daily_count(&app, cx), 26);
 }
 
+/// FR-1.1/FR-1.2: the feed lists every calendar day back to the oldest daily page and
+/// then stops. Without a terminal state the sentinel kept asking for another batch for
+/// as long as it was laid out, walking back through empty years.
+#[gpui::test]
+fn fr_1_1_feed_stops_at_the_oldest_daily_page(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // One page, older than the first batch, so there is something to load.
+    let oldest = today() - chrono::Duration::days(23);
+    app.update(cx, |app, _| {
+        let (p, b) = app.store.open_daily(oldest).unwrap();
+        app.store
+            .set_block_text(&p, &b, "the first note", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    // Scroll far past the last real day.
+    for _ in 0..20 {
+        scroll_main(cx, -4000.);
+    }
+    let pages = ws.update(cx, |w, cx| w.journal_days(cx));
+    assert_eq!(pages.len(), 2, "today's draft and the only written day");
+    assert_eq!(pages[0], today_page(&app, cx), "today comes first");
+    // The end of the feed is a terminal state, not an endless sentinel.
+    assert!(
+        cx.debug_bounds("feed-end").is_some(),
+        "the feed says it has no earlier notes once the oldest day is loaded"
+    );
+    let shown = ws
+        .update(cx, |w, cx| w.journal_shown_through(cx))
+        .expect("in the feed");
+    assert!(
+        shown <= oldest,
+        "the oldest day is inside the loaded window: {shown} vs {oldest}"
+    );
+    assert!(
+        shown > oldest - chrono::Duration::days(10),
+        "stops within one batch of the oldest day, not years past it: {shown}"
+    );
+    // Scrolling on asks for nothing more: the window is final.
+    let open_before = ws.update(cx, |w, cx| w.open_journal_days(cx));
+    for _ in 0..5 {
+        scroll_main(cx, -4000.);
+    }
+    assert_eq!(
+        ws.update(cx, |w, cx| w.journal_shown_through(cx)),
+        Some(shown),
+        "an exhausted feed never loads another batch"
+    );
+    assert_eq!(
+        ws.update(cx, |w, cx| w.open_journal_days(cx)),
+        open_before,
+        "no day opened on the extra scrolls either"
+    );
+    // Writing on a blank day inside the window writes that day (FR-1.2) but does not
+    // move the feed's floor: the day is above `shown_through`, so the feed stays ended.
+    // `today()` is 2026-11-02 in this file, so 25 days back is 2026-10-08: older than
+    // the only note (2026-10-10) but inside the loaded window (down to 2026-10-04).
+    let inside = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+    assert_eq!(inside, today() - chrono::Duration::days(25));
+    let folded = cx
+        .debug_bounds("day-folded-2026-10-08")
+        .expect("a blank day inside the window");
+    cx.simulate_click(folded.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_input("late note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.journal_shown_through(cx)),
+        Some(shown),
+        "writing inside the loaded window leaves the window where it was"
+    );
+    assert!(
+        ws.update(cx, |w, cx| w.journal_days(cx))
+            .contains(&PageId::for_date(inside)),
+        "the blank day became a page"
+    );
+    // Nothing was created by scrolling; the one page is the day just written (FR-1.2).
+    assert_eq!(daily_count(&app, cx), 2);
+}
+
+/// FR-1.2: visiting a day without writing on it only makes a draft, so it must not
+/// extend the feed: the feed still ends at the oldest *written* day, not at whatever
+/// date was last opened from the calendar.
+#[gpui::test]
+fn fr_1_2_visited_day_does_not_extend_the_feed(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // Three written days: the oldest is two days back.
+    let oldest = today() - chrono::Duration::days(2);
+    app.update(cx, |app, _| {
+        for i in 0..3 {
+            let d = today() - chrono::Duration::days(i);
+            let (p, b) = app.store.open_daily(d).unwrap();
+            app.store
+                .set_block_text(&p, &b, &format!("note {i}"), None, None)
+                .unwrap();
+            app.store.commit_block(&p, &b).unwrap();
+        }
+        app.store.sync_index().unwrap();
+    });
+    // Visit (do not write) a day years back: a draft for the session (FR-1.2).
+    let visited = NaiveDate::from_ymd_opt(2019, 1, 1).unwrap();
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(visited, false, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(
+        app.update(cx, |app, _| app.store.is_draft(&PageId::for_date(visited))),
+        "opening a date only drafts it"
+    );
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    // The visited draft must not make the feed load towards 2019.
+    for _ in 0..20 {
+        scroll_main(cx, -4000.);
+    }
+    assert!(
+        cx.debug_bounds("feed-end").is_some(),
+        "the feed ends at the oldest written day, not at the visited draft"
+    );
+    let shown = ws
+        .update(cx, |w, cx| w.journal_shown_through(cx))
+        .expect("in the feed");
+    assert!(
+        shown <= oldest && shown > oldest - chrono::Duration::days(10),
+        "the window stays within one batch of the oldest written day: {shown} vs {oldest}"
+    );
+    // Visiting wrote nothing.
+    assert_eq!(daily_count(&app, cx), 3);
+}
+
+/// FR-1.2: an exhausted feed re-opens when an older daily page appears later (from a
+/// `[[date]]` link, an import or a sync). The terminal state is recomputed on every
+/// rebuild, not latched: the sentinel comes back and the next batch reaches the day.
+#[gpui::test]
+fn fr_1_2_feed_reopens_when_an_older_day_appears(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // Today's note only: the feed ends at once.
+    cx.simulate_input("today's note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("feed-end").is_some(),
+        "there is no older note yet"
+    );
+    // An older day appears without navigating the feed.
+    let older = today() - chrono::Duration::days(14);
+    let older_page = app.update(cx, |app, cx| {
+        let (p, b) = app.store.open_daily(older).unwrap();
+        app.store
+            .set_block_text(&p, &b, "found later", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+        app.changed(vec![p.clone()], true, cx);
+        p
+    });
+    cx.run_until_parked();
+    // The feed asks again and loads down to the day that appeared.
+    for _ in 0..10 {
+        scroll_main(cx, -4000.);
+    }
+    let shown = ws
+        .update(cx, |w, cx| w.journal_shown_through(cx))
+        .expect("in the feed");
+    assert!(
+        shown <= older && shown > older - chrono::Duration::days(10),
+        "the window reaches the new oldest day within one batch: {shown} vs {older}"
+    );
+    let pages = ws.update(cx, |w, cx| w.journal_days(cx));
+    assert_eq!(pages.len(), 2, "today and the day that appeared");
+    assert!(pages.contains(&older_page));
+}
+
 fn scroll_main(cx: &mut VisualTestContext, dy: f32) {
     let main = cx.debug_bounds("main-pane").expect("main pane");
     cx.simulate_event(gpui::ScrollWheelEvent {

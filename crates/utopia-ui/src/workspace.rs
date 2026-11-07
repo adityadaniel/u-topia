@@ -1272,6 +1272,11 @@ impl Workspace {
         self.main.read(cx).journal_days()
     }
 
+    /// The oldest calendar day the feed has loaded (FR-1.2); `None` outside the feed.
+    pub fn journal_shown_through(&self, cx: &gpui::App) -> Option<NaiveDate> {
+        self.main.read(cx).journal_shown_through()
+    }
+
     /// The date whose heading is pinned at the top of the feed (DN-3), for scripts.
     pub fn main_sticky_day(&self, cx: &gpui::App) -> Option<NaiveDate> {
         self.main.read(cx).sticky_day()

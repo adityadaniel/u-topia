@@ -115,6 +115,44 @@ fn ac_1_4_backfill_thirty_days() {
     assert_eq!(s.journal(14).unwrap().len(), 14);
 }
 
+/// FR-1.2: the Daily Notes feed stops loading older days at the oldest daily page. A day
+/// that was only visited is a draft, not a page, so it does not extend the feed; a
+/// trashed day does not hold it open either.
+#[test]
+fn fr_1_2_oldest_daily_page_bounds_the_feed() {
+    let mut s = store();
+    assert_eq!(s.oldest_daily().unwrap(), None, "a fresh graph has no day");
+    // Visiting an old day creates a draft, not a page (FR-1.2).
+    let drafted = s.draft_daily(date(2026, 10, 20)).unwrap();
+    assert_eq!(
+        s.oldest_daily().unwrap(),
+        None,
+        "a visited day is a draft, not a page"
+    );
+    write(&mut s, &drafted, "older");
+    assert_eq!(s.oldest_daily().unwrap(), Some(date(2026, 10, 20)));
+    // A later visit to an even older date must not move the feed's floor.
+    s.draft_daily(date(2019, 1, 1)).unwrap();
+    assert_eq!(
+        s.oldest_daily().unwrap(),
+        Some(date(2026, 10, 20)),
+        "drafts do not bound the feed"
+    );
+    let (trashed, _) = s.open_daily(date(2026, 10, 10)).unwrap();
+    assert_eq!(
+        s.oldest_daily().unwrap(),
+        Some(date(2026, 10, 10)),
+        "a live page older than every other"
+    );
+    s.delete_page(&trashed).unwrap();
+    assert_eq!(
+        s.oldest_daily().unwrap(),
+        Some(date(2026, 10, 20)),
+        "trashed days do not hold the feed open"
+    );
+    assert_doctor(&mut s);
+}
+
 #[test]
 fn fr_1_2_visited_day_is_a_draft_until_written() {
     let mut s = store();
