@@ -249,3 +249,51 @@ fn ac_13_3_a_strict_index_read_does_not_consume_the_writer_failure() {
         "the read must not consume the failed commit"
     );
 }
+
+/// Review P1: a visit must not write a day (FR-1.2). An unedited draft is in `docs` only
+/// so the feed can render it; a repair must not turn it into a page.
+#[test]
+fn fr_1_2_a_writer_failure_does_not_promote_unedited_drafts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g.utopia");
+    let mut s = Store::open(&path).unwrap();
+    s.set_today(Some(date(2026, 11, 2)));
+    s.set_debounced(true).unwrap();
+    // Both days were visited (their drafts are in memory); only one is edited.
+    let untouched = s.draft_daily(date(2026, 11, 2)).unwrap();
+    let edited = s.draft_daily(date(2026, 11, 1)).unwrap();
+    let block = s.page_state(&edited).unwrap().live_roots()[0].clone();
+
+    fail_commits(&s);
+    s.set_block_text(&edited, &block, "typed", None, None)
+        .unwrap();
+    let _ = s.write_ticket().wait();
+    allow_commits(&s);
+    let _ = s.sync_index();
+    s.sync_index().unwrap();
+
+    assert_eq!(
+        count(
+            &s,
+            "SELECT count(*) FROM page_doc WHERE page_id=?1",
+            &edited
+        ),
+        1,
+        "the edited draft became a page"
+    );
+    assert_eq!(
+        count(
+            &s,
+            "SELECT count(*) FROM page_doc WHERE page_id=?1",
+            &untouched
+        ),
+        0,
+        "an unedited draft must not be written by a repair"
+    );
+    assert_eq!(
+        count(&s, "SELECT count(*) FROM page WHERE id=?1", &untouched),
+        0
+    );
+    assert!(s.is_draft(&untouched), "the day is still only visited");
+    assert!(s.page_state(&untouched).is_ok(), "the draft stays loaded");
+}

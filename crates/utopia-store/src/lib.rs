@@ -89,6 +89,10 @@ struct DocEntry {
     /// The last job submitted for this shard, and the frontier its update log will reach.
     /// Promoted into `durable` on completion, discarded on failure.
     in_flight: Option<InFlight>,
+    /// A draft day whose first edit was queued (FR-1.2). Until that commit is durable the
+    /// shard is still a draft, so a repair must keep trying to write it, while a day that
+    /// was only visited must never be written.
+    promoted: bool,
 }
 
 /// A submitted (not yet confirmed) commit for one page (store-commit-pipeline).
@@ -439,6 +443,10 @@ impl Store {
     /// Returns the pages that were requeued (used to retire repaired drafts).
     fn repair_writer(&mut self) -> Vec<PageId> {
         self.reconcile_writer();
+        // Days that were only visited are still drafts (FR-1.2): the feed renders them
+        // from memory, and a repair must not write them. Only a draft that was promoted
+        // (taken out of `drafts` by `queue`) is rewritten.
+        let still_drafts: HashSet<PageId> = self.drafts.values().cloned().collect();
         let mut requeued = Vec::new();
         let mut drafts = Vec::new();
         for (page, entry) in self.docs.iter_mut() {
@@ -446,10 +454,12 @@ impl Store {
             // rolled it back or dropped it. The shard is rewritten whole below.
             let was_durable = entry.has_snapshot;
             entry.in_flight = None;
-            if entry.has_snapshot && entry.doc.frontier() == entry.durable {
+            if (still_drafts.contains(page) && !entry.promoted)
+                || (entry.has_snapshot && entry.doc.frontier() == entry.durable)
+            {
                 continue;
             }
-            if !was_durable {
+            if entry.promoted && !was_durable {
                 if let Some(date) = entry.doc.state().meta.daily_date {
                     drafts.push((date, page.clone()));
                 }
@@ -491,6 +501,11 @@ impl Store {
             if retried.is_ok() {
                 // Those pages are durable now, so they are no longer drafts.
                 self.drafts.retain(|_, p| !requeued.contains(p));
+                for page in &requeued {
+                    if let Some(entry) = self.docs.get_mut(page) {
+                        entry.promoted = false;
+                    }
+                }
             }
             return match retried {
                 Ok(()) => Err(failure),
@@ -516,6 +531,9 @@ impl Store {
             // A draft's first edit writes the whole page (meta, first block, the edit).
             let delta = if self.take_draft(page) {
                 promoted = true;
+                if let Some(entry) = self.docs.get_mut(page) {
+                    entry.promoted = true;
+                }
                 None
             } else {
                 delta.clone()
@@ -669,6 +687,7 @@ impl Store {
                     has_snapshot: true,
                     pending_updates: updates.len() as i64,
                     in_flight: None,
+                    promoted: false,
                 },
             );
         }
@@ -682,6 +701,7 @@ impl Store {
             has_snapshot: false,
             pending_updates: 0,
             in_flight: None,
+            promoted: false,
         })
     }
 
