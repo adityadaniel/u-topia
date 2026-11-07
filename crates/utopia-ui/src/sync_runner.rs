@@ -122,11 +122,28 @@ pub fn spawn_realtime(
         });
 }
 
+/// Which half of a sync round is running, and therefore where the transport is (§12.3,
+/// §13.3). The transport's home is [`SyncPhase::Idle`]; no phase ever means "no transport
+/// exists". `interval` and `last` stay fields of [`SyncRunner`] on purpose: they are the
+/// cadence and the history, not a phase, and both survive every transition.
+pub enum SyncPhase {
+    /// Between rounds: the transport is home and the next poll waits `interval`.
+    Idle { transport: BoxTransport },
+    /// The UI thread holds the transport and gathers pushes (short store reads, no network).
+    Preparing,
+    /// The background thread holds the transport and is talking to the relay.
+    Exchanging,
+    /// The exchange returned; the UI thread holds the transport and imports the result.
+    Applying,
+}
+
 pub struct SyncRunner {
     pub engine: SyncEngine,
-    /// `None` while an exchange is in flight on the background thread.
-    pub transport: Option<BoxTransport>,
-    pub status: Option<SyncStatus>,
+    /// The round's phase; the only place that says where the transport is.
+    pub phase: SyncPhase,
+    /// The last round's outcome; `None` = no round has finished yet ("connecting…").
+    pub last: Option<SyncStatus>,
+    /// Cadence between rounds: [`FAST`] while there is activity, backing off to [`SLOW`].
     pub interval: Duration,
     /// "Merged N changes" notice (§9.3) with the time it was raised.
     pub notice: Option<(String, i64)>,
@@ -138,20 +155,67 @@ impl SyncRunner {
     pub fn new(engine: SyncEngine, transport: BoxTransport) -> Self {
         Self {
             engine,
-            transport: Some(transport),
-            status: None,
+            phase: SyncPhase::Idle { transport },
+            last: None,
             interval: FAST,
             notice: None,
             nudge: Default::default(),
         }
     }
 
-    /// Next poll interval after a round.
-    pub fn next_interval(&self, result: &Result<SyncReport, SyncError>) -> Duration {
-        match result {
-            Ok(r) if !r.is_quiet() => FAST,
-            _ => (self.interval * 2).min(SLOW),
+    /// Start a round: take the transport out of [`SyncPhase::Idle`]. `None` when a round is
+    /// already running, which the loop treats as someone else's round and leaves alone.
+    pub fn begin_round(&mut self) -> Option<BoxTransport> {
+        if !matches!(self.phase, SyncPhase::Idle { .. }) {
+            return None;
         }
+        match std::mem::replace(&mut self.phase, SyncPhase::Exchanging) {
+            SyncPhase::Idle { transport } => {
+                self.phase = SyncPhase::Preparing;
+                Some(transport)
+            }
+            // Not reachable: the guard above proved `Idle`. Kept panic-free (rule 11).
+            other => {
+                self.phase = other;
+                None
+            }
+        }
+    }
+
+    /// The round's store work failed, so nothing left the device: the transport comes home.
+    pub fn round_failed(&mut self, transport: BoxTransport, status: SyncStatus) {
+        self.last = Some(status);
+        self.phase = SyncPhase::Idle { transport };
+    }
+
+    /// The prepared pushes leave for the background thread.
+    pub fn exchange(&mut self) {
+        self.phase = SyncPhase::Exchanging;
+    }
+
+    /// The exchange returned; the UI thread imports it next.
+    pub fn exchange_returned(&mut self) {
+        self.phase = SyncPhase::Applying;
+    }
+
+    /// The round is over: remember what to show and how soon to poll again.
+    pub fn end_round(
+        &mut self,
+        transport: BoxTransport,
+        report: &Result<SyncReport, SyncError>,
+        status: SyncStatus,
+    ) {
+        self.interval = next_interval(self.interval, report);
+        self.last = Some(status);
+        self.phase = SyncPhase::Idle { transport };
+    }
+}
+
+/// Next poll interval after a round: fast again when anything moved, else back off.
+fn next_interval(current: Duration, result: &Result<SyncReport, SyncError>) -> Duration {
+    match result {
+        Ok(r) if !r.is_quiet() => FAST,
+        _ => (current * 2).min(SLOW),
     }
 }
 
@@ -191,11 +255,10 @@ pub fn sync_dot(runner: Option<&SyncRunner>) -> SyncDot {
     let Some(runner) = runner else {
         return SyncDot::Off;
     };
-    // The transport is checked out of the runner while the background thread exchanges.
-    if runner.transport.is_none() {
+    if !matches!(runner.phase, SyncPhase::Idle { .. }) {
         return SyncDot::Syncing;
     }
-    match runner.status {
+    match runner.last {
         None => SyncDot::Syncing,
         Some(SyncStatus::Synced { .. }) => SyncDot::Synced,
         Some(SyncStatus::Offline { .. })
@@ -204,8 +267,13 @@ pub fn sync_dot(runner: Option<&SyncRunner>) -> SyncDot {
     }
 }
 
-/// Human status line for the sidebar.
-pub fn status_line(status: Option<&SyncStatus>, now_ms: i64) -> (String, bool) {
+/// Human status line for the sidebar, from the one state the dot reads.
+pub fn status_line(runner: &SyncRunner, now_ms: i64) -> (String, bool) {
+    status_text(runner.last.as_ref(), now_ms)
+}
+
+/// The line for one outcome.
+pub fn status_text(status: Option<&SyncStatus>, now_ms: i64) -> (String, bool) {
     match status {
         None => ("Sync: connecting…".into(), false),
         Some(SyncStatus::Synced { at_ms }) => {
@@ -278,24 +346,52 @@ mod tests {
         ));
         let mut runner = SyncRunner::new(engine, transport);
         assert_eq!(sync_dot(Some(&runner)), SyncDot::Syncing);
-        runner.status = Some(SyncStatus::Synced { at_ms: 0 });
+        runner.last = Some(SyncStatus::Synced { at_ms: 0 });
         assert_eq!(sync_dot(Some(&runner)), SyncDot::Synced);
-        runner.status = Some(SyncStatus::Offline { queued: 2 });
+        runner.last = Some(SyncStatus::Offline { queued: 2 });
         assert_eq!(sync_dot(Some(&runner)), SyncDot::Error);
-        // An exchange in flight wins over the last round's status.
-        runner.status = Some(SyncStatus::Synced { at_ms: 0 });
-        runner.transport = None;
+        // A round in flight wins over the last round's status.
+        runner.last = Some(SyncStatus::Synced { at_ms: 0 });
+        runner.begin_round().expect("the transport is home");
         assert_eq!(sync_dot(Some(&runner)), SyncDot::Syncing);
     }
 
     #[test]
     fn status_lines() {
         assert_eq!(
-            status_line(Some(&SyncStatus::Synced { at_ms: 0 }), 150_000).0,
+            status_text(Some(&SyncStatus::Synced { at_ms: 0 }), 150_000).0,
             "Synced 2m ago"
         );
-        let (s, warn) = status_line(Some(&SyncStatus::Offline { queued: 3 }), 0);
+        let (s, warn) = status_text(Some(&SyncStatus::Offline { queued: 3 }), 0);
         assert_eq!(s, "● Offline — 3 changes queued");
         assert!(warn);
+    }
+
+    /// Only one round at a time, and the transport always comes home: `begin_round` is the
+    /// only way to take it, and it refuses while a round runs. This is what made the old
+    /// "no transport at prepare" path unreachable (`sync-runner-round.md`, issue 7).
+    #[test]
+    fn one_round_at_a_time() {
+        let engine = utopia_sync::SyncEngine::new(&utopia_store::Store::open_in_memory().unwrap())
+            .expect("engine");
+        let transport: BoxTransport = Box::new(utopia_sync::relay::RelayTransport::new(
+            utopia_sync::relay::Relay::new(),
+            "g",
+        ));
+        let mut runner = SyncRunner::new(engine, transport);
+        let transport = runner.begin_round().expect("idle round starts");
+        assert!(
+            runner.begin_round().is_none(),
+            "a second round cannot take the transport"
+        );
+        runner.exchange();
+        assert!(runner.begin_round().is_none(), "the exchange owns it");
+        runner.exchange_returned();
+        runner.end_round(
+            transport,
+            &Ok(SyncReport::default()),
+            SyncStatus::Synced { at_ms: 0 },
+        );
+        assert!(runner.begin_round().is_some(), "the transport came home");
     }
 }

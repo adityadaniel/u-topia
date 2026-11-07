@@ -504,19 +504,22 @@ impl Workspace {
             let prepared = this.update(cx, |this, cx| {
                 let Workspace { app, sync, .. } = this;
                 let runner = sync.as_mut()?;
-                let transport = runner.transport.take()?;
+                let transport = runner.begin_round()?;
                 // The footer's dot says "syncing" from now until the exchange returns; ask
                 // for the frame now, or an idle window keeps last round's green (SB-4).
                 cx.notify();
                 let out = app.update(cx, |app, _| runner.engine.prepare(&mut app.store));
                 match out {
-                    Ok(out) => Some((out, transport)),
+                    Ok(out) => {
+                        runner.exchange();
+                        Some((out, transport))
+                    }
                     Err(e) => {
-                        runner.transport = Some(transport);
-                        runner.status = Some(utopia_sync::SyncStatus::from_result(
+                        let status = utopia_sync::SyncStatus::from_result(
                             &Err(e),
                             &app.read(cx).store,
-                        ));
+                        );
+                        runner.round_failed(transport, status);
                         None
                     }
                 }
@@ -534,7 +537,7 @@ impl Workspace {
             let applied = this.update(cx, |this, cx| {
                 let Workspace { app, sync, .. } = this;
                 let Some(runner) = sync.as_mut() else { return };
-                runner.transport = Some(transport);
+                runner.exchange_returned();
                 let report = match result {
                     Ok(inc) => app.update(cx, |app, cx| {
                         let r = runner.engine.apply(&mut app.store, inc);
@@ -558,11 +561,8 @@ impl Workspace {
                         ));
                     }
                 }
-                runner.interval = runner.next_interval(&report);
-                runner.status = Some(utopia_sync::SyncStatus::from_result(
-                    &report,
-                    &app.read(cx).store,
-                ));
+                let status = utopia_sync::SyncStatus::from_result(&report, &app.read(cx).store);
+                runner.end_round(transport, &report, status);
                 cx.notify();
             });
             if applied.is_err() {
@@ -601,7 +601,7 @@ impl Workspace {
 
     /// Current sync status, if sync is enabled.
     pub fn sync_status(&self) -> Option<utopia_sync::SyncStatus> {
-        self.sync.as_ref().and_then(|s| s.status.clone())
+        self.sync.as_ref().and_then(|s| s.last.clone())
     }
 
     /// The shared block editor (startup/latency probe).
@@ -2070,7 +2070,7 @@ impl Workspace {
         let th = theme(cx).clone();
         let (line, warn) = match &self.sync {
             None => ("Off — this graph stays on this machine.".to_string(), false),
-            Some(runner) => status_line(runner.status.as_ref(), self.app.read(cx).store.now()),
+            Some(runner) => status_line(runner, self.app.read(cx).store.now()),
         };
         let target = self
             .sync_target
