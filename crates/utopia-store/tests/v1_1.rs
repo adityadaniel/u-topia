@@ -614,6 +614,68 @@ fn tag_classification_is_updated_incrementally() {
     assert_eq!(s.tag_page_full_scans(), full);
 }
 
+/// SB-2 review fix: a commit must not walk the published tag pages. A destination that lost
+/// its last reference is already one of the commit's changed destinations, so an edit that
+/// cannot remove one visits only the page it wrote — not every tag in the graph.
+#[test]
+fn unrelated_commits_do_not_walk_every_tag_page() {
+    let (mut s, _d) = store();
+    let notes = s.create_page("Notes").unwrap();
+    let alpha_block = write(&mut s, &notes, "a note about #alpha");
+    for tag in ["beta", "gamma", "delta", "epsilon"] {
+        write(&mut s, &notes, &format!("a note about #{tag}"));
+    }
+    s.sync_index().unwrap();
+    let alpha = s.find_page("alpha").unwrap().unwrap();
+    assert_eq!(s.tag_pages().unwrap().len(), 5, "five tag-only pages");
+    let visited = s.tag_pages_visited();
+
+    // An ordinary block mentions no tag: nothing can lose a reference, so only the pages
+    // being written are looked at (before the fix the publisher probed all five tags).
+    write(&mut s, &notes, "an ordinary note");
+    s.sync_index().unwrap();
+    let unrelated = s.tag_pages_visited() - visited;
+    assert!(
+        unrelated <= 2,
+        "an unrelated commit visits only the page it wrote, not every tag page: {unrelated}"
+    );
+    assert_eq!(s.tag_pages().unwrap().len(), 5, "still five tag pages");
+
+    // Growing the graph must not make an unrelated edit cost more: the work is the written
+    // page's, whatever the number of published tags.
+    for tag in ["zeta", "eta"] {
+        write(&mut s, &notes, &format!("a note about #{tag}"));
+    }
+    s.sync_index().unwrap();
+    assert_eq!(s.tag_pages().unwrap().len(), 7);
+    let visited = s.tag_pages_visited();
+    write(&mut s, &notes, "another ordinary note");
+    s.sync_index().unwrap();
+    assert_eq!(
+        s.tag_pages_visited() - visited,
+        unrelated,
+        "the cost of an unrelated commit does not grow with the graph"
+    );
+
+    // The last reference going away still unpublishes the page: the edge that disappeared is
+    // one of the commit's changed destinations.
+    let visited = s.tag_pages_visited();
+    s.set_block_text(&notes, &alpha_block, "no tag here", None, None)
+        .unwrap();
+    s.commit_block(&notes, &alpha_block).unwrap();
+    assert!(
+        s.tag_pages_visited() - visited <= unrelated + 2,
+        "a lost reference adds its destination, nothing more"
+    );
+    assert!(!s.tag_pages().unwrap().contains(&alpha));
+    assert_eq!(s.tag_pages().unwrap().len(), 6);
+    assert_eq!(
+        s.tag_pages().unwrap(),
+        s.hashtag_only_pages().unwrap(),
+        "the published set still matches a full classification"
+    );
+}
+
 /// SB-2 review fix: a page that was a plain page only because of one `[[link]]` becomes a
 /// tag page when that link goes away. The destination is no longer referenced by the page
 /// that changed, so the reclassification has to start from the references the commit

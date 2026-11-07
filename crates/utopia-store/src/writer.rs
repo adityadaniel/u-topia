@@ -121,14 +121,19 @@ pub(crate) struct Shared {
     tag_scans: std::sync::atomic::AtomicU64,
     /// How many per-page classifications the incremental path ran (tests, SB-2).
     tag_classifications: std::sync::atomic::AtomicU64,
+    /// How many pages the incremental tag publisher looked at — classified or probed
+    /// (tests, SB-2). A commit must never walk the published set, so this stays as small as
+    /// the pages it wrote plus the destinations it changed.
+    tag_pages_visited: std::sync::atomic::AtomicU64,
 }
 
 impl Shared {
     /// Update the published tag-page classification after a commit (SB-2). Only the pages
-    /// the commit wrote, the pages their blocks referenced before or after it, and published
-    /// pages whose last reference went away can change; everything else keeps its entry, so
-    /// no commit has to re-tokenize the whole graph. The first commit (before there is a
-    /// set) classifies once. A failure leaves the previous set in place.
+    /// the commit wrote and the destinations whose reference edges it changed can flip:
+    /// losing the last reference to a page removes that edge, so it is one of
+    /// `changed_refs`. Everything else keeps its entry, so no commit walks the whole graph.
+    /// The first commit (before there is a set) classifies once. A failure leaves the
+    /// previous set in place.
     fn publish_tag_pages(&self, conn: &Connection, job: &Job, changed_refs: &HashSet<PageId>) {
         let mut slot = match self.tag_pages.lock() {
             Ok(slot) => slot,
@@ -148,24 +153,9 @@ impl Shared {
         // Only destinations whose reference edges changed can flip classification. The
         // pages a job wrote are included above; unchanged refs on them are not rescanned.
         affected.extend(changed_refs.iter().cloned());
-        // A published page can only lose a reference through a page this commit wrote. If
-        // it has no references at all now, it cannot be a tag page any more.
-        for page in set.iter() {
-            if affected.contains(page) {
-                continue;
-            }
-            match crate::query::has_any_ref(conn, page) {
-                Ok(true) => {}
-                Ok(false) => {
-                    affected.insert(page.clone());
-                }
-                Err(e) => {
-                    eprintln!("utopia: tag pages: {e}");
-                    return;
-                }
-            }
-        }
         for page in affected {
+            self.tag_pages_visited
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.tag_classifications
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match crate::query::classify_tag_page(conn, &page) {
@@ -345,6 +335,19 @@ impl Persister {
     }
 
     /// How many whole-graph tag classifications this writer has run (tests, SB-2).
+    /// How many pages the incremental tag publisher looked at (tests, SB-2): the pages a
+    /// commit wrote plus the destinations whose ref edges it changed, never the whole
+    /// published set.
+    pub fn tag_pages_visited(&self) -> u64 {
+        let shared = match self {
+            Persister::Inline { shared } => shared,
+            Persister::Thread { shared, .. } => shared,
+        };
+        shared
+            .tag_pages_visited
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn tag_scans(&self) -> u64 {
         let shared = match self {
             Persister::Inline { shared } => shared,

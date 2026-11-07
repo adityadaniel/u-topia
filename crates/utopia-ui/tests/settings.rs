@@ -822,6 +822,18 @@ mod appearance {
         Some(serde_json::from_str(&s).expect("settings.json is JSON"))
     }
 
+    /// Open the main window's launch page and its right sidebar, as a user would.
+    fn open_sidebar(w: &mut VisualTestContext) {
+        let ws = w
+            .update(|window, _| window.root::<Workspace>())
+            .flatten()
+            .expect("the workspace root");
+        ws.update_in(w, |this, window, cx| this.open_launch_page(window, cx));
+        w.run_until_parked();
+        w.simulate_keystrokes("escape cmd-shift-\\");
+        w.run_until_parked();
+    }
+
     /// A main window and the Settings window, both open, as in the app.
     fn open_both(
         cx: &mut TestAppContext,
@@ -950,8 +962,9 @@ mod appearance {
                 "font": "ibm-plex-sans",
                 "density": "comfortable",
                 "ref_children": 2,
-                "pinned": [],
                 "attribute-blocks": "compact",
+                "pinned": [],
+                "right_sidebar_width": 380.0,
             }))
         );
         assert!(
@@ -1067,6 +1080,130 @@ mod appearance {
         assert_eq!(
             view.update(cx, |v, _| v.status().map(str::to_string)),
             Some("Unpinned every page.".to_string())
+        );
+    }
+
+    /// RS-3: the Pinned tab writes through the same local list as the left sidebar's Pinned
+    /// group (SB-3), so a pin made there is in `settings.json` and the next launch sees it.
+    #[gpui::test]
+    fn pinning_a_page_is_written_to_settings_json(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        cx.update(|cx| {
+            cx.set_global(Theme::light());
+            install_keymap(cx, None);
+            appearance::install(cx, &path);
+        });
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+        let page = store.create_page("Keep me").unwrap();
+        let app = cx.new(|_| AppState::new(store));
+        let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(app, window, cx));
+        ws.update_in(cx, |w, window, cx| {
+            w.open(page.clone(), None, None, false, window, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape cmd-shift-\\");
+        cx.run_until_parked();
+        let pinned_tab = cx.debug_bounds("panel-pinned").expect("the Pinned tab");
+        cx.simulate_click(pinned_tab.center(), Modifiers::default());
+        cx.run_until_parked();
+        let pin = cx.debug_bounds("pin-current").expect("the pin control");
+        cx.simulate_click(pin.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            settings_json(dir.path()).expect("settings.json written")["pinned"],
+            serde_json::json!([page.as_str()])
+        );
+        let (prefs, warnings) = appearance::Prefs::load(dir.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(prefs.pinned, vec![page.clone()]);
+        assert_eq!(
+            prefs.density,
+            Density::Comfortable,
+            "pinning does not disturb the other preferences"
+        );
+
+        let unpin = cx.debug_bounds("unpin-0").expect("the unpin control");
+        cx.simulate_click(unpin.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            settings_json(dir.path()).unwrap()["pinned"],
+            serde_json::json!([])
+        );
+    }
+
+    /// RS-4: dragging the sidebar's edge changes its width at once and writes the width to
+    /// `settings.json` on release; Settings → Appearance reports it and can reset it.
+    #[gpui::test]
+    fn the_sidebar_width_is_dragged_and_saved(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, settings) = open_both(cx, dir.path());
+        let mut w = VisualTestContext::from_window(main, cx);
+        open_sidebar(&mut w);
+        let handle = w.debug_bounds("right-resize").expect("the 4 px handle");
+        let start = handle.center();
+        w.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::default());
+        let to = gpui::point(start.x - gpui::px(80.), start.y);
+        w.simulate_mouse_move(to, gpui::MouseButton::Left, Modifiers::default());
+        w.simulate_mouse_up(to, gpui::MouseButton::Left, Modifiers::default());
+        w.run_until_parked();
+
+        let side = w.debug_bounds("right-sidebar").expect("the sidebar");
+        assert!(
+            (f32::from(side.size.width) - 460.).abs() < 1.5,
+            "dragged 80 px wider: {side:?}"
+        );
+        assert_eq!(
+            settings_json(dir.path()).expect("settings.json written")["right_sidebar_width"],
+            serde_json::json!(460.0),
+            "one write on release, with the width in it"
+        );
+
+        let mut s = VisualTestContext::from_window(settings, cx);
+        // The Appearance tab is a scrolling column and this card is its last one, so give
+        // the window room to show it rather than clicking bounds that are scrolled away.
+        s.simulate_resize(gpui::size(gpui::px(1100.), gpui::px(1200.)));
+        s.run_until_parked();
+        assert!(
+            s.debug_bounds("settings-sidebar-width-460").is_some(),
+            "Settings reports the width in force"
+        );
+        let reset = s
+            .debug_bounds("settings-sidebar-reset")
+            .expect("the reset control");
+        s.simulate_click(reset.center(), Modifiers::default());
+        s.run_until_parked();
+        assert_eq!(
+            settings_json(dir.path()).unwrap()["right_sidebar_width"],
+            serde_json::json!(380.0),
+            "the default is written down too"
+        );
+        w.run_until_parked();
+        let side = w.debug_bounds("right-sidebar").expect("the sidebar");
+        assert!(
+            (f32::from(side.size.width) - 380.).abs() < 1.5,
+            "the sidebar went back to the default width: {side:?}"
+        );
+    }
+
+    /// RS-4: the width a previous session left is the width the next one opens with.
+    #[gpui::test]
+    fn a_saved_sidebar_width_is_used_at_startup(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"version": 1, "right_sidebar_width": 480}"#,
+        )
+        .unwrap();
+        let (main, _) = open_both(cx, dir.path());
+        let mut w = VisualTestContext::from_window(main, cx);
+        open_sidebar(&mut w);
+        let side = w.debug_bounds("right-sidebar").expect("the sidebar");
+        assert!(
+            (f32::from(side.size.width) - 480.).abs() < 1.5,
+            "the saved width is in force: {side:?}"
         );
     }
 

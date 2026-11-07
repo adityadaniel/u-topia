@@ -743,6 +743,592 @@ fn sidebar_stacks_pages(cx: &mut TestAppContext) {
     );
 }
 
+/// RS-1: clicking a reference in the right sidebar opens the page it came from with that
+/// block focused, and clicking a page chip inside it follows the chip instead.
+#[gpui::test]
+fn a_reference_row_in_the_sidebar_opens_its_block(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (target, source, block, fold) = app.update(cx, |app, _| {
+        use utopia_core::{BlockId, BlockKind, Command};
+        let target = app.store.create_page("Target").unwrap();
+        let source = app.store.create_page("Source").unwrap();
+        // The referencing block sits under a folded parent, so opening it has to unfold that
+        // parent first.
+        let fold = BlockId::new();
+        app.store
+            .execute(
+                &source,
+                vec![Command::InsertBlock {
+                    id: fold.clone(),
+                    parent: None,
+                    after: None,
+                    text: "Fold".into(),
+                    kind: BlockKind::Bullet,
+                }],
+                Default::default(),
+            )
+            .unwrap();
+        let b = BlockId::new();
+        app.store
+            .execute(
+                &source,
+                vec![Command::InsertBlock {
+                    id: b.clone(),
+                    parent: Some(fold.clone()),
+                    after: None,
+                    text: "the note that references [[Target]]".into(),
+                    kind: BlockKind::Bullet,
+                }],
+                Default::default(),
+            )
+            .unwrap();
+        app.store.set_collapsed(&fold, true).unwrap();
+        app.store.sync_index().unwrap();
+        (target, source, b, fold)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let row = (0..20)
+        .find_map(|ix| {
+            let sel: &'static str = Box::leak(format!("ref-block-{ix}").into_boxed_str());
+            cx.debug_bounds(sel)
+        })
+        .expect("the sidebar lists the reference");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(source),
+        "the reference row opened the page it came from"
+    );
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.block.clone())),
+        Some(block),
+        "the caret is in the block that made the reference"
+    );
+    assert!(
+        !app.read_with(cx, |app, _| app.store.is_collapsed(&fold)),
+        "its folded parent was unfolded to show the row"
+    );
+}
+
+/// RS-2: an unresolved reference in the sidebar offers "Create page", which makes the page
+/// on the spot, and an empty Unresolved tab says so.
+#[gpui::test]
+fn unresolved_references_can_be_created_from_the_sidebar(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = app.update(cx, |app, _| {
+        let p = app.store.create_page("Drafting").unwrap();
+        let b = app.store.ensure_first_block(&p).unwrap();
+        app.store
+            .set_block_text(&p, &b, "ask [[Ana Lovelace]] about it", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        // A link creates its page on commit, so the only way to a dangling intent is to
+        // delete the page that the link now points at (AC-2.10).
+        let ana = app.store.find_page("Ana Lovelace").unwrap().unwrap();
+        app.store.delete_page(&ana).unwrap();
+        app.store.sync_index().unwrap();
+        p
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let unresolved = cx.debug_bounds("tab-un").expect("the Unresolved tab");
+    cx.simulate_click(unresolved.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("unresolved-empty").is_none(),
+        "there is one unresolved reference, so the tab lists it"
+    );
+    let create = cx
+        .debug_bounds("unresolved-create-0")
+        .expect("the row offers Create page");
+    cx.simulate_click(create.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    app.update(cx, |app, _| {
+        assert!(
+            app.store.unresolved_refs(&page).unwrap().is_empty(),
+            "the intent resolves now that its page exists (FR-4.14)"
+        );
+    });
+
+    // A page with nothing dangling says so instead of showing an empty panel.
+    let other = app.update(cx, |app, _| app.store.create_page("Clean").unwrap());
+    ws.update_in(cx, |w, window, cx| {
+        w.open(other, None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("unresolved-empty").is_some(),
+        "the empty state is drawn for a page with no unresolved references"
+    );
+}
+
+/// RS-3: the sidebar's Outline tab lists the page's headings and a click jumps to one.
+#[gpui::test]
+fn the_outline_lists_headings_and_jumps_to_them(cx: &mut TestAppContext) {
+    use utopia_core::{BlockKind, Command};
+    let (app, ws, cx) = setup(cx);
+    let (page, heading) = app.update(cx, |app, _| {
+        let p = app.store.create_page("Plan").unwrap();
+        let b = app.store.ensure_first_block(&p).unwrap();
+        app.store
+            .set_block_text(&p, &b, "Risks", None, None)
+            .unwrap();
+        app.store
+            .execute(
+                &p,
+                vec![Command::SetBlockKind {
+                    id: b.clone(),
+                    kind: BlockKind::Heading(2),
+                    checked: false,
+                }],
+                Default::default(),
+            )
+            .unwrap();
+        let plan = utopia_core::outline::append_block(app.store.page_state(&p).unwrap(), None);
+        let plan = app.store.execute_plan(&p, plan, None).unwrap().unwrap();
+        app.store
+            .set_block_text(&p, &plan.block, "not a heading", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+        (p, b)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page, None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let outline = cx.debug_bounds("panel-outline").expect("the Outline tab");
+    cx.simulate_click(outline.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let heading_row = cx.debug_bounds("outline-0").expect("the heading is listed");
+    assert!(
+        cx.debug_bounds("outline-1").is_none(),
+        "only headings are listed, not the body block below it"
+    );
+    assert!(
+        heading_row.size.height >= gpui::px(utopia_ui::theme::H2_SIZE),
+        "a heading draws at the heading size: {heading_row:?}"
+    );
+    cx.simulate_click(heading_row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.block.clone())),
+        Some(heading),
+        "clicking the outline row jumped to the heading"
+    );
+}
+
+/// RS-3: the Pinned tab keeps a page one click away; pinning is local (settings.json,
+/// rule 9) and the row can be unpinned again.
+#[gpui::test]
+fn pinned_pages_can_be_added_and_removed(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = app.update(cx, |app, _| {
+        let p = app.store.create_page("Pinboard").unwrap();
+        let b = app.store.ensure_first_block(&p).unwrap();
+        app.store
+            .set_block_text(&p, &b, "a page worth keeping", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+        p
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page, None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let pinned_tab = cx.debug_bounds("panel-pinned").expect("the Pinned tab");
+    cx.simulate_click(pinned_tab.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("pinned-empty").is_some(),
+        "nothing is pinned at first"
+    );
+    let pin = cx.debug_bounds("pin-current").expect("the pin control");
+    cx.simulate_click(pin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("pinned-0").is_some(),
+        "the page now sits in the Pinned tab"
+    );
+    assert!(
+        ws.update(cx, |w, cx| w.pinned_pages(cx)).len() == 1,
+        "the workspace remembers the pin"
+    );
+    let unpin = cx.debug_bounds("unpin-0").expect("the unpin control");
+    cx.simulate_click(unpin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        ws.update(cx, |w, cx| w.pinned_pages(cx)).is_empty(),
+        "unpinning removed it"
+    );
+}
+
+/// RS-5: pages shift-opened in the sidebar stack as cards with a fold arrow and a close ×.
+#[gpui::test]
+fn sidebar_cards_collapse_and_close(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (alpha, beta) = app.update(cx, |app, _| {
+        (
+            app.store.create_page("Alpha").unwrap(),
+            app.store.create_page("Beta").unwrap(),
+        )
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(alpha.clone(), None, None, true, window, cx);
+        w.open(beta.clone(), None, None, true, window, cx);
+    });
+    // Opening a page in the sidebar is what shows it, so no toggle here.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.sidebar_pages(cx)),
+        vec![beta.clone(), alpha.clone()],
+        "the newest card is on top"
+    );
+    // Each card names its page.
+    assert!(cx.debug_bounds("pane-title-0").is_some());
+    assert!(cx.debug_bounds("pane-title-1").is_some());
+    let expanded = cx.debug_bounds("pane-0").expect("the top card");
+    let fold = cx.debug_bounds("pane-collapse-0").expect("the fold arrow");
+    cx.simulate_click(fold.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let folded = cx.debug_bounds("pane-0").expect("the folded card");
+    assert!(
+        folded.size.height < expanded.size.height && folded.size.height < gpui::px(40.),
+        "a folded card is its header: {folded:?} (was {expanded:?})"
+    );
+    assert!(
+        cx.debug_bounds("pane-title-0").is_some(),
+        "the header, and so the page's name, stays"
+    );
+
+    // The × closes a card; the rest of the stack stays.
+    assert_eq!(ws.update(cx, |w, cx| w.sidebar_pages(cx)).len(), 2);
+    let close = cx.debug_bounds("pane-close-1").expect("the close ×");
+    cx.simulate_click(close.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.sidebar_pages(cx)),
+        vec![beta.clone()],
+        "closing a card removes just that page"
+    );
+
+    // Opening that page again moves its card to the top without a duplicate, still folded.
+    ws.update_in(cx, |w, window, cx| {
+        w.open(beta.clone(), None, None, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.sidebar_pages(cx)), vec![beta]);
+    let again = cx.debug_bounds("pane-0").expect("the card again");
+    assert!(
+        again.size.height < gpui::px(40.),
+        "the card was still folded: {again:?}"
+    );
+}
+
+/// RS-5 + the focus invariant in AGENTS.md: folding the card that hosts the edit must end
+/// the edit and hand the keyboard back to the workspace, because a focused element that is
+/// no longer rendered gets no keystrokes, so every shortcut would die.
+#[gpui::test]
+fn folding_an_edited_card_gives_the_keyboard_back(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (blank, card) = app.update(cx, |app, _| {
+        // The main pane shows a page with no rows, so the selectors below can only be the
+        // card's.
+        let blank = app.store.create_page("Blank").unwrap();
+        let card = app.store.create_page("Alpha").unwrap();
+        for text in ["one", "two", "three"] {
+            let st = app.store.page_state(&card).unwrap();
+            let after = st.last_child(None, true);
+            let plan = utopia_core::outline::append_block(st, after.as_ref());
+            let done = app.store.execute_plan(&card, plan, None).unwrap().unwrap();
+            app.store
+                .set_block_text(&card, &done.block, text, None, None)
+                .unwrap();
+            app.store.commit_block(&card, &done.block).unwrap();
+        }
+        app.store.sync_index().unwrap();
+        (blank, card)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(blank, None, None, false, window, cx);
+        w.open(card, None, None, true, window, cx);
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    let row = cx
+        .debug_bounds("content-3")
+        .expect("the card's third block");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        ws.update(cx, |w, cx| w.editor().read(cx).target.is_some()),
+        "clicking a block in the card started an edit there"
+    );
+
+    let fold = cx.debug_bounds("pane-collapse-0").expect("the fold arrow");
+    cx.simulate_click(fold.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        ws.update(cx, |w, cx| w.editor().read(cx).target.is_none()),
+        "folding the card ended the edit it hosted"
+    );
+
+    // The keyboard went back to the workspace: Cmd+Shift+\ still closes the sidebar, and
+    // the page takes the width back.
+    let before = cx
+        .debug_bounds("main-pane")
+        .expect("the main pane")
+        .size
+        .width;
+    cx.simulate_keystrokes("cmd-shift-\\");
+    cx.run_until_parked();
+    let after = cx
+        .debug_bounds("main-pane")
+        .expect("the main pane")
+        .size
+        .width;
+    assert!(
+        after > before,
+        "shortcuts still reach the workspace after folding: {before:?} -> {after:?}"
+    );
+}
+
+/// RS-3: the Outline lists every heading of the page, so clicking one has to reach it even
+/// when it sits under a folded block or outside the zoom the page is showing — otherwise
+/// the row is a dead control.
+#[gpui::test]
+fn outline_reaches_headings_that_are_folded_away(cx: &mut TestAppContext) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    let (app, ws, cx) = setup(cx);
+    let (page, fold, hidden, shown) = app.update(cx, |app, _| {
+        let page = app.store.create_page("Plan").unwrap();
+        let insert = |app: &mut AppState,
+                      id: &BlockId,
+                      parent: Option<BlockId>,
+                      after: Option<BlockId>,
+                      text: &str,
+                      kind: BlockKind| {
+            app.store
+                .execute(
+                    &page,
+                    vec![Command::InsertBlock {
+                        id: id.clone(),
+                        parent,
+                        after,
+                        text: text.to_string(),
+                        kind,
+                    }],
+                    Default::default(),
+                )
+                .unwrap();
+        };
+        let fold = BlockId::new();
+        insert(app, &fold, None, None, "Fold", BlockKind::Bullet);
+        let hidden = BlockId::new();
+        insert(
+            app,
+            &hidden,
+            Some(fold.clone()),
+            None,
+            "Hidden heading",
+            BlockKind::Heading(2),
+        );
+        let shown = BlockId::new();
+        insert(
+            app,
+            &shown,
+            None,
+            Some(fold.clone()),
+            "Shown heading",
+            BlockKind::Heading(2),
+        );
+        app.store.set_collapsed(&fold, true).unwrap();
+        app.store.sync_index().unwrap();
+        (page, fold, hidden, shown)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let outline = cx.debug_bounds("panel-outline").expect("the Outline tab");
+    cx.simulate_click(outline.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // The folded heading is listed and clickable; before the fix the click did nothing.
+    let first = cx.debug_bounds("outline-0").expect("the first heading");
+    cx.simulate_click(first.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.block.clone())),
+        Some(hidden.clone()),
+        "clicking the folded heading put the caret there"
+    );
+    assert!(
+        !app.read_with(cx, |app, _| app.store.is_collapsed(&fold)),
+        "its ancestor was unfolded so the row could be shown"
+    );
+
+    // A heading outside the zoom is reachable too: the page leaves the zoom to show it.
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page, Some(shown), None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let first = cx.debug_bounds("outline-0").expect("the first heading");
+    cx.simulate_click(first.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.block.clone())),
+        Some(hidden),
+        "clicking a heading outside the zoom left the zoom and focused it"
+    );
+    assert!(
+        ws.update(cx, |w, cx| w.main_zoom(cx)).is_none(),
+        "the zoom was cleared"
+    );
+}
+
+/// RS-3: a pinned row's title comes from the shard, so renaming the page reaches the
+/// Pinned tab without toggling another pin or restarting.
+#[gpui::test]
+fn a_renamed_pinned_page_shows_its_new_title(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let page = app.update(cx, |app, _| {
+        let p = app.store.create_page("Old Name").unwrap();
+        let b = app.store.ensure_first_block(&p).unwrap();
+        app.store
+            .set_block_text(&p, &b, "pinned", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+        p
+    });
+    cx.update(|_, cx| {
+        utopia_ui::appearance::toggle_pinned(cx, &page).expect("settings.json is writable")
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(page.clone(), None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let tab = cx.debug_bounds("panel-pinned").expect("the Pinned tab");
+    cx.simulate_click(tab.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, _| w.pinned_titles()),
+        vec!["Old Name".to_string()]
+    );
+
+    // Rename through the store, as the page menu's Rename does, and let the index catch up.
+    app.update(cx, |app, cx| {
+        app.store.rename_page(&page, "New Name").unwrap();
+        app.changed(Vec::new(), true, cx);
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, _| w.pinned_titles()),
+        vec!["New Name".to_string()],
+        "the pinned row follows the rename"
+    );
+}
+
+/// LR-4 with RS-1's shared row: a link inside an inline reference child is followed.
+/// The child used to be drawn without its own hit-testing, so a click on its link fell
+/// through to the row's handler and opened the referencing block instead.
+#[gpui::test]
+fn a_link_inside_an_inline_reference_child_is_followed(cx: &mut TestAppContext) {
+    use utopia_core::{BlockId, BlockKind, Command};
+    let (app, ws, cx) = setup(cx);
+    let (target, source, other) = app.update(cx, |app, _| {
+        let target = app.store.create_page("Target").unwrap();
+        let source = app.store.create_page("Source").unwrap();
+        let other = app.store.create_page("Other Page").unwrap();
+        let parent = app.store.ensure_first_block(&source).unwrap();
+        app.store
+            .set_block_text(&source, &parent, "see [[Target]]", None, None)
+            .unwrap();
+        // A child whose whole body is a page link: its first characters are the link.
+        let child = BlockId::new();
+        app.store
+            .execute(
+                &source,
+                vec![Command::InsertBlock {
+                    id: child,
+                    parent: Some(parent.clone()),
+                    after: None,
+                    text: "[[Other Page]]".into(),
+                    kind: BlockKind::Bullet,
+                }],
+                Default::default(),
+            )
+            .unwrap();
+        app.store.commit_block(&source, &parent).unwrap();
+        app.store.sync_index().unwrap();
+        (target, source, other)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let child = (0..40)
+        .find_map(|ix| {
+            let sel: &'static str = Box::leak(format!("hit-child-{ix}-0").into_boxed_str());
+            cx.debug_bounds(sel)
+        })
+        .expect("the reference's first child is drawn inline (LR-4)");
+    // The child starts with a bullet, then its text; the link is at the start of the text.
+    let link = gpui::point(child.origin.x + gpui::px(28. + 16.), child.center().y);
+    cx.simulate_click(link, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(other),
+        "the child's link was followed, not the referencing block opened"
+    );
+    assert_ne!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(source),
+        "the row's own target was not opened"
+    );
+}
+
 #[gpui::test]
 fn keystrokes_are_debounced_then_committed(cx: &mut TestAppContext) {
     let (app, _ws, cx) = setup(cx);

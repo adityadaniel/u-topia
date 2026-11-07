@@ -13,15 +13,13 @@ use utopia_core::inline::{extract_refs, plain_text};
 use utopia_core::outline::{self, Focus, Plan};
 use utopia_core::undo::Caret;
 use utopia_core::{BlockId, BlockKind, PageId, PageKind};
-use utopia_store::{
-    BlockRefStatus, LinkedRefs, Mention, PageRow, RefChildren, RefHit, RefQuery, RefSort,
-};
+use utopia_store::{LinkedRefs, Mention, PageRow, RefChildren, RefHit, RefQuery, RefSort};
 
 use crate::app_state::{AppState, Changed, IndexUpdated};
 use crate::editor::{BlockEditor, EditTarget, EditorEvent};
 use crate::field::Goal;
 use crate::line_input::{LineInput, LineInputEvent};
-use crate::rich::{self, ChipState, LinkTarget};
+use crate::rich::{self, LinkTarget};
 use crate::theme::{quiet_control, quiet_danger, quiet_menu, theme, INDENT, MAX_VISUAL_DEPTH};
 
 /// Transclusions stop expanding at this depth (FR-4.5).
@@ -292,6 +290,9 @@ pub struct PageView {
     pub page: Option<PageId>,
     pub zoom: Option<BlockId>,
     pub compact: bool,
+    /// Whether this pane draws its own ✕ in the page header (split panes do, sidebar cards
+    /// carry the close in their card header, RS-5).
+    close: bool,
     items: Vec<Item>,
     list: ListState,
     header: Header,
@@ -350,11 +351,74 @@ pub struct PageView {
 
 impl EventEmitter<PageViewEvent> for PageView {}
 
+impl crate::reference::RefRowHost for PageView {
+    fn open_reference(
+        &mut self,
+        page: PageId,
+        block: BlockId,
+        sidebar: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |e, cx| e.end(cx));
+        cx.emit(PageViewEvent::Open {
+            page,
+            zoom: None,
+            focus: Some(block),
+            sidebar,
+        });
+    }
+
+    fn follow_reference(
+        &mut self,
+        target: LinkTarget,
+        sidebar: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.follow(target, None, sidebar, window, cx);
+    }
+
+    fn open_reference_page(
+        &mut self,
+        page: PageId,
+        block: Option<BlockId>,
+        sidebar: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |e, cx| e.end(cx));
+        cx.emit(PageViewEvent::Open {
+            page,
+            zoom: None,
+            focus: block,
+            sidebar,
+        });
+    }
+
+    /// LR-4: the "+N more" chip opens the rest of this block's children. The children are a
+    /// store read, so fill the cache now, before the next frame.
+    fn expand_reference_children(
+        &mut self,
+        block: &BlockId,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.expanded_children.insert(block.clone()) {
+            self.rebuild(cx);
+            cx.notify();
+        }
+    }
+}
+
 impl PageView {
+    /// `compact` is a pane rather than the main page; `close` draws the pane's own ✕ — the
+    /// right sidebar's cards carry theirs (RS-5), split panes do not.
     pub fn new(
         app: Entity<AppState>,
         editor: Entity<BlockEditor>,
         compact: bool,
+        close: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -408,6 +472,7 @@ impl PageView {
             page: None,
             zoom: None,
             compact,
+            close,
             items: Vec::new(),
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             header: Header::default(),
@@ -603,6 +668,42 @@ impl PageView {
             }
         };
         self.edit(page, block, Some(0), None, window, cx);
+    }
+
+    /// Show `block` and put the caret in it: unfold collapsed ancestors and leave a zoom
+    /// that does not contain it first. The Outline tab lists every heading of the page
+    /// (RS-3), including ones folded away or outside the zoom, so a click there must reach
+    /// them — `focus_block` only sees the rows currently built.
+    pub fn reveal_block(&mut self, block: &BlockId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(page) = self.page.clone() else {
+            return;
+        };
+        let zoom = self.zoom.clone();
+        let mut unfolded = false;
+        let reachable = self.app.update(cx, |app, _| {
+            let Ok(st) = app.store.page_state(&page) else {
+                return true;
+            };
+            // A zoomed page only builds rows below its root; the root itself is the header.
+            let inside = match &zoom {
+                None => true,
+                Some(z) => z != block && st.ancestors(block).contains(z),
+            };
+            for a in st.ancestors(block) {
+                if app.store.is_collapsed(&a) {
+                    let _ = app.store.set_collapsed(&a, false);
+                    unfolded = true;
+                }
+            }
+            inside
+        });
+        if !reachable {
+            self.zoom = None;
+            self.dirty = true;
+        } else if unfolded {
+            self.dirty = true;
+        }
+        self.focus_block(block, None, window, cx);
     }
 
     pub fn focus_block(
@@ -1745,13 +1846,16 @@ impl PageView {
                 }
             }
             LinkTarget::Block(uid) => {
-                if sidebar {
+                if sidebar || row.is_none() {
+                    // A chip in a read-only row (a Linked Reference) has no row to expand,
+                    // so following it opens the block it points at (FR-4.3).
                     if let Ok(Some(b)) = self.app.read(cx).store.block_row(&BlockId(uid.clone())) {
+                        self.editor.update(cx, |e, cx| e.end(cx));
                         cx.emit(PageViewEvent::Open {
                             page: b.page_id,
                             zoom: Some(b.id),
                             focus: None,
-                            sidebar: true,
+                            sidebar,
                         });
                     }
                 } else if let Some(row) = row {
@@ -2039,17 +2143,6 @@ impl PageView {
 
     // ---------------------------------------------------------------- rendering
 
-    fn chip_state(store: &utopia_store::Store, uid: &str, row_block: &BlockId) -> ChipState {
-        if uid == row_block.as_str() {
-            return ChipState::Cyclic;
-        }
-        match store.block_ref_status(uid) {
-            Ok(BlockRefStatus::Live { text, .. }) => ChipState::Live(text),
-            Ok(BlockRefStatus::Deleted { .. }) => ChipState::Deleted,
-            _ => ChipState::Missing,
-        }
-    }
-
     /// `prefix` is how many bytes of the block's text `text` starts after (a code block's
     /// language line, PG-5), so a click still puts the caret at the right offset.
     fn render_rich(
@@ -2065,7 +2158,7 @@ impl PageView {
         let rendered = {
             let store = &self.app.read(cx).store;
             rich::render(text, &th, &mut |uid| {
-                Self::chip_state(store, uid, row_block)
+                crate::reference::chip_state(store, uid, row_block)
             })
         };
         let styled =
@@ -2492,7 +2585,7 @@ impl PageView {
             .flex()
             .items_center()
             .gap_1()
-            .when(self.compact, |d| {
+            .when(self.compact && self.close, |d| {
                 d.child(
                     self.button("close", "✕", cx)
                         .on_click(cx.listener(|_, _, _, cx| cx.emit(PageViewEvent::Close))),
@@ -3564,159 +3657,23 @@ impl PageView {
                 children,
                 hidden,
             } => {
-                let page = hit.page.clone();
-                let block = hit.block.clone();
-                let text = self.render_rich(
-                    &hit.text,
-                    &hit.block,
-                    None,
-                    crate::appearance::density(cx).line_height(),
-                    0,
-                    cx,
-                );
-                // LR-3: the full path above the block, page first, each part clickable. A
-                // block that sits directly on its page has no ancestors, and the group header
-                // right above already names that page, so it gets no path line.
-                let path = (!hit.breadcrumb.is_empty()).then(|| {
-                    let mut line = div()
-                        .debug_selector(|| format!("hit-path-{ix}"))
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_1()
-                        .text_size(px(crate::theme::CAPTION_SIZE))
-                        .text_color(th.faint);
-                    let target = page.clone();
-                    line = line.child(
-                        div()
-                            .id(SharedString::from(format!("path-page-{ix}")))
-                            .debug_selector(|| format!("hit-path-part-{ix}-0"))
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(th.accent))
-                            .child(page_title.clone())
-                            .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
-                                // The hit row under the path opens the block; the page part
-                                // opens the page itself.
-                                cx.stop_propagation();
-                                this.editor.update(cx, |ed, cx| ed.end(cx));
-                                cx.emit(PageViewEvent::Open {
-                                    page: target.clone(),
-                                    zoom: None,
-                                    focus: None,
-                                    sidebar: e.modifiers().shift,
-                                });
-                            })),
-                    );
-                    for (i, (ancestor, caption)) in hit.breadcrumb.iter().enumerate() {
-                        let label: String = caption.chars().take(40).collect();
-                        let label = if label.is_empty() {
-                            "(empty)".to_string()
-                        } else {
-                            label
-                        };
-                        let target = page.clone();
-                        let ancestor = ancestor.clone();
-                        line = line.child(div().child("›")).child(
-                            div()
-                                .id(SharedString::from(format!("path-part-{ix}-{i}")))
-                                .debug_selector(|| format!("hit-path-part-{ix}-{}", i + 1))
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(th.accent))
-                                .child(label)
-                                .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    this.editor.update(cx, |ed, cx| ed.end(cx));
-                                    cx.emit(PageViewEvent::Open {
-                                        page: target.clone(),
-                                        zoom: None,
-                                        focus: Some(ancestor.clone()),
-                                        sidebar: e.modifiers().shift,
-                                    });
-                                })),
-                        );
-                    }
-                    line.into_any_element()
-                });
-                // LR-4: the first children inline, then a chip that opens the rest. The
-                // list is built in `rebuild`, so this only lays out what the index returned.
-                let mut kids = div().flex().flex_col();
-                for (i, (child, child_text)) in children.iter().enumerate() {
-                    let rendered = self.render_rich(
-                        child_text,
-                        child,
-                        None,
-                        crate::appearance::density(cx).line_height(),
-                        0,
-                        cx,
-                    );
-                    kids = kids.child(
-                        div()
-                            .debug_selector(|| format!("hit-child-{ix}-{i}"))
-                            .flex()
-                            .ml(px(14.))
-                            .child(div().w(px(14.)).text_color(th.bullet).child("•"))
-                            .child(div().flex_1().min_w_0().child(rendered)),
-                    );
-                }
-                let more = (hidden > 0).then(|| {
-                    let block = block.clone();
-                    div()
-                        .id(SharedString::from(format!("hit-more-{ix}")))
-                        .debug_selector(|| format!("hit-more-{ix}-{hidden}"))
-                        .ml(px(28.))
-                        .px_2()
-                        .rounded_md()
-                        .text_size(px(crate::theme::CAPTION_SIZE))
-                        .text_color(th.accent)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(th.hover))
-                        .child(format!("+{hidden} more"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            // The chip is inside the hit row, whose click opens the block.
-                            cx.stop_propagation();
-                            if this.expanded_children.insert(block.clone()) {
-                                // LR-4: the opened children are a store read. Fill the cache
-                                // here, before the next frame, like an index update does.
-                                this.rebuild(cx);
-                                cx.notify();
-                            }
-                        }))
-                });
-
-                div()
-                    .id(("hit", ix))
-                    .px_6()
-                    .py_0p5()
-                    .flex()
-                    .flex_col()
-                    .cursor_pointer()
-                    .children(path)
-                    .child(
-                        div()
-                            .flex()
-                            .child(div().w(px(14.)).text_color(th.bullet).child("•"))
-                            // As in `render_row`: a flex item's minimum width is its
-                            // unwrapped text unless `min_w_0`, so it would run wide.
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .debug_selector(|| format!("hit-{ix}"))
-                                    .child(text),
-                            ),
-                    )
-                    .when(!children.is_empty(), |d| d.child(kids))
-                    .children(more)
-                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
-                        this.editor.update(cx, |ed, cx| ed.end(cx));
-                        cx.emit(PageViewEvent::Open {
-                            page: page.clone(),
-                            zoom: None,
-                            focus: Some(block.clone()),
-                            sidebar: e.modifiers().shift,
-                        });
-                    }))
-                    .into_any_element()
+                // The same row the right sidebar draws (RS-1), with the path above it (LR-3)
+                // and its first children inline (LR-4).
+                let th = th.clone();
+                crate::reference::reference_row(
+                    "hit",
+                    ix,
+                    crate::reference::RefRow {
+                        hit: &hit,
+                        page_title: &page_title,
+                        children: &children,
+                        hidden,
+                    },
+                    &th,
+                    &self.app.read(cx).store,
+                    24.,
+                    cx.entity(),
+                )
             }
             Item::More { page, hidden } => div()
                 .id(("more", ix))

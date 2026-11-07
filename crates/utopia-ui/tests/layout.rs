@@ -1023,6 +1023,38 @@ fn sidebar_linked_reference_wraps(cx: &mut TestAppContext) {
     assert_wraps_within(hit, left, left + f32::from(side.size.width));
 }
 
+/// RS-1: the right sidebar's References tab shows the referencing block itself — the same
+/// row Linked References draws, wrapped at the panel's edge — not just a page name and a
+/// count.
+#[gpui::test]
+fn inspector_shows_the_referencing_block(cx: &mut TestAppContext) {
+    let (cx, ws, target) = setup_refs(cx, false);
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, None, false, window, cx)
+    });
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    cx.run_until_parked();
+    let side = bounds(cx, "right-sidebar");
+    let group = bounds(cx, "ref-group-0");
+    let row = bounds(cx, "ref-block-0");
+    assert!(
+        group.origin.y > side.origin.y && group.origin.y < row.origin.y,
+        "the source page heads its blocks: {group:?} {row:?}"
+    );
+    assert!(
+        row.size.height >= px(40.),
+        "the long referencing block wraps onto several lines: {row:?}"
+    );
+    let (x0, x1) = (
+        f32::from(row.origin.x),
+        f32::from(row.origin.x + row.size.width),
+    );
+    assert!(
+        x0 >= f32::from(side.origin.x) && x1 <= f32::from(side.right()) + 0.5,
+        "the row stays inside the panel: {row:?} {side:?}"
+    );
+}
+
 /// FR-3.9: a long unlinked mention wraps too, keeping its "Link" button in the column.
 #[gpui::test]
 fn unlinked_mention_wraps_and_keeps_link_in_view(cx: &mut TestAppContext) {
@@ -1125,6 +1157,52 @@ fn daily_page_menu_does_not_offer_rename(cx: &mut TestAppContext) {
         cx.debug_bounds("page-menu-rename").is_none(),
         "daily titles are display-only: no Rename action"
     );
+}
+
+/// RS-4: the sidebar's left edge is a 4 px drag handle, the header has a close ×, and the
+/// width the drag set comes back when the sidebar is reopened.
+#[gpui::test]
+fn the_right_sidebar_resizes_and_closes(cx: &mut TestAppContext) {
+    let cx = setup(cx);
+    cx.simulate_keystrokes("escape cmd-shift-\\");
+    let side = bounds(cx, "right-sidebar");
+    assert!(approx(side.size.width, 380.), "the default width: {side:?}");
+    let handle = bounds(cx, "right-resize");
+    assert!(approx(handle.size.width, 4.), "a 4 px handle: {handle:?}");
+    assert!(
+        approx(handle.origin.x, f32::from(side.origin.x)),
+        "the handle is the sidebar's left edge: {handle:?} {side:?}"
+    );
+
+    // Drag the edge 60 px to the left: the sidebar widens by 60 and the page gives way.
+    let start = handle.center();
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    let to = gpui::point(start.x - px(60.), start.y);
+    cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let side = bounds(cx, "right-sidebar");
+    assert!(
+        approx(side.size.width, 440.),
+        "dragged 60 px wider: {side:?}"
+    );
+    let main = bounds(cx, "main-pane");
+    assert!(
+        approx(main.size.width, W - 250. - 440.),
+        "the page gives the space up: {main:?}"
+    );
+
+    // The × collapses the sidebar and the page takes the space back.
+    let close = bounds(cx, "right-close");
+    cx.simulate_click(close.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let main = bounds(cx, "main-pane");
+    assert!(approx(main.size.width, W - 250.), "{main:?}");
+
+    // Reopening brings the dragged width back (RS-4 "remember").
+    cx.simulate_keystrokes("cmd-shift-\\");
+    let side = bounds(cx, "right-sidebar");
+    assert!(approx(side.size.width, 440.), "{side:?}");
 }
 
 /// ALL-1: page title 28, H1 20, body 15 — measured as line boxes, since the heading used to

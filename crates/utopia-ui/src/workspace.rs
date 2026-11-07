@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use chrono::NaiveDate;
 use gpui::{
-    anchored, deferred, div, prelude::*, px, AnyElement, Context, Entity, FocusHandle, Focusable,
-    MouseButton, MouseDownEvent, SharedString, Subscription, Task, Window,
+    anchored, deferred, div, prelude::*, px, AnyElement, Context, Entity, EntityId, FocusHandle,
+    Focusable, MouseButton, MouseDownEvent, SharedString, Subscription, Task, Window,
 };
 use utopia_core::inline::{extract_refs, plain_text};
 use utopia_core::title::normalize_title;
@@ -28,11 +28,42 @@ use crate::sync_runner::{
 };
 use crate::theme::{quiet_control, theme};
 
+/// The reference panel's sub-tabs: which way the edges are looked at (FR-4.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InspectorTab {
     Incoming,
     Outgoing,
     Unresolved,
+}
+
+/// What the right sidebar's own tabs show (RS-3): the page's references, its headings, or
+/// the pages pinned to stay reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelTab {
+    References,
+    Outline,
+    Pinned,
+}
+
+impl PanelTab {
+    /// Spelled in a `debug_selector`, so tests can name the panel they are looking at.
+    fn id(self) -> &'static str {
+        match self {
+            PanelTab::References => "references",
+            PanelTab::Outline => "outline",
+            PanelTab::Pinned => "pinned",
+        }
+    }
+}
+
+/// One heading of the page in the main pane, for the Outline tab (RS-3).
+#[derive(Debug, Clone)]
+struct OutlineEntry {
+    block: BlockId,
+    /// `BlockKind::Heading(level)`: 1–3.
+    level: u8,
+    depth: usize,
+    text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +73,14 @@ enum JumpMode {
     Search,
     Capture,
     Extract { page: PageId, block: BlockId },
+}
+
+/// A page stacked in the right sidebar (RS-5): its view, whether its card is folded to the
+/// header, and the title the header shows.
+struct SidePane {
+    view: Entity<PageView>,
+    collapsed: bool,
+    title: SharedString,
 }
 
 #[derive(Default)]
@@ -59,10 +98,13 @@ struct SidebarData {
 
 #[derive(Default)]
 struct InspectorData {
-    incoming: Vec<(PageRow, usize)>,
+    /// Linked References, grouped by source page; each group carries its blocks (RS-1).
+    incoming: Vec<utopia_store::RefGroup>,
     outgoing: Vec<OutgoingRef>,
     /// Unresolved targets with a display title recovered from the source text.
     unresolved: Vec<(OutgoingRef, String)>,
+    /// The page's headings in document order (RS-3).
+    outline: Vec<OutlineEntry>,
 }
 
 /// `local_state` key holding the pages opened last, newest first (QJ-1). Device-local UI
@@ -101,14 +143,27 @@ pub struct Workspace {
     app: Entity<AppState>,
     editor: Entity<BlockEditor>,
     main: Entity<PageView>,
-    panes: Vec<Entity<PageView>>,
+    panes: Vec<SidePane>,
     splits: Vec<Entity<PageView>>,
     right_open: bool,
+    /// The right sidebar's width in points (RS-4), kept in `settings.json` (rule 9).
+    right_width: f32,
+    /// A drag of the sidebar's left edge: where it started and the width then.
+    resize_from: Option<(f32, f32)>,
     /// Left sidebar and its month grid; local UI state (rule 9), kept in `local_state`.
     left_open: bool,
     calendar_open: bool,
     inspector_open: bool,
     tab: InspectorTab,
+    /// Which of the sidebar's own tabs is showing (RS-3).
+    panel_tab: PanelTab,
+    /// Pages pinned in the Pinned tab, resolved to titles, and the ids they came from (one
+    /// list shared with the left sidebar's Pinned group, SB-3/RS-3).
+    pinned: Vec<(PageId, String)>,
+    pinned_ids: Vec<PageId>,
+    /// The `refs_version` the resolved titles were read at, so an index update (a rename, a
+    /// merge) re-resolves them even though the id list is unchanged.
+    pinned_version: Option<u64>,
     jump: Option<(Entity<JumpPalette>, JumpMode)>,
     /// The graph view, shown in place of the main page while open (P2).
     graph: Option<Entity<GraphView>>,
@@ -142,6 +197,42 @@ pub struct Workspace {
     _tasks: Vec<Task<()>>,
 }
 
+impl crate::reference::RefRowHost for Workspace {
+    /// A reference row was clicked: open its page with that block focused (§7). Shift
+    /// stacks the page in this sidebar instead of replacing the main pane.
+    fn open_reference(
+        &mut self,
+        page: PageId,
+        block: BlockId,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open(page, None, Some(block), shift, window, cx);
+    }
+
+    fn open_reference_page(
+        &mut self,
+        page: PageId,
+        block: Option<BlockId>,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open(page, None, block, shift, window, cx);
+    }
+
+    fn follow_reference(
+        &mut self,
+        target: crate::rich::LinkTarget,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.follow_link(target, shift, window, cx);
+    }
+}
+
 impl Focusable for Workspace {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
         self.focus.clone()
@@ -151,7 +242,8 @@ impl Focusable for Workspace {
 impl Workspace {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| BlockEditor::new(app.clone(), cx));
-        let main = cx.new(|cx| PageView::new(app.clone(), editor.clone(), false, window, cx));
+        let main =
+            cx.new(|cx| PageView::new(app.clone(), editor.clone(), false, false, window, cx));
         let today = app.read(cx).store.today();
         let backup_dir = app
             .read(cx)
@@ -211,10 +303,16 @@ impl Workspace {
             panes: Vec::new(),
             splits: Vec::new(),
             right_open: false,
+            right_width: crate::appearance::right_sidebar_width(cx),
+            resize_from: None,
             left_open,
             calendar_open,
             inspector_open: true,
             tab: InspectorTab::Incoming,
+            panel_tab: PanelTab::References,
+            pinned: Vec::new(),
+            pinned_ids: Vec::new(),
+            pinned_version: None,
             jump: None,
             graph: None,
             graph_panel: None,
@@ -481,7 +579,16 @@ impl Workspace {
         // Cmd+Shift+Click opens a split without going through `open`, and it is still a page
         // opened: the Quick jump empty state should offer it next time (QJ-1).
         self.note_opened(&page, cx);
-        let v = cx.new(|cx| PageView::new(self.app.clone(), self.editor.clone(), true, window, cx));
+        let v = cx.new(|cx| {
+            PageView::new(
+                self.app.clone(),
+                self.editor.clone(),
+                true,
+                true,
+                window,
+                cx,
+            )
+        });
         self.subs
             .push(cx.subscribe_in(&v, window, Self::on_page_event));
         v.update(cx, |v, cx| v.open(page, None, cx));
@@ -526,11 +633,35 @@ impl Workspace {
             .collect()
     }
 
+    /// The title a sidebar card shows for `page` (RS-5): the display title, from the shard,
+    /// so a draft day and a renamed page both read right.
+    fn pane_title(&self, page: &PageId, cx: &mut Context<Self>) -> SharedString {
+        self.app
+            .update(cx, |app, _| {
+                let fmt = app.store.date_format().clone();
+                app.store
+                    .page_state(page)
+                    .map(|st| utopia_store::display_title(st, &fmt))
+                    .unwrap_or_default()
+            })
+            .into()
+    }
+
+    /// Pages pinned in the sidebar's Pinned tab, in the order they show (RS-3).
+    pub fn pinned_pages(&self, _cx: &gpui::App) -> Vec<PageId> {
+        self.pinned.iter().map(|(p, _)| p.clone()).collect()
+    }
+
+    /// The titles the Pinned tab shows, in the order they show (RS-3).
+    pub fn pinned_titles(&self) -> Vec<String> {
+        self.pinned.iter().map(|(_, title)| title.clone()).collect()
+    }
+
     /// Pages stacked in the right sidebar, top first.
     pub fn sidebar_pages(&self, cx: &gpui::App) -> Vec<PageId> {
         self.panes
             .iter()
-            .filter_map(|p| p.read(cx).page.clone())
+            .filter_map(|p| p.view.read(cx).page.clone())
             .collect()
     }
 
@@ -608,7 +739,7 @@ impl Workspace {
                 cx,
             ),
             PageViewEvent::Close => {
-                self.panes.retain(|p| p != view);
+                self.panes.retain(|p| &p.view != view);
                 self.splits.retain(|p| p != view);
                 cx.notify();
             }
@@ -650,23 +781,34 @@ impl Workspace {
         self.note_opened(&page, cx);
         if sidebar {
             // Shift-click stacks the page beside the current one (§0, W6).
-            let existing = self
-                .panes
-                .iter()
-                .position(|p| p.read(cx).page.as_ref() == Some(&page) && p.read(cx).zoom == zoom);
-            let view = match existing {
+            let existing = self.panes.iter().position(|p| {
+                p.view.read(cx).page.as_ref() == Some(&page) && p.view.read(cx).zoom == zoom
+            });
+            let pane = match existing {
+                // Re-opening moves the card back to the top but keeps it folded if it was.
                 Some(i) => self.panes.remove(i),
                 None => {
                     let v = cx.new(|cx| {
-                        PageView::new(self.app.clone(), self.editor.clone(), true, window, cx)
+                        PageView::new(
+                            self.app.clone(),
+                            self.editor.clone(),
+                            true,
+                            false,
+                            window,
+                            cx,
+                        )
                     });
                     self.subs
                         .push(cx.subscribe_in(&v, window, Self::on_page_event));
                     v.update(cx, |v, cx| v.open(page.clone(), zoom.clone(), cx));
-                    v
+                    SidePane {
+                        view: v,
+                        collapsed: false,
+                        title: self.pane_title(&page, cx),
+                    }
                 }
             };
-            self.panes.insert(0, view);
+            self.panes.insert(0, pane);
             self.right_open = true;
         } else {
             self.pdf = None;
@@ -687,9 +829,9 @@ impl Workspace {
             });
             window.set_window_title(&format!("{title} — Utopia"));
             match focus {
-                Some(b) => self
-                    .main
-                    .update(cx, |m, cx| m.focus_block(&b, None, window, cx)),
+                // A reference row or a link can point at a block that is folded away, so
+                // reveal it rather than quietly failing to place the caret (RS-1, RS-3).
+                Some(b) => self.main.update(cx, |m, cx| m.reveal_block(&b, window, cx)),
                 None => window.focus(&self.focus),
             }
         }
@@ -1185,18 +1327,78 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.right_open = !self.right_open;
-        // AGENTS.md focus invariant: hiding the sidebar stops drawing the graph panel. If it
-        // owns focus, hand it back, or every workspace shortcut dies with it (the same rule
-        // `GraphEvent::Close` follows).
-        if !self.right_open {
-            let focused = self
-                .graph_panel
-                .as_ref()
-                .is_some_and(|panel| panel.read(cx).focus_handle(cx).is_focused(window));
-            if focused {
-                window.focus(&self.focus);
-            }
+        if self.right_open {
+            self.hide_right(window, cx);
+        } else {
+            self.right_open = true;
+            cx.notify();
+        }
+    }
+
+    /// End the edit if `host` owns it and hand the keyboard back to the workspace. Hiding a
+    /// card removes its `PageView` from the window, and a focused element that is not
+    /// rendered gets no keystrokes, so every shortcut would die (AGENTS.md, §13.4).
+    fn end_edit_in(&mut self, host: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        let owned = self
+            .editor
+            .read(cx)
+            .target
+            .as_ref()
+            .is_some_and(|t| t.host == host);
+        if owned {
+            self.editor.update(cx, |e, cx| e.end(cx));
+            window.focus(&self.focus);
+        }
+    }
+
+    /// Close the sidebar: end any edit a stacked card hosts (the same invariant as folding
+    /// one card, RS-5) and hand focus back from the graph panel, whose drawing stops with
+    /// the sidebar (GR-5). Either way a focused element that is no longer rendered would
+    /// swallow every shortcut.
+    fn hide_right(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let hosts: Vec<EntityId> = self.panes.iter().map(|p| p.view.entity_id()).collect();
+        for host in hosts {
+            self.end_edit_in(host, window, cx);
+        }
+        let focused = self
+            .graph_panel
+            .as_ref()
+            .is_some_and(|panel| panel.read(cx).focus_handle(cx).is_focused(window));
+        if focused {
+            window.focus(&self.focus);
+        }
+        self.right_open = false;
+        cx.notify();
+    }
+
+    /// Dragging the sidebar's left edge (RS-4). The window-level move listener runs wherever
+    /// the pointer is, so dragging past the edge keeps the width following the pointer.
+    fn resize_move(&mut self, e: &gpui::MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((start_x, start_width)) = self.resize_from else {
+            return;
+        };
+        if e.pressed_button.is_none() {
+            self.resize_from = None;
+            return;
+        }
+        let width = crate::appearance::clamp_sidebar_width(
+            start_width + (start_x - f32::from(e.position.x)),
+        );
+        if (width - self.right_width).abs() >= 1. {
+            self.right_width = width;
+            crate::appearance::set_right_sidebar_width(cx, width);
+        }
+    }
+
+    /// The drag ended: remember the width in `settings.json` (rule 9). One write per drag,
+    /// not one per pixel.
+    fn resize_done(&mut self, _: &gpui::MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.resize_from.take().is_none() {
+            return;
+        }
+        self.right_width = crate::appearance::right_sidebar_width(cx);
+        if let Err(e) = crate::appearance::remember(cx) {
+            eprintln!("utopia: settings.json: {e}");
         }
         cx.notify();
     }
@@ -1301,6 +1503,16 @@ impl Workspace {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let v = self.app.read(cx).refs_version;
+        // RS-4: the width lives in the preferences, so a reset from Settings (or another
+        // window's drag) reaches this sidebar too. Never while this one is dragging.
+        if self.resize_from.is_none() {
+            self.right_width = crate::appearance::right_sidebar_width(cx);
+        }
+        // Pinned pages are a local preference (rule 9); re-read when it changes, and on an
+        // index update so a renamed page's new title reaches its row (RS-3).
+        if crate::appearance::pinned(cx) != self.pinned_ids || self.pinned_version != Some(v) {
+            self.load_pinned(cx);
+        }
         if self.sidebar_seen != Some(v) {
             self.sidebar_seen = Some(v);
             let store = &self.app.read(cx).store;
@@ -1315,21 +1527,66 @@ impl Workspace {
                 pages: all.iter().filter(|p| !p.is_daily()).cloned().collect(),
                 all,
             };
+            // Card headers name their page (RS-5); a rename must reach them.
+            let pages: Vec<Option<PageId>> = self
+                .panes
+                .iter()
+                .map(|p| p.view.read(cx).page.clone())
+                .collect();
+            let titles: Vec<SharedString> = self.app.update(cx, |app, _| {
+                let fmt = app.store.date_format().clone();
+                pages
+                    .into_iter()
+                    .map(|page| {
+                        page.and_then(|p| {
+                            app.store
+                                .page_state(&p)
+                                .ok()
+                                .map(|st| utopia_store::display_title(st, &fmt))
+                        })
+                        .unwrap_or_default()
+                        .into()
+                    })
+                    .collect()
+            });
+            for (pane, title) in self.panes.iter_mut().zip(titles) {
+                pane.title = title;
+            }
         }
         let Some(page) = self.main.read(cx).page.clone() else {
             return;
         };
         if self.inspector_seen.as_ref() != Some(&(page.clone(), v)) {
             self.inspector_seen = Some((page.clone(), v));
+            // RS-3's Outline: the page's headings in document order, so a long page is
+            // navigable from the panel. Read from the shard, never resolved at paint time.
+            let outline = self.app.update(cx, |app, _| {
+                app.store
+                    .page_state(&page)
+                    .map(|st| {
+                        st.live_preorder()
+                            .into_iter()
+                            .filter_map(|(id, depth)| {
+                                let b = st.block(&id)?;
+                                match b.kind {
+                                    utopia_core::BlockKind::Heading(level) => Some(OutlineEntry {
+                                        block: id,
+                                        level: level.clamp(1, 3),
+                                        depth,
+                                        text: plain_text(&b.text),
+                                    }),
+                                    _ => None,
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            });
             let store = &self.app.read(cx).store;
-            let refs = store
+            let incoming = store
                 .linked_references(&page, &Default::default())
-                .unwrap_or_default();
-            let incoming = refs
-                .groups
-                .into_iter()
-                .map(|g| (g.page, g.hits.len()))
-                .collect();
+                .unwrap_or_default()
+                .groups;
             let outgoing = store.outgoing_refs(&page, None).unwrap_or_default();
             let unresolved = store
                 .unresolved_refs(&page)
@@ -1360,6 +1617,7 @@ impl Workspace {
                 incoming,
                 outgoing,
                 unresolved,
+                outline,
             };
         }
     }
@@ -1851,7 +2109,143 @@ impl Workspace {
             })
     }
 
+    /// The muted line a panel shows when it has nothing to list (RS-2, RS-3). `id` names
+    /// it for `debug_selector`, so a test can tell the empty state from a missing panel.
+    fn panel_empty(
+        &self,
+        id: &'static str,
+        text: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let th = theme(cx).clone();
+        div()
+            .debug_selector(move || id.to_string())
+            .px_2()
+            .py_1()
+            .text_size(px(crate::theme::CAPTION_SIZE))
+            .text_color(th.faint)
+            .child(text)
+            .into_any_element()
+    }
+
+    /// Follow a page or block chip clicked in the right sidebar: a page opens in the main
+    /// pane, a block opens its page zoomed to it. An unresolved title is created, exactly as
+    /// following it from the outline does (FR-4.14). Local UI state only — nothing here
+    /// writes a shard beyond that page creation.
+    fn follow_link(
+        &mut self,
+        target: crate::rich::LinkTarget,
+        sidebar: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            crate::rich::LinkTarget::Page(title) => {
+                let page = self.app.update(cx, |app, cx| {
+                    let found = app.store.find_page(&title).ok().flatten();
+                    match found {
+                        Some(p) => Some(p),
+                        None => {
+                            let r = app.store.create_page(&title);
+                            let p = app.report(r);
+                            app.changed(Vec::new(), true, cx);
+                            p
+                        }
+                    }
+                });
+                if let Some(page) = page {
+                    self.open(page, None, None, sidebar, window, cx);
+                }
+            }
+            crate::rich::LinkTarget::Block(uid) => {
+                if let Ok(Some(b)) = self.app.read(cx).store.block_row(&BlockId(uid)) {
+                    self.open(b.page_id, Some(b.id), None, sidebar, window, cx);
+                }
+            }
+            // Attachments and URLs are the page's business, not the panel's.
+            crate::rich::LinkTarget::Url(_) => {}
+        }
+    }
+
+    /// The right sidebar's reference panel: three tabs (RS-3) over the page's references,
+    /// its headings, or the pages pinned to stay reachable.
     fn render_inspector(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let th = theme(cx).clone();
+        let panel_tab = |this: &Self,
+                         id: &'static str,
+                         t: PanelTab,
+                         label: &'static str,
+                         cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .text_size(px(crate::theme::CONTROL_SIZE))
+                .cursor_pointer()
+                .text_color(if this.panel_tab == t {
+                    th.accent
+                } else {
+                    th.muted
+                })
+                .when(this.panel_tab == t, |d| d.bg(th.hover))
+                .hover(|d| d.bg(th.hover))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.panel_tab = t;
+                    cx.notify();
+                }))
+        };
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(panel_tab(
+                self,
+                "panel-references",
+                PanelTab::References,
+                "References",
+                cx,
+            ))
+            .child(panel_tab(
+                self,
+                "panel-outline",
+                PanelTab::Outline,
+                "Outline",
+                cx,
+            ))
+            .child(panel_tab(
+                self,
+                "panel-pinned",
+                PanelTab::Pinned,
+                "Pinned",
+                cx,
+            ));
+        let body = match self.panel_tab {
+            PanelTab::References => self.render_references(cx),
+            PanelTab::Outline => self.render_outline(cx),
+            PanelTab::Pinned => self.render_pinned(cx),
+        };
+        // With no pages stacked above it, the panel is the sidebar and fills it. With
+        // pages, it keeps a fixed share at the bottom so both stay usable.
+        let only_panel = self.panes.is_empty();
+        div()
+            .debug_selector(|| format!("panel-{}", self.panel_tab.id()))
+            .when(only_panel, |d| d.flex_1().min_h_0())
+            .when(!only_panel, |d| d.h(px(260.)).flex_none())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .border_t_1()
+            .border_color(th.line)
+            .child(header)
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_references(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let th = theme(cx).clone();
         let tab = |this: &Self,
                    id: &'static str,
@@ -1860,6 +2254,7 @@ impl Workspace {
                    cx: &mut Context<Self>| {
             div()
                 .id(id)
+                .debug_selector(move || id.to_string())
                 .px_2()
                 .text_size(px(crate::theme::CAPTION_SIZE))
                 .rounded_sm()
@@ -1872,7 +2267,7 @@ impl Workspace {
                     cx.notify();
                 }))
         };
-        let n_in: usize = self.inspector.incoming.iter().map(|(_, n)| n).sum();
+        let n_in: usize = self.inspector.incoming.iter().map(|g| g.hits.len()).sum();
         let tabs = div()
             .flex()
             .gap_1()
@@ -1906,19 +2301,66 @@ impl Workspace {
             .flex_1();
         match self.tab {
             InspectorTab::Incoming => {
-                let rows: Vec<(PageId, String, usize)> = self
-                    .inspector
-                    .incoming
-                    .iter()
-                    .map(|(p, n)| (p.id.clone(), p.title.clone(), *n))
-                    .collect();
-                for (i, (id, title, n)) in rows.into_iter().enumerate() {
-                    body = body.child(self.nav_item(
-                        ("in", i),
-                        format!("{title}  ·  {n}"),
-                        Some(id),
-                        cx,
-                    ));
+                // One group per source page, its count next to the name (LR-2), and below
+                // it each referencing block drawn the way Linked References draws it (RS-1).
+                let groups: Vec<utopia_store::RefGroup> = self.inspector.incoming.clone();
+                let me = cx.entity();
+                if groups.is_empty() {
+                    body =
+                        body.child(self.panel_empty("references-empty", "No references yet.", cx));
+                }
+                let mut ix = 0usize;
+                for (gi, group) in groups.iter().enumerate() {
+                    let page = group.page.id.clone();
+                    let header = div()
+                        .id(("ref-group", gi))
+                        .debug_selector(move || format!("ref-group-{gi}"))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .pt_2()
+                        .pb_0p5()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(th.hover))
+                        .child(
+                            div()
+                                .text_size(px(crate::theme::CAPTION_SIZE))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(th.muted)
+                                .child(group.page.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(th.chip_bg)
+                                .text_size(px(crate::theme::CAPTION_SIZE))
+                                .text_color(th.muted)
+                                .child(group.hits.len().to_string()),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                                this.open(page.clone(), None, None, e.modifiers.shift, window, cx)
+                            }),
+                        );
+                    body = body.child(header);
+                    for hit in &group.hits {
+                        body = body.child(crate::reference::reference_row(
+                            "ref-block",
+                            ix,
+                            // The group header above names the page, and the sidebar is too
+                            // narrow for LR-4's inline children.
+                            crate::reference::RefRow::alone(hit, &group.page.title),
+                            &th,
+                            &self.app.read(cx).store,
+                            8.,
+                            me.clone(),
+                        ));
+                        ix += 1;
+                    }
                 }
             }
             InspectorTab::Outgoing => {
@@ -1952,54 +2394,54 @@ impl Workspace {
                 }
             }
             InspectorTab::Unresolved => {
+                // RS-2: every dangling reference is a row you can act on — the title becomes
+                // a page, or the intent is pointed elsewhere or turned back into text
+                // (FR-4.14). A missing `((block))` has no page to create, only these choices.
                 let rows = self.inspector.unresolved.clone();
                 if rows.is_empty() {
-                    body = body.child(
-                        div()
-                            .px_2()
-                            .text_size(px(crate::theme::CAPTION_SIZE))
-                            .text_color(th.faint)
-                            .child("Every reference resolves."),
-                    );
+                    body = body.child(self.panel_empty(
+                        "unresolved-empty",
+                        "No unresolved references",
+                        cx,
+                    ));
                 }
                 for (i, (o, label)) in rows.into_iter().enumerate() {
                     let block = o.from_block.clone();
-                    let mut row = div().flex().flex_col().px_2().py_1().child(
+                    let mut row = div().flex().flex_col().gap_1().px_2().py_1().child(
                         div()
                             .text_size(px(crate::theme::BODY_SIZE))
                             .text_color(th.danger)
                             .child(label.clone()),
                     );
                     if let RefTarget::UnresolvedPage { key } = &o.target {
-                        let (k1, k2, k3) = (key.clone(), key.clone(), key.clone());
+                        let (k2, k3) = (key.clone(), key.clone());
                         let (b2, b3) = (block.clone(), block.clone());
                         let title = label.clone();
-                        let action = |id: (&'static str, usize), text: &'static str| {
-                            div()
-                                .id(id)
-                                .px_1()
-                                .text_size(px(crate::theme::CAPTION_SIZE))
-                                .rounded_sm()
-                                .text_color(th.accent)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(th.hover))
-                                .child(text)
-                        };
+                        let action =
+                            |id: &'static str, text: &'static str, th: &crate::theme::Theme| {
+                                quiet_control((id, i), text, th)
+                                    .debug_selector(move || format!("unresolved-{id}-{i}"))
+                            };
                         row = row.child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .gap_1()
-                                .child(action(("create", i), "Create").on_click(cx.listener(
+                                .child(action("create", "Create page", &th).on_click(cx.listener(
                                     move |this, _, _, cx| {
-                                        let _ = &k1;
-                                        this.app.update(cx, |app, cx| {
+                                        // The row's title is the page title, exactly as
+                                        // following the intent from the outline would
+                                        // create it (FR-4.14).
+                                        let page = this.app.update(cx, |app, cx| {
                                             let r = app.store.create_page(&title);
-                                            app.report(r);
+                                            let page = app.report(r);
                                             app.changed(Vec::new(), true, cx);
+                                            page
                                         });
+                                        let _ = page;
                                     },
                                 )))
-                                .child(action(("redirect", i), "Redirect…").on_click(cx.listener(
+                                .child(action("redirect", "Redirect…", &th).on_click(cx.listener(
                                     move |this, _, window, cx| {
                                         this.start_jump(
                                             JumpMode::Redirect {
@@ -2011,7 +2453,7 @@ impl Workspace {
                                         )
                                     },
                                 )))
-                                .child(action(("plain", i), "Show as text").on_click(cx.listener(
+                                .child(action("plain", "Show as text", &th).on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         this.app.update(cx, |app, cx| {
                                             let r = app.store.unlink_intent(&b3, &k3);
@@ -2027,24 +2469,173 @@ impl Workspace {
             }
         }
         div()
-            .h(px(260.))
-            .flex_none()
             .flex()
             .flex_col()
             .gap_1()
-            .p_2()
-            .border_t_1()
-            .border_color(th.line)
-            .child(
-                div()
-                    .text_size(px(crate::theme::CAPTION_SIZE))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(th.muted)
-                    .child("REFERENCES"),
-            )
+            .flex_1()
+            .min_h_0()
             .child(tabs)
             .child(body)
             .into_any_element()
+    }
+
+    /// RS-3: the headings of the page in the main pane, indented as they are in the outline
+    /// and drawn at the type scale's heading sizes. Clicking one jumps to it (caret at its
+    /// start, scrolled into view).
+    fn render_outline(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let th = theme(cx).clone();
+        let entries = self.inspector.outline.clone();
+        let mut body = div()
+            .id("outline-body")
+            .debug_selector(|| "outline-body".into())
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .overflow_y_scroll()
+            .flex_1()
+            .min_h_0();
+        if entries.is_empty() {
+            body = body.child(self.panel_empty("outline-empty", "No headings in this page.", cx));
+        }
+        for (i, e) in entries.iter().enumerate() {
+            let block = e.block.clone();
+            body = body.child(
+                div()
+                    .id(("outline", i))
+                    .debug_selector(move || format!("outline-{i}"))
+                    .flex()
+                    .items_center()
+                    .pr_2()
+                    .pl(px(8. + e.depth.min(6) as f32 * 10.))
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_size(px(match e.level {
+                        1 => crate::theme::H1_SIZE,
+                        2 => crate::theme::H2_SIZE,
+                        _ => crate::theme::H3_SIZE,
+                    }))
+                    .text_color(th.text)
+                    .hover(|d| d.bg(th.hover))
+                    .child(div().flex_1().min_w_0().child(e.text.clone()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.main
+                            .update(cx, |m, cx| m.reveal_block(&block, window, cx));
+                    })),
+            );
+        }
+        body.into_any_element()
+    }
+
+    /// RS-3: pages pinned to the sidebar, and the control that pins the page being read.
+    /// Pinning is local UI state, kept in `settings.json` (rule 9) and never synced.
+    fn render_pinned(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let th = theme(cx).clone();
+        let current = self.main.read(cx).page.clone();
+        let pinned_here = current
+            .as_ref()
+            .is_some_and(|p| self.pinned.iter().any(|(q, _)| q == p));
+        let mut body = div()
+            .id("pinned-body")
+            .debug_selector(|| "pinned-body".into())
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .overflow_y_scroll()
+            .flex_1()
+            .min_h_0();
+        if let Some(page) = current {
+            body = body.child(
+                quiet_control(
+                    "pin-current",
+                    if pinned_here {
+                        "Unpin this page"
+                    } else {
+                        "Pin this page"
+                    },
+                    &th,
+                )
+                .debug_selector(|| "pin-current".into())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    // The same pin the left sidebar's page menu toggles (SB-3).
+                    this.toggle_pin(page.clone(), cx);
+                })),
+            );
+        }
+        if self.pinned.is_empty() {
+            body = body.child(self.panel_empty(
+                "pinned-empty",
+                "No pinned pages yet. Pin the page you are reading to keep it one click away.",
+                cx,
+            ));
+        }
+        for (i, (page, title)) in self.pinned.clone().into_iter().enumerate() {
+            let open_page = page.clone();
+            let unpin = page.clone();
+            body = body.child(
+                div()
+                    .id(("pinned", i))
+                    .debug_selector(move || format!("pinned-{i}"))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(th.hover))
+                    .child(div().flex_1().min_w_0().child(title))
+                    .child(
+                        div()
+                            .id(("unpin", i))
+                            .debug_selector(move || format!("unpin-{i}"))
+                            .px_1()
+                            .rounded_sm()
+                            .text_color(th.muted)
+                            .cursor_pointer()
+                            .hover(|d| d.bg(th.hover).text_color(th.text))
+                            .child("×")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_pin(unpin.clone(), cx);
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                        this.open(
+                            open_page.clone(),
+                            None,
+                            None,
+                            e.modifiers().shift,
+                            window,
+                            cx,
+                        )
+                    })),
+            );
+        }
+        body.into_any_element()
+    }
+
+    /// Read the pinned ids from the preferences and resolve each to its current title, so a
+    /// rename shows up without a restart and an id from another graph is skipped.
+    fn load_pinned(&mut self, cx: &mut Context<Self>) {
+        let ids = crate::appearance::pinned(cx);
+        let resolved = self.app.update(cx, |app, _| {
+            let fmt = app.store.date_format().clone();
+            ids.iter()
+                .filter_map(|page| {
+                    let title = app
+                        .store
+                        .page_state(page)
+                        .map(|st| utopia_store::display_title(st, &fmt))
+                        .ok()
+                        .filter(|t| !t.is_empty())?;
+                    Some((page.clone(), title))
+                })
+                .collect::<Vec<_>>()
+        });
+        self.pinned = resolved;
+        self.pinned_ids = ids;
+        self.pinned_version = Some(self.app.read(cx).refs_version);
     }
 }
 
@@ -2149,16 +2740,56 @@ impl Render for Workspace {
         let right = self.right_open.then(|| {
             let mut col = div()
                 .debug_selector(|| "right-sidebar".into())
-                .w(px(380.))
+                .w(px(self.right_width))
                 .h_full()
                 .flex_none()
                 .flex()
-                .flex_col()
+                .flex_row()
                 .bg(th.surface)
                 .border_l_1()
-                .border_color(th.line);
-            if let Some(panel) = &self.graph_panel {
-                col = col.child(
+                .border_color(th.line)
+                // RS-4: a 4 px handle on the left edge. The drag is tracked from here and
+                // read by the window-level move handler below, so it survives the pointer
+                // leaving the sidebar.
+                .child(
+                    div()
+                        .id("right-resize")
+                        .debug_selector(|| "right-resize".into())
+                        .w(px(4.))
+                        .h_full()
+                        .flex_none()
+                        .cursor(gpui::CursorStyle::ResizeLeftRight)
+                        .when(self.resize_from.is_some(), |d| d.bg(th.accent))
+                        .hover(|d| d.bg(th.accent))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                                this.resize_from =
+                                    Some((f32::from(e.position.x), this.right_width));
+                                cx.notify();
+                            }),
+                        ),
+                );
+            let mut panel = div().flex().flex_col().flex_1().min_w_0().h_full().child(
+                // The sidebar's own header: it collapses here (RS-4).
+                div().flex().items_center().justify_end().px_1().child(
+                    div()
+                        .id("right-close")
+                        .debug_selector(|| "right-close".into())
+                        .px_1()
+                        .rounded_sm()
+                        .text_size(px(crate::theme::CONTROL_SIZE))
+                        .text_color(th.muted)
+                        .cursor_pointer()
+                        .hover(|d| d.bg(th.hover).text_color(th.text))
+                        .child("×")
+                        .on_click(cx.listener(|this, _, window, cx| this.hide_right(window, cx))),
+                ),
+            );
+            // GR-5: the page's local graph sits above the reference panel, beside the page
+            // that stays editable. It keeps its own focus handling (`hide_right`).
+            if let Some(graph) = &self.graph_panel {
+                panel = panel.child(
                     div()
                         .debug_selector(|| "graph-panel".into())
                         .w_full()
@@ -2166,11 +2797,11 @@ impl Render for Workspace {
                         .flex_none()
                         .border_b_1()
                         .border_color(th.line)
-                        .child(panel.clone()),
+                        .child(graph.clone()),
                 );
             }
             if self.panes.is_empty() && !self.inspector_open {
-                col = col.child(
+                panel = panel.child(
                     div()
                         .p_4()
                         .text_size(px(crate::theme::BODY_SIZE))
@@ -2178,19 +2809,99 @@ impl Render for Workspace {
                         .child("Shift-click a link to open it here."),
                 );
             }
-            for p in &self.panes {
-                col = col.child(
+            for (i, pane) in self.panes.iter().enumerate() {
+                // RS-5: a card per page, its header carrying the fold arrow and the close ×,
+                // like Roam's right sidebar. A folded card is its header and nothing more.
+                let collapsed = pane.collapsed;
+                let title = pane.title.clone();
+                let mut card = div()
+                    .id(("pane-card", i))
+                    .debug_selector(move || format!("pane-{i}"))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .border_b_1()
+                    .border_color(th.line)
+                    .when(collapsed, |d| d.flex_none())
+                    .when(!collapsed, |d| d.flex_1().min_h(px(140.)));
+                card = card.child(
                     div()
-                        .flex_1()
-                        .min_h(px(140.))
-                        .border_b_1()
-                        .border_color(th.line)
-                        .child(p.clone()),
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_1()
+                        .py_0p5()
+                        .hover(|d| d.bg(th.hover))
+                        .child(
+                            div()
+                                .id(("pane-collapse", i))
+                                .debug_selector(move || format!("pane-collapse-{i}"))
+                                .px_1()
+                                .rounded_sm()
+                                .text_size(px(crate::theme::CONTROL_SIZE))
+                                .text_color(th.muted)
+                                .cursor_pointer()
+                                .hover(|d| d.text_color(th.text))
+                                .child(if collapsed { "▸" } else { "▾" })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let host = this.panes.get(i).map(|p| p.view.entity_id());
+                                    let folding = this.panes.get(i).is_some_and(|p| !p.collapsed);
+                                    if let (true, Some(host)) = (folding, host) {
+                                        this.end_edit_in(host, window, cx);
+                                    }
+                                    if let Some(pane) = this.panes.get_mut(i) {
+                                        pane.collapsed = !pane.collapsed;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(move || format!("pane-title-{i}"))
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(crate::theme::CAPTION_SIZE))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(th.muted)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .id(("pane-close", i))
+                                .debug_selector(move || format!("pane-close-{i}"))
+                                .px_1()
+                                .rounded_sm()
+                                .text_size(px(crate::theme::CONTROL_SIZE))
+                                .text_color(th.muted)
+                                .cursor_pointer()
+                                .hover(|d| d.bg(th.hover).text_color(th.text))
+                                .child("×")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if i < this.panes.len() {
+                                        let host = this.panes[i].view.entity_id();
+                                        this.end_edit_in(host, window, cx);
+                                        this.panes.remove(i);
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
                 );
+                if !collapsed {
+                    card = card.child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .border_t_1()
+                            .border_color(th.line)
+                            .child(pane.view.clone()),
+                    );
+                }
+                panel = panel.child(card);
             }
             if self.inspector_open {
-                col = col.child(self.render_inspector(cx));
+                panel = panel.child(self.render_inspector(cx));
             }
+            col = col.child(panel);
             col
         });
         let overlay = self.jump.as_ref().map(|(j, _)| {
@@ -2252,6 +2963,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::prev_day))
             .on_action(cx.listener(Self::next_day))
             .on_action(cx.listener(Self::toggle_right))
+            .on_mouse_move(cx.listener(Self::resize_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::resize_done))
             .on_action(cx.listener(Self::toggle_left))
             .on_action(cx.listener(Self::toggle_refs))
             .on_action(cx.listener(Self::undo))

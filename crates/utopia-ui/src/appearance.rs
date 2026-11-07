@@ -13,7 +13,8 @@
 //!   "density": "comfortable",
 //!   "ref_children": 2,
 //!   "pinned": [],
-//!   "attribute-blocks": "compact"
+//!   "attribute-blocks": "compact",
+//!   "right_sidebar_width": 380.0
 //! }
 //! ```
 //!
@@ -21,8 +22,10 @@
 //! `"comfortable"` (the default) or `"compact"` (ALL-5); `ref_children` is how many
 //! children a Linked Reference shows inline, 0 to `REF_CHILDREN_MAX` (LR-4, default 2,
 //! 0 folds every child behind the "+N more" chip); `pinned` is the list of page ids the
-//! sidebar keeps in its Pinned group, in the order they were pinned (SB-3);
-//! `attribute-blocks` is `"compact"` (the default) or `"blocks"` (PG-1). A missing file
+//! sidebars keep, in the order they were pinned — one list shared by the left sidebar's
+//! Pinned group (SB-3) and the right sidebar's Pinned tab (RS-3); `attribute-blocks` is
+//! `"compact"` (the default) or `"blocks"` (PG-1); `right_sidebar_width` is the width that
+//! sidebar was dragged to (RS-4). A missing file
 //! means defaults; an
 //! unreadable file, an unknown value or a newer version is logged and read as far as it can
 //! be, never a panic (rule 11). Keys this version does not know are kept when the file is
@@ -138,6 +141,21 @@ impl Density {
     }
 }
 
+/// The right sidebar's width as it was before the setting existed.
+pub const RIGHT_SIDEBAR_DEFAULT_WIDTH: f32 = 380.;
+/// Narrow enough to leave a readable page beside it, wide enough for a reference.
+pub const RIGHT_SIDEBAR_MIN_WIDTH: f32 = 240.;
+pub const RIGHT_SIDEBAR_MAX_WIDTH: f32 = 640.;
+
+/// Keep a width — dragged, typed or read from a file — inside what the layout can show.
+pub fn clamp_sidebar_width(width: f32) -> f32 {
+    if width.is_finite() {
+        width.clamp(RIGHT_SIDEBAR_MIN_WIDTH, RIGHT_SIDEBAR_MAX_WIDTH)
+    } else {
+        RIGHT_SIDEBAR_DEFAULT_WIDTH
+    }
+}
+
 /// How a page draws its `Key:: value` root blocks (PG-1). The metadata header always keeps
 /// the projection; this only decides whether the blocks are also drawn in full.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -190,10 +208,13 @@ pub struct Prefs {
     pub ref_children: usize,
     /// How a page draws its `key:: value` blocks (PG-1).
     pub attribute_blocks: AttributeBlocks,
-    /// Page ids kept at the top of the sidebar, in the order they were pinned (SB-3).
-    /// Local state: a pin is a pointer to a page, not a property of the page, so it never
-    /// goes into a CRDT shard (rule 9).
+    /// Page ids kept at the top of the sidebar, in the order they were pinned (SB-3), and
+    /// listed in the right sidebar's Pinned tab (RS-3). Local state: a pin is a pointer to
+    /// a page, not a property of the page, so it never goes into a CRDT shard (rule 9).
     pub pinned: Vec<PageId>,
+    /// How wide the right sidebar is, in points (RS-4). Clamped to
+    /// [`RIGHT_SIDEBAR_MIN_WIDTH`]..=[`RIGHT_SIDEBAR_MAX_WIDTH`] when read and written.
+    pub right_sidebar_width: f32,
     /// Keys this version does not understand, written back untouched.
     rest: Map<String, Value>,
 }
@@ -206,6 +227,7 @@ impl Default for Prefs {
             ref_children: DEFAULT_REF_CHILDREN,
             attribute_blocks: AttributeBlocks::default(),
             pinned: Vec::new(),
+            right_sidebar_width: RIGHT_SIDEBAR_DEFAULT_WIDTH,
             rest: Map::new(),
         }
     }
@@ -256,6 +278,26 @@ impl Prefs {
                     "{FILE}: density should be a string, not {v}; using Comfortable"
                 ));
                 Density::default()
+            }
+        };
+        let right_sidebar_width = match rest.remove("right_sidebar_width") {
+            None => RIGHT_SIDEBAR_DEFAULT_WIDTH,
+            Some(Value::Number(n)) => match n.as_f64() {
+                Some(w) if w.is_finite() => clamp_sidebar_width(w as f32),
+                _ => {
+                    warnings.push(format!(
+                        "{FILE}: right_sidebar_width {n} is not a width; using \
+                         {RIGHT_SIDEBAR_DEFAULT_WIDTH}"
+                    ));
+                    RIGHT_SIDEBAR_DEFAULT_WIDTH
+                }
+            },
+            Some(v) => {
+                warnings.push(format!(
+                    "{FILE}: right_sidebar_width should be a number, not {v}; using \
+                     {RIGHT_SIDEBAR_DEFAULT_WIDTH}"
+                ));
+                RIGHT_SIDEBAR_DEFAULT_WIDTH
             }
         };
         let ref_children = match rest.remove("ref_children") {
@@ -319,6 +361,31 @@ impl Prefs {
                 Vec::new()
             }
         };
+        // The branch this preference came from stored the sidebar pins under
+        // `pinned_pages`; the left sidebar's group (SB-3) and the right sidebar's tab (RS-3)
+        // now share `pinned`, so fold the old list in rather than dropping it.
+        let mut pinned = pinned;
+        match rest.remove("pinned_pages") {
+            None => {}
+            Some(Value::Array(items)) => {
+                for item in items {
+                    match item {
+                        Value::String(id) if !id.is_empty() => {
+                            let id = PageId(id);
+                            if !pinned.contains(&id) {
+                                pinned.push(id);
+                            }
+                        }
+                        other => warnings.push(format!(
+                            "{FILE}: ignoring pinned page {other}; page ids are strings"
+                        )),
+                    }
+                }
+            }
+            Some(v) => warnings.push(format!(
+                "{FILE}: pinned_pages should be a list of page ids, not {v}; ignoring it"
+            )),
+        }
         (
             Self {
                 font,
@@ -326,6 +393,7 @@ impl Prefs {
                 ref_children,
                 attribute_blocks,
                 pinned,
+                right_sidebar_width,
                 rest,
             },
             warnings,
@@ -337,6 +405,11 @@ impl Prefs {
         m.insert("version".into(), VERSION.into());
         m.insert("font".into(), self.font.key().into());
         m.insert("density".into(), self.density.key().into());
+        m.insert(
+            "right_sidebar_width".into(),
+            serde_json::Number::from_f64(clamp_sidebar_width(self.right_sidebar_width) as f64)
+                .map_or(Value::Null, Value::Number),
+        );
         m.insert("ref_children".into(), self.ref_children.into());
         m.insert(
             "attribute-blocks".into(),
@@ -423,6 +496,28 @@ pub fn density(cx: &App) -> Density {
         .map_or(Density::default(), |a| a.prefs.density)
 }
 
+/// The right sidebar's width in force (RS-4). 380 when nothing was installed.
+pub fn right_sidebar_width(cx: &App) -> f32 {
+    cx.try_global::<Appearance>()
+        .map_or(RIGHT_SIDEBAR_DEFAULT_WIDTH, |a| {
+            clamp_sidebar_width(a.prefs.right_sidebar_width)
+        })
+}
+
+/// Set the sidebar's width in memory while it is being dragged; the file follows on release
+/// through [`remember`] (RS-4: one write per drag, not one per pixel).
+pub fn set_right_sidebar_width(cx: &mut App, width: f32) {
+    cx.default_global::<Appearance>().prefs.right_sidebar_width = clamp_sidebar_width(width);
+    cx.refresh_windows();
+}
+
+/// Put the sidebar back to its default width and write that down (Settings → Appearance).
+pub fn reset_right_sidebar_width(cx: &mut App, config_dir: &Path) -> std::io::Result<()> {
+    cx.default_global::<Appearance>().prefs.right_sidebar_width = RIGHT_SIDEBAR_DEFAULT_WIDTH;
+    cx.refresh_windows();
+    cx.global::<Appearance>().prefs.save(config_dir)
+}
+
 /// How many children a Linked Reference shows inline (LR-4), clamped to the offered range.
 pub fn ref_children(cx: &App) -> usize {
     cx.try_global::<Appearance>()
@@ -462,7 +557,7 @@ pub fn toggle_pinned(cx: &mut App, page: &PageId) -> std::io::Result<bool> {
             true
         }
     };
-    let saved = save(cx);
+    let saved = remember(cx);
     // The sidebar and an open page menu both show the pin state.
     cx.refresh_windows();
     saved.map(|()| on)
@@ -471,14 +566,15 @@ pub fn toggle_pinned(cx: &mut App, page: &PageId) -> std::io::Result<bool> {
 /// Unpin every page (Settings → Appearance). Returns whether a write failed.
 pub fn clear_pinned(cx: &mut App) -> std::io::Result<()> {
     cx.default_global::<Appearance>().prefs.pinned.clear();
-    let saved = save(cx);
+    let saved = remember(cx);
     cx.refresh_windows();
     saved
 }
 
-/// Write `settings.json` beside the running app; nothing to do for a test that never
-/// installed a config dir.
-fn save(cx: &mut App) -> std::io::Result<()> {
+/// Write the preferences in force to the installed `settings.json`; nothing to do for a
+/// test that never installed a config dir. A view that owns a preference (a pin, the right
+/// sidebar's dragged width, RS-4) calls this instead of being handed the path.
+pub fn remember(cx: &mut App) -> std::io::Result<()> {
     let a = cx.default_global::<Appearance>();
     if a.config_dir.as_os_str().is_empty() {
         return Ok(());
@@ -513,7 +609,7 @@ pub fn set_ref_children(cx: &mut App, count: usize, config_dir: &Path) -> std::i
 /// dir `install` recorded; a test that never installed one stays in memory.
 pub fn set_attribute_blocks(cx: &mut App, value: AttributeBlocks) -> std::io::Result<()> {
     cx.default_global::<Appearance>().prefs.attribute_blocks = value;
-    let saved = save(cx);
+    let saved = remember(cx);
     cx.refresh_windows();
     saved
 }
@@ -547,6 +643,7 @@ mod tests {
             ref_children: 0,
             attribute_blocks: AttributeBlocks::Blocks,
             pinned: vec![PageId("page-a".into()), PageId("page-b".into())],
+            right_sidebar_width: 420.0,
             ..Default::default()
         };
         let json = p.to_json();
@@ -560,9 +657,42 @@ mod tests {
                 "ref_children": 0,
                 "attribute-blocks": "blocks",
                 "pinned": ["page-a", "page-b"],
+                "right_sidebar_width": 420.0,
             })
         );
         assert_eq!(Prefs::from_json(&json), (p, vec![]));
+    }
+
+    /// Merge fix: the branch before the merge stored the sidebar pins under
+    /// `pinned_pages`, and the two lists were merged into one `pinned`. A file written by
+    /// that build must keep its pins instead of silently coming up with none.
+    #[test]
+    fn legacy_pinned_pages_are_migrated() {
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned_pages": ["a", "b"]}"#);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(p.pinned, [PageId("a".into()), PageId("b".into())]);
+        let v: Value = serde_json::from_str(&p.to_json()).unwrap();
+        assert_eq!(v["pinned"], serde_json::json!(["a", "b"]));
+        assert!(
+            v.get("pinned_pages").is_none(),
+            "the legacy key is migrated, not left behind: {v}"
+        );
+
+        // Both keys (a file already saved after the merge): the shared list wins and the
+        // legacy entries it lacks are added once, in pin order.
+        let (p, warnings) =
+            Prefs::from_json(r#"{"version": 1, "pinned": ["a"], "pinned_pages": ["a", "b", 3]}"#);
+        assert_eq!(p.pinned, [PageId("a".into()), PageId("b".into())]);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the junk entry is reported: {warnings:?}"
+        );
+
+        // Junk in the legacy key is reported, not a panic (rule 11).
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned_pages": "a"}"#);
+        assert!(p.pinned.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     /// PG-1: attribute blocks default to compact rows, and a value this version does not
@@ -645,6 +775,33 @@ mod tests {
             assert_eq!(p.ref_children, DEFAULT_REF_CHILDREN, "{bad}");
             assert_eq!(warnings.len(), 1, "{bad}: {warnings:?}");
         }
+    }
+
+    /// RS-4: the sidebar width is clamped to what the layout can show, and junk is the
+    /// default with a warning rather than a panic (rule 11).
+    #[test]
+    fn the_sidebar_width_is_clamped_and_never_fatal() {
+        assert_eq!(clamp_sidebar_width(10.), RIGHT_SIDEBAR_MIN_WIDTH);
+        assert_eq!(clamp_sidebar_width(10_000.), RIGHT_SIDEBAR_MAX_WIDTH);
+        assert_eq!(clamp_sidebar_width(f32::NAN), RIGHT_SIDEBAR_DEFAULT_WIDTH);
+        let (p, w) = Prefs::from_json(r#"{"version": 1, "right_sidebar_width": 480}"#);
+        assert_eq!(p.right_sidebar_width, 480.);
+        assert!(w.is_empty(), "{w:?}");
+        for bad in [
+            r#"{"version": 1, "right_sidebar_width": "wide"}"#,
+            r#"{"version": 1, "right_sidebar_width": null}"#,
+        ] {
+            let (p, w) = Prefs::from_json(bad);
+            assert_eq!(p.right_sidebar_width, RIGHT_SIDEBAR_DEFAULT_WIDTH, "{bad}");
+            assert_eq!(w.len(), 1, "{bad}: {w:?}");
+        }
+        // A width outside the range is brought back into it on the way in and out.
+        let (p, _) = Prefs::from_json(r#"{"version": 1, "right_sidebar_width": 4000}"#);
+        assert_eq!(p.right_sidebar_width, RIGHT_SIDEBAR_MAX_WIDTH);
+        assert_eq!(
+            serde_json::from_str::<Value>(&p.to_json()).unwrap()["right_sidebar_width"],
+            serde_json::json!(RIGHT_SIDEBAR_MAX_WIDTH as f64)
+        );
     }
 
     /// An unknown density is the comfortable one, said out loud, never a panic (rule 11).
