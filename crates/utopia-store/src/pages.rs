@@ -250,6 +250,30 @@ impl Store {
         self.drafts.remove(page);
     }
 
+    /// A promoted draft (FR-1.2) may belong to a day another page already owns: a remote
+    /// device wrote the date under a fresh id because this device's uuidv5 is tombstoned
+    /// there (rule 4). Writing the draft as a second live daily page would violate
+    /// `page_daily_uq` and fail the commit, so its blocks move into the page that has the
+    /// day instead (§8.6) and the draft's shard gets the merge tombstone. Returns the
+    /// surviving page, which the caller must commit as well.
+    pub(crate) fn resolve_promotion(
+        &mut self,
+        page: &PageId,
+        date: NaiveDate,
+    ) -> Result<Option<PageId>> {
+        let Some(live) = self.live_daily(date)? else {
+            return Ok(None);
+        };
+        if live == *page {
+            return Ok(None);
+        }
+        let now = self.now();
+        for (p, cmds) in self.plan_merge(page, &live)? {
+            self.apply_cmds(&p, &cmds, now, false)?;
+        }
+        Ok(Some(live))
+    }
+
     /// Visiting a page: make sure there is a block to type into (§9.3) and return the
     /// first visible one. Not an undoable edit.
     pub fn ensure_first_block(&mut self, page: &PageId) -> Result<BlockId> {

@@ -213,6 +213,50 @@ fn fr_1_2_writer_failure_keeps_the_draft() {
     assert!(s.page_state(&draft).unwrap().block(&appended).is_some());
 }
 
+/// `docs/state-machines/draft-daily-page.md` issue 3: a draft is promoted for a date that a
+/// remote device already wrote under another id (its uuidv5 was tombstoned there, rule 4).
+/// Both would be live daily pages for the same date, `page_daily_uq` rejects the second row
+/// and the commit fails with the typed text still only in memory (FR-1.2, §8.6).
+#[test]
+fn fr_1_2_promoted_draft_merges_into_the_days_page() {
+    let d = date(2026, 11, 2);
+    // Another device: the day's deterministic id was tombstoned there, so the live page for
+    // the date is a fresh ULID.
+    let mut remote = store();
+    let gone = remote.ensure_daily_page(d).unwrap();
+    write(&mut remote, &gone, "remote one");
+    remote.delete_page(&gone).unwrap();
+    let live = remote.ensure_daily_page(d).unwrap();
+    assert_ne!(live, gone, "a tombstoned id is never resurrected");
+    write(&mut remote, &live, "remote two");
+    let shard = remote.export_since(&live, &Frontier::default()).unwrap();
+
+    // This device already shows the day as a draft; only the live page's update arrives
+    // (the tombstoned id may come in a later round).
+    let mut s = store();
+    let draft = s.draft_daily(d).unwrap();
+    s.import_batch(&[(live.clone(), shard)]).unwrap();
+    assert!(s.is_draft(&draft), "the draft is still open");
+    let block = s.page_state(&draft).unwrap().live_roots()[0].clone();
+    s.set_block_text(&draft, &block, "typed here", None, None)
+        .unwrap();
+    s.sync_index().expect("promoting a draft must not fail");
+    assert!(!s.is_draft(&draft));
+    let days = s.days_between(d, d).unwrap();
+    assert_eq!(days.get(&d).cloned(), Some(live.clone()), "one live day");
+    let texts = live_texts(&mut s, &live);
+    assert!(
+        texts.iter().any(|(t, _)| t == "typed here"),
+        "the draft's text moved into the day's page: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|(t, _)| t == "remote two"),
+        "the remote text stays: {texts:?}"
+    );
+    assert_eq!(s.find_page("2026-11-02").unwrap(), Some(live));
+    assert_doctor(&mut s);
+}
+
 #[test]
 fn ac_1_5_deleted_daily_is_recreated_and_recoverable() {
     let mut s = store();

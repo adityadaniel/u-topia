@@ -366,32 +366,48 @@ impl Store {
     /// Queue shard commits; strict mode ships them immediately.
     fn queue(&mut self, pages: &[(PageId, Option<DocDelta>)], enqueue: bool) -> Result<()> {
         let mut promoted = false;
+        // Pages a promoted draft had to be merged into (§8.6); their shards changed too.
+        let mut merged_into: Vec<PageId> = Vec::new();
         for (page, delta) in pages {
             // A draft's first edit writes the whole page (meta, first block, the edit).
-            let delta = if self.promote_draft(page).is_some() {
-                promoted = true;
-                None
-            } else {
-                delta.clone()
-            };
-            match self.pending.iter_mut().find(|(p, _, _)| p == page) {
-                Some((_, d, e)) => {
-                    *d = match (d.take(), delta) {
-                        (Some(mut a), Some(b)) => {
-                            a.merge(b);
-                            Some(a)
-                        }
-                        _ => None,
-                    };
-                    *e |= enqueue;
+            let delta = match self.promote_draft(page) {
+                Some(date) => {
+                    promoted = true;
+                    // One page per date (rule 4): if a remote copy of the day already
+                    // owns it under another id, the draft's blocks move into that page.
+                    if let Some(live) = self.resolve_promotion(page, date)? {
+                        merged_into.push(live);
+                    }
+                    None
                 }
-                None => self.pending.push((page.clone(), delta, enqueue)),
-            }
+                None => delta.clone(),
+            };
+            self.push_pending(page, delta, enqueue);
+        }
+        for page in merged_into {
+            self.push_pending(&page, None, enqueue);
         }
         if self.debounced && !promoted {
             Ok(())
         } else {
             self.flush()
+        }
+    }
+
+    /// Append a page to the pending commit, merging its delta with an earlier one.
+    fn push_pending(&mut self, page: &PageId, delta: Option<DocDelta>, enqueue: bool) {
+        match self.pending.iter_mut().find(|(p, _, _)| p == page) {
+            Some((_, d, e)) => {
+                *d = match (d.take(), delta) {
+                    (Some(mut a), Some(b)) => {
+                        a.merge(b);
+                        Some(a)
+                    }
+                    _ => None,
+                };
+                *e |= enqueue;
+            }
+            None => self.pending.push((page.clone(), delta, enqueue)),
         }
     }
 
