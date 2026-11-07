@@ -1470,6 +1470,630 @@ fn background_sync_imports_and_pushes(cx: &mut TestAppContext) {
     assert_eq!(st.block(&st.live_roots()[0]).unwrap().text, "local words");
 }
 
+/// A transport that counts how many rounds reached the network, so a test can tell one
+/// polling loop from two (§12.3).
+struct CountingTransport {
+    inner: utopia_sync::relay::RelayTransport,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl utopia_sync::Transport for CountingTransport {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.manifest(if_none_match)
+    }
+
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        self.inner.push(page, req)
+    }
+
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.inner.pull(page, since_seq)
+    }
+
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// A transport that refuses the first `refusals` rounds with 401, then behaves like a real
+/// relay: the transient refusal a proxy hiccup or a restarting relay produces.
+struct FlakyTransport {
+    inner: utopia_sync::relay::RelayTransport,
+    refusals: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl utopia_sync::Transport for FlakyTransport {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.refusals.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.refusals
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(utopia_sync::SyncError::Unauthorized);
+        }
+        self.inner.manifest(if_none_match)
+    }
+
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        self.inner.push(page, req)
+    }
+
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.inner.pull(page, since_seq)
+    }
+
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// A transport that refuses every round with a fixed error.
+struct Refusing {
+    err: fn() -> utopia_sync::SyncError,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl utopia_sync::Transport for Refusing {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        utopia_sync::CursorSpace::new("test:refusing", utopia_sync::CursorKind::Seq)
+    }
+
+    fn manifest(
+        &mut self,
+        _if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err((self.err)())
+    }
+
+    fn push(
+        &mut self,
+        _page: &PageId,
+        _req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        Err((self.err)())
+    }
+
+    fn pull(
+        &mut self,
+        _page: &PageId,
+        _since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        Err((self.err)())
+    }
+
+    fn put_snapshot(
+        &mut self,
+        _page: &PageId,
+        _covers_seq: u64,
+        _payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        Err((self.err)())
+    }
+}
+
+/// §12.3, §13.3: one `SyncRunner` must have one polling loop. A second `enable_sync_with`
+/// replaces the runner; it must also retire the loop the previous runner started, or both
+/// loops poll the new runner (and the old loop writes its transport into it).
+#[gpui::test]
+fn enabling_sync_twice_keeps_one_poll_loop(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    let (_app, ws, cx) = setup(cx);
+    let relay = Relay::new();
+    let first = Arc::new(AtomicUsize::new(0));
+    let second = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(relay.clone(), "g"),
+                calls: first.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    // Replace the runner while the first loop is asleep.
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(relay.clone(), "g"),
+                calls: second.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    for _ in 0..4 {
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        first.load(Ordering::SeqCst) + second.load(Ordering::SeqCst),
+        2,
+        "one loop rounds at 5 s and 15 s in 20 s (5 s then a 10 s idle backoff); a second \
+         loop adds rounds"
+    );
+}
+
+/// §12.6: a round that fails on the device (the store, not the relay) must not be reported
+/// as the relay being offline — the network was never tried.
+#[gpui::test]
+fn a_local_store_error_is_not_reported_as_offline(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    use utopia_sync::SyncStatus;
+    let (app, ws, cx) = setup(cx);
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(Box::new(RelayTransport::new(Relay::new(), "g")), None, cx)
+    });
+    cx.simulate_input("local words");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    // `prepare` reads `sync_state`; without it the round dies before the network.
+    app.update(cx, |app, _| {
+        app.store
+            .conn()
+            .execute_batch("DROP TABLE sync_state")
+            .unwrap();
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    let status = ws.read_with(cx, |w, _| w.sync_status());
+    assert!(
+        !matches!(status, Some(SyncStatus::Offline { .. })),
+        "a local store error is not the relay being offline: {status:?}"
+    );
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Error,
+        "the dot still says something is wrong"
+    );
+}
+
+/// §12.6: a failing round backs off. A prepare failure used to keep the last good round's
+/// cadence, so a persistent local failure polled every 5 s.
+#[gpui::test]
+fn a_failed_round_backs_off(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    let (app, ws, cx) = setup(cx);
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(Box::new(RelayTransport::new(Relay::new(), "g")), None, cx)
+    });
+    // A round with work keeps the fast 5 s cadence.
+    cx.simulate_input("queued words");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    app.update(cx, |app, _| {
+        app.store
+            .conn()
+            .execute_batch("DROP TABLE sync_state")
+            .unwrap();
+    });
+    // This round fails on the device, so the next attempt is 10 s away, not 5 s.
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    // Make the store usable again; a loop without backoff retries at once (5 s).
+    app.update(cx, |app, _| {
+        app.store
+            .conn()
+            .execute_batch("CREATE TABLE sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert!(
+        !matches!(
+            ws.read_with(cx, |w, _| w.sync_status()),
+            Some(utopia_sync::SyncStatus::Synced { .. })
+        ),
+        "the failed round's 10 s backoff was ignored; it retried after 5 s"
+    );
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert!(
+        matches!(
+            ws.read_with(cx, |w, _| w.sync_status()),
+            Some(utopia_sync::SyncStatus::Synced { .. })
+        ),
+        "the round after the backoff recovers"
+    );
+}
+
+/// A relay that advertises one page and then hands back an update the store cannot import:
+/// the round fails after the network was reached.
+struct BadPull {
+    page: PageId,
+}
+
+impl utopia_sync::Transport for BadPull {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        utopia_sync::CursorSpace::new("test:bad-pull", utopia_sync::CursorKind::Seq)
+    }
+
+    fn manifest(
+        &mut self,
+        _if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        Ok(Some(utopia_sync::Manifest {
+            rev: 1,
+            protocol_version: utopia_sync::PROTOCOL_VERSION,
+            pages: vec![utopia_sync::ManifestPage {
+                page_id: self.page.to_string(),
+                head_seq: 1,
+                frontier: String::new(),
+                snapshot_seq: 0,
+                tail_bytes: 0,
+                updated_at: 0,
+                deleted: false,
+            }],
+            instance: "test-relay".into(),
+        }))
+    }
+
+    fn push(
+        &mut self,
+        _page: &PageId,
+        _req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        Ok(utopia_sync::PushResponse {
+            accepted: 0,
+            head_seq: 0,
+            duplicate: 0,
+        })
+    }
+
+    fn pull(
+        &mut self,
+        _page: &PageId,
+        _since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        Ok(utopia_sync::PullResponse {
+            snapshot: None,
+            updates: vec![utopia_sync::UpdateOut {
+                seq: 1,
+                id: "garbage".into(),
+                frontier: String::new(),
+                payload: vec![0xff; 8],
+            }],
+            head_seq: 1,
+        })
+    }
+
+    fn put_snapshot(
+        &mut self,
+        _page: &PageId,
+        _covers_seq: u64,
+        _payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        Ok(())
+    }
+}
+
+/// §13.3: replacing the runner while its round is in the background must not hand that
+/// round's result (or its transport) to the new runner. The old loop owns the exchange, so
+/// replacing the runner cancels it: it never reaches the relay, and what it would have
+/// imported never reaches the store; the new runner starts from `Idle` with no outcome of
+/// its own.
+#[gpui::test]
+fn replacing_the_runner_mid_exchange_discards_the_old_round(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    use utopia_sync::{SyncClient, SyncStatus};
+    use utopia_ui::sync_runner::SyncPhase;
+    let (app, ws, cx) = setup(cx);
+    let relay = Relay::new();
+    let old_calls = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(relay.clone(), "g"),
+                calls: old_calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    // One round must finish first: `sync_dot` is amber both while connecting and while an
+    // exchange is in flight, so the dot cannot name the moment on its own.
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert_eq!(old_calls.load(Ordering::SeqCst), 1, "one round ran");
+    assert!(matches!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(SyncStatus::Synced { .. })
+    ));
+    // Something the next round would import if its result were applied.
+    let mut other = Store::open_in_memory().unwrap();
+    let mut oc = SyncClient::new(RelayTransport::new(relay.clone(), "g"), &other).unwrap();
+    other.create_page("From the abandoned round").unwrap();
+    oc.sync_once(&mut other).unwrap();
+    // Step one task at a time until the runner is really `Exchanging`, i.e. the transport has
+    // been handed to the background exchange. (The exchange task itself is only queued.)
+    let mut started = false;
+    for _ in 0..500 {
+        if ws.read_with(cx, |w, _| {
+            matches!(w.sync_phase(), Some(SyncPhase::Exchanging))
+        }) {
+            started = true;
+            break;
+        }
+        cx.dispatcher.advance_clock_to_next_delayed();
+        if !cx.background_executor.tick() {
+            break;
+        }
+    }
+    assert!(started, "no round ever reached the exchange");
+    assert_eq!(
+        old_calls.load(Ordering::SeqCst),
+        1,
+        "the transport is handed over but the exchange has not run: the round is in flight"
+    );
+    // Replace the runner while that exchange is in flight, pointing it at another relay so
+    // anything the abandoned round pulled would be visible as a page only it could import.
+    let calls = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(Relay::new(), "g"),
+                calls: calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    assert_eq!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        None,
+        "the new runner has no round of its own yet"
+    );
+    for _ in 0..4 {
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        old_calls.load(Ordering::SeqCst),
+        1,
+        "the in-flight round was cancelled with its loop and never reached the relay"
+    );
+    assert!(calls.load(Ordering::SeqCst) >= 1, "the new runner polls");
+    assert!(matches!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(SyncStatus::Synced { .. })
+    ));
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Synced
+    );
+    assert!(
+        app.update(cx, |app, _| app
+            .store
+            .find_page("From the abandoned round")
+            .unwrap()
+            .is_none()),
+        "the abandoned round's result must not be applied"
+    );
+}
+
+/// §12.6: a store failure *after* the network was reached (an update the store cannot
+/// import) is still a local fault, not "the relay is offline". The round applies the rest
+/// and reports the page as failed, so it is `Partial` rather than `LocalError`; a failure
+/// that stops the whole round (in `prepare`) is `LocalError`, covered by
+/// `a_local_store_error_is_not_reported_as_offline`.
+#[gpui::test]
+fn a_store_failure_after_the_network_is_not_offline(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    use utopia_sync::SyncStatus;
+    let (app, ws, cx) = setup(cx);
+    let page = app.update(cx, |app, _| app.store.create_page("Remote").unwrap());
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(Box::new(BadPull { page }), None, cx)
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    let status = ws.read_with(cx, |w, _| w.sync_status());
+    assert!(
+        matches!(status, Some(SyncStatus::Partial { failed: 1, .. })),
+        "an import the store rejects is a failed page, not the relay: {status:?}"
+    );
+    assert!(
+        !matches!(status, Some(SyncStatus::Offline { .. })),
+        "a local fault is not offline: {status:?}"
+    );
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Error
+    );
+}
+
+/// §12.6: a refusal stops the fast polls. One retry per slow interval, not every 5 s — the
+/// relay refused this device, so hammering it is exactly wrong.
+#[gpui::test]
+fn a_refusal_retries_only_at_the_slow_cadence(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    let (_app, ws, cx) = setup(cx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(Refusing {
+                err: || utopia_sync::SyncError::Unauthorized,
+                calls: calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one refused round");
+    assert_eq!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(utopia_sync::SyncStatus::NeedsAuth)
+    );
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Error
+    );
+    // Well inside the slow interval: the refusal must not be retried at 5 s.
+    cx.executor().advance_clock(Duration::from_secs(30));
+    cx.run_until_parked();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a refused relay must not be polled every 5 s"
+    );
+}
+
+/// §12.6: a *transient* refusal (a proxy hiccup, a relay restarting before it has loaded its
+/// token file) must not end sync for the session. Polling retries at the slow cadence, so it
+/// heals by itself; a 401 that never clears just stays red.
+#[gpui::test]
+fn a_refusal_recovers_without_a_restart(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    let (_app, ws, cx) = setup(cx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let refusals = Arc::new(AtomicUsize::new(1));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(FlakyTransport {
+                inner: RelayTransport::new(Relay::new(), "g"),
+                refusals: refusals.clone(),
+                calls: calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert_eq!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(utopia_sync::SyncStatus::NeedsAuth),
+        "the first round was refused"
+    );
+    // The next attempt is a slow interval away, not immediate.
+    cx.executor().advance_clock(Duration::from_secs(30));
+    cx.run_until_parked();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no 5 s hammering");
+    // After the slow interval the relay answers again and sync resumes by itself.
+    cx.executor().advance_clock(Duration::from_secs(40));
+    cx.run_until_parked();
+    assert!(calls.load(Ordering::SeqCst) >= 2, "the slow retry happened");
+    assert!(
+        matches!(
+            ws.read_with(cx, |w, _| w.sync_status()),
+            Some(utopia_sync::SyncStatus::Synced { .. })
+        ),
+        "a transient 401 must not kill sync until the app is relaunched"
+    );
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Synced
+    );
+}
+
+/// §12.6: starting sync again is the explicit way out of a refusal, and it must not need a
+/// new Workspace. The replacement runner polls immediately.
+#[gpui::test]
+fn restarting_sync_after_a_refusal_polls_again(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    let (_app, ws, cx) = setup(cx);
+    let refused = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(Refusing {
+                err: || utopia_sync::SyncError::Unauthorized,
+                calls: refused.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert_eq!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(utopia_sync::SyncStatus::NeedsAuth)
+    );
+    // The user fixes the token; the app starts sync again on the same workspace.
+    let calls = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(Relay::new(), "g"),
+                calls: calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert!(calls.load(Ordering::SeqCst) >= 1, "the new runner polled");
+    assert!(matches!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(utopia_sync::SyncStatus::Synced { .. })
+    ));
+}
+
 // ---------------------------------------------------------------- v1.1 (P1)
 
 fn kind_of(
@@ -3190,6 +3814,183 @@ fn daily_notes_feed_scrolls_into_older_days(cx: &mut TestAppContext) {
     assert_eq!(daily_count(&app, cx), 26);
 }
 
+/// FR-1.1/FR-1.2: the feed lists every calendar day back to the oldest daily page and
+/// then stops. Without a terminal state the sentinel kept asking for another batch for
+/// as long as it was laid out, walking back through empty years.
+#[gpui::test]
+fn fr_1_1_feed_stops_at_the_oldest_daily_page(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // One page, older than the first batch, so there is something to load.
+    let oldest = today() - chrono::Duration::days(23);
+    app.update(cx, |app, _| {
+        let (p, b) = app.store.open_daily(oldest).unwrap();
+        app.store
+            .set_block_text(&p, &b, "the first note", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    // Scroll far past the last real day.
+    for _ in 0..20 {
+        scroll_main(cx, -4000.);
+    }
+    let pages = ws.update(cx, |w, cx| w.journal_days(cx));
+    assert_eq!(pages.len(), 2, "today's draft and the only written day");
+    assert_eq!(pages[0], today_page(&app, cx), "today comes first");
+    // The end of the feed is a terminal state, not an endless sentinel.
+    assert!(
+        cx.debug_bounds("feed-end").is_some(),
+        "the feed says it has no earlier notes once the oldest day is loaded"
+    );
+    let shown = ws
+        .update(cx, |w, cx| w.journal_shown_through(cx))
+        .expect("in the feed");
+    assert!(
+        shown <= oldest,
+        "the oldest day is inside the loaded window: {shown} vs {oldest}"
+    );
+    assert!(
+        shown > oldest - chrono::Duration::days(10),
+        "stops within one batch of the oldest day, not years past it: {shown}"
+    );
+    // Scrolling on asks for nothing more: the window is final.
+    let open_before = ws.update(cx, |w, cx| w.open_journal_days(cx));
+    for _ in 0..5 {
+        scroll_main(cx, -4000.);
+    }
+    assert_eq!(
+        ws.update(cx, |w, cx| w.journal_shown_through(cx)),
+        Some(shown),
+        "an exhausted feed never loads another batch"
+    );
+    assert_eq!(
+        ws.update(cx, |w, cx| w.open_journal_days(cx)),
+        open_before,
+        "no day opened on the extra scrolls either"
+    );
+    // Writing on a blank day inside the window writes that day (FR-1.2) but does not
+    // move the feed's floor: the day is above `shown_through`, so the feed stays ended.
+    // `today()` is 2026-11-02 in this file, so 25 days back is 2026-10-08: older than
+    // the only note (2026-10-10) but inside the loaded window (down to 2026-10-04).
+    let inside = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+    assert_eq!(inside, today() - chrono::Duration::days(25));
+    let folded = cx
+        .debug_bounds("day-folded-2026-10-08")
+        .expect("a blank day inside the window");
+    cx.simulate_click(folded.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_input("late note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.journal_shown_through(cx)),
+        Some(shown),
+        "writing inside the loaded window leaves the window where it was"
+    );
+    assert!(
+        ws.update(cx, |w, cx| w.journal_days(cx))
+            .contains(&PageId::for_date(inside)),
+        "the blank day became a page"
+    );
+    // Nothing was created by scrolling; the one page is the day just written (FR-1.2).
+    assert_eq!(daily_count(&app, cx), 2);
+}
+
+/// FR-1.2: visiting a day without writing on it only makes a draft, so it must not
+/// extend the feed: the feed still ends at the oldest *written* day, not at whatever
+/// date was last opened from the calendar.
+#[gpui::test]
+fn fr_1_2_visited_day_does_not_extend_the_feed(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // Three written days: the oldest is two days back.
+    let oldest = today() - chrono::Duration::days(2);
+    app.update(cx, |app, _| {
+        for i in 0..3 {
+            let d = today() - chrono::Duration::days(i);
+            let (p, b) = app.store.open_daily(d).unwrap();
+            app.store
+                .set_block_text(&p, &b, &format!("note {i}"), None, None)
+                .unwrap();
+            app.store.commit_block(&p, &b).unwrap();
+        }
+        app.store.sync_index().unwrap();
+    });
+    // Visit (do not write) a day years back: a draft for the session (FR-1.2).
+    let visited = NaiveDate::from_ymd_opt(2019, 1, 1).unwrap();
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(visited, false, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(
+        app.update(cx, |app, _| app.store.is_draft(&PageId::for_date(visited))),
+        "opening a date only drafts it"
+    );
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    // The visited draft must not make the feed load towards 2019.
+    for _ in 0..20 {
+        scroll_main(cx, -4000.);
+    }
+    assert!(
+        cx.debug_bounds("feed-end").is_some(),
+        "the feed ends at the oldest written day, not at the visited draft"
+    );
+    let shown = ws
+        .update(cx, |w, cx| w.journal_shown_through(cx))
+        .expect("in the feed");
+    assert!(
+        shown <= oldest && shown > oldest - chrono::Duration::days(10),
+        "the window stays within one batch of the oldest written day: {shown} vs {oldest}"
+    );
+    // Visiting wrote nothing.
+    assert_eq!(daily_count(&app, cx), 3);
+}
+
+/// FR-1.2: an exhausted feed re-opens when an older daily page appears later (from a
+/// `[[date]]` link, an import or a sync). The terminal state is recomputed on every
+/// rebuild, not latched: the sentinel comes back and the next batch reaches the day.
+#[gpui::test]
+fn fr_1_2_feed_reopens_when_an_older_day_appears(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // Today's note only: the feed ends at once.
+    cx.simulate_input("today's note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("feed-end").is_some(),
+        "there is no older note yet"
+    );
+    // An older day appears without navigating the feed.
+    let older = today() - chrono::Duration::days(14);
+    let older_page = app.update(cx, |app, cx| {
+        let (p, b) = app.store.open_daily(older).unwrap();
+        app.store
+            .set_block_text(&p, &b, "found later", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+        app.changed(vec![p.clone()], true, cx);
+        p
+    });
+    cx.run_until_parked();
+    // The feed asks again and loads down to the day that appeared.
+    for _ in 0..10 {
+        scroll_main(cx, -4000.);
+    }
+    let shown = ws
+        .update(cx, |w, cx| w.journal_shown_through(cx))
+        .expect("in the feed");
+    assert!(
+        shown <= older && shown > older - chrono::Duration::days(10),
+        "the window reaches the new oldest day within one batch: {shown} vs {older}"
+    );
+    let pages = ws.update(cx, |w, cx| w.journal_days(cx));
+    assert_eq!(pages.len(), 2, "today and the day that appeared");
+    assert!(pages.contains(&older_page));
+}
+
 fn scroll_main(cx: &mut VisualTestContext, dy: f32) {
     let main = cx.debug_bounds("main-pane").expect("main pane");
     cx.simulate_event(gpui::ScrollWheelEvent {
@@ -3255,6 +4056,32 @@ fn folded_empty_day_opens_on_a_click(cx: &mut TestAppContext) {
     );
 }
 
+/// `docs/state-machines/draft-daily-page.md` issue 5: starting a day writes nothing, so it
+/// must not report a structural change, which forces an index flush and an `IndexUpdated`
+/// cycle for a commit that does not exist (FR-1.2).
+#[gpui::test]
+fn fr_1_2_starting_a_draft_does_not_flush_the_index(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let day = today() - chrono::Duration::days(4);
+    let before = app.read_with(cx, |app, _| app.refs_version);
+    let selector: &'static str =
+        Box::leak(format!("day-folded-{}", utopia_core::date::iso(day)).into_boxed_str());
+    let row = cx.debug_bounds(selector).expect("a folded empty day");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        app.read_with(cx, |app, _| app.store.is_draft(&PageId::for_date(day))),
+        "the click started a draft for the day"
+    );
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "starting a draft queues no write, so the index is not refreshed"
+    );
+}
+
 #[gpui::test]
 fn shortcuts_work_after_scrolling_the_caret_away(cx: &mut TestAppContext) {
     let (_app, ws, cx) = setup(cx);
@@ -3266,6 +4093,213 @@ fn shortcuts_work_after_scrolling_the_caret_away(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let shown = ws.update(cx, |w, cx| w.main_page(cx)).unwrap();
     assert_eq!(shown, PageId::for_date(today().pred_opt().unwrap()));
+}
+
+/// P2 of the draft-day review: the first keystroke on a draft whose day a remote copy
+/// already owns merges the draft into that page. The editor and the view still hold the
+/// draft's id; they must follow it, or every later keystroke would edit a shard that no
+/// longer exists (FR-1.2, rule 5).
+#[gpui::test]
+fn fr_1_2_typing_survives_a_merged_promotion(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let draft = app.update(cx, |app, _| app.store.draft_daily(day).unwrap());
+    // Show the day as a draft, caret in its first block, before the remote copy lands.
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(draft.clone()));
+    // Another device deleted the day's deterministic id and wrote it under a fresh one;
+    // only that page arrives, while the draft is still open here.
+    let live = app.update(cx, |app, _| {
+        let mut remote = Store::open_in_memory().unwrap();
+        remote.set_today(Some(day));
+        let gone = remote.ensure_daily_page(day).unwrap();
+        remote.delete_page(&gone).unwrap();
+        let live = remote.ensure_daily_page(day).unwrap();
+        let shard = remote.export_since(&live, &Default::default()).unwrap();
+        app.store.import_batch(&[(live.clone(), shard)]).unwrap();
+        live
+    });
+    app.update(cx, |app, cx| app.changed(Vec::new(), false, cx));
+    cx.run_until_parked();
+    // First keystroke: promotes the draft, merges it into the day's page and redirects.
+    cx.simulate_input("t");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(live.clone()),
+        "the view follows the day"
+    );
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.page.clone())),
+        Some(live.clone()),
+        "the editor follows the day"
+    );
+    // The second keystroke must land on the day, not on the discarded draft.
+    cx.simulate_input("y");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &live, cx), [("ty".to_string(), 0)]);
+}
+
+/// A view can still be showing a draft when the same day arrives from sync under another
+/// id. Opening the date elsewhere used to discard the draft's shard silently, leaving that
+/// view on a missing page (FR-1.2: a remote copy of the day replaces the draft).
+#[gpui::test]
+fn fr_1_2_opening_a_day_replaces_a_stale_draft_everywhere(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let draft = app.update(cx, |app, _| app.store.draft_daily(day).unwrap());
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(draft.clone()));
+    // Another device wrote the day under a fresh id while this draft was open.
+    let live = app.update(cx, |app, _| {
+        let mut remote = Store::open_in_memory().unwrap();
+        remote.set_today(Some(day));
+        let gone = remote.ensure_daily_page(day).unwrap();
+        remote.delete_page(&gone).unwrap();
+        let live = remote.ensure_daily_page(day).unwrap();
+        let shard = remote.export_since(&live, &Default::default()).unwrap();
+        app.store.import_batch(&[(live.clone(), shard)]).unwrap();
+        live
+    });
+    app.update(cx, |app, cx| app.changed(Vec::new(), false, cx));
+    cx.run_until_parked();
+    // Opening the date in a sidebar pane retires the stale draft.
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, true, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(live.clone()),
+        "the open draft follows the day that replaced it"
+    );
+    assert!(
+        app.update(cx, |app, _| app.store.page_state(&live).is_ok()),
+        "the main pane shows a page that loads"
+    );
+}
+
+/// The undo group saved the draft's id in its carets. Undo and redo put the editor back on
+/// that id while the feed renders the survivor, so `BlockEditor::is_editing` stops matching
+/// and the focused row disappears (FR-1.2, AGENTS.md "the list keeps rendering the row
+/// being edited").
+#[gpui::test]
+fn fr_1_2_undo_after_a_merged_promotion_keeps_the_editor(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let draft = app.update(cx, |app, _| app.store.draft_daily(day).unwrap());
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(draft.clone()));
+    // Another device wrote the day under a fresh id; only that page arrives.
+    let live = app.update(cx, |app, _| {
+        let mut remote = Store::open_in_memory().unwrap();
+        remote.set_today(Some(day));
+        let gone = remote.ensure_daily_page(day).unwrap();
+        remote.delete_page(&gone).unwrap();
+        let live = remote.ensure_daily_page(day).unwrap();
+        let shard = remote.export_since(&live, &Default::default()).unwrap();
+        app.store.import_batch(&[(live.clone(), shard)]).unwrap();
+        live
+    });
+    app.update(cx, |app, cx| app.changed(Vec::new(), false, cx));
+    cx.run_until_parked();
+    // One keystroke promotes the draft and merges it into the day's page.
+    cx.simulate_input("t");
+    cx.run_until_parked();
+    let target_page = |ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
+        ws.update(cx, |w, cx| {
+            w.editor().read(cx).target.as_ref().map(|t| t.page.clone())
+        })
+    };
+    // Undo restores the caret: it must point at the page that owns the day.
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(
+        target_page(&ws, cx),
+        Some(live.clone()),
+        "undo puts the caret back on the day"
+    );
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(live.clone()));
+    // So does redo.
+    cx.simulate_keystrokes("cmd-shift-z");
+    cx.run_until_parked();
+    assert_eq!(
+        target_page(&ws, cx),
+        Some(live.clone()),
+        "redo puts the caret back on the day"
+    );
+    // The focused row is drawn, so the next keystroke reaches the day.
+    cx.simulate_input("y");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &live, cx), [("ty".to_string(), 0)]);
+}
+
+/// P3 of the draft-day review: visiting a date writes nothing, so none of the visit paths
+/// may report a structural change (which forces a synchronous index flush and an
+/// `IndexUpdated` cycle) (FR-1.2, FR-1.5).
+#[gpui::test]
+fn fr_1_2_visiting_a_day_does_not_flush_the_index(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let before = app.read_with(cx, |app, _| app.refs_version);
+
+    // Quick jump / previous day (`open_date`): a draft until written.
+    let day = today() - chrono::Duration::days(6);
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(
+        app.read_with(cx, |app, _| app.store.is_draft(&PageId::for_date(day))),
+        "the day is a draft"
+    );
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "opening a draft day queues no write"
+    );
+
+    // The day header's calendar (`pick_date` on the page view).
+    let title = cx.debug_bounds("page-title").expect("the day's header");
+    cx.simulate_click(title.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    // The calendar opens on the day's own month (October, for `day` above).
+    let cell = cx
+        .debug_bounds("cal-pop-2026-10-15")
+        .expect("the header calendar opens");
+    cx.simulate_click(cell.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "the calendar queues no write"
+    );
+
+    // The Daily Notes feed (`open_journal`).
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "opening the feed queues no write"
+    );
 }
 
 #[gpui::test]

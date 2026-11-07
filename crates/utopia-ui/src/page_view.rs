@@ -15,7 +15,7 @@ use utopia_core::undo::Caret;
 use utopia_core::{BlockId, BlockKind, PageId, PageKind};
 use utopia_store::{LinkedRefs, Mention, PageRow, RefChildren, RefHit, RefQuery, RefSort};
 
-use crate::app_state::{AppState, Changed, IndexUpdated};
+use crate::app_state::{AppState, Changed, IndexUpdated, PageReplaced};
 use crate::editor::{BlockEditor, EditTarget, EditorEvent};
 use crate::field::Goal;
 use crate::line_input::{LineInput, LineInputEvent};
@@ -191,6 +191,9 @@ enum Item {
     },
     /// The end of the loaded days; older ones load when it comes into view.
     JournalEnd,
+    /// The end of the feed (FR-1.2): the oldest daily page is loaded, so no older day
+    /// can hold anything. Drawn instead of [`Item::JournalEnd`].
+    JournalExhausted,
 }
 
 /// A day heading in the feed, kept so the sticky header can find the day at the top of
@@ -216,13 +219,89 @@ struct FeedDay {
     rows: Vec<Item>,
 }
 
+/// Pagination state of the Daily Notes feed (FR-1.2, `journal-feed-pagination`).
+///
+/// The dates are *calendar* days: the feed shows every day from today back to
+/// `shown_through`, written or blank. [`Journal::pages`] counts only the days that own a
+/// page, so the two units stay apart instead of hiding in one counter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Feed {
+    /// The window down to `shown_through` is what is on screen; the row after it asks
+    /// for more when it is laid out.
+    Idle { shown_through: NaiveDate },
+    /// One batch has been asked for and not rebuilt yet: `want_through` is the day the
+    /// next rebuild loads down to. Keeping the request in the state means a second
+    /// layout of the sentinel cannot ask twice.
+    Loading {
+        shown_through: NaiveDate,
+        want_through: NaiveDate,
+    },
+    /// Every calendar day back to the oldest live daily page is loaded, so there is
+    /// nothing older to ask for. Recomputed on each rebuild: a page created or arriving
+    /// by sync re-opens the feed instead of latching it shut.
+    Exhausted { shown_through: NaiveDate },
+}
+
+impl Feed {
+    /// How far back the loaded window reaches.
+    fn shown_through(&self) -> NaiveDate {
+        match *self {
+            Feed::Idle { shown_through }
+            | Feed::Loading { shown_through, .. }
+            | Feed::Exhausted { shown_through } => shown_through,
+        }
+    }
+
+    /// The day a rebuild must load down to (the pending request, if any).
+    fn want_through(&self) -> NaiveDate {
+        match *self {
+            Feed::Loading { want_through, .. } => want_through,
+            Feed::Idle { shown_through } | Feed::Exhausted { shown_through } => shown_through,
+        }
+    }
+
+    /// Ask for the next batch: only from an idle feed, one request at a time.
+    fn request(&self) -> Option<Feed> {
+        match *self {
+            Feed::Idle { shown_through } => Some(
+                match shown_through.checked_sub_days(chrono::Days::new(JOURNAL_BATCH as u64)) {
+                    Some(want_through) => Feed::Loading {
+                        shown_through,
+                        want_through,
+                    },
+                    // Older than any representable date: nothing to load.
+                    None => Feed::Exhausted { shown_through },
+                },
+            ),
+            Feed::Loading { .. } | Feed::Exhausted { .. } => None,
+        }
+    }
+
+    /// Resolve a rebuild that loaded down to `shown_through`, given the oldest live
+    /// daily page (`None`: the graph has no days at all).
+    fn settle(self, shown_through: NaiveDate, oldest: Option<NaiveDate>) -> Feed {
+        match oldest {
+            // The oldest page is inside the loaded window: every older calendar day is
+            // blank, so loading them would only walk back through empty years.
+            Some(oldest) if shown_through <= oldest => Feed::Exhausted { shown_through },
+            None => Feed::Exhausted { shown_through },
+            Some(_) => Feed::Idle { shown_through },
+        }
+    }
+
+    /// The row drawn after the last day asks for more when laid out (only while idle).
+    fn sentinel(&self) -> bool {
+        matches!(self, Feed::Idle { .. })
+    }
+}
+
 /// The Daily Notes feed: today, then every older calendar day, as one editable outline.
 #[derive(Debug, Clone)]
 struct Journal {
-    /// How many days to show; grows as the end of the feed comes into view.
-    limit: usize,
-    days: Vec<PageId>,
-    loading: bool,
+    /// How much of the calendar is loaded, and whether a batch is pending.
+    feed: Feed,
+    /// The days with a page, newest first (fewer than the calendar days loaded).
+    pages: Vec<PageId>,
     /// Each day's Linked References, valid for one `refs_version`.
     refs: HashMap<PageId, LinkedRefs>,
     refs_version: u64,
@@ -429,8 +508,18 @@ impl PageView {
                     || this
                         .journal
                         .as_ref()
-                        .is_some_and(|j| j.days.iter().any(|d| e.pages.contains(d)));
+                        .is_some_and(|j| j.pages.iter().any(|d| e.pages.contains(d)));
                 if e.structural || e.pages.is_empty() || shown || this.has_embeds() {
+                    this.dirty = true;
+                    cx.notify();
+                }
+            }),
+            // A promoted draft merged into the day's page (FR-1.2): this view may be
+            // showing the discarded id, so follow the page that owns the day.
+            cx.subscribe(&app, |this, _, e: &PageReplaced, cx| {
+                if this.page.as_ref() == Some(&e.from) {
+                    this.page = Some(e.to.clone());
+                    this.refs_key = None;
                     this.dirty = true;
                     cx.notify();
                 }
@@ -528,10 +617,14 @@ impl PageView {
     /// page newest first, each editable in place. Days are never created by scrolling past
     /// them (FR-1.2).
     pub fn open_journal(&mut self, today: PageId, cx: &mut Context<Self>) {
+        // The first window is the last `JOURNAL_BATCH` calendar days, today included.
+        let today_date = self.app.read(cx).store.today();
+        let shown_through = today_date
+            .checked_sub_days(chrono::Days::new((JOURNAL_BATCH - 1) as u64))
+            .unwrap_or(today_date);
         self.journal = Some(Journal {
-            limit: JOURNAL_BATCH,
-            days: Vec::new(),
-            loading: false,
+            feed: Feed::Idle { shown_through },
+            pages: Vec::new(),
             refs: HashMap::new(),
             refs_version: 0,
         });
@@ -555,12 +648,19 @@ impl PageView {
         self.journal.is_some()
     }
 
-    /// Days in the Daily Notes feed, newest first (empty outside the feed).
+    /// Days in the Daily Notes feed that own a page, newest first (empty outside the
+    /// feed). Blank calendar days are loaded but have no page; use
+    /// [`Self::journal_shown_through`] for how far back the window reaches.
     pub fn journal_days(&self) -> Vec<PageId> {
         self.journal
             .as_ref()
-            .map(|j| j.days.clone())
+            .map(|j| j.pages.clone())
             .unwrap_or_default()
+    }
+
+    /// The oldest calendar day the feed has loaded (FR-1.2), `None` outside the feed.
+    pub fn journal_shown_through(&self) -> Option<NaiveDate> {
+        self.journal.as_ref().map(|j| j.feed.shown_through())
     }
 
     /// The day heading pinned to the top of the feed at the current scroll offset
@@ -652,17 +752,21 @@ impl PageView {
                                 .page_state(&page)
                                 .map(|st| outline::append_block(st, Some(z)));
                             plan.and_then(|p| app.store.execute_plan(&page, p, None))
-                                .map(|f| f.map(|f| f.block))
+                                .map(|f| f.map(|f| (f.block, true)))
                         }
-                        None => start_note(&mut app.store, &page).map(Some),
+                        None => start_note(&mut app.store, &page).map(|n| Some((n.block, n.wrote))),
+                    };
+                    let structural = match &r {
+                        Ok(Some((_, wrote))) => *wrote,
+                        _ => true,
                     };
                     let b = app.report(r).flatten();
-                    app.changed(vec![page.clone()], true, cx);
+                    app.changed(vec![page.clone()], structural, cx);
                     b
                 });
                 self.rebuild(cx);
                 match created {
-                    Some(b) => b,
+                    Some((block, _)) => block,
                     None => return,
                 }
             }
@@ -726,7 +830,7 @@ impl PageView {
                 // until it is the editor's target. Find the page that holds it so `edit` can
                 // open the attribute's path around it (search results, backlinks, undo).
                 let pages: Vec<PageId> = match &self.journal {
-                    Some(j) => j.days.clone(),
+                    Some(j) => j.pages.clone(),
                     None => self.page.iter().cloned().collect(),
                 };
                 pages.into_iter().find(|p| {
@@ -917,11 +1021,14 @@ impl PageView {
             self.day_headings.clear();
         }
         let Some(page) = self.page.clone() else {
+            // A feed always has a page (`open_journal` → `show`), and its state is kept
+            // as it is: clearing it here would drop a batch that is already in flight.
+            debug_assert!(self.journal.is_none(), "a feed without a page");
             self.replace_items(Vec::new(), cx);
             return;
         };
-        if let Some(limit) = self.journal.as_ref().map(|j| j.limit) {
-            self.rebuild_journal(page, limit, cx);
+        if let Some(feed) = self.journal.as_ref().map(|j| j.feed.clone()) {
+            self.rebuild_journal(page, feed.want_through(), cx);
             return;
         }
         let zoom = self.zoom.clone();
@@ -1085,7 +1192,8 @@ impl PageView {
         cx.notify();
     }
 
-    fn rebuild_journal(&mut self, today: PageId, limit: usize, cx: &mut Context<Self>) {
+    /// Rebuild the feed's outline for the calendar window down to `want_through`.
+    fn rebuild_journal(&mut self, today: PageId, want_through: NaiveDate, cx: &mut Context<Self>) {
         let open_embeds = self.open_embeds.clone();
         let compact_attributes = self.attributes_are_compact();
         let editing = self.editing_block(cx.entity_id(), cx);
@@ -1094,14 +1202,19 @@ impl PageView {
             Some(j) if j.refs_version == refs_version => std::mem::take(&mut j.refs),
             _ => HashMap::new(),
         };
-        let (header, days, today_date) = self.app.update(cx, |app, _| {
+        let (header, days, today_date, shown_through, oldest) = self.app.update(cx, |app, _| {
             let collapsed = app.store.collapsed_set().clone();
             let fmt = app.store.date_format().clone();
             let today_date = app.store.today();
-            let from = today_date
-                .checked_sub_days(chrono::Days::new(limit.saturating_sub(1) as u64))
-                .unwrap_or(today_date);
+            // The requested window is absolute, so a rebuild never grows it by accident.
+            let from = want_through.min(today_date);
             let mut pages = app.store.days_between(from, today_date).unwrap_or_default();
+            // The feed stops at the oldest daily page (FR-1.2). `oldest_daily` is one seek
+            // on the partial `page_daily_uq` index, not a scan. A failed read is reported
+            // and leaves the feed idle rather than claiming there is nothing older; the
+            // sentinel then re-requests a batch per frame until the store recovers. That is
+            // the chosen degradation: nothing is written and the error is in `last_error`.
+            let oldest = app.report(app.store.oldest_daily());
             // Today comes from the caller (its draft), not the index, which may lag.
             pages.insert(today_date, today.clone());
             let mut header = Header {
@@ -1153,7 +1266,7 @@ impl PageView {
                     _ => break,
                 }
             }
-            (header, days, today_date)
+            (header, days, today_date, from, oldest)
         });
         self.header = header;
         let mut items = Vec::new();
@@ -1224,13 +1337,24 @@ impl PageView {
                 headings[h].end = items.len();
             }
         }
-        items.push(Item::JournalEnd);
+        // A rebuild resolves the window it just loaded into a terminal or open state.
+        // A read error stays `Idle`, so the next rebuild tries again instead of the feed
+        // claiming there are no earlier notes.
+        let next_feed = match (self.journal.as_ref(), oldest) {
+            (Some(j), Some(oldest)) => j.feed.clone().settle(shown_through, oldest),
+            (Some(_), None) | (None, _) => Feed::Idle { shown_through },
+        };
+        items.push(if next_feed.sentinel() {
+            Item::JournalEnd
+        } else {
+            Item::JournalExhausted
+        });
         self.day_headings = headings;
         if let Some(j) = &mut self.journal {
-            j.days = ids;
-            j.loading = false;
+            j.pages = ids;
             j.refs = refs_cache;
             j.refs_version = refs_version;
+            j.feed = next_feed;
         }
         self.replace_items(items, cx);
     }
@@ -1270,14 +1394,11 @@ impl PageView {
 
     /// Load the next batch of older days into the feed (once per batch).
     fn load_older_days(&mut self, cx: &mut Context<Self>) {
-        if let Some(j) = &mut self.journal {
-            if !j.loading {
-                j.loading = true;
-                j.limit += JOURNAL_BATCH;
-                self.dirty = true;
-                cx.notify();
-            }
-        }
+        let Some(j) = &mut self.journal else { return };
+        let Some(next) = j.feed.request() else { return };
+        j.feed = next;
+        self.dirty = true;
+        cx.notify();
     }
 
     /// Start writing on a feed day with nothing on it: a draft until the first keystroke
@@ -1285,11 +1406,17 @@ impl PageView {
     fn start_day(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
         let target = self.app.update(cx, |app, cx| {
             let r = app.store.draft_daily(date).and_then(|page| {
-                let block = start_note(&mut app.store, &page)?;
-                Ok((page, block))
+                let note = start_note(&mut app.store, &page)?;
+                Ok((page, note))
             });
-            let t = app.report(r);
-            app.changed(Vec::new(), true, cx);
+            // The click writes nothing on a draft, so only a real write is structural
+            // (an index flush for a commit that does not exist is a wasted cycle).
+            let structural = match &r {
+                Ok((_, note)) => note.wrote,
+                Err(_) => true,
+            };
+            let t = app.report(r).map(|(page, note)| (page, note.block));
+            app.changed(Vec::new(), structural, cx);
             t
         });
         self.rebuild(cx);
@@ -2047,7 +2174,8 @@ impl PageView {
         let page = self.app.update(cx, |app, cx| {
             let r = app.store.draft_daily(d);
             let p = app.report(r);
-            app.changed(Vec::new(), true, cx);
+            // A visit writes nothing (FR-1.2): no structural change, no index flush.
+            app.changed(Vec::new(), false, cx);
             p
         });
         if let Some(page) = page {
@@ -3577,6 +3705,15 @@ impl PageView {
                     .child("Loading older days…")
                     .into_any_element()
             }
+            Item::JournalExhausted => div()
+                .debug_selector(|| "feed-end".into())
+                .px_4()
+                .pt_8()
+                .pb_6()
+                .text_size(px(crate::theme::BODY_SIZE))
+                .text_color(th.faint)
+                .child("No earlier notes.")
+                .into_any_element(),
             Item::RefsHeader { title, count } => div()
                 .debug_selector(|| "refs-header".into())
                 .mt_6()
@@ -3795,13 +3932,21 @@ impl PageView {
     }
 }
 
+/// What "Click to start writing" did: the block the caret goes to, and whether the store
+/// now has a write coming. Starting a draft (FR-1.2) writes nothing, so its caller must not
+/// report a structural change and force an index flush.
+struct StartedNote {
+    block: BlockId,
+    wrote: bool,
+}
+
 /// The block a "Click to start writing" prompt writes into (FR-1.2): a new root block after
 /// whatever the page already has. Not `ensure_first_block` alone — on a page whose only
 /// blocks are attributes that hands back the attribute, and typing rewrites its key (PG-1).
 fn start_note(
     store: &mut utopia_store::Store,
     page: &PageId,
-) -> Result<BlockId, utopia_store::StoreError> {
+) -> Result<StartedNote, utopia_store::StoreError> {
     let (reuse, has_roots) = {
         let st = store.page_state(page)?;
         let roots = st.live_roots();
@@ -3814,15 +3959,24 @@ fn start_note(
         (reuse, !roots.is_empty())
     };
     if let Some(block) = reuse {
-        return Ok(block);
+        return Ok(StartedNote {
+            block,
+            wrote: false,
+        });
     }
     if store.is_draft(page) {
         // A journal template already gave the draft blocks: adding the row the caret goes
         // to must not write the day, so it lives in the draft's memory until a keystroke.
-        return store.draft_append_block(page);
+        return Ok(StartedNote {
+            block: store.draft_append_block(page)?,
+            wrote: false,
+        });
     }
     if !has_roots {
-        return store.ensure_first_block(page);
+        return Ok(StartedNote {
+            block: store.ensure_first_block(page)?,
+            wrote: true,
+        });
     }
     // The borrow of the shard ends here, before the write.
     let after = store.page_state(page)?.last_child(None, false);
@@ -3841,7 +3995,10 @@ fn start_note(
             ..Default::default()
         },
     )?;
-    Ok(id)
+    Ok(StartedNote {
+        block: id,
+        wrote: true,
+    })
 }
 
 /// PG-1's one classification of page metadata: a root `key:: value` block is an attribute,
@@ -4312,6 +4469,83 @@ fn human_size(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-1.2: a laid-out sentinel asks for exactly one batch. A second layout before the
+    /// rebuild runs must not ask again — the pending request lives in the state, so there
+    /// is no separate `loading` flag to leave behind. The request moves the window by
+    /// *calendar* days, not by pages: a blank day has no page to count
+    /// (journal-feed-pagination, "two units for how much is loaded").
+    #[test]
+    fn feed_requests_one_batch_at_a_time() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        let shown = today - chrono::Duration::days(JOURNAL_BATCH as i64 - 1);
+        let idle = Feed::Idle {
+            shown_through: shown,
+        };
+        assert!(idle.sentinel(), "an idle feed draws its end row");
+        let loading = idle.request().expect("an idle feed asks for more");
+        assert_eq!(
+            loading,
+            Feed::Loading {
+                shown_through: shown,
+                want_through: shown - chrono::Duration::days(JOURNAL_BATCH as i64),
+            }
+        );
+        assert_eq!(
+            loading.want_through(),
+            shown - chrono::Duration::days(JOURNAL_BATCH as i64)
+        );
+        assert_eq!(
+            loading.shown_through(),
+            shown,
+            "nothing moves until the rebuild"
+        );
+        assert_eq!(
+            (shown - loading.want_through()).num_days(),
+            JOURNAL_BATCH as i64,
+            "one request moves the calendar window by a batch, pages or not"
+        );
+        assert_eq!(loading.request(), None, "one request in flight at a time");
+        assert!(!loading.sentinel());
+    }
+
+    /// FR-1.2: the feed is exhausted once the oldest daily page is inside the loaded
+    /// window. `settle` recomputes it from the store on every rebuild, so a page created
+    /// or synced in later re-opens the feed rather than latching it shut.
+    #[test]
+    fn feed_exhausts_at_the_oldest_daily_page() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        let shown = today - chrono::Duration::days(29);
+        let idle = Feed::Idle {
+            shown_through: shown,
+        };
+        // Older pages exist beyond the window: keep the sentinel.
+        let older = idle
+            .clone()
+            .settle(shown, Some(today - chrono::Duration::days(40)));
+        assert_eq!(older, idle);
+        assert!(older.sentinel());
+        // The oldest page is at or inside the window: no older calendar day can hold
+        // anything, so the sentinel goes away.
+        for oldest in [shown, today] {
+            let next = idle.clone().settle(shown, Some(oldest));
+            assert_eq!(
+                next,
+                Feed::Exhausted {
+                    shown_through: shown
+                }
+            );
+            assert!(!next.sentinel());
+            assert_eq!(next.request(), None, "an exhausted feed asks for nothing");
+        }
+        assert_eq!(
+            idle.settle(shown, None),
+            Feed::Exhausted {
+                shown_through: shown
+            },
+            "a graph with no daily page at all is exhausted too"
+        );
+    }
 
     /// PG-5: a fenced code block's first line is its language, shown as the card's label.
     /// Anything else stays the first line of code, so a block of real code is never eaten.

@@ -24,7 +24,7 @@ use crate::page_view::{PageView, PageViewEvent};
 use crate::pdf_view::{PdfEvent, PdfView};
 use crate::quick_jump::{JumpPalette, PaletteMode, QuickJumpEvent};
 use crate::sync_runner::{
-    exchange_owned, status_line, sync_dot, BoxTransport, SyncDot, SyncRunner,
+    exchange_owned, status_line, sync_dot, BoxTransport, SyncDot, SyncPhase, SyncRunner,
 };
 use crate::theme::{quiet_control, theme};
 
@@ -494,41 +494,55 @@ impl Workspace {
         if let Some(n) = nudge {
             runner.nudge = n;
         }
+        let generation = runner.generation;
+        // Installing the runner drops the previous one, and with it the previous loop's
+        // task: one runner, one loop. The generation below is the second guard, for a loop
+        // that is already past an await when this new runner arrives.
         self.sync = Some(runner);
-        self._tasks.push(cx.spawn(async move |this, cx| loop {
+        let task = cx.spawn(async move |this, cx| loop {
             let wait = this.update(cx, |this, _| {
-                this.sync.as_ref().map(|s| (s.interval, s.nudge.clone()))
+                this.sync
+                    .as_ref()
+                    .filter(|s| s.is_generation(generation))
+                    .map(|s| {
+                        // §12.6: a refused relay gets the slow cadence and no notice-driven
+                        // rounds, but it is retried, so a transient refusal heals.
+                        let refused = matches!(s.phase, SyncPhase::Refused { .. });
+                        (s.interval, s.nudge.clone(), refused)
+                    })
             });
-            let Ok(Some((interval, nudge))) = wait else {
+            let Ok(Some((interval, nudge, refused))) = wait else {
                 break;
             };
-            // Poll interval, cut short by a realtime notice.
+            // Poll interval, cut short by a realtime notice — except while refused, where a
+            // notice must not bring the fast polling back.
             let mut waited = Duration::ZERO;
             while waited < interval {
                 let step = Duration::from_millis(250).min(interval - waited);
                 cx.background_executor().timer(step).await;
                 waited += step;
-                if nudge.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                if !refused && nudge.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
             }
             // 1. Gather pushes on the UI thread (short store reads).
             let prepared = this.update(cx, |this, cx| {
                 let Workspace { app, sync, .. } = this;
-                let runner = sync.as_mut()?;
-                let transport = runner.transport.take()?;
+                let runner = sync.as_mut().filter(|r| r.is_generation(generation))?;
+                let transport = runner.begin_round()?;
                 // The footer's dot says "syncing" from now until the exchange returns; ask
                 // for the frame now, or an idle window keeps last round's green (SB-4).
                 cx.notify();
                 let out = app.update(cx, |app, _| runner.engine.prepare(&mut app.store));
                 match out {
-                    Ok(out) => Some((out, transport)),
+                    Ok(out) => {
+                        runner.exchange();
+                        Some((out, transport))
+                    }
                     Err(e) => {
-                        runner.transport = Some(transport);
-                        runner.status = Some(utopia_sync::SyncStatus::from_result(
-                            &Err(e),
-                            &app.read(cx).store,
-                        ));
+                        let status =
+                            utopia_sync::SyncStatus::from_result(&Err(e), &app.read(cx).store);
+                        runner.round_failed(transport, status);
                         None
                     }
                 }
@@ -545,8 +559,10 @@ impl Workspace {
             // 3. Import on the UI thread and announce merges.
             let applied = this.update(cx, |this, cx| {
                 let Workspace { app, sync, .. } = this;
-                let Some(runner) = sync.as_mut() else { return };
-                runner.transport = Some(transport);
+                let Some(runner) = sync.as_mut().filter(|r| r.is_generation(generation)) else {
+                    return;
+                };
+                runner.exchange_returned();
                 let report = match result {
                     Ok(inc) => app.update(cx, |app, cx| {
                         let r = runner.engine.apply(&mut app.store, inc);
@@ -570,17 +586,19 @@ impl Workspace {
                         ));
                     }
                 }
-                runner.interval = runner.next_interval(&report);
-                runner.status = Some(utopia_sync::SyncStatus::from_result(
-                    &report,
-                    &app.read(cx).store,
-                ));
+                let status = utopia_sync::SyncStatus::from_result(&report, &app.read(cx).store);
+                runner.end_round(transport, &report, status);
                 cx.notify();
             });
             if applied.is_err() {
                 break;
             }
-        }));
+        });
+        if let Some(runner) = self.sync.as_mut() {
+            if runner.is_generation(generation) {
+                runner.loop_task = Some(task);
+            }
+        }
         cx.notify();
         true
     }
@@ -613,7 +631,15 @@ impl Workspace {
 
     /// Current sync status, if sync is enabled.
     pub fn sync_status(&self) -> Option<utopia_sync::SyncStatus> {
-        self.sync.as_ref().and_then(|s| s.status.clone())
+        self.sync.as_ref().and_then(|s| s.last.clone())
+    }
+
+    /// The round's phase, if sync is enabled: which half of a round is running and where the
+    /// transport is. The dot is derived from the same field (`sync_dot`), but the dot alone
+    /// cannot tell "connecting" from "an exchange in flight" (both are amber); tests that
+    /// need that distinction read the phase.
+    pub fn sync_phase(&self) -> Option<&SyncPhase> {
+        self.sync.as_ref().map(|s| &s.phase)
     }
 
     /// The shared block editor (startup/latency probe).
@@ -1258,7 +1284,9 @@ impl Workspace {
         let page = self.app.update(cx, |app, cx| {
             let r = app.store.draft_daily(today);
             let p = app.report(r);
-            app.changed(Vec::new(), true, cx);
+            // A visit writes nothing (a draft, or a page already there): no structural
+            // change, so no synchronous index flush (FR-1.2).
+            app.changed(Vec::new(), false, cx);
             p
         });
         let Some(page) = page else { return };
@@ -1282,6 +1310,11 @@ impl Workspace {
         self.main.read(cx).journal_days()
     }
 
+    /// The oldest calendar day the feed has loaded (FR-1.2); `None` outside the feed.
+    pub fn journal_shown_through(&self, cx: &gpui::App) -> Option<NaiveDate> {
+        self.main.read(cx).journal_shown_through()
+    }
+
     /// The date whose heading is pinned at the top of the feed (DN-3), for scripts.
     pub fn main_sticky_day(&self, cx: &gpui::App) -> Option<NaiveDate> {
         self.main.read(cx).sticky_day()
@@ -1303,7 +1336,9 @@ impl Workspace {
         let page = self.app.update(cx, |app, cx| {
             let r = app.store.draft_daily(d);
             let p = app.report(r);
-            app.changed(Vec::new(), true, cx);
+            // A visit writes nothing (FR-1.2): the caret's own block, if one has to be
+            // created, reports its write from `focus_first`.
+            app.changed(Vec::new(), false, cx);
             p
         });
         if let Some(page) = page {
@@ -2082,7 +2117,7 @@ impl Workspace {
         let th = theme(cx).clone();
         let (line, warn) = match &self.sync {
             None => ("Off — this graph stays on this machine.".to_string(), false),
-            Some(runner) => status_line(runner.status.as_ref(), self.app.read(cx).store.now()),
+            Some(runner) => status_line(runner, self.app.read(cx).store.now()),
         };
         let target = self
             .sync_target

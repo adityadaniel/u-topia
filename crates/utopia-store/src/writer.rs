@@ -103,10 +103,36 @@ pub(crate) fn write_job(conn: &mut Connection, job: &Job) -> Result<HashSet<Page
     Ok(work.changed)
 }
 
-#[derive(Default)]
+/// The writer's health, explicit (store-commit-pipeline): a failed commit is a state the
+/// store stays in until `Store::sync_index` has reconciled the shards and resubmitted
+/// them. It is not a one-shot string that the next reader may take.
+enum WriterState {
+    Healthy,
+    Failed { error: String },
+}
+
 struct Progress {
+    /// Highest job sequence whose transaction committed. Never advances on failure, so a
+    /// ticket that asks for an uncommitted job cannot mistake it for durable.
     completed: u64,
-    error: Option<String>,
+    /// Highest job sequence the writer has accounted for (committed, failed or dropped).
+    /// Tickets wait on this: a job dropped after a failure must not leave a waiter hanging.
+    processed: u64,
+    /// Jobs at or below this sequence were submitted before a repair and are never written
+    /// (their base may be the job that failed).
+    stale_through: u64,
+    state: WriterState,
+}
+
+impl Default for Progress {
+    fn default() -> Self {
+        Self {
+            completed: 0,
+            processed: 0,
+            stale_through: 0,
+            state: WriterState::Healthy,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -128,6 +154,63 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    fn failure(&self) -> Option<String> {
+        let p = self.progress.lock().ok()?;
+        match &p.state {
+            WriterState::Healthy => None,
+            WriterState::Failed { error } => Some(error.clone()),
+        }
+    }
+
+    fn completed(&self) -> u64 {
+        self.progress.lock().map_or(0, |p| p.completed)
+    }
+
+    fn fail(&self, error: String) {
+        if let Ok(mut p) = self.progress.lock() {
+            p.state = WriterState::Failed { error };
+        }
+        self.cv.notify_all();
+    }
+
+    fn commit(&self, seq: u64) {
+        if let Ok(mut p) = self.progress.lock() {
+            p.completed = seq;
+            p.processed = p.processed.max(seq);
+        }
+        self.cv.notify_all();
+    }
+
+    /// Decide one dequeued job: `true` means drop it unwritten. Jobs submitted before the
+    /// last repair are stale by sequence; so is everything while the writer is failed.
+    /// Either way the job counts as processed, so nobody waits for it forever.
+    fn skip(&self, seq: u64) -> bool {
+        let mut skipped = true;
+        if let Ok(mut p) = self.progress.lock() {
+            skipped = p.stale_through >= seq || matches!(p.state, WriterState::Failed { .. });
+            if skipped {
+                p.processed = p.processed.max(seq);
+            }
+        }
+        if skipped {
+            self.cv.notify_all();
+        }
+        skipped
+    }
+
+    /// Mark the writer healthy again after `Store` requeued the shards as snapshots.
+    /// Everything submitted up to `through` is stale and must not be written: its base may
+    /// be the job that failed. `processed` jumps to `through` so a repair that has nothing
+    /// to requeue cannot leave a ticket waiting on a job that will never run.
+    fn clear_failure(&self, through: u64) {
+        if let Ok(mut p) = self.progress.lock() {
+            p.state = WriterState::Healthy;
+            p.stale_through = p.stale_through.max(through);
+            p.processed = p.processed.max(through);
+        }
+        self.cv.notify_all();
+    }
+
     /// Update the published tag-page classification after a commit (SB-2). Only the pages
     /// the commit wrote and the destinations whose reference edges it changed can flip:
     /// losing the last reference to a page removes that edge, so it is one of
@@ -189,26 +272,34 @@ pub struct WriteTicket {
 }
 
 impl WriteTicket {
+    /// Whether there is nothing left to wait for: the job committed or the writer failed.
     pub fn is_done(&self) -> bool {
         self.shared.as_ref().is_none_or(|s| {
-            s.progress
-                .lock()
-                .map_or(true, |p| p.completed >= self.target)
+            s.progress.lock().map_or(true, |p| {
+                p.completed >= self.target || matches!(p.state, WriterState::Failed { .. })
+            })
         })
     }
 
-    /// Block until the writer has committed every job up to this ticket.
-    pub fn wait(&self) {
-        let Some(s) = &self.shared else { return };
-        let mut p = match s.progress.lock() {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        while p.completed < self.target && p.error.is_none() {
-            p = match s.cv.wait(p) {
-                Ok(p) => p,
-                Err(_) => return,
-            };
+    /// Block until the writer has committed every job up to this ticket, or report the
+    /// failure that stopped it. The failure is *not* consumed: the store stays failed
+    /// until it has been repaired (store-commit-pipeline issue 1).
+    pub fn wait(&self) -> Result<()> {
+        let Some(s) = &self.shared else { return Ok(()) };
+        let mut p = s
+            .progress
+            .lock()
+            .map_err(|_| StoreError::Writer("writer lock poisoned".into()))?;
+        loop {
+            if let WriterState::Failed { error } = &p.state {
+                return Err(StoreError::Writer(error.clone()));
+            }
+            if p.processed >= self.target {
+                return Ok(());
+            }
+            p =
+                s.cv.wait(p)
+                    .map_err(|_| StoreError::Writer("writer lock poisoned".into()))?;
         }
     }
 }
@@ -216,6 +307,7 @@ impl WriteTicket {
 pub(crate) enum Persister {
     Inline {
         shared: Arc<Shared>,
+        submitted: u64,
     },
     Thread {
         tx: Sender<Msg>,
@@ -226,10 +318,17 @@ pub(crate) enum Persister {
 }
 
 impl Persister {
+    fn shared(&self) -> &Arc<Shared> {
+        match self {
+            Persister::Inline { shared, .. } | Persister::Thread { shared, .. } => shared,
+        }
+    }
+
     /// Writes on the caller's thread (in-memory graphs, tests, the CLI).
     pub fn inline() -> Self {
         Persister::Inline {
             shared: Arc::new(Shared::default()),
+            submitted: 0,
         }
     }
 
@@ -247,18 +346,25 @@ impl Persister {
                 for msg in rx {
                     match msg {
                         Msg::Job(seq, job) => {
+                            // A failed writer must not process later jobs (issue 8), and
+                            // jobs submitted before a repair are stale even after it clears
+                            // the failure: their update builds on a snapshot that never
+                            // landed. They are dropped; `Store::sync_index` rewrites the
+                            // shards whole.
+                            if s2.skip(seq) {
+                                continue;
+                            }
                             let r = write_job(&mut conn, &job);
                             if let Ok(referenced_before) = &r {
                                 s2.publish_tag_pages(&conn, &job, referenced_before);
                             }
-                            if let Ok(mut p) = s2.progress.lock() {
-                                p.completed = seq;
-                                if let Err(e) = r {
+                            match r {
+                                Ok(_) => s2.commit(seq),
+                                Err(e) => {
                                     eprintln!("utopia: commit failed: {e}");
-                                    p.error.get_or_insert(e.to_string());
+                                    s2.fail(e.to_string());
                                 }
                             }
-                            s2.cv.notify_all();
                         }
                         Msg::Stop => break,
                     }
@@ -272,12 +378,27 @@ impl Persister {
         })
     }
 
-    pub fn submit(&mut self, conn: &mut Connection, job: Job) -> Result<()> {
+    /// Hand a job to the writer and return its sequence number. A failed writer accepts no
+    /// jobs until it has been repaired (issue 8).
+    pub fn submit(&mut self, conn: &mut Connection, job: Job) -> Result<u64> {
+        if let Some(e) = self.shared().failure() {
+            return Err(StoreError::Writer(e));
+        }
         match self {
-            Persister::Inline { shared } => {
-                let referenced_before = write_job(conn, &job)?;
-                shared.publish_tag_pages(conn, &job, &referenced_before);
-                Ok(())
+            Persister::Inline { shared, submitted } => {
+                *submitted += 1;
+                let seq = *submitted;
+                match write_job(conn, &job) {
+                    Ok(referenced_before) => {
+                        shared.publish_tag_pages(conn, &job, &referenced_before);
+                        shared.commit(seq);
+                        Ok(seq)
+                    }
+                    Err(e) => {
+                        shared.fail(e.to_string());
+                        Err(e)
+                    }
+                }
             }
             Persister::Thread {
                 tx,
@@ -288,48 +409,57 @@ impl Persister {
                 *submitted += 1;
                 if tx.send(Msg::Job(*submitted, job)).is_err() {
                     // The writer is gone; make waiters return instead of hanging.
-                    if let Ok(mut p) = shared.progress.lock() {
-                        p.error.get_or_insert("writer thread stopped".into());
-                    }
-                    shared.cv.notify_all();
+                    shared.fail("writer thread stopped".into());
                     return Err(StoreError::Writer("writer thread stopped".into()));
                 }
-                Ok(())
+                Ok(*submitted)
             }
         }
     }
 
     pub fn ticket(&self) -> WriteTicket {
-        match self {
-            Persister::Inline { .. } => WriteTicket {
-                shared: None,
-                target: 0,
-            },
-            Persister::Thread {
-                shared, submitted, ..
-            } => WriteTicket {
-                shared: Some(shared.clone()),
-                target: *submitted,
-            },
+        let shared = self.shared();
+        let target = match self {
+            Persister::Inline { submitted, .. } | Persister::Thread { submitted, .. } => *submitted,
+        };
+        WriteTicket {
+            shared: Some(shared.clone()),
+            target,
         }
+    }
+
+    /// The failure that stopped the writer, if it is still failed.
+    pub fn failure(&self) -> Option<StoreError> {
+        self.shared().failure().map(StoreError::Writer)
+    }
+
+    /// Highest job sequence that actually committed.
+    pub fn completed(&self) -> u64 {
+        self.shared().completed()
+    }
+
+    /// Mark the writer healthy again, after `Store` has queued a full rewrite of every
+    /// shard whose durable copy lagged. Nothing submitted before this point will be
+    /// written, so the requeued snapshots are the source of truth.
+    pub fn clear_failure(&self) {
+        let through = match self {
+            Persister::Inline { submitted, .. } | Persister::Thread { submitted, .. } => *submitted,
+        };
+        self.shared().clear_failure(through);
     }
 
     /// The tag-page classification published by the last commit, if any (SB-2).
     pub fn tag_pages(&self) -> Option<HashSet<PageId>> {
-        let shared = match self {
-            Persister::Inline { shared } => shared,
-            Persister::Thread { shared, .. } => shared,
-        };
-        shared.tag_pages.lock().ok().and_then(|slot| slot.clone())
+        self.shared()
+            .tag_pages
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     /// How many per-page tag classifications the incremental path has run (tests, SB-2).
     pub fn tag_classifications(&self) -> u64 {
-        let shared = match self {
-            Persister::Inline { shared } => shared,
-            Persister::Thread { shared, .. } => shared,
-        };
-        shared
+        self.shared()
             .tag_classifications
             .load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -339,37 +469,20 @@ impl Persister {
     /// commit wrote plus the destinations whose ref edges it changed, never the whole
     /// published set.
     pub fn tag_pages_visited(&self) -> u64 {
-        let shared = match self {
-            Persister::Inline { shared } => shared,
-            Persister::Thread { shared, .. } => shared,
-        };
-        shared
+        self.shared()
             .tag_pages_visited
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn tag_scans(&self) -> u64 {
-        let shared = match self {
-            Persister::Inline { shared } => shared,
-            Persister::Thread { shared, .. } => shared,
-        };
-        shared.tag_scans.load(std::sync::atomic::Ordering::Relaxed)
+        self.shared()
+            .tag_scans
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Wait for every submitted job; report (and clear) the first failure.
+    /// Wait for every submitted job; report the failure, which stays set until repaired.
     pub fn wait(&self) -> Result<()> {
-        let Persister::Thread { shared, .. } = self else {
-            return Ok(());
-        };
-        self.ticket().wait();
-        let mut p = shared
-            .progress
-            .lock()
-            .map_err(|_| StoreError::Writer("writer lock poisoned".into()))?;
-        match p.error.take() {
-            Some(e) => Err(StoreError::Writer(e)),
-            None => Ok(()),
-        }
+        self.ticket().wait()
     }
 
     pub fn stop(&mut self) {
@@ -379,5 +492,37 @@ impl Persister {
                 let _ = h.join();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review P2: a job submitted before the repair (while `submit` still saw a healthy
+    /// writer) must not run after `clear_failure`; only jobs submitted after it may.
+    #[test]
+    fn jobs_submitted_before_a_repair_are_stale() {
+        let shared = Arc::new(Shared::default());
+        shared.fail("boom".into());
+        assert!(shared.skip(1), "a failed writer drops queued jobs");
+        assert_eq!(shared.completed(), 0, "a dropped job is not durable");
+
+        let ticket = WriteTicket {
+            shared: Some(shared.clone()),
+            target: 2,
+        };
+        assert!(ticket.wait().is_err(), "a failed writer reports the error");
+
+        shared.clear_failure(2);
+        assert_eq!(shared.failure(), None);
+        assert!(shared.skip(2), "submitted before the repair: stale");
+        assert!(!shared.skip(3), "the repair job itself is written");
+        // Nothing was written for job 2, but the writer has accounted for it; a waiter on
+        // the pre-repair target must not hang.
+        ticket.wait().expect("a processed job releases its ticket");
+
+        shared.commit(3);
+        assert_eq!(shared.completed(), 3);
     }
 }

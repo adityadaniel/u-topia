@@ -1,5 +1,63 @@
 # Daily Notes feed: loading older days
 
+## Status
+
+Implemented on `fix/journal-feed-pagination`. The machine is now an explicit `Feed`
+enum in `crates/utopia-ui/src/page_view.rs`:
+
+```rust
+enum Feed {
+    Idle { shown_through: NaiveDate },
+    Loading { shown_through: NaiveDate, want_through: NaiveDate },
+    Exhausted { shown_through: NaiveDate },
+}
+```
+
+`Journal` holds `feed` (calendar days) and `pages` (the days that own a page, renamed
+from `days`), so the two units are separate named fields instead of one `limit` counter.
+`PageView::journal_shown_through` / `Workspace::journal_shown_through` expose the
+calendar window for scripts; `journal_days` remains the page list. The file:line table
+and the transition list below describe `main` before this change.
+
+- **Issue 1, unbounded growth and no terminal state — fixed.** A rebuild asks
+  `Store::oldest_daily` (oldest stored daily page; drafts and trashed days are excluded,
+  so visiting an old date does not extend the feed) and `Feed::settle` returns
+  `Exhausted` once that day is inside the loaded window.
+  `Exhausted` never requests another batch and draws "No earlier notes." (debug selector
+  `feed-end`) instead of the "Loading older days…" sentinel. The state is recomputed on
+  every rebuild, so a page created or synced in later re-opens the feed instead of
+  latching it shut. Tests: `fr_1_1_feed_stops_at_the_oldest_daily_page`,
+  `fr_1_2_visited_day_does_not_extend_the_feed` (`crates/utopia-ui/tests/workspace.rs`),
+  `fr_1_2_oldest_daily_page_bounds_the_feed` (`crates/utopia-store/tests/acceptance.rs`),
+  and `feed_exhausts_at_the_oldest_daily_page` (unit). Deliberate behaviour change:
+  scrolling no longer walks back through blank days older than the oldest daily page;
+  use the calendar, a `[[date]]` link or Cmd+Shift+D to reach such a day — but only a day
+  written that way moves the feed's floor, not a bare visit (FR-1.2). That is what
+  `Exhausted` means (FR-1.2 still lists every calendar day back to the oldest note).
+  The window still ends on a `JOURNAL_BATCH` boundary, so up to nine blank folded days
+  can follow the oldest note (the tail of the batch that reached it); that is the blank
+  canvas DN-1 draws, not another request. Trimming it would delete the folded days
+  `feed_folds_empty_days_to_one_row` requires and shrink a fresh graph's feed to today
+  and yesterday after the first keystroke.
+- **Issue 2, two units for "how much is loaded" — fixed by naming.** `Feed` dates count
+  calendar days; `Journal::pages` is the page list, which is never longer than the
+  window. Test: `feed_requests_one_batch_at_a_time` (the request moves the calendar
+  window by a batch, not a page count).
+- **Re-opening after an older page appears — covered by a behaviour test.**
+  `fr_1_2_feed_reopens_when_an_older_day_appears` drives Exhausted → an older daily page
+  is written → `Changed` → sentinel back → the next batch loads it.
+- **Issue 3, `loading` meaningless outside `rebuild_journal` — fixed by construction.**
+  There is no boolean flag: a pending request is `Feed::Loading { want_through }`, so a
+  rebuild that cannot draw (no page) keeps the request instead of stranding a separate
+  flag, and `Feed::request` accepts one batch at a time. The old early-return path is
+  guarded by a `debug_assert!` that a feed always has a page (`open_journal` → `show`).
+  Test: `feed_requests_one_batch_at_a_time`. This combination was never live (the
+  document says so), so there is no behaviour-level reproduction, only the unit test on
+  the type.
+
+No listed issue is left open. Verification shot of the terminal state:
+`docs/verification/journal-feed-pagination/feed-end.png`.
+
 ## What it controls
 
 How many calendar days the Daily Notes feed (FR-1.1) shows, when the next batch of older

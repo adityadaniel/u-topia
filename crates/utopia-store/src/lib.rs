@@ -81,16 +81,58 @@ pub type OutboxRow = (i64, PageId, i64, Vec<u8>);
 
 struct DocEntry {
     doc: LoroPageDoc,
-    /// Version already durable in `page_doc` + `page_update`.
-    persisted: utopia_doc::Frontier,
+    /// Version confirmed durable in `page_doc` + `page_update`. Only a committed job may
+    /// advance it, never the act of submitting one (store-commit-pipeline issue 1).
+    durable: utopia_doc::Frontier,
     has_snapshot: bool,
     pending_updates: i64,
+    /// The last job submitted for this shard, and the frontier its update log will reach.
+    /// Promoted into `durable` on completion, discarded on failure.
+    in_flight: Option<InFlight>,
+    /// A draft day whose first edit was queued (FR-1.2). Until that commit is durable the
+    /// shard is still a draft, so a repair must keep trying to write it, while a day that
+    /// was only visited must never be written.
+    promoted: bool,
+}
+
+/// A submitted (not yet confirmed) commit for one page (store-commit-pipeline).
+struct InFlight {
+    seq: u64,
+    frontier: utopia_doc::Frontier,
+    /// The job writes a full snapshot: it replaces `page_doc` and clears the update log.
+    snapshot: bool,
+    /// The job appends one `page_update` row.
+    update: bool,
+    /// The queued entry wanted an outbox payload (local ops only; remote imports do not).
+    enqueue: bool,
+}
+
+/// One page's share of a commit, prepared before anything is taken from `pending`.
+struct PreparedPage {
+    page: PageId,
+    frontier: utopia_doc::Frontier,
+    writes_snapshot: bool,
+    writes_update: bool,
+    enqueue: bool,
+    job: PageJob,
 }
 
 impl DocEntry {
     fn doc_state(&self) -> PageState {
         self.doc.state().clone()
     }
+}
+
+/// A calendar day that has been looked at but never written (FR-1.2): shown in the Daily
+/// Notes feed, editable in place, but not projected, synced or seen by `doctor` until its
+/// first character is committed.
+///
+/// The shard lives inside the entry rather than in `Store::docs`, so "a draft whose shard
+/// is gone" cannot be expressed: `is_draft`, `day`-lookups and `page_state` all read this
+/// one value, and promotion is the only transition that moves it into `docs`.
+struct DraftDay {
+    date: NaiveDate,
+    entry: DocEntry,
 }
 
 /// Options for recording an edit in the undo history.
@@ -117,8 +159,17 @@ pub struct Store {
     persister: Persister,
     /// Pages with in-memory changes not yet handed to the writer.
     pending: Vec<(PageId, Option<DocDelta>, bool)>,
-    /// Daily pages shown but never written: in memory only until their first edit (FR-1.2).
-    drafts: HashMap<NaiveDate, PageId>,
+    /// Daily pages shown but never written (FR-1.2), by page id: in memory only until
+    /// their first edit.
+    drafts: HashMap<PageId, DraftDay>,
+    /// Draft ids whose promotion merged them into the page that already owned the day
+    /// (FR-1.2). The ids were never durable, so this is a session alias for views and the
+    /// editor that still hold one.
+    promotions: HashMap<PageId, PageId>,
+    /// Replacements not yet announced to the views ([`Store::take_replacements`]): a stale
+    /// draft retired for the day's page (FR-1.2) can be shown by a view the caller did not
+    /// name.
+    replacements: Vec<(PageId, PageId)>,
     debounced: bool,
     /// Attachment bytes for in-memory graphs (file graphs use the blob directory).
     mem_blobs: HashMap<String, Vec<u8>>,
@@ -192,6 +243,8 @@ impl Store {
             persister: Persister::inline(),
             pending: Vec::new(),
             drafts: HashMap::new(),
+            promotions: HashMap::new(),
+            replacements: Vec::new(),
             debounced: false,
             mem_blobs: HashMap::new(),
             tag_page_scans: std::sync::atomic::AtomicU64::new(0),
@@ -268,76 +321,292 @@ impl Store {
     }
 
     /// Hand every pending change to the writer (non-blocking with a writer thread).
+    ///
+    /// A failed writer is a state: this refuses new jobs, keeps `pending` for the repair,
+    /// and leaves every in-memory shard alone (rule 5). `sync_index` is the repair path.
     pub fn flush(&mut self) -> Result<()> {
+        self.reconcile_writer();
+        self.settle_drafts();
+        if let Some(e) = self.persister.failure() {
+            return Err(e);
+        }
         if self.pending.is_empty() {
             return Ok(());
         }
+        // Prepare before taking `pending`: a failing snapshot/export must not strand the
+        // queue (issue 9).
         let pending = std::mem::take(&mut self.pending);
-        let mut pages = Vec::with_capacity(pending.len());
-        for (page, delta, enqueue) in &pending {
-            let Some(entry) = self.docs.get_mut(page) else {
-                continue;
-            };
-            let frontier = entry.doc.frontier();
-            let changed = frontier != entry.persisted;
-            let snapshot = if !entry.has_snapshot || entry.pending_updates >= COMPACT_AFTER {
-                entry.pending_updates = 0;
-                Some((entry.doc.snapshot()?, frontier.0.clone()))
-            } else {
-                None
-            };
-            let update = if changed {
-                Some(entry.doc.export_since(&entry.persisted)?)
-            } else {
-                None
-            };
-            // A snapshot in the same job already covers the update.
-            let log_update = if snapshot.is_none() {
-                update.clone()
-            } else {
-                None
-            };
-            if log_update.is_some() {
-                entry.pending_updates += 1;
+        let prepared = {
+            let docs = &mut self.docs;
+            let drafts = &mut self.drafts;
+            let mut prepared = Vec::with_capacity(pending.len());
+            let mut failed = None;
+            for (page, delta, enqueue) in &pending {
+                // A draft is queued only by the repair path, for a day whose first commit
+                // failed: its shard lives in the draft entry (FR-1.2).
+                let Some(entry) = docs
+                    .get_mut(page)
+                    .or_else(|| drafts.get_mut(page).map(|d| &mut d.entry))
+                else {
+                    continue;
+                };
+                // An earlier submitted job's update lands first, so later updates build on
+                // it; a snapshot is only skipped when one is confirmed durable.
+                let frontier = entry.doc.frontier();
+                let base = entry
+                    .in_flight
+                    .as_ref()
+                    .map_or(&entry.durable, |f| &f.frontier);
+                let snapshot = if !entry.has_snapshot || entry.pending_updates >= COMPACT_AFTER {
+                    match entry.doc.snapshot() {
+                        Ok(snap) => Some((snap, frontier.0.clone())),
+                        Err(e) => {
+                            failed = Some(e.into());
+                            break;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let update = if frontier != *base {
+                    match entry.doc.export_since(base) {
+                        Ok(update) => Some(update),
+                        Err(e) => {
+                            failed = Some(e.into());
+                            break;
+                        }
+                    }
+                } else {
+                    None
+                };
+                // A snapshot in the same job already covers the update.
+                let log_update = if snapshot.is_none() {
+                    update.clone()
+                } else {
+                    None
+                };
+                prepared.push(PreparedPage {
+                    page: page.clone(),
+                    frontier,
+                    writes_snapshot: snapshot.is_some(),
+                    writes_update: log_update.is_some(),
+                    enqueue: *enqueue,
+                    job: PageJob {
+                        page: page.clone(),
+                        state: entry.doc.state().clone(),
+                        delta: delta.clone(),
+                        snapshot,
+                        update: log_update,
+                        outbox: if *enqueue { update } else { None },
+                    },
+                });
             }
-            entry.persisted = frontier;
-            entry.has_snapshot = true;
-            pages.push(PageJob {
-                page: page.clone(),
-                state: entry.doc.state().clone(),
-                delta: delta.clone(),
-                snapshot,
-                update: log_update,
-                outbox: if *enqueue { update } else { None },
-            });
+            match failed {
+                Some(e) => Err(e),
+                None => Ok(prepared),
+            }
+        };
+        let prepared = match prepared {
+            Ok(p) => p,
+            Err(e) => {
+                self.pending = pending;
+                return Err(e);
+            }
+        };
+        let mut pages = Vec::with_capacity(prepared.len());
+        let mut bookkeeping = Vec::with_capacity(prepared.len());
+        for p in prepared {
+            pages.push(p.job);
+            bookkeeping.push((
+                p.page,
+                p.frontier,
+                p.writes_snapshot,
+                p.writes_update,
+                p.enqueue,
+            ));
+        }
+        if pages.is_empty() {
+            return Ok(());
         }
         let job = Job {
             pages,
             fmt: self.date_format.clone(),
             now: self.now(),
         };
-        let result = self.persister.submit(&mut self.conn, job);
-        if result.is_err() {
-            // Reload the affected shards from the last durable state.
-            for (p, _, _) in &pending {
-                self.docs.remove(p);
+        let seq = match self.persister.submit(&mut self.conn, job) {
+            Ok(seq) => seq,
+            Err(e) => {
+                // Nothing was submitted: keep the queue so the repair can ship it.
+                self.pending = pending;
+                return Err(e);
+            }
+        };
+        for (page, frontier, snapshot, update, enqueue) in bookkeeping {
+            // A repair retries a failed first commit from the draft entry (FR-1.2).
+            let entry = self
+                .docs
+                .get_mut(&page)
+                .or_else(|| self.drafts.get_mut(&page).map(|d| &mut d.entry));
+            if let Some(entry) = entry {
+                // `reconcile_writer` promoted every confirmed job at the top of this flush.
+                // A job still in flight below will also append its update row before this
+                // one, so count it now: overwriting `in_flight` must not lose it.
+                if let Some(prev) = entry.in_flight.take() {
+                    if prev.snapshot {
+                        entry.pending_updates = 0;
+                    } else if prev.update && !snapshot {
+                        entry.pending_updates += 1;
+                    }
+                }
+                entry.in_flight = Some(InFlight {
+                    seq,
+                    frontier,
+                    snapshot,
+                    update,
+                    enqueue,
+                });
             }
         }
-        result
+        // Inline graphs commit inside `submit`; promote them at once.
+        self.reconcile_writer();
+        Ok(())
+    }
+
+    /// Promote the shards of jobs the writer confirmed, and no others. `completed` never
+    /// counts a failed job, so a failed submission stays `in_flight` until it is repaired.
+    fn reconcile_writer(&mut self) {
+        let completed = self.persister.completed();
+        // A draft's shard lives in its own entry (FR-1.2); a failed promotion puts it back
+        // there, so the repair's retry must be reconciled there too.
+        let drafts = self.drafts.values_mut().map(|d| &mut d.entry);
+        for entry in self.docs.values_mut().chain(drafts) {
+            let Some(in_flight) = entry.in_flight.take() else {
+                continue;
+            };
+            if in_flight.seq > completed {
+                entry.in_flight = Some(in_flight);
+                continue;
+            }
+            entry.durable = in_flight.frontier;
+            entry.has_snapshot = true;
+            if in_flight.snapshot {
+                entry.pending_updates = 0;
+            } else if in_flight.update {
+                entry.pending_updates += 1;
+            }
+        }
+    }
+
+    /// A draft whose first commit is durable is a page (FR-1.2): move its shard out of the
+    /// draft entry, so the feed stops treating the day as unwritten and a later repair sees
+    /// a live shard.
+    fn settle_drafts(&mut self) {
+        let durable: Vec<PageId> = self
+            .drafts
+            .iter()
+            .filter(|(_, d)| {
+                d.entry.promoted
+                    && d.entry.has_snapshot
+                    && d.entry.in_flight.is_none()
+                    && d.entry.doc.frontier() == d.entry.durable
+            })
+            .map(|(page, _)| page.clone())
+            .collect();
+        for page in durable {
+            self.promote_draft(&page);
+            if let Some(entry) = self.docs.get_mut(&page) {
+                entry.promoted = false;
+            }
+        }
+    }
+
+    /// Reconcile a failed writer without losing a character (rule 5): promote the jobs that
+    /// did commit, then queue every shard whose durable copy is behind as a full snapshot.
+    /// Returns the pages that were requeued (used to retire repaired drafts).
+    fn repair_writer(&mut self) -> Vec<PageId> {
+        self.reconcile_writer();
+        // Days that were only visited are drafts (FR-1.2): the feed renders them from
+        // memory and a repair must not write them. Only a draft whose first commit was
+        // queued (`promoted`) is rewritten.
+        let mut requeued: Vec<(PageId, bool)> = Vec::new();
+        let mut redraft: Vec<(NaiveDate, PageId)> = Vec::new();
+        for (page, entry) in self.docs.iter_mut() {
+            // A submitted job that was not confirmed cannot be trusted: the writer either
+            // rolled it back or dropped it. The shard is rewritten whole below.
+            let was_durable = entry.has_snapshot;
+            // Keep the job's outbox intent: a page queued from `import_batch` must not be
+            // echoed to the relay by the repair.
+            let enqueue = entry.in_flight.as_ref().is_some_and(|f| f.enqueue);
+            entry.in_flight = None;
+            if entry.has_snapshot && entry.doc.frontier() == entry.durable {
+                continue;
+            }
+            if entry.promoted && !was_durable {
+                if let Some(date) = entry.doc.state().meta.daily_date {
+                    redraft.push((date, page.clone()));
+                }
+            }
+            entry.has_snapshot = false;
+            requeued.push((page.clone(), enqueue));
+        }
+        // A draft's shard lives in its own entry: a retry of its failed first commit is
+        // queued from there.
+        for (page, draft) in self.drafts.iter_mut() {
+            let entry = &mut draft.entry;
+            let enqueue = entry.in_flight.as_ref().is_some_and(|f| f.enqueue);
+            entry.in_flight = None;
+            if !entry.promoted || (entry.has_snapshot && entry.doc.frontier() == entry.durable) {
+                continue;
+            }
+            entry.has_snapshot = false;
+            requeued.push((page.clone(), enqueue));
+        }
+        // A draft whose first commit failed is still a draft (FR-1.2): the feed keeps its
+        // page id, and the next edit does not mint a second page for the same day. Its shard
+        // goes into the draft entry, where `flush` still finds it for the repair.
+        for (date, page) in redraft {
+            if self.drafts.contains_key(&page) {
+                continue;
+            }
+            if let Some(entry) = self.docs.remove(&page) {
+                self.drafts.insert(page, DraftDay { date, entry });
+            }
+        }
+        for (page, enqueue) in &requeued {
+            match self.pending.iter_mut().find(|(p, _, _)| p == page) {
+                Some((_, delta, _)) => {
+                    // Keep the queued entry's own flag: it is newer than the in-flight job.
+                    *delta = None;
+                }
+                None => self.pending.push((page.clone(), None, *enqueue)),
+            }
+        }
+        self.persister.clear_failure();
+        requeued.into_iter().map(|(page, _)| page).collect()
     }
 
     /// Wait until the index reflects every change (flush + wait). Required before
     /// operations that read the index to decide what to write (create, rename, merge).
+    ///
+    /// A writer failure is repaired here by rewriting the affected shards as snapshots,
+    /// and still reported to this caller: the commit it asked for did not land.
     pub fn sync_index(&mut self) -> Result<()> {
-        self.flush()?;
-        let r = self.persister.wait();
-        if r.is_err() {
-            // The disk lags the in-memory shards: drop them so they reload consistently.
-            self.docs.clear();
-            self.pending.clear();
-            self.drafts.clear();
+        let flushed = self.flush();
+        let waited = self.persister.wait();
+        self.reconcile_writer();
+        self.settle_drafts();
+        if let Some(failure) = self.persister.failure() {
+            self.repair_writer();
+            let retried = self.flush().and_then(|()| self.persister.wait());
+            self.reconcile_writer();
+            // A retried draft whose commit is durable now is a page (FR-1.2).
+            self.settle_drafts();
+            return match retried {
+                Ok(()) => Err(failure),
+                Err(e) => Err(e),
+            };
         }
-        r
+        flushed.and(waited)
     }
 
     /// Strict mode waits for in-flight commits before an index read.
@@ -352,32 +621,55 @@ impl Store {
     /// Queue shard commits; strict mode ships them immediately.
     fn queue(&mut self, pages: &[(PageId, Option<DocDelta>)], enqueue: bool) -> Result<()> {
         let mut promoted = false;
+        // Pages a promoted draft had to be merged into (§8.6); their shards changed too.
+        let mut merged_into: Vec<PageId> = Vec::new();
         for (page, delta) in pages {
             // A draft's first edit writes the whole page (meta, first block, the edit).
-            let delta = if self.take_draft(page) {
-                promoted = true;
-                None
-            } else {
-                delta.clone()
-            };
-            match self.pending.iter_mut().find(|(p, _, _)| p == page) {
-                Some((_, d, e)) => {
-                    *d = match (d.take(), delta) {
-                        (Some(mut a), Some(b)) => {
-                            a.merge(b);
-                            Some(a)
-                        }
-                        _ => None,
-                    };
-                    *e |= enqueue;
+            let delta = match self.promote_draft(page) {
+                Some(date) => {
+                    promoted = true;
+                    // The first commit of a promoted draft is still in flight: until it is
+                    // durable the day is still a draft for a repair (store-commit-pipeline).
+                    if let Some(entry) = self.docs.get_mut(page) {
+                        entry.promoted = true;
+                    }
+                    // One page per date (rule 4): if a remote copy of the day already
+                    // owns it under another id, the draft's blocks move into that page
+                    // and its own shard is dropped (nothing to write).
+                    if let Some(live) = self.resolve_promotion(page, date)? {
+                        merged_into.push(live);
+                        continue;
+                    }
+                    None
                 }
-                None => self.pending.push((page.clone(), delta, enqueue)),
-            }
+                None => delta.clone(),
+            };
+            self.push_pending(page, delta, enqueue);
+        }
+        for page in merged_into {
+            self.push_pending(&page, None, enqueue);
         }
         if self.debounced && !promoted {
             Ok(())
         } else {
             self.flush()
+        }
+    }
+
+    /// Append a page to the pending commit, merging its delta with an earlier one.
+    fn push_pending(&mut self, page: &PageId, delta: Option<DocDelta>, enqueue: bool) {
+        match self.pending.iter_mut().find(|(p, _, _)| p == page) {
+            Some((_, d, e)) => {
+                *d = match (d.take(), delta) {
+                    (Some(mut a), Some(b)) => {
+                        a.merge(b);
+                        Some(a)
+                    }
+                    _ => None,
+                };
+                *e |= enqueue;
+            }
+            None => self.pending.push((page.clone(), delta, enqueue)),
         }
     }
 
@@ -466,7 +758,9 @@ impl Store {
     // ---------------------------------------------------------------- shards
 
     pub fn page_exists(&self, page: &PageId) -> Result<bool> {
-        if self.docs.contains_key(page) {
+        // Deliberately not redirected: an incoming shard for a draft's old id (FR-1.2) is a
+        // different page and must be imported under its own id, not folded into the day.
+        if self.docs.contains_key(page) || self.drafts.contains_key(page) {
             return Ok(true);
         }
         self.read_barrier()?;
@@ -478,6 +772,15 @@ impl Store {
     }
 
     fn load_doc(&mut self, page: &PageId) -> Result<&mut DocEntry> {
+        // A promoted draft that merged into the day's page (FR-1.2) leaves its id behind as
+        // a session alias: reads follow the page that owns the day, so a view or an editor
+        // that still holds the old id keeps working.
+        let page = &self.redirect(page).unwrap_or_else(|| page.clone());
+        // A draft day has no `page_doc` row yet: its shard is inside the draft entry, and
+        // every reader must find it there rather than look for a row (FR-1.2).
+        if self.drafts.contains_key(page) {
+            return Ok(&mut self.drafts.get_mut(page).expect("checked above").entry);
+        }
         if !self.docs.contains_key(page) {
             let snap: Option<Vec<u8>> = self
                 .conn
@@ -500,14 +803,16 @@ impl Store {
                 rows
             };
             let doc = LoroPageDoc::load(page.clone(), &snap, &updates, self.peer)?;
-            let persisted = doc.frontier();
+            let durable = doc.frontier();
             self.docs.insert(
                 page.clone(),
                 DocEntry {
                     doc,
-                    persisted,
+                    durable,
                     has_snapshot: true,
                     pending_updates: updates.len() as i64,
+                    in_flight: None,
+                    promoted: false,
                 },
             );
         }
@@ -515,12 +820,23 @@ impl Store {
     }
 
     fn new_doc(&mut self, page: &PageId) -> &mut DocEntry {
-        self.docs.entry(page.clone()).or_insert_with(|| DocEntry {
+        if !self.docs.contains_key(page) {
+            let entry = self.fresh_entry(page);
+            self.docs.insert(page.clone(), entry);
+        }
+        self.docs.get_mut(page).expect("inserted above")
+    }
+
+    /// A new, empty shard for `page` that has never been written.
+    fn fresh_entry(&self, page: &PageId) -> DocEntry {
+        DocEntry {
             doc: LoroPageDoc::new(page.clone(), self.peer),
-            persisted: utopia_doc::Frontier::default(),
+            durable: utopia_doc::Frontier::default(),
             has_snapshot: false,
             pending_updates: 0,
-        })
+            in_flight: None,
+            promoted: false,
+        }
     }
 
     /// Anchor a caret in a block so it survives remote merges (§6.5).
@@ -627,6 +943,15 @@ impl Store {
 
     // ---------------------------------------------------------------- editing
 
+    /// Drop an in-memory shard a failed command group may have left half-applied. A live
+    /// page reloads from its last durable state. A draft has none, so the day goes back to
+    /// unwritten: its shard and its draft entry are one value and go together (FR-1.2),
+    /// rather than leaving a draft `page_state` cannot find.
+    fn drop_shard(&mut self, page: &PageId) {
+        self.docs.remove(page);
+        self.drafts.remove(page);
+    }
+
     /// Apply commands to one page as a single undo group.
     pub fn execute(
         &mut self,
@@ -645,6 +970,13 @@ impl Store {
         steps: Vec<(PageId, Vec<Command>)>,
         opts: EditOpts,
     ) -> Result<Vec<(PageId, DocDelta)>> {
+        // A promoted draft that merged into the day (FR-1.2) is an alias: writes to its id
+        // apply to the page that owns the day, so an editor holding the old id keeps
+        // typing into the same block instead of a shard that no longer exists (rule 5).
+        let steps: Vec<(PageId, Vec<Command>)> = steps
+            .into_iter()
+            .map(|(page, cmds)| (self.redirect(&page).unwrap_or(page), cmds))
+            .collect();
         let now = self.now();
         let mut group = UndoGroup::new(now);
         group.coalesce = opts.coalesce.clone();
@@ -660,9 +992,9 @@ impl Store {
                 Err(e) => {
                     // Roll back what this group already applied in memory.
                     for (p, _) in &deltas {
-                        self.docs.remove(p);
+                        self.drop_shard(p);
                     }
-                    self.docs.remove(&page);
+                    self.drop_shard(&page);
                     return Err(e);
                 }
             };
@@ -685,6 +1017,21 @@ impl Store {
         // at once so resolution and autocomplete see them.
         if deltas.iter().any(|(_, d)| d.structural || d.meta_changed) {
             self.flush()?;
+        }
+        // A draft that promotion merged into the day (see `resolve_promotion`) has this
+        // group's commands in the survivor's shard now. Point the undo step *and the two
+        // saved carets* there too: undo/redo restore the caret into the page it names, and a
+        // discarded id would put the editor on a row the view does not draw (rule 2, FR-1.2).
+        for step in &mut group.steps {
+            if let Some(to) = self.redirect(&step.page) {
+                step.page = to;
+            }
+        }
+        for caret in [&mut group.caret_before, &mut group.caret_after] {
+            let Some(caret) = caret else { continue };
+            if let Some(to) = self.redirect(&caret.page) {
+                caret.page = to;
+            }
         }
         if !opts.no_undo {
             self.undo.push(group);
@@ -900,6 +1247,18 @@ impl Store {
         Ok(rows)
     }
 
+    /// How many changes are waiting for the relay, without loading their payloads (the
+    /// sidebar shows this count on the UI thread, §9.2, rule 10).
+    pub fn outbox_count(&self) -> Result<usize> {
+        self.read_barrier()?;
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM outbox WHERE sent_at IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     pub fn outbox_mark_sent(&self, seqs: &[i64]) -> Result<()> {
         let now = self.now();
         for s in seqs {
@@ -918,18 +1277,32 @@ impl Store {
             .optional()?)
     }
 
-    /// Relay positions already imported: `(page id, seq)` from `seq:<page>` keys.
-    pub fn sync_seqs(&self) -> Result<Vec<(String, u64)>> {
+    /// `sync_state` entries whose key starts with `prefix:` as `(suffix, value)`. Cursors
+    /// live under `cursor:<page>`; the value is opaque here (utopia-sync owns its shape).
+    pub fn sync_prefixed(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let like = format!("{prefix}:%");
         let mut stmt = self
             .conn
-            .prepare("SELECT substr(key, 5), value FROM sync_state WHERE key LIKE 'seq:%'")?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|(k, v)| v.parse().ok().map(|v| (k, v)))
-            .collect())
+            .prepare("SELECT key, value FROM sync_state WHERE key LIKE ?1")?;
+        let rows = stmt.query_map([&like], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, value) = row?;
+            if let Some(suffix) = key.strip_prefix(&format!("{prefix}:")) {
+                out.push((suffix.to_string(), value));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete every `sync_state` entry whose key starts with `prefix:`; returns how many.
+    pub fn sync_delete_prefixed(&self, prefix: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM sync_state WHERE key LIKE ?1",
+            [format!("{prefix}:%")],
+        )?)
     }
 
     pub fn sync_set(&self, key: &str, value: &str) -> Result<()> {
@@ -967,5 +1340,50 @@ impl Drop for Store {
         self.persister.stop();
         self.persister = Persister::inline();
         let _ = self.compact();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    /// Review P3: with a slow writer two jobs for one page can be in flight at once. Each
+    /// appends a `page_update` row, but the second `flush` replaces `in_flight`; the count
+    /// that drives `COMPACT_AFTER` must keep both or compaction drifts.
+    #[test]
+    fn overlapping_jobs_keep_the_update_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path().join("g.utopia")).unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        s.set_today(Some(day));
+        let (page, block) = s.open_daily(day).unwrap();
+        s.set_block_text(&page, &block, "a", None, None).unwrap();
+        s.sync_index().unwrap();
+        s.set_debounced(true).unwrap();
+        let before = s.docs[&page].pending_updates;
+
+        // Hold the write lock so both flushes queue while the first job is blocked.
+        s.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        s.set_block_text(&page, &block, "ab", None, None).unwrap();
+        s.flush().unwrap();
+        s.set_block_text(&page, &block, "abc", None, None).unwrap();
+        s.flush().unwrap();
+        s.conn().execute_batch("ROLLBACK").unwrap();
+        s.sync_index().unwrap();
+
+        let rows: i64 = s
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM page_update WHERE page_id=?1",
+                [page.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            s.docs[&page].pending_updates, rows,
+            "the compaction count matches the rows that landed"
+        );
+        assert_eq!(rows, before + 2, "both jobs appended an update row");
     }
 }

@@ -3,9 +3,9 @@
 
 use chrono::NaiveDate;
 use utopia_core::outline::{self, Plan};
-use utopia_core::{BlockId, PageId, PageKind};
+use utopia_core::{BlockId, BlockKind, Command, PageId, PageKind};
 use utopia_doc::Frontier;
-use utopia_store::{BlockRefStatus, RefQuery, RefTarget, Store};
+use utopia_store::{BlockRefStatus, EditOpts, RefQuery, RefTarget, Store, StoreError};
 
 fn date(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -115,6 +115,44 @@ fn ac_1_4_backfill_thirty_days() {
     assert_eq!(s.journal(14).unwrap().len(), 14);
 }
 
+/// FR-1.2: the Daily Notes feed stops loading older days at the oldest daily page. A day
+/// that was only visited is a draft, not a page, so it does not extend the feed; a
+/// trashed day does not hold it open either.
+#[test]
+fn fr_1_2_oldest_daily_page_bounds_the_feed() {
+    let mut s = store();
+    assert_eq!(s.oldest_daily().unwrap(), None, "a fresh graph has no day");
+    // Visiting an old day creates a draft, not a page (FR-1.2).
+    let drafted = s.draft_daily(date(2026, 10, 20)).unwrap();
+    assert_eq!(
+        s.oldest_daily().unwrap(),
+        None,
+        "a visited day is a draft, not a page"
+    );
+    write(&mut s, &drafted, "older");
+    assert_eq!(s.oldest_daily().unwrap(), Some(date(2026, 10, 20)));
+    // A later visit to an even older date must not move the feed's floor.
+    s.draft_daily(date(2019, 1, 1)).unwrap();
+    assert_eq!(
+        s.oldest_daily().unwrap(),
+        Some(date(2026, 10, 20)),
+        "drafts do not bound the feed"
+    );
+    let (trashed, _) = s.open_daily(date(2026, 10, 10)).unwrap();
+    assert_eq!(
+        s.oldest_daily().unwrap(),
+        Some(date(2026, 10, 10)),
+        "a live page older than every other"
+    );
+    s.delete_page(&trashed).unwrap();
+    assert_eq!(
+        s.oldest_daily().unwrap(),
+        Some(date(2026, 10, 20)),
+        "trashed days do not hold the feed open"
+    );
+    assert_doctor(&mut s);
+}
+
 #[test]
 fn fr_1_2_visited_day_is_a_draft_until_written() {
     let mut s = store();
@@ -141,6 +179,288 @@ fn fr_1_2_visited_day_is_a_draft_until_written() {
     write(&mut s, &p, "see [[2026-11-03]]");
     assert_eq!(s.find_page("2026-11-03").unwrap(), Some(next.clone()));
     assert!(!s.is_draft(&next));
+    assert_doctor(&mut s);
+}
+
+/// `docs/state-machines/draft-daily-page.md` issue 1: a command that fails on a draft used
+/// to remove its shard but keep the `drafts` entry, so `is_draft` said "draft" while
+/// `page_state` said `NotFound`. A draft and its shard go together (FR-1.2).
+#[test]
+fn fr_1_2_failed_command_leaves_no_ghost_draft() {
+    let mut s = store();
+    let d = date(2026, 11, 2);
+    let draft = s.draft_daily(d).unwrap();
+    assert!(s.is_draft(&draft));
+    // A block id that is already in the shard fails the whole command group (the same
+    // NOOP a racing insert produces), after the earlier commands applied in memory.
+    let taken = s.page_state(&draft).unwrap().live_roots()[0].clone();
+    let failed = s.execute(
+        &draft,
+        vec![Command::InsertBlock {
+            id: taken,
+            parent: None,
+            after: None,
+            text: String::new(),
+            kind: BlockKind::Bullet,
+        }],
+        EditOpts::default(),
+    );
+    assert!(failed.is_err(), "the duplicate block id must fail");
+    assert!(
+        !s.is_draft(&draft),
+        "a draft whose shard is gone must not be reported as a draft"
+    );
+    assert!(
+        s.page_state(&draft).is_err(),
+        "the shard went with the draft entry"
+    );
+    assert!(
+        matches!(s.draft_append_block(&draft), Err(StoreError::Invalid(_))),
+        "typing on it is refused before `load_doc` looks for a draft shard"
+    );
+    // The day is simply unwritten again: visiting it builds a fresh draft under the same
+    // deterministic id.
+    let again = s.draft_daily(d).unwrap();
+    assert_eq!(again, draft, "the date keeps its identity");
+    assert!(s.is_draft(&again));
+    assert_eq!(s.page_state(&again).unwrap().live_count(), 1);
+    assert_doctor(&mut s);
+}
+
+/// `docs/state-machines/draft-daily-page.md` issue 2: a writer failure clears the in-memory
+/// shards so they reload from disk. A draft has no disk state to disagree with, so clearing
+/// it too threw away the day the view was still showing (FR-1.2).
+#[test]
+fn fr_1_2_writer_failure_keeps_the_draft() {
+    let mut s = store();
+    let live = s.create_page("Ana").unwrap();
+    let d = date(2026, 11, 2);
+    let draft = s.draft_daily(d).unwrap();
+    // Fault injection: the next commit cannot write its outbox row, so the writer thread
+    // records an error and `sync_index` drops the shards that have a durable counterpart.
+    s.conn().execute_batch("DROP TABLE outbox").unwrap();
+    let plan = outline::append_block(s.page_state(&live).unwrap(), None);
+    run(&mut s, &live, plan);
+    assert!(s.sync_index().is_err(), "the writer reported the failure");
+    assert!(
+        s.is_draft(&draft),
+        "a draft has no durable state to reload, so it survives"
+    );
+    assert_eq!(s.page_state(&draft).unwrap().live_count(), 1);
+    let appended = s.draft_append_block(&draft).unwrap();
+    assert!(s.page_state(&draft).unwrap().block(&appended).is_some());
+}
+
+/// `docs/state-machines/draft-daily-page.md` issue 3: a draft is promoted for a date that a
+/// remote device already wrote under another id (its uuidv5 was tombstoned there, rule 4).
+/// Both would be live daily pages for the same date, `page_daily_uq` rejects the second row
+/// and the commit fails with the typed text still only in memory (FR-1.2, §8.6).
+#[test]
+fn fr_1_2_promoted_draft_merges_into_the_days_page() {
+    let d = date(2026, 11, 2);
+    // Another device: the day's deterministic id was tombstoned there, so the live page for
+    // the date is a fresh ULID.
+    let mut remote = store();
+    let gone = remote.ensure_daily_page(d).unwrap();
+    write(&mut remote, &gone, "remote one");
+    remote.delete_page(&gone).unwrap();
+    let live = remote.ensure_daily_page(d).unwrap();
+    assert_ne!(live, gone, "a tombstoned id is never resurrected");
+    write(&mut remote, &live, "remote two");
+    let shard = remote.export_since(&live, &Frontier::default()).unwrap();
+
+    // This device already shows the day as a draft; only the live page's update arrives
+    // (the tombstoned id may come in a later round).
+    let mut s = store();
+    let draft = s.draft_daily(d).unwrap();
+    s.import_batch(&[(live.clone(), shard)]).unwrap();
+    assert!(s.is_draft(&draft), "the draft is still open");
+    let block = s.page_state(&draft).unwrap().live_roots()[0].clone();
+    s.set_block_text(&draft, &block, "typed here", None, None)
+        .unwrap();
+    s.sync_index().expect("promoting a draft must not fail");
+    assert!(!s.is_draft(&draft));
+    let days = s.days_between(d, d).unwrap();
+    assert_eq!(days.get(&d).cloned(), Some(live.clone()), "one live day");
+    let texts = live_texts(&mut s, &live);
+    assert!(
+        texts.iter().any(|(t, _)| t == "typed here"),
+        "the draft's text moved into the day's page: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|(t, _)| t == "remote two"),
+        "the remote text stays: {texts:?}"
+    );
+    assert_eq!(s.find_page("2026-11-02").unwrap(), Some(live));
+    assert_doctor(&mut s);
+}
+
+/// Continuing issue 3: the only way a draft's date is owned by another page is that the
+/// remote *deleted* the deterministic id (rule 4). Writing the draft's shard as a
+/// `merged_into` tombstone then lets `reconcile_merged` move the trashed blocks into the
+/// live day, on both devices. A draft has no durable identity, so its shard must never be
+/// written when the date is owned (rule 5).
+#[test]
+fn fr_1_2_promoted_draft_does_not_resurrect_a_deleted_page() {
+    let d = date(2026, 11, 2);
+    // Remote: "remote one" was written on uuidv5(D), then trashed; the live page for the
+    // date is a fresh ULID.
+    let mut remote = store();
+    let gone = remote.ensure_daily_page(d).unwrap();
+    write(&mut remote, &gone, "remote one");
+    remote.delete_page(&gone).unwrap();
+    let live = remote.ensure_daily_page(d).unwrap();
+    write(&mut remote, &live, "remote two");
+    let gone_shard = remote.export_since(&gone, &Frontier::default()).unwrap();
+    let live_shard = remote.export_since(&live, &Frontier::default()).unwrap();
+
+    // This device drafts the day and receives only the live page (batches are per round).
+    let mut local = store();
+    let draft = local.draft_daily(d).unwrap();
+    assert_eq!(draft, gone);
+    local.import_batch(&[(live.clone(), live_shard)]).unwrap();
+    let block = local.page_state(&draft).unwrap().live_roots()[0].clone();
+    local
+        .set_block_text(&draft, &block, "typed here", None, None)
+        .unwrap();
+    local.sync_index().unwrap();
+
+    // The trashed uuidv5(D) shard arrives in the next round: it stays deleted.
+    local.import_batch(&[(gone.clone(), gone_shard)]).unwrap();
+    let texts = live_texts(&mut local, &live);
+    assert!(texts.iter().any(|(t, _)| t == "typed here"), "{texts:?}");
+    assert!(
+        !texts.iter().any(|(t, _)| t == "remote one"),
+        "a trashed page's blocks came back on this device: {texts:?}"
+    );
+    // Imported tombstones do not create a local trash row, but the shard stays deleted.
+    assert!(
+        local.page_row(&gone).unwrap().is_some_and(|r| !r.is_live()),
+        "the trashed page stays out of the index"
+    );
+
+    // And our shards must not bring them back on the other device either.
+    push(&mut local, &mut remote);
+    let texts = live_texts(&mut remote, &live);
+    assert!(texts.iter().any(|(t, _)| t == "typed here"), "{texts:?}");
+    assert!(
+        !texts.iter().any(|(t, _)| t == "remote one"),
+        "a trashed page's blocks came back on the other device: {texts:?}"
+    );
+    assert!(
+        remote
+            .list_trash()
+            .unwrap()
+            .iter()
+            .any(|(id, ..)| *id == gone),
+        "the trashed page stays trashed"
+    );
+}
+
+/// Continuing issue 3 / P2: after a merged promotion the editor still targets the draft's
+/// id. The id was never durable, so it is a session alias for the day (`Store::redirect`):
+/// every later keystroke must reach the page that owns the date (rule 5).
+#[test]
+fn fr_1_2_typing_after_a_merged_promotion_reaches_the_day() {
+    let d = date(2026, 11, 2);
+    let mut remote = store();
+    let gone = remote.ensure_daily_page(d).unwrap();
+    remote.delete_page(&gone).unwrap();
+    let live = remote.ensure_daily_page(d).unwrap();
+    write(&mut remote, &live, "remote two");
+    let shard = remote.export_since(&live, &Frontier::default()).unwrap();
+
+    let mut s = store();
+    let draft = s.draft_daily(d).unwrap();
+    s.import_batch(&[(live.clone(), shard)]).unwrap();
+    let block = s.page_state(&draft).unwrap().live_roots()[0].clone();
+    s.set_block_text(&draft, &block, "t", None, None).unwrap();
+    // The editor has not been told yet: same page id, same block id.
+    assert_eq!(s.redirect(&draft), Some(live.clone()));
+    s.set_block_text(&draft, &block, "ty", None, None).unwrap();
+    s.sync_index().unwrap();
+    let texts = live_texts(&mut s, &live);
+    assert!(texts.iter().any(|(t, _)| t == "ty"), "{texts:?}");
+    assert!(!s.is_draft(&draft));
+}
+
+/// P3 of the draft-day review: undo after a merged promotion must reach the day's shard.
+/// The undo step used to keep the draft's id, whose shard no longer exists, so undo changed
+/// only the in-memory survivor and the index kept the typed text (rule 2).
+#[test]
+fn fr_1_2_undo_after_a_merged_promotion_reaches_the_day() {
+    let d = date(2026, 11, 2);
+    let mut remote = store();
+    let gone = remote.ensure_daily_page(d).unwrap();
+    remote.delete_page(&gone).unwrap();
+    let live = remote.ensure_daily_page(d).unwrap();
+    write(&mut remote, &live, "remote two");
+    let shard = remote.export_since(&live, &Frontier::default()).unwrap();
+
+    let mut s = store();
+    let draft = s.draft_daily(d).unwrap();
+    s.import_batch(&[(live.clone(), shard)]).unwrap();
+    let block = s.page_state(&draft).unwrap().live_roots()[0].clone();
+    s.set_block_text(&draft, &block, "t", None, None).unwrap();
+    s.undo().unwrap();
+    s.sync_index().unwrap();
+    let texts = live_texts(&mut s, &live);
+    assert!(
+        !texts.iter().any(|(t, _)| t == "t"),
+        "undo reached the day in memory: {texts:?}"
+    );
+    let stored: String = s
+        .conn()
+        .query_row(
+            "SELECT text FROM block WHERE id=?1",
+            [block.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "", "undo reached the day's shard, not a dead id");
+    assert_doctor(&mut s);
+}
+
+/// An id that is still a session alias must stay reserved. Once the merged promotion's
+/// survivor is deleted, reusing the discarded id for a recreated day would shadow the new
+/// draft behind the deleted page (`Store::redirect`, rule 4).
+#[test]
+fn fr_1_2_a_recreated_day_does_not_reuse_a_live_alias() {
+    let d = date(2026, 11, 2);
+    let mut remote = store();
+    let gone = remote.ensure_daily_page(d).unwrap();
+    remote.delete_page(&gone).unwrap();
+    let live = remote.ensure_daily_page(d).unwrap();
+    write(&mut remote, &live, "remote two");
+    let shard = remote.export_since(&live, &Frontier::default()).unwrap();
+
+    let mut s = store();
+    let draft = s.draft_daily(d).unwrap();
+    s.import_batch(&[(live.clone(), shard)]).unwrap();
+    let block = s.page_state(&draft).unwrap().live_roots()[0].clone();
+    s.set_block_text(&draft, &block, "t", None, None).unwrap();
+    s.sync_index().unwrap();
+    assert_eq!(
+        s.redirect(&draft),
+        Some(live.clone()),
+        "the draft's id is an alias for the day"
+    );
+
+    // The survivor is deleted before the remote tombstone for the draft's id arrives.
+    s.delete_page(&live).unwrap();
+    // Revisiting the date must not reuse an id that redirects to the deleted page.
+    let again = s.draft_daily(d).unwrap();
+    assert_ne!(again, draft, "an id that is still an alias is reserved");
+    let (deleted, live_count) = {
+        let st = s.page_state(&again).unwrap();
+        (st.meta.deleted_at.is_some(), st.live_count())
+    };
+    assert!(
+        !deleted,
+        "the recreated day is a usable draft, not a deleted page"
+    );
+    assert!(s.is_draft(&again));
+    assert_eq!(live_count, 1);
     assert_doctor(&mut s);
 }
 
@@ -840,7 +1160,9 @@ fn debounced_commits_reach_disk_on_flush() {
         }
         assert!(s.has_pending(), "keystrokes stay in memory until a flush");
         s.flush().unwrap();
-        s.write_ticket().wait();
+        s.write_ticket()
+            .wait()
+            .expect("the debounced commit reaches disk");
         assert!(!s.has_pending());
         page = p;
         // Dropping the store flushes, stops the writer and compacts.
