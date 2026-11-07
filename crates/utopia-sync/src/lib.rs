@@ -467,7 +467,19 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
         first
     } else {
         // What was pushed may have changed the manifest, so ask again unconditionally.
-        t.manifest(None)?
+        // Failing to re-read it must not throw away the acks this round just earned: the
+        // rows stay marked sent, no cursor moves, and the next round pulls normally.
+        match t.manifest(None) {
+            Ok(m) => m,
+            Err(e) => {
+                let f = Failure::object(&e);
+                if f.is_terminal() {
+                    return Err(e);
+                }
+                inc.failed.push(f);
+                None
+            }
+        }
     };
     if let Some(m) = &manifest {
         for p in &m.pages {

@@ -124,6 +124,86 @@ fn ac_12_3_switching_transport_pulls_the_new_transport_from_zero() {
     assert!(seen.contains(&"from the relay".to_string()), "{seen:?}");
 }
 
+/// A relay that takes the pushes but times out on the manifest read that follows them.
+struct NoSecondManifest {
+    inner: RelayTransport,
+    calls: usize,
+}
+
+impl utopia_sync::Transport for NoSecondManifest {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.calls += 1;
+        if self.calls > 1 {
+            return Err(utopia_sync::SyncError::Transport(
+                "manifest timed out".into(),
+            ));
+        }
+        self.inner.manifest(if_none_match)
+    }
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        self.inner.push(page, req)
+    }
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.inner.pull(page, since_seq)
+    }
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// §12.3 steps 2–3: a manifest read that fails after the relay accepted the pushes must not
+/// lose their acks; only the pulls are skipped.
+#[test]
+fn ac_12_3_a_failed_second_manifest_keeps_the_acks() {
+    let relay = Relay::new();
+    let (mut a, _) = device(&relay);
+    let page = a.create_page("Pushed").unwrap();
+    write(&mut a, &page, "the relay takes this");
+    let mut ca = SyncClient::new(
+        NoSecondManifest {
+            inner: RelayTransport::new(relay.clone(), "g1"),
+            calls: 0,
+        },
+        &a,
+    )
+    .unwrap();
+    let report = ca
+        .sync_once(&mut a)
+        .expect("the pushes count even without the second manifest");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert!(report.failed[0].page.is_none());
+    assert!(report.pushed > 0, "{report:?}");
+    assert_eq!(
+        a.outbox_pending(100).unwrap().len(),
+        0,
+        "the acknowledged rows are marked sent"
+    );
+    assert_eq!(
+        a.sync_get("rev").unwrap(),
+        None,
+        "no manifest was applied, so none is remembered"
+    );
+}
+
 /// A relay that refuses one page (a 413, a poison batch) and serves every other page.
 struct Flaky {
     inner: RelayTransport,
