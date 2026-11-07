@@ -4097,6 +4097,56 @@ fn ac_13_5_focus_leaving_commits_the_ime_composition(cx: &mut TestAppContext) {
     assert_eq!(rows(&app, &page, cx)[1].0, "second!");
 }
 
+/// §13.5: the latest host request wins, except the idle commit, which never displaces one.
+/// A click on another block followed by a request to finish the block must not open that
+/// block when the composition finally commits: focusing a row the host has since moved on
+/// from is the stranded-focus bug every shortcut dies from.
+#[gpui::test]
+fn ac_13_5_a_later_request_supersedes_a_queued_begin(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    use utopia_ui::editor::EditTarget;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("ab");
+    cx.run_until_parked();
+    let editor = ws.update(cx, |w, _| w.editor());
+    let (host, first) = editor.read_with(cx, |e, _| {
+        let t = e.target.clone().expect("editing");
+        (t.host, t.block)
+    });
+    let second = add_block(&app, &page, "second", cx);
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "にほ", None, window, cx)
+    });
+    cx.run_until_parked();
+    // A click on the second block, queued behind the composition.
+    editor.update_in(cx, |e, window, cx| {
+        e.begin(
+            EditTarget {
+                host,
+                page: page.clone(),
+                block: second,
+            },
+            None,
+            None,
+            window,
+            cx,
+        )
+    });
+    // The host asks to finish the block instead (the undo and navigation paths call
+    // `commit` the same way): the later request is the one that counts.
+    editor.update(cx, |e, cx| e.commit(cx));
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_text_in_range(None, "にほ", window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        editor.read_with(cx, |e, _| e.target.as_ref().map(|t| t.block.clone())),
+        Some(first),
+        "the superseded click does not take the editor elsewhere"
+    );
+}
+
 /// No page titled like a relative date, and the day's page linked instead.
 fn assert_tomorrow_linked(app: &Entity<AppState>, cx: &mut VisualTestContext) {
     app.update(cx, |app, _| {

@@ -229,14 +229,10 @@ enum Deferred {
 }
 
 impl Deferred {
-    /// A request that goes further replaces one that goes less far, so the idle commit a
-    /// click interrupts cannot displace the click.
-    fn rank(&self) -> u8 {
-        match self {
-            Deferred::Commit { finished: false } => 0,
-            Deferred::Commit { finished: true } => 1,
-            Deferred::Begin { .. } => 2,
-        }
+    /// The idle commit is the only request that may not displace one already queued: it is
+    /// not a user action, just housekeeping that the next keystroke re-arms anyway.
+    fn is_idle(&self) -> bool {
+        matches!(self, Deferred::Commit { finished: false })
     }
 }
 
@@ -631,15 +627,14 @@ impl BlockEditor {
         }
     }
 
-    /// Queue a host request that must wait for the input method (§13.5).
+    /// Queue a host request that must wait for the input method (§13.5). The latest request
+    /// wins — the user's last click or command is the one they meant — except that the idle
+    /// commit never displaces anything.
     fn defer(&mut self, next: Deferred) {
-        if self
-            .deferred
-            .as_ref()
-            .is_none_or(|d| next.rank() >= d.rank())
-        {
-            self.deferred = Some(next);
+        if next.is_idle() && self.deferred.is_some() {
+            return;
         }
+        self.deferred = Some(next);
     }
 
     /// The input method let go of the buffer (§13.5): do what a host asked for meanwhile.
