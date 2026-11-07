@@ -4147,6 +4147,52 @@ fn ac_13_5_a_later_request_supersedes_a_queued_begin(cx: &mut TestAppContext) {
     );
 }
 
+/// §13.5: the same has to happen when focus moves without any host calling `end` (a popup,
+/// another window, the application deactivating). The platform sends no IME event to a
+/// field that has stopped being its input handler, so the focus-out listener closes the
+/// composition and keeps its text.
+#[gpui::test]
+fn ac_13_5_focus_out_without_end_keeps_the_composed_text(cx: &mut TestAppContext) {
+    use gpui::{EntityInputHandler as _, Focusable as _};
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("ab");
+    cx.run_until_parked();
+    let editor = ws.update(cx, |w, _| w.editor());
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "にほ", None, window, cx)
+    });
+    cx.run_until_parked();
+    // Focus leaves the editor; nobody ends the edit. (gpui only reports focus paths for an
+    // active window, which the test platform does not make the window until asked.)
+    ws.update_in(cx, |_, window, _| window.activate_window());
+    cx.run_until_parked();
+    ws.update_in(cx, |w, window, cx| {
+        let handle = w.focus_handle(cx);
+        window.focus(&handle);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        editor.update_in(cx, |e, window, cx| e.marked_text_range(window, cx)),
+        None,
+        "the composition is closed: the input method can no longer reach the field"
+    );
+    assert_eq!(rows(&app, &page, cx)[0].0, "abにほ");
+    assert!(
+        ws.update(cx, |w, cx| w.editor().read(cx).target.is_some()),
+        "the edit itself is still open, just without a composition"
+    );
+    // And the block edits again normally.
+    editor.update_in(cx, |e, window, cx| {
+        let target = e.target.clone().expect("still editing");
+        e.begin(target, None, None, window, cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_input("!?");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "abにほ!?");
+}
+
 /// §13.5: the idle commit a host queued before the composition does not run on top of the
 /// IME's own persist. It waits for the 300 ms timer that persist re-arms, as it would
 /// without a composition; otherwise every IME phrase runs the commit (NFC, hashtags, page
