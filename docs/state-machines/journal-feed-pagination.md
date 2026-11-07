@@ -34,6 +34,11 @@ and the transition list below describe `main` before this change.
   use the calendar, a `[[date]]` link or Cmd+Shift+D to reach such a day — but only a day
   written that way moves the feed's floor, not a bare visit (FR-1.2). That is what
   `Exhausted` means (FR-1.2 still lists every calendar day back to the oldest note).
+  The window still ends on a `JOURNAL_BATCH` boundary, so up to nine blank folded days
+  can follow the oldest note (the tail of the batch that reached it); that is the blank
+  canvas DN-1 draws, not another request. Trimming it would delete the folded days
+  `feed_folds_empty_days_to_one_row` requires and shrink a fresh graph's feed to today
+  and yesterday after the first keystroke.
 - **Issue 2, two units for "how much is loaded" — fixed by naming.** `Feed` dates count
   calendar days; `Journal::pages` is the page list, which is never longer than the
   window. Test: `feed_requests_one_batch_at_a_time` (the request moves the calendar
