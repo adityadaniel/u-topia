@@ -1526,15 +1526,9 @@ impl utopia_sync::Transport for FlakyTransport {
         if_none_match: Option<u64>,
     ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self
-            .refusals
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |n| n.checked_sub(1),
-            )
-            .is_ok()
-        {
+        if self.refusals.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.refusals
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             return Err(utopia_sync::SyncError::Unauthorized);
         }
         self.inner.manifest(if_none_match)
@@ -1739,6 +1733,219 @@ fn a_failed_round_backs_off(cx: &mut TestAppContext) {
             Some(utopia_sync::SyncStatus::Synced { .. })
         ),
         "the round after the backoff recovers"
+    );
+}
+
+/// A relay transport whose first round blocks until the test opens the gate, so the runner
+/// can be replaced while that exchange is in flight.
+struct GatedTransport {
+    gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    inner: utopia_sync::relay::RelayTransport,
+}
+
+impl utopia_sync::Transport for GatedTransport {
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let gate = self.gate.lock().unwrap().take();
+        if let Some(rx) = gate {
+            let _ = rx.recv();
+        }
+        self.inner.manifest(if_none_match)
+    }
+
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        self.inner.push(page, req)
+    }
+
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.inner.pull(page, since_seq)
+    }
+
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// A relay that advertises one page and then hands back an update the store cannot import:
+/// the round fails after the network was reached.
+struct BadPull {
+    page: PageId,
+}
+
+impl utopia_sync::Transport for BadPull {
+    fn manifest(
+        &mut self,
+        _if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        Ok(Some(utopia_sync::Manifest {
+            rev: 1,
+            protocol_version: utopia_sync::PROTOCOL_VERSION,
+            pages: vec![utopia_sync::ManifestPage {
+                page_id: self.page.to_string(),
+                head_seq: 1,
+                frontier: String::new(),
+                snapshot_seq: 0,
+                tail_bytes: 0,
+                updated_at: 0,
+                deleted: false,
+            }],
+        }))
+    }
+
+    fn push(
+        &mut self,
+        _page: &PageId,
+        _req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        Ok(utopia_sync::PushResponse {
+            accepted: 0,
+            head_seq: 0,
+            duplicate: 0,
+        })
+    }
+
+    fn pull(
+        &mut self,
+        _page: &PageId,
+        _since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        Ok(utopia_sync::PullResponse {
+            snapshot: None,
+            updates: vec![utopia_sync::UpdateOut {
+                seq: 1,
+                id: "garbage".into(),
+                frontier: String::new(),
+                payload: vec![0xff; 8],
+            }],
+            head_seq: 1,
+        })
+    }
+
+    fn put_snapshot(
+        &mut self,
+        _page: &PageId,
+        _covers_seq: u64,
+        _payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        Ok(())
+    }
+}
+
+/// §13.3: replacing the runner while its round is in the background must not hand that
+/// round's result (or its transport) to the new runner. The old loop owns the exchange, so
+/// replacing the runner cancels it; it never reaches the relay and the new runner starts
+/// from `Idle` with no outcome of its own.
+#[gpui::test]
+fn replacing_the_runner_mid_exchange_discards_the_old_round(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    let (_app, ws, cx) = setup(cx);
+    let relay = Relay::new();
+    let (_gate, gated) = std::sync::mpsc::channel::<()>();
+    let old_calls = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(GatedTransport {
+                gate: std::sync::Mutex::new(Some(gated)),
+                calls: old_calls.clone(),
+                inner: RelayTransport::new(relay.clone(), "g"),
+            }),
+            None,
+            cx,
+        )
+    });
+    // Step to the moment the old loop has handed its transport to the background exchange;
+    // the exchange itself is only queued, so it has not run yet.
+    let mut started = false;
+    for _ in 0..500 {
+        if ws.update(cx, |w, _| w.sync_dot()) == utopia_ui::sync_runner::SyncDot::Syncing {
+            started = true;
+            break;
+        }
+        cx.dispatcher.advance_clock_to_next_delayed();
+        if !cx.background_executor.tick() {
+            break;
+        }
+    }
+    assert!(started, "the first exchange never started");
+    // Replace the runner while the old exchange is blocked inside `manifest`.
+    let calls = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(relay.clone(), "g"),
+                calls: calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    assert_eq!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        None,
+        "the new runner has not finished a round of its own"
+    );
+    // Pumping afterwards must not resurrect the abandoned round or feed it to the new one.
+    for _ in 0..4 {
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        old_calls.load(Ordering::SeqCst),
+        0,
+        "the abandoned round was cancelled with its loop and never reached the relay"
+    );
+    assert!(calls.load(Ordering::SeqCst) >= 1, "the new runner polls");
+    assert!(matches!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(utopia_sync::SyncStatus::Synced { .. })
+    ));
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Synced
+    );
+}
+
+/// §12.6: a store failure *after* the network was reached (an update the store cannot
+/// import) is still a local error, not "the relay is offline".
+#[gpui::test]
+fn a_store_failure_after_the_network_is_a_local_error(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    use utopia_sync::SyncStatus;
+    let (app, ws, cx) = setup(cx);
+    let page = app.update(cx, |app, _| app.store.create_page("Remote").unwrap());
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(Box::new(BadPull { page }), None, cx)
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    let status = ws.read_with(cx, |w, _| w.sync_status());
+    assert!(
+        matches!(status, Some(SyncStatus::LocalError { .. })),
+        "an import the store rejects is a local error: {status:?}"
+    );
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Error
     );
 }
 
