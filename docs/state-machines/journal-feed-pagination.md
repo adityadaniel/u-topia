@@ -36,7 +36,11 @@ and the transition list below describe `main` before this change.
   `Exhausted` means (FR-1.2 still lists every calendar day back to the oldest note).
 - **Issue 2, two units for "how much is loaded" — fixed by naming.** `Feed` dates count
   calendar days; `Journal::pages` is the page list, which is never longer than the
-  window. Test: `feed_window_counts_calendar_days_not_pages`.
+  window. Test: `feed_requests_one_batch_at_a_time` (the request moves the calendar
+  window by a batch, not a page count).
+- **Re-opening after an older page appears — covered by a behaviour test.**
+  `fr_1_2_feed_reopens_when_an_older_day_appears` drives Exhausted → an older daily page
+  is written → `Changed` → sentinel back → the next batch loads it.
 - **Issue 3, `loading` meaningless outside `rebuild_journal` — fixed by construction.**
   There is no boolean flag: a pending request is `Feed::Loading { want_through }`, so a
   rebuild that cannot draw (no page) keeps the request instead of stranding a separate

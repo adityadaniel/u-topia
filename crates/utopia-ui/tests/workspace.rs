@@ -3232,6 +3232,7 @@ fn fr_1_1_feed_stops_at_the_oldest_daily_page(cx: &mut TestAppContext) {
         "stops within one batch of the oldest day, not years past it: {shown}"
     );
     // Scrolling on asks for nothing more: the window is final.
+    let open_before = ws.update(cx, |w, cx| w.open_journal_days(cx));
     for _ in 0..5 {
         scroll_main(cx, -4000.);
     }
@@ -3240,8 +3241,37 @@ fn fr_1_1_feed_stops_at_the_oldest_daily_page(cx: &mut TestAppContext) {
         Some(shown),
         "an exhausted feed never loads another batch"
     );
-    // Nothing was created by scrolling (FR-1.2).
-    assert_eq!(daily_count(&app, cx), 1);
+    assert_eq!(
+        ws.update(cx, |w, cx| w.open_journal_days(cx)),
+        open_before,
+        "no day opened on the extra scrolls either"
+    );
+    // Writing on a blank day inside the window writes that day (FR-1.2) but does not
+    // move the feed's floor: the day is above `shown_through`, so the feed stays ended.
+    // `today()` is 2026-11-02 in this file, so 25 days back is 2026-10-08: older than
+    // the only note (2026-10-10) but inside the loaded window (down to 2026-10-04).
+    let inside = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+    assert_eq!(inside, today() - chrono::Duration::days(25));
+    let folded = cx
+        .debug_bounds("day-folded-2026-10-08")
+        .expect("a blank day inside the window");
+    cx.simulate_click(folded.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_input("late note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.journal_shown_through(cx)),
+        Some(shown),
+        "writing inside the loaded window leaves the window where it was"
+    );
+    assert!(
+        ws.update(cx, |w, cx| w.journal_days(cx))
+            .contains(&PageId::for_date(inside)),
+        "the blank day became a page"
+    );
+    // Nothing was created by scrolling; the one page is the day just written (FR-1.2).
+    assert_eq!(daily_count(&app, cx), 2);
 }
 
 /// FR-1.2: visiting a day without writing on it only makes a draft, so it must not
@@ -3292,6 +3322,49 @@ fn fr_1_2_visited_day_does_not_extend_the_feed(cx: &mut TestAppContext) {
     );
     // Visiting wrote nothing.
     assert_eq!(daily_count(&app, cx), 3);
+}
+
+/// FR-1.2: an exhausted feed re-opens when an older daily page appears later (from a
+/// `[[date]]` link, an import or a sync). The terminal state is recomputed on every
+/// rebuild, not latched: the sentinel comes back and the next batch reaches the day.
+#[gpui::test]
+fn fr_1_2_feed_reopens_when_an_older_day_appears(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // Today's note only: the feed ends at once.
+    cx.simulate_input("today's note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("feed-end").is_some(),
+        "there is no older note yet"
+    );
+    // An older day appears without navigating the feed.
+    let older = today() - chrono::Duration::days(14);
+    let older_page = app.update(cx, |app, cx| {
+        let (p, b) = app.store.open_daily(older).unwrap();
+        app.store
+            .set_block_text(&p, &b, "found later", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+        app.changed(vec![p.clone()], true, cx);
+        p
+    });
+    cx.run_until_parked();
+    // The feed asks again and loads down to the day that appeared.
+    for _ in 0..10 {
+        scroll_main(cx, -4000.);
+    }
+    let shown = ws
+        .update(cx, |w, cx| w.journal_shown_through(cx))
+        .expect("in the feed");
+    assert!(
+        shown <= older && shown > older - chrono::Duration::days(10),
+        "the window reaches the new oldest day within one batch: {shown} vs {older}"
+    );
+    let pages = ws.update(cx, |w, cx| w.journal_days(cx));
+    assert_eq!(pages.len(), 2, "today and the day that appeared");
+    assert!(pages.contains(&older_page));
 }
 
 fn scroll_main(cx: &mut VisualTestContext, dy: f32) {

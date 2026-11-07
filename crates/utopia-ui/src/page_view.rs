@@ -4428,7 +4428,9 @@ mod tests {
 
     /// FR-1.2: a laid-out sentinel asks for exactly one batch. A second layout before the
     /// rebuild runs must not ask again — the pending request lives in the state, so there
-    /// is no separate `loading` flag to leave behind.
+    /// is no separate `loading` flag to leave behind. The request moves the window by
+    /// *calendar* days, not by pages: a blank day has no page to count
+    /// (journal-feed-pagination, "two units for how much is loaded").
     #[test]
     fn feed_requests_one_batch_at_a_time() {
         let today = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
@@ -4453,6 +4455,11 @@ mod tests {
             loading.shown_through(),
             shown,
             "nothing moves until the rebuild"
+        );
+        assert_eq!(
+            (shown - loading.want_through()).num_days(),
+            JOURNAL_BATCH as i64,
+            "one request moves the calendar window by a batch, pages or not"
         );
         assert_eq!(loading.request(), None, "one request in flight at a time");
         assert!(!loading.sentinel());
@@ -4493,25 +4500,6 @@ mod tests {
                 shown_through: shown
             },
             "a graph with no daily page at all is exhausted too"
-        );
-    }
-
-    /// The loaded window is a range of *calendar* days; the pages in it are fewer because
-    /// a blank day has none. The two units are separate fields, so a caller cannot read
-    /// one for the other (journal-feed-pagination, "two units for how much is loaded").
-    #[test]
-    fn feed_window_counts_calendar_days_not_pages() {
-        let today = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
-        let shown = today - chrono::Duration::days(JOURNAL_BATCH as i64 - 1);
-        let idle = Feed::Idle {
-            shown_through: shown,
-        };
-        assert_eq!(idle.shown_through(), shown, "a date, not a count");
-        let want = idle.request().unwrap().want_through();
-        assert_eq!(
-            (shown - want).num_days(),
-            JOURNAL_BATCH as i64,
-            "one request moves the calendar window by a batch, pages or not"
         );
     }
 
