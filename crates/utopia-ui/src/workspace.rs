@@ -1169,8 +1169,25 @@ impl Workspace {
         self.open_date(d.succ_opt().unwrap_or(d), false, false, window, cx);
     }
 
-    fn toggle_right(&mut self, _: &ToggleRightSidebar, _: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_right(
+        &mut self,
+        _: &ToggleRightSidebar,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.right_open = !self.right_open;
+        // AGENTS.md focus invariant: hiding the sidebar stops drawing the graph panel. If it
+        // owns focus, hand it back, or every workspace shortcut dies with it (the same rule
+        // `GraphEvent::Close` follows).
+        if !self.right_open {
+            let focused = self
+                .graph_panel
+                .as_ref()
+                .is_some_and(|panel| panel.read(cx).focus_handle(cx).is_focused(window));
+            if focused {
+                window.focus(&self.focus);
+            }
+        }
         cx.notify();
     }
 

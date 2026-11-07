@@ -2226,6 +2226,39 @@ fn closing_the_graph_panel_restores_focus(cx: &mut TestAppContext) {
     );
 }
 
+/// AGENTS.md focus invariant: hiding the right sidebar removes the focused graph panel
+/// from rendering. Focus must come back to the workspace, or every shortcut (including the
+/// one that would reopen the sidebar) stops reaching a handler.
+#[gpui::test]
+fn hiding_the_sidebar_restores_focus_from_the_graph_panel(cx: &mut TestAppContext) {
+    let (_app, ws, cx) = setup(cx);
+    cx.simulate_input("[[Alpha]] meets [[Beta]]");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let local = cx
+        .debug_bounds("graph-local")
+        .expect("Around this page filter")
+        .center();
+    cx.simulate_click(local, Modifiers::default());
+    cx.run_until_parked();
+    let canvas = cx.debug_bounds("graph-canvas").expect("panel canvas");
+    cx.simulate_click(canvas.origin + point(px(6.), px(6.)), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-shift-\\");
+    cx.run_until_parked();
+    // The panel is still logically open; it is just not drawn any more.
+    assert!(ws.update(cx, |w, _| w.graph_panel()).is_some());
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("jump-palette").is_some(),
+        "workspace shortcuts work after hiding the sidebar"
+    );
+}
+
 /// AGENTS.md focus invariant: ⌘-click opens a split, then the full-screen graph that had
 /// focus disappears; focus must not go with it.
 #[gpui::test]
