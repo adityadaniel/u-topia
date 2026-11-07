@@ -586,10 +586,10 @@ impl BlockEditor {
     /// composition is over whichever way it ended. `true` when the stored text changed.
     fn settle(&mut self, cx: &mut Context<Self>) -> bool {
         if std::mem::take(&mut self.pending_sync) {
-            // A store change landed while the input method owned the buffer. If the block
-            // is gone the composition has nowhere to go: end the edit before persisting
-            // rather than write into a tombstone (§13.5, rule 5). A block that merely
-            // changed keeps what the user just committed: the persist below is newer.
+            // A store change landed while the input method owned the buffer. A block that
+            // merely changed keeps what the user just committed: the persist below is
+            // newer (block text is last-writer-wins). A block that went away first takes
+            // the composed text with it, into the tombstone, and then the edit ends.
             let gone = self
                 .target
                 .clone()
@@ -597,7 +597,7 @@ impl BlockEditor {
             if gone {
                 // Keep what the input method typed (rule 5): the block is tombstoned but
                 // still in the store, so an undo or the trash brings the characters back,
-                // and only emptying the trash loses them. Then stop editing it.
+                // and only emptying the trash loses them.
                 self.persist(cx);
                 self.detach(cx);
                 return false;
