@@ -46,6 +46,84 @@ fn settle(devs: &mut [(&mut Store, &mut SyncClient<RelayTransport>)]) {
     }
 }
 
+/// §12.3 step 4: the folder cursor is a revision, not a file count. A peer that drops two
+/// files and adds two others leaves the count unchanged but must still be pulled.
+#[test]
+fn ac_12_3_a_folder_revision_with_an_unchanged_file_count_still_pulls() {
+    use utopia_sync::folder::FolderTransport;
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Store::open_in_memory().unwrap();
+    let mut b = Store::open_in_memory().unwrap();
+    let mut ca = SyncClient::new(FolderTransport::new(dir.path(), "a").unwrap(), &a).unwrap();
+    let mut cb = SyncClient::new(FolderTransport::new(dir.path(), "b").unwrap(), &b).unwrap();
+    let page = a.create_page("Shared").unwrap();
+    for i in 0..6 {
+        write(&mut a, &page, &format!("first {i}"));
+    }
+    ca.sync_once(&mut a).unwrap();
+    cb.sync_once(&mut b).unwrap();
+    assert_eq!(texts(&mut b, &page).len(), 6);
+
+    // Two more local updates, not yet pushed, plus the same number of already-imported
+    // files removed: the file count stays the same and only the contents change.
+    write(&mut a, &page, "later one");
+    write(&mut a, &page, "later two");
+    let pending = a.outbox_pending(100).unwrap();
+    let page_dir = dir.path().join("pages").join(page.as_str()).join("a");
+    let mut existing: Vec<_> = std::fs::read_dir(&page_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "upd"))
+        .collect();
+    existing.sort();
+    assert!(existing.len() >= pending.len());
+    for f in existing.iter().take(pending.len()) {
+        std::fs::remove_file(f).unwrap();
+    }
+    for (_, _, client_seq, payload) in &pending {
+        std::fs::write(
+            page_dir.join(format!("{:012}.upd", client_seq.max(&0))),
+            payload,
+        )
+        .unwrap();
+    }
+
+    cb.sync_once(&mut b).unwrap();
+    let seen = texts(&mut b, &page);
+    assert!(seen.contains(&"later one".to_string()), "{seen:?}");
+    assert!(seen.contains(&"later two".to_string()), "{seen:?}");
+}
+
+/// §12.3 step 4: a cursor measured on one transport is not compared with another's
+/// `head_seq`. Switching from a folder (a file count) to a fresh relay must pull.
+#[test]
+fn ac_12_3_switching_transport_pulls_the_new_transport_from_zero() {
+    use utopia_sync::folder::FolderTransport;
+    let relay = Relay::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Store::open_in_memory().unwrap();
+    let mut ca = SyncClient::new(FolderTransport::new(dir.path(), "a").unwrap(), &a).unwrap();
+    let page = a.create_page("Shared").unwrap();
+    for i in 0..10 {
+        write(&mut a, &page, &format!("folder {i}"));
+    }
+    ca.sync_once(&mut a).unwrap();
+
+    // The same page on a fresh relay: its sequence starts at 1, far below the folder's
+    // file count.
+    let (mut c, mut cc) = device(&relay);
+    let same = c.create_page("Shared").unwrap();
+    assert_eq!(same, page, "titles make the same page id");
+    write(&mut c, &same, "from the relay");
+    cc.sync_once(&mut c).unwrap();
+
+    let mut ca = SyncClient::new(RelayTransport::new(relay.clone(), "g1"), &a).unwrap();
+    ca.sync_once(&mut a).unwrap();
+    let seen = texts(&mut a, &page);
+    assert!(seen.contains(&"from the relay".to_string()), "{seen:?}");
+}
+
 /// A relay that refuses one page (a 413, a poison batch) and serves every other page.
 struct Flaky {
     inner: RelayTransport,

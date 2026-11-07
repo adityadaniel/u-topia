@@ -918,18 +918,24 @@ impl Store {
             .optional()?)
     }
 
-    /// Relay positions already imported: `(page id, seq)` from `seq:<page>` keys.
-    pub fn sync_seqs(&self) -> Result<Vec<(String, u64)>> {
+    /// `sync_state` entries whose key starts with `prefix:` as `(suffix, value)`. Cursors
+    /// live under `cursor:<page>`; the value is opaque here (utopia-sync owns its shape).
+    pub fn sync_prefixed(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let like = format!("{prefix}:%");
         let mut stmt = self
             .conn
-            .prepare("SELECT substr(key, 5), value FROM sync_state WHERE key LIKE 'seq:%'")?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|(k, v)| v.parse().ok().map(|v| (k, v)))
-            .collect())
+            .prepare("SELECT key, value FROM sync_state WHERE key LIKE ?1")?;
+        let rows = stmt.query_map([&like], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, value) = row?;
+            if let Some(suffix) = key.strip_prefix(&format!("{prefix}:")) {
+                out.push((suffix.to_string(), value));
+            }
+        }
+        Ok(out)
     }
 
     pub fn sync_set(&self, key: &str, value: &str) -> Result<()> {

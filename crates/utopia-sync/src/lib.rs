@@ -299,8 +299,8 @@ impl SyncStatus {
 pub struct Outgoing {
     /// `(page, outbox seqs, request)`, each request at most [`MAX_PUSH_BYTES`].
     pub pushes: Vec<(PageId, Vec<i64>, PushRequest)>,
-    /// Highest relay `seq` already imported, per page.
-    pub local_seqs: BTreeMap<PageId, u64>,
+    /// Where each page was pulled to, tagged with the transport that measured it.
+    pub cursors: BTreeMap<PageId, Cursor>,
     pub rev: Option<u64>,
     pub snapshots: Vec<(PageId, u64, Vec<u8>)>,
     /// Attachments to upload: `(sha256, bytes)`.
@@ -342,14 +342,15 @@ pub struct Incoming {
     pub failed: Vec<Failure>,
 }
 
-fn seq_key(page: &PageId) -> String {
-    format!("seq:{page}")
+fn cursor_key(page: &PageId) -> String {
+    format!("cursor:{page}")
 }
 
 /// The network half of a round (§12.3 steps 1–2, 5): touches only the transport, so it
 /// can run on a background thread while the UI keeps editing.
 pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incoming> {
     let mut inc = Incoming::default();
+    let space = t.cursor_space();
     let first = t.manifest(None)?;
     if let Some(m) = &first {
         if m.protocol_version != PROTOCOL_VERSION {
@@ -425,9 +426,13 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
     if let Some(m) = &manifest {
         for p in &m.pages {
             let page = PageId(p.page_id.clone());
-            let local = out.local_seqs.get(&page).copied().unwrap_or(0);
-            if p.head_seq > local {
-                match t.pull(&page, local) {
+            // A cursor from another transport (or another relay) is not comparable with
+            // this manifest's `head_seq`: treat the page as never pulled (§12.3 step 4).
+            let local = out.cursors.get(&page).filter(|c| c.space == space);
+            let up_to_date = local.is_some_and(|c| c.covers(&space, p.head_seq));
+            if !up_to_date {
+                let since = local.map_or(0, |c| c.pos);
+                match t.pull(&page, since) {
                     Ok(resp) => {
                         inc.pages.entry(page.clone()).or_default().pull = Some(resp);
                     }
@@ -449,7 +454,7 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
             }
         }
     }
-    inc.cursor_space = Some(t.cursor_space());
+    inc.cursor_space = Some(space);
     inc.manifest = manifest;
     Ok(inc)
 }
@@ -525,8 +530,15 @@ impl SyncEngine {
                 out.pushes.push((page, seqs, PushRequest { updates }));
             }
         }
-        for (k, v) in store.sync_seqs()? {
-            out.local_seqs.insert(PageId(k), v);
+        for (k, raw) in store.sync_prefixed("cursor")? {
+            match Cursor::decode(&raw) {
+                Some(c) => {
+                    out.cursors.insert(PageId(k), c);
+                }
+                // A hand-edited or older value is ignored: the page is pulled again, which
+                // imports idempotently (§12.3 step 4).
+                None => eprintln!("utopia-sync: ignoring unreadable cursor for page {k}"),
+            }
         }
         out.blob_puts = store.blobs_to_upload(BLOBS_PER_ROUND)?;
         out.blob_wants = store.missing_blobs()?;
@@ -612,8 +624,12 @@ impl SyncEngine {
                 continue;
             }
             store.outbox_mark_sent(&done.sent)?;
-            if let Some(resp) = &done.pull {
-                store.sync_set(&seq_key(&page), &resp.head_seq.to_string())?;
+            if let (Some(resp), Some(space)) = (&done.pull, &inc.cursor_space) {
+                let cursor = Cursor {
+                    space: space.clone(),
+                    pos: resp.head_seq,
+                };
+                store.sync_set(&cursor_key(&page), &cursor.encode())?;
             }
         }
         // Only a manifest whose pulls were all applied may be remembered: with a page
@@ -625,10 +641,11 @@ impl SyncEngine {
         }
         store.sync_set("synced_at", &store.now().to_string())?;
         for (page, head) in inc.compact {
-            let local: u64 = store
-                .sync_get(&seq_key(&page))?
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
+            let local = store
+                .sync_get(&cursor_key(&page))?
+                .and_then(|raw| Cursor::decode(&raw))
+                .filter(|c| c.space.kind == CursorKind::Seq)
+                .map_or(0, |c| c.pos);
             // Only a client that has imported everything up to head may cover it.
             if local >= head && store.page_exists(&page)? {
                 let full = store.export_since(&page, &Frontier::default())?;
