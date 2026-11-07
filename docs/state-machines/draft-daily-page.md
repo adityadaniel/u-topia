@@ -36,11 +36,11 @@ Issues, as numbered below:
 
 1. **Fixed** — a failed command group drops the draft *and* its shard (`Store::drop_shard`), so
    the day is simply unwritten again; `is_draft`, `page_state` and `draft_append_block` agree.
-2. **Fixed** — `sync_index` clears `docs`/`pending` on a writer failure but no longer `drafts`:
-   a draft has no durable state to reload, so the day the view is showing survives. This is
-   about a *draft's* survival: a promotion job that itself fails still takes the typed text
-   with it, because `sync_index` drops the promoted (no longer draft) shard — see the scope
-   note below.
+2. **Fixed** — a writer failure keeps every draft: `sync_index` repairs instead of clearing
+   loaded shards (`store-commit-pipeline.md`), and a promoted draft whose first commit never
+   landed is put back into its `DraftDay` by `repair_writer` (shard and entry together) and
+   retried; `settle_drafts` moves it into `docs` once the commit is durable, so the typed text
+   survives too.
 3. **Fixed** — `resolve_promotion` merges instead of colliding (`page_daily_uq`); the typed
    text lands on the date's page and the draft's id is never written. Visible change: a view
    or the editor holding the draft's id is retargeted to the page that owns the day.
@@ -56,11 +56,6 @@ Issues, as numbered below:
 
 Nothing listed here is left open. **Not covered here** (other machines):
 
-- a writer failure of the promotion job itself still loses the just-typed text, because
-  `sync_index` drops the promoted shard and the text was never on disk. That is
-  `store-commit-pipeline.md`'s repair path (the fix re-queues failed shards instead of
-  dropping them), not this machine's; issue 2 above only keeps *un-promoted* drafts, which by
-  construction hold no user text.
 - what the editor/view should do for a page merged away by another mechanism (rename, §8.6);
   this machine only redirects the ids it discarded itself.
 
@@ -136,8 +131,8 @@ Readers: `is_draft` at `page_view.rs:945, 3819`; `draft_daily` at `page_view.rs:
 2. **`sync_index` error clears `drafts` but the view keeps the id** (`lib.rs:336-338` vs
    `page_view.rs:240/945`). Same `NotFound` outcome; the draft's typed text was already
    promoted on the first keystroke, so only the empty block/template is lost (rule 5 holds
-   for characters, not for the day's existence) — unless the *promotion job itself* fails,
-   which the Status section lists as the pipeline's problem.
+   for characters, not for the day's existence) — and if the *promotion job itself* fails,
+   the pipeline's repair path now retries it (see Status).
 3. **Promoted draft can collide with a live page under a different id.** `dedupe_collisions`
    (`pages.rs:657-695`) runs only for imported pages present in the index; a draft has no
    row. If sync imports date D under a fresh ULID (the uuidv5 was tombstoned remotely, rule
