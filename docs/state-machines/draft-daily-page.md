@@ -20,34 +20,58 @@ fixed (each fix has a failing-first test; see the commit list).
 - **The write guard the sketch asked for** is `resolve_promotion` in
   `crates/utopia-store/src/pages.rs`: before a promoted draft is committed, the index is asked
   whether another page already owns its date (a remote copy under a fresh id, rule 4). If so
-  the draft's blocks are merged into that page (§8.6) and the draft's shard is written with the
-  merge tombstone, instead of inserting a second live daily row.
+  the draft's blocks move into that page (`plan_block_moves`, the same ids, so an open editor
+  keeps its block) and the draft's shard is **dropped**, not written: a draft was never
+  durable, and a `merged_into` tombstone for its id would let `reconcile_merged` drag the
+  *still trashed* blocks of that id (the remote deleted it, rule 4) into the live day on every
+  device (rule 5).
+- **The discarded id stays a session alias.** `Store::redirect(&PageId)` maps it to the
+  survivor; `load_doc`/`execute_multi` follow it (reads and writes keep working), `AppState`
+  resolves it in `changed()` and emits `PageReplaced { from, to }`, and `BlockEditor` and
+  `PageView` retarget themselves. `import_batch` drops the alias when a shard for the old id
+  arrives, because the id is a page of its own again and identity logic must not act on the
+  day instead. Undo steps are pointed at the survivor too (`execute_multi`), so undo commits.
 
 Issues, as numbered below:
 
 1. **Fixed** — a failed command group drops the draft *and* its shard (`Store::drop_shard`), so
    the day is simply unwritten again; `is_draft`, `page_state` and `draft_append_block` agree.
 2. **Fixed** — `sync_index` clears `docs`/`pending` on a writer failure but no longer `drafts`:
-   a draft has no durable state to reload, so the day the view is showing survives.
+   a draft has no durable state to reload, so the day the view is showing survives. This is
+   about a *draft's* survival: a promotion job that itself fails still takes the typed text
+   with it, because `sync_index` drops the promoted (no longer draft) shard — see the scope
+   note below.
 3. **Fixed** — `resolve_promotion` merges instead of colliding (`page_daily_uq`); the typed
-   text lands on the date's page. The draft's id becomes a tombstoned page with `merged_into`,
-   so a later create for the date finds the survivor. Visible change: the draft page a view
-   held can now become a merged page; the day keeps the remote page's id.
+   text lands on the date's page and the draft's id is never written. Visible change: a view
+   or the editor holding the draft's id is retargeted to the page that owns the day.
 4. **Fixed** — `id_taken` counts a shard only once it is queued or written (`claims_id`), and
    `create_page`/`ensure_daily_page` build the shard before inserting it (`install_new_page`),
-   so the leak cannot happen either.
+   so the leak cannot happen either. The test (`fr_1_2_unwritten_shard_does_not_claim_its_id`)
+   is a regression pin: it builds the pre-fix leak shape directly instead of making
+   `SetPageMeta` fail, which it cannot be made to do through the public API.
 5. **Fixed** — `start_note` reports whether it wrote (`StartedNote`) and `start_day` (and the
    same pattern in `focus_first`) only calls `AppState::changed` with `structural = true` for a
-   real write; clicking to start a draft no longer forces a flush and an `IndexUpdated` cycle.
+   real write; the three other visit paths (`open_journal`, `open_date`, `pick_date`) pass
+   `false` because a visit never writes. No path forces a flush for a visit any more.
 
-Nothing listed here is left open. Not covered (other machines): the writer's own failure
-bookkeeping (`store-commit-pipeline.md`) and the editor's caret when a draft it holds is
-replaced by a merged page.
+Nothing listed here is left open. **Not covered here** (other machines):
+
+- a writer failure of the promotion job itself still loses the just-typed text, because
+  `sync_index` drops the promoted shard and the text was never on disk. That is
+  `store-commit-pipeline.md`'s repair path (the fix re-queues failed shards instead of
+  dropping them), not this machine's; issue 2 above only keeps *un-promoted* drafts, which by
+  construction hold no user text.
+- what the editor/view should do for a page merged away by another mechanism (rename, §8.6);
+  this machine only redirects the ids it discarded itself.
 
 Tests: `crates/utopia-store/tests/acceptance.rs` (`fr_1_2_failed_command_leaves_no_ghost_draft`,
-`fr_1_2_writer_failure_keeps_the_draft`, `fr_1_2_promoted_draft_merges_into_the_days_page`),
-`crates/utopia-store/src/pages.rs` (`fr_1_2_unwritten_shard_does_not_claim_its_id`) and
-`crates/utopia-ui/tests/workspace.rs` (`fr_1_2_starting_a_draft_does_not_flush_the_index`).
+`fr_1_2_writer_failure_keeps_the_draft`, `fr_1_2_promoted_draft_merges_into_the_days_page`,
+`fr_1_2_promoted_draft_does_not_resurrect_a_deleted_page`,
+`fr_1_2_typing_after_a_merged_promotion_reaches_the_day`,
+`fr_1_2_undo_after_a_merged_promotion_reaches_the_day`), `crates/utopia-store/src/pages.rs`
+(`fr_1_2_unwritten_shard_does_not_claim_its_id`) and `crates/utopia-ui/tests/workspace.rs`
+(`fr_1_2_starting_a_draft_does_not_flush_the_index`,
+`fr_1_2_typing_survives_a_merged_promotion`, `fr_1_2_visiting_a_day_does_not_flush_the_index`).
 Screenshots: `docs/verification/draft-daily-page/` — `feed.png` (the feed with mock data;
 the day to click is folded), `day-started.png` (after clicking it: the day opened with the
 caret in its empty block, RECENT DAYS unchanged, so the click wrote nothing) and
@@ -112,7 +136,8 @@ Readers: `is_draft` at `page_view.rs:945, 3819`; `draft_daily` at `page_view.rs:
 2. **`sync_index` error clears `drafts` but the view keeps the id** (`lib.rs:336-338` vs
    `page_view.rs:240/945`). Same `NotFound` outcome; the draft's typed text was already
    promoted on the first keystroke, so only the empty block/template is lost (rule 5 holds
-   for characters, not for the day's existence).
+   for characters, not for the day's existence) — unless the *promotion job itself* fails,
+   which the Status section lists as the pipeline's problem.
 3. **Promoted draft can collide with a live page under a different id.** `dedupe_collisions`
    (`pages.rs:657-695`) runs only for imported pages present in the index; a draft has no
    row. If sync imports date D under a fresh ULID (the uuidv5 was tombstoned remotely, rule
@@ -141,15 +166,18 @@ stateDiagram-v2
     Draft --> Draft : draft_append_block (memory only)
     Draft --> Live : promote_draft (first keystroke -> queue -> flush, whole page, one job)
     Draft --> Live : ensure_daily_page (a link to the date)
-    Draft --> Live : promote_draft + resolve_promotion [another page owns the date -> §8.6 merge]
+    Draft --> Live : promote_draft + resolve_promotion [another page owns the date]
     Draft --> NoPage : command group fails (drop_shard, nothing was written)
     Draft --> NoPage : import_batch brings a remote shard for that draft id
     Live --> Tombstoned : delete
     Tombstoned --> Draft : draft_daily (fresh ULID)
 ```
 
-The old `Ghost` states are gone: a draft cannot exist without its shard (`DraftDay` owns it),
-and a writer failure no longer clears drafts (they have no durable state to disagree with).
+`resolve_promotion` moves the draft's blocks into the page that owns the date; the draft's id
+is dropped and kept only as a session alias (`Store::redirect`) that views and the editor
+follow. The old `Ghost` states are gone: a draft cannot exist without its shard (`DraftDay`
+owns it), and a writer failure no longer clears drafts (they have no durable state to disagree
+with).
 
 ## Would an explicit state type help?
 
