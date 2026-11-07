@@ -1401,14 +1401,6 @@ pub(crate) fn classify_tag_page(conn: &Connection, page: &PageId) -> Result<Opti
     Ok(Some(any && all_tags))
 }
 
-/// Whether anything references `page` at all (SB-2): a published tag page whose last
-/// reference went away is no longer one, and this is the cheap way to notice.
-pub(crate) fn has_any_ref(conn: &Connection, page: &PageId) -> Result<bool> {
-    let mut stmt =
-        conn.prepare_cached("SELECT 1 FROM ref WHERE dst_page_id=?1 AND dst_kind='page' LIMIT 1")?;
-    Ok(stmt.exists([page.as_str()])?)
-}
-
 /// The classification itself, over any connection: the writer publishes it after every
 /// commit, so the UI thread never runs it (SB-2, §15.1). The body re-reads reference spans
 /// from the source blocks because `ref` stores the resolved edge only.

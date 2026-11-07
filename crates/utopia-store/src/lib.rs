@@ -247,6 +247,12 @@ impl Store {
         self.persister.tag_classifications()
     }
 
+    /// How many pages the commit path's tag publisher looked at (tests, SB-2). One commit
+    /// touches only the pages it wrote and the destinations whose ref edges it changed.
+    pub fn tag_pages_visited(&self) -> u64 {
+        self.persister.tag_pages_visited()
+    }
+
     /// How many full tag-page classifications this store's own connection has run. The
     /// commit path classifies on the writer, so this stays put while the UI edits.
     pub fn tag_page_scans(&self) -> u64 {
