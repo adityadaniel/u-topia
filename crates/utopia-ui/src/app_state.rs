@@ -124,10 +124,14 @@ impl AppState {
             // and only claim the index moved when the repaired commit actually landed.
             self.report::<()>(Err(e));
             let _ = self.store.sync_index();
-            if !self.store.has_pending() {
-                self.index_updated(cx);
-            } else {
-                cx.notify();
+            // The repair's retry takes `pending` even when it fails, so an empty queue
+            // does not mean the index moved: ask the writer's ticket instead.
+            match self.store.write_ticket().wait() {
+                Ok(()) => self.index_updated(cx),
+                Err(e) => {
+                    self.report::<()>(Err(e));
+                    cx.notify();
+                }
             }
             return;
         }
@@ -238,19 +242,54 @@ mod tests {
         });
     }
 
+    const FAIL_COMMIT: &str = "CREATE TRIGGER fail_commit BEFORE INSERT ON outbox
+         BEGIN SELECT RAISE(ABORT, 'injected commit failure'); END";
+
+    /// Review P1: with the thread persister the repair's retry takes `pending` even when it
+    /// fails, so an empty queue does not mean the index moved. Key off the writer instead.
+    #[gpui::test]
+    fn a_failed_repair_does_not_claim_the_index_moved(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("g.utopia")).unwrap();
+        store.set_today(Some(today()));
+        let (page, block) = store.open_daily(today()).unwrap();
+        store
+            .set_block_text(&page, &block, "a", None, None)
+            .unwrap();
+        store.sync_index().unwrap();
+        store.conn().execute_batch(FAIL_COMMIT).unwrap();
+
+        let app = cx.new(|_| AppState::new(store));
+        app.update(cx, |app, cx| {
+            app.store
+                .set_block_text(&page, &block, "ab", None, None)
+                .unwrap();
+            app.flush_now(cx);
+        });
+        // The writer runs the first job and records the failure.
+        app.update(cx, |app, _| {
+            let _ = app.store.write_ticket().wait();
+        });
+        app.update(cx, |app, cx| {
+            app.store
+                .set_block_text(&page, &block, "abc", None, None)
+                .unwrap();
+            app.flush_now(cx);
+            assert!(app.last_error.is_some(), "the failure is reported");
+            assert_eq!(
+                app.refs_version, 0,
+                "a repair that also failed did not move the index"
+            );
+        });
+    }
+
     /// Issue 2: the wait task resolves on a writer error, so the failure must be reported
     /// and must not be announced as an index update for a commit that did not happen.
     #[gpui::test]
     fn a_failed_commit_does_not_claim_the_index_moved(cx: &mut TestAppContext) {
         let (store, page, block) = store();
         // Fail the commit through SQLite itself: the writer path runs unchanged.
-        store
-            .conn()
-            .execute_batch(
-                "CREATE TRIGGER fail_commit BEFORE INSERT ON outbox
-                 BEGIN SELECT RAISE(ABORT, 'injected commit failure'); END",
-            )
-            .unwrap();
+        store.conn().execute_batch(FAIL_COMMIT).unwrap();
         let app = cx.new(|_| AppState::new(store));
         app.update(cx, |app, cx| {
             app.store
