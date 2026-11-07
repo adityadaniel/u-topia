@@ -13,8 +13,8 @@ Fixed from the list below:
 
 | # | Issue | Fix |
 |---|---|---|
-| 1 | Two loops driving one runner | Runner owns its loop task (replacing the runner cancels the old loop) plus a generation check per step (`workspace.rs:485-590`) |
-| 2 | A local store error reads as "Offline" | `SyncStatus::LocalError` (`crates/utopia-sync/src/lib.rs:144`), mapped in `from_result` (`:155`), rendered in `status_text` |
+| 1 | Two loops driving one runner | Runner owns its loop task (replacing the runner cancels the old loop) plus a generation check per step (`workspace.rs:485-588`) |
+| 2 | A local store error reads as "Offline" | `SyncStatus::LocalError` (`crates/utopia-sync/src/lib.rs:148`), mapped in `from_result` (`:156`), rendered in `status_text` |
 | 3 | No backoff after a prepare failure | `SyncRunner::round_failed` (`sync_runner.rs:234`) doubles the interval like a failed exchange |
 | 4 | `status` stale during a round | `status_line` (`sync_runner.rs:336`) reads the phase, like the dot |
 | 6 | Realtime 401 terminal, HTTP not | `SyncPhase::Halted` (`:140`) on 401/403 and a protocol mismatch: the loop ends (§12.6). Both halves are now terminal, as the PRD asks |
@@ -55,7 +55,7 @@ a single `cx.spawn` loop in `Workspace::enable_sync_with`.
 | Round phase, and where the transport is | `crates/utopia-ui/src/sync_runner.rs:129` `phase: SyncPhase` | `Idle { transport }` = home between rounds; `Preparing` / `Exchanging` / `Applying` = the transport is with the UI thread, the background thread, the UI thread; `Halted { reason }` = the transport is gone |
 | Last round's outcome | `sync_runner.rs:176` `last: Option<SyncStatus>` | `None` = no round finished yet ("connecting…"); survives every phase |
 | Poll cadence | `sync_runner.rs:178` `interval: Duration` | `FAST` 5 s … `SLOW` 60 s |
-| Merge banner | `sync_runner.rs:180` `notice: Option<(String, i64)>` | shown for 5 s after `at` (`workspace.rs:2713-2716`) |
+| Merge banner | `sync_runner.rs:180` `notice: Option<(String, i64)>` | shown for 5 s after `at` (`workspace.rs:2711-2714`) |
 | Wake-up from realtime | `sync_runner.rs:182` `nudge: Arc<AtomicBool>` | set by the WebSocket thread (`sync_runner.rs:113`), consumed in the wait loop (`workspace.rs:505-514`) |
 | Loop identity | `sync_runner.rs:185` `generation: u64` | a loop only drives the runner it was started for |
 | Loop task | `sync_runner.rs:189` `loop_task: Option<Task<()>>` | replaced (cancelled), never accumulated |
@@ -90,20 +90,20 @@ only when `Idle`/`Halted`).
   `Halted` phase ends the loop there.
 - **prepare** `runner.begin_round()?` (`workspace.rs:519`, `sync_runner.rs:214`) moves
   `Idle → Preparing` and hands out the transport; `engine.prepare` (`workspace.rs:523`, which calls
-  `store.sync_index()` at `crates/utopia-sync/src/lib.rs:287`) then runs.
+  `store.sync_index()` at `crates/utopia-sync/src/lib.rs:293`) then runs.
   - prepare `Ok` → `runner.exchange()`: `Preparing → Exchanging` (`:241`).
   - prepare `Err` → `runner.round_failed(transport, status)` (`:234`): transport home,
     `last = from_result(Err)`, `interval` doubled (capped at `SLOW`).
 - **exchange** `exchange_owned` on the background executor (`workspace.rs:544-547`); this is
   the only time `Exchanging` holds.
 - **apply** `runner.exchange_returned()` (`:246`, `Exchanging → Applying`), `engine.apply`
-  (`workspace.rs:557`); imported pages raise `app.changed(.., structural=true)`; banner set if anything
+  (`workspace.rs:555`); imported pages raise `app.changed(.., structural=true)`; banner set if anything
   imported; `runner.end_round(transport, &report, status)` (`:252`): `Applying → Idle` with
   `interval = FAST` if the round was busy else doubled (`sync_runner.rs:272`), or
   `Applying → Halted` when the report is `Unauthorized`/`ProtocolVersion`
   (`sync_runner.rs:258-264`).
-- **quit / runner removed** Any `this.update` error breaks the loop (`workspace.rs:502`, `539`,
-  `582`), as does a runner that is no longer this loop's generation.
+- **quit / runner removed** Any `this.update` error breaks the loop (`workspace.rs:502`, `537`,
+  `580`), as does a runner that is no longer this loop's generation.
 
 ## Impossible or unhandled combinations (evidence)
 
@@ -112,7 +112,7 @@ only when `Idle`/`Halted`).
    (`workspace.rs:494,518,551`). Test: `enabling_sync_twice_keeps_one_poll_loop`
    (`crates/utopia-ui/tests/workspace.rs`).
 2. ~~**A local store error reads as "Offline".**~~ Fixed: `SyncError::Store` maps to
-   `SyncStatus::LocalError` (`crates/utopia-sync/src/lib.rs:155`) and the line says
+   `SyncStatus::LocalError` (`crates/utopia-sync/src/lib.rs:156`) and the line says
    "● Sync: local error — …" rather than blaming the relay. Test:
    `a_local_store_error_is_not_reported_as_offline`.
 3. ~~**Backoff is not applied on prepare failure.**~~ Fixed in `round_failed`
