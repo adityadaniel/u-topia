@@ -721,7 +721,12 @@ impl<T: Transport> SyncClient<T> {
     }
 
     /// Number of local updates not yet accepted by the relay.
-    pub fn queued(store: &Store) -> Result<usize> {
+    ///
+    /// Flushes first: in the UI's debounced mode an edit lives in memory for up to 250 ms,
+    /// and a count read straight from the index would say "nothing queued" while the
+    /// keystrokes are still unsent (§9.3). `prepare` does the same before pushing.
+    pub fn queued(store: &mut Store) -> Result<usize> {
+        store.sync_index()?;
         Ok(store.outbox_pending(usize::MAX >> 1)?.len())
     }
 

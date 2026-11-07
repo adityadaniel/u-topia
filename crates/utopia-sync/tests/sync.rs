@@ -488,19 +488,36 @@ fn offline_edits_queue_and_flush() {
     let p = a.create_page("Queued").unwrap();
     write(&mut a, &p, "one");
     write(&mut a, &p, "two");
-    let queued = SyncClient::<RelayTransport>::queued(&a).unwrap();
+    let queued = SyncClient::<RelayTransport>::queued(&mut a).unwrap();
     assert!(queued > 0);
     assert_eq!(ca.sync_status(&mut a), SyncStatus::Offline { queued });
     assert_eq!(
-        SyncClient::<RelayTransport>::queued(&a).unwrap(),
+        SyncClient::<RelayTransport>::queued(&mut a).unwrap(),
         queued,
         "outbox retained"
     );
     ca.transport_mut().offline = false;
     ca.sync_once(&mut a).unwrap();
-    assert_eq!(SyncClient::<RelayTransport>::queued(&a).unwrap(), 0);
+    assert_eq!(SyncClient::<RelayTransport>::queued(&mut a).unwrap(), 0);
     cb.sync_once(&mut b).unwrap();
     assert_eq!(texts(&mut b, &p), vec!["one", "two"]);
+}
+
+/// §9.3/§12.3: the "N changes queued" count must not lag behind a debounced edit.
+#[test]
+fn ac_12_3_queued_counts_edits_still_waiting_for_the_writer() {
+    let mut s = Store::open_in_memory().unwrap();
+    s.set_debounced(true).unwrap();
+    let page = s.create_page("Debounced").unwrap();
+    let block = write(&mut s, &page, "first");
+    let before = SyncClient::<RelayTransport>::queued(&mut s).unwrap();
+    // A plain text edit stays in memory until a flush: still unsent, so still queued.
+    s.set_block_text(&page, &block, "first, edited", None, None)
+        .unwrap();
+    assert!(s.has_pending(), "the edit is debounced");
+    let after = SyncClient::<RelayTransport>::queued(&mut s).unwrap();
+    assert_eq!(after, before + 1, "the waiting edit is counted");
+    assert!(!s.has_pending(), "counting flushed it");
 }
 
 #[test]

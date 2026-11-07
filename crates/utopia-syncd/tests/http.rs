@@ -131,13 +131,13 @@ fn auth_is_enforced() {
     assert!(matches!(ca.sync_once(&mut a), Err(SyncError::Unauthorized)));
     assert_eq!(ca.sync_status(&mut a), SyncStatus::NeedsAuth);
     assert!(
-        SyncClient::<HttpTransport>::queued(&a).unwrap() > 0,
+        SyncClient::<HttpTransport>::queued(&mut a).unwrap() > 0,
         "edits stay queued"
     );
     let (mut b, mut cb) = device(&server, Some("secret"));
     b.create_page("Allowed").unwrap();
     cb.sync_once(&mut b).unwrap();
-    assert_eq!(SyncClient::<HttpTransport>::queued(&b).unwrap(), 0);
+    assert_eq!(SyncClient::<HttpTransport>::queued(&mut b).unwrap(), 0);
 }
 
 /// §12.6: a batch the relay stored but whose response was lost is re-pushed. Dedupe runs
