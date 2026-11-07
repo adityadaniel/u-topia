@@ -100,7 +100,8 @@ final class GraphModel: ObservableObject {
                 self.syncing = false
                 switch result {
                 case .success(let s):
-                    self.lastSync = "Synced: \(s.pushed) sent, \(s.importedPages) pages updated"
+                    let failed = s.failed > 0 ? " — \(s.failed) page(s) failed" : ""
+                    self.lastSync = "Synced: \(s.pushed) sent, \(s.importedPages) pages updated\(failed)"
                     self.reload()
                 case .failure(let e):
                     self.lastSync = "Offline: \(e)"

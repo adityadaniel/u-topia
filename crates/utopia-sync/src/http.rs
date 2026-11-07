@@ -9,7 +9,7 @@ use serde::Serialize;
 use utopia_core::PageId;
 
 use crate::wire::{Manifest, PullResponse, PushRequest, PushResponse, SnapshotRequest};
-use crate::{Result, SyncError, Transport};
+use crate::{CursorKind, CursorSpace, Result, SyncError, Transport};
 
 /// Largest response body accepted (a page snapshot plus its tail).
 const MAX_BODY: u64 = 256 << 20;
@@ -20,6 +20,31 @@ pub struct HttpTransport {
     base: String,
     graph: String,
     token: Option<String>,
+    /// The relay store's id, learned from its manifest (§12.6). `None` until the first
+    /// manifest, and forever with a relay that predates the field.
+    instance: Option<String>,
+}
+
+/// A stable spelling of a relay origin for the cursor space: scheme and authority
+/// lowercased, a default port dropped, no trailing slash. `http://Relay.Example:80/` and
+/// `http://relay.example` are the same relay; a different scheme or port is not.
+fn normalize_origin(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return base.to_ascii_lowercase();
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let authority = authority.to_ascii_lowercase();
+    let authority = match authority.rsplit_once(':') {
+        Some((host, "80")) if scheme == "http" => host.to_string(),
+        Some((host, "443")) if scheme == "https" => host.to_string(),
+        _ => authority,
+    };
+    format!("{scheme}://{authority}{}", path.trim_end_matches('/'))
 }
 
 /// Graph ids travel in URLs; keep them to a safe alphabet.
@@ -70,6 +95,7 @@ impl HttpTransport {
             base: base.trim_end_matches('/').to_string(),
             graph: graph.to_string(),
             token,
+            instance: None,
         })
     }
 
@@ -98,6 +124,18 @@ impl HttpTransport {
 }
 
 impl Transport for HttpTransport {
+    fn cursor_space(&self) -> CursorSpace {
+        // The relay store id once its manifest has been seen: the URL can change (a DHCP
+        // lease, a LAN port, a host rename) without the data changing, and a wiped store
+        // keeps its URL while its sequence restarts. A relay that predates the field is
+        // identified by its URL and graph.
+        let store = self
+            .instance
+            .clone()
+            .unwrap_or_else(|| normalize_origin(&self.base));
+        CursorSpace::new(format!("relay:{store}#{}", self.graph), CursorKind::Seq)
+    }
+
     fn manifest(&mut self, if_none_match: Option<u64>) -> Result<Option<Manifest>> {
         let mut req = self.request("GET", &self.url("manifest"));
         if let Some(rev) = if_none_match {
@@ -107,7 +145,11 @@ impl Transport for HttpTransport {
         if resp.status() == 304 {
             return Ok(None);
         }
-        read_json(resp).map(Some)
+        let m: Manifest = read_json(resp)?;
+        if !m.instance.is_empty() {
+            self.instance = Some(m.instance.clone());
+        }
+        Ok(Some(m))
     }
 
     fn push(&mut self, page: &PageId, req: PushRequest) -> Result<PushResponse> {
@@ -179,6 +221,21 @@ mod tests {
         assert!(!valid_graph_id("../etc"));
         assert!(!valid_graph_id(""));
         assert!(HttpTransport::new("http://x", "a/b", None).is_err());
+    }
+
+    #[test]
+    fn the_fallback_cursor_space_ignores_url_spelling() {
+        let a = HttpTransport::new("http://Relay.Example:80/", "g", None).unwrap();
+        let b = HttpTransport::new("HTTP://relay.example", "g", None).unwrap();
+        assert_eq!(a.cursor_space(), b.cursor_space());
+        let secure = HttpTransport::new("https://relay.example", "g", None).unwrap();
+        assert_ne!(
+            a.cursor_space(),
+            secure.cursor_space(),
+            "another scheme is another relay"
+        );
+        let other_graph = HttpTransport::new("http://relay.example", "h", None).unwrap();
+        assert_ne!(a.cursor_space(), other_graph.cursor_space());
     }
 
     #[test]

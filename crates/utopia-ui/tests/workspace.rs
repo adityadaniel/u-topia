@@ -1478,6 +1478,10 @@ struct CountingTransport {
 }
 
 impl utopia_sync::Transport for CountingTransport {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+
     fn manifest(
         &mut self,
         if_none_match: Option<u64>,
@@ -1521,6 +1525,10 @@ struct FlakyTransport {
 }
 
 impl utopia_sync::Transport for FlakyTransport {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+
     fn manifest(
         &mut self,
         if_none_match: Option<u64>,
@@ -1567,6 +1575,10 @@ struct Refusing {
 }
 
 impl utopia_sync::Transport for Refusing {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        utopia_sync::CursorSpace::new("test:refusing", utopia_sync::CursorKind::Seq)
+    }
+
     fn manifest(
         &mut self,
         _if_none_match: Option<u64>,
@@ -1745,6 +1757,10 @@ struct GatedTransport {
 }
 
 impl utopia_sync::Transport for GatedTransport {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+
     fn manifest(
         &mut self,
         if_none_match: Option<u64>,
@@ -1790,6 +1806,10 @@ struct BadPull {
 }
 
 impl utopia_sync::Transport for BadPull {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        utopia_sync::CursorSpace::new("test:bad-pull", utopia_sync::CursorKind::Seq)
+    }
+
     fn manifest(
         &mut self,
         _if_none_match: Option<u64>,
@@ -1806,6 +1826,7 @@ impl utopia_sync::Transport for BadPull {
                 updated_at: 0,
                 deleted: false,
             }],
+            instance: "test-relay".into(),
         }))
     }
 
@@ -1926,9 +1947,12 @@ fn replacing_the_runner_mid_exchange_discards_the_old_round(cx: &mut TestAppCont
 }
 
 /// §12.6: a store failure *after* the network was reached (an update the store cannot
-/// import) is still a local error, not "the relay is offline".
+/// import) is still a local fault, not "the relay is offline". The round applies the rest
+/// and reports the page as failed, so it is `Partial` rather than `LocalError`; a failure
+/// that stops the whole round (in `prepare`) is `LocalError`, covered by
+/// `a_local_store_error_is_not_reported_as_offline`.
 #[gpui::test]
-fn a_store_failure_after_the_network_is_a_local_error(cx: &mut TestAppContext) {
+fn a_store_failure_after_the_network_is_not_offline(cx: &mut TestAppContext) {
     use std::time::Duration;
     use utopia_sync::SyncStatus;
     let (app, ws, cx) = setup(cx);
@@ -1940,8 +1964,12 @@ fn a_store_failure_after_the_network_is_a_local_error(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let status = ws.read_with(cx, |w, _| w.sync_status());
     assert!(
-        matches!(status, Some(SyncStatus::LocalError { .. })),
-        "an import the store rejects is a local error: {status:?}"
+        matches!(status, Some(SyncStatus::Partial { failed: 1, .. })),
+        "an import the store rejects is a failed page, not the relay: {status:?}"
+    );
+    assert!(
+        !matches!(status, Some(SyncStatus::Offline { .. })),
+        "a local fault is not offline: {status:?}"
     );
     assert_eq!(
         ws.update(cx, |w, _| w.sync_dot()),
@@ -3807,6 +3835,183 @@ fn daily_notes_feed_scrolls_into_older_days(cx: &mut TestAppContext) {
     assert_eq!(daily_count(&app, cx), 26);
 }
 
+/// FR-1.1/FR-1.2: the feed lists every calendar day back to the oldest daily page and
+/// then stops. Without a terminal state the sentinel kept asking for another batch for
+/// as long as it was laid out, walking back through empty years.
+#[gpui::test]
+fn fr_1_1_feed_stops_at_the_oldest_daily_page(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // One page, older than the first batch, so there is something to load.
+    let oldest = today() - chrono::Duration::days(23);
+    app.update(cx, |app, _| {
+        let (p, b) = app.store.open_daily(oldest).unwrap();
+        app.store
+            .set_block_text(&p, &b, "the first note", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    // Scroll far past the last real day.
+    for _ in 0..20 {
+        scroll_main(cx, -4000.);
+    }
+    let pages = ws.update(cx, |w, cx| w.journal_days(cx));
+    assert_eq!(pages.len(), 2, "today's draft and the only written day");
+    assert_eq!(pages[0], today_page(&app, cx), "today comes first");
+    // The end of the feed is a terminal state, not an endless sentinel.
+    assert!(
+        cx.debug_bounds("feed-end").is_some(),
+        "the feed says it has no earlier notes once the oldest day is loaded"
+    );
+    let shown = ws
+        .update(cx, |w, cx| w.journal_shown_through(cx))
+        .expect("in the feed");
+    assert!(
+        shown <= oldest,
+        "the oldest day is inside the loaded window: {shown} vs {oldest}"
+    );
+    assert!(
+        shown > oldest - chrono::Duration::days(10),
+        "stops within one batch of the oldest day, not years past it: {shown}"
+    );
+    // Scrolling on asks for nothing more: the window is final.
+    let open_before = ws.update(cx, |w, cx| w.open_journal_days(cx));
+    for _ in 0..5 {
+        scroll_main(cx, -4000.);
+    }
+    assert_eq!(
+        ws.update(cx, |w, cx| w.journal_shown_through(cx)),
+        Some(shown),
+        "an exhausted feed never loads another batch"
+    );
+    assert_eq!(
+        ws.update(cx, |w, cx| w.open_journal_days(cx)),
+        open_before,
+        "no day opened on the extra scrolls either"
+    );
+    // Writing on a blank day inside the window writes that day (FR-1.2) but does not
+    // move the feed's floor: the day is above `shown_through`, so the feed stays ended.
+    // `today()` is 2026-11-02 in this file, so 25 days back is 2026-10-08: older than
+    // the only note (2026-10-10) but inside the loaded window (down to 2026-10-04).
+    let inside = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+    assert_eq!(inside, today() - chrono::Duration::days(25));
+    let folded = cx
+        .debug_bounds("day-folded-2026-10-08")
+        .expect("a blank day inside the window");
+    cx.simulate_click(folded.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_input("late note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.journal_shown_through(cx)),
+        Some(shown),
+        "writing inside the loaded window leaves the window where it was"
+    );
+    assert!(
+        ws.update(cx, |w, cx| w.journal_days(cx))
+            .contains(&PageId::for_date(inside)),
+        "the blank day became a page"
+    );
+    // Nothing was created by scrolling; the one page is the day just written (FR-1.2).
+    assert_eq!(daily_count(&app, cx), 2);
+}
+
+/// FR-1.2: visiting a day without writing on it only makes a draft, so it must not
+/// extend the feed: the feed still ends at the oldest *written* day, not at whatever
+/// date was last opened from the calendar.
+#[gpui::test]
+fn fr_1_2_visited_day_does_not_extend_the_feed(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // Three written days: the oldest is two days back.
+    let oldest = today() - chrono::Duration::days(2);
+    app.update(cx, |app, _| {
+        for i in 0..3 {
+            let d = today() - chrono::Duration::days(i);
+            let (p, b) = app.store.open_daily(d).unwrap();
+            app.store
+                .set_block_text(&p, &b, &format!("note {i}"), None, None)
+                .unwrap();
+            app.store.commit_block(&p, &b).unwrap();
+        }
+        app.store.sync_index().unwrap();
+    });
+    // Visit (do not write) a day years back: a draft for the session (FR-1.2).
+    let visited = NaiveDate::from_ymd_opt(2019, 1, 1).unwrap();
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(visited, false, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(
+        app.update(cx, |app, _| app.store.is_draft(&PageId::for_date(visited))),
+        "opening a date only drafts it"
+    );
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    // The visited draft must not make the feed load towards 2019.
+    for _ in 0..20 {
+        scroll_main(cx, -4000.);
+    }
+    assert!(
+        cx.debug_bounds("feed-end").is_some(),
+        "the feed ends at the oldest written day, not at the visited draft"
+    );
+    let shown = ws
+        .update(cx, |w, cx| w.journal_shown_through(cx))
+        .expect("in the feed");
+    assert!(
+        shown <= oldest && shown > oldest - chrono::Duration::days(10),
+        "the window stays within one batch of the oldest written day: {shown} vs {oldest}"
+    );
+    // Visiting wrote nothing.
+    assert_eq!(daily_count(&app, cx), 3);
+}
+
+/// FR-1.2: an exhausted feed re-opens when an older daily page appears later (from a
+/// `[[date]]` link, an import or a sync). The terminal state is recomputed on every
+/// rebuild, not latched: the sentinel comes back and the next batch reaches the day.
+#[gpui::test]
+fn fr_1_2_feed_reopens_when_an_older_day_appears(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    // Today's note only: the feed ends at once.
+    cx.simulate_input("today's note");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("feed-end").is_some(),
+        "there is no older note yet"
+    );
+    // An older day appears without navigating the feed.
+    let older = today() - chrono::Duration::days(14);
+    let older_page = app.update(cx, |app, cx| {
+        let (p, b) = app.store.open_daily(older).unwrap();
+        app.store
+            .set_block_text(&p, &b, "found later", None, None)
+            .unwrap();
+        app.store.commit_block(&p, &b).unwrap();
+        app.store.sync_index().unwrap();
+        app.changed(vec![p.clone()], true, cx);
+        p
+    });
+    cx.run_until_parked();
+    // The feed asks again and loads down to the day that appeared.
+    for _ in 0..10 {
+        scroll_main(cx, -4000.);
+    }
+    let shown = ws
+        .update(cx, |w, cx| w.journal_shown_through(cx))
+        .expect("in the feed");
+    assert!(
+        shown <= older && shown > older - chrono::Duration::days(10),
+        "the window reaches the new oldest day within one batch: {shown} vs {older}"
+    );
+    let pages = ws.update(cx, |w, cx| w.journal_days(cx));
+    assert_eq!(pages.len(), 2, "today and the day that appeared");
+    assert!(pages.contains(&older_page));
+}
+
 fn scroll_main(cx: &mut VisualTestContext, dy: f32) {
     let main = cx.debug_bounds("main-pane").expect("main pane");
     cx.simulate_event(gpui::ScrollWheelEvent {
@@ -3872,6 +4077,32 @@ fn folded_empty_day_opens_on_a_click(cx: &mut TestAppContext) {
     );
 }
 
+/// `docs/state-machines/draft-daily-page.md` issue 5: starting a day writes nothing, so it
+/// must not report a structural change, which forces an index flush and an `IndexUpdated`
+/// cycle for a commit that does not exist (FR-1.2).
+#[gpui::test]
+fn fr_1_2_starting_a_draft_does_not_flush_the_index(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let day = today() - chrono::Duration::days(4);
+    let before = app.read_with(cx, |app, _| app.refs_version);
+    let selector: &'static str =
+        Box::leak(format!("day-folded-{}", utopia_core::date::iso(day)).into_boxed_str());
+    let row = cx.debug_bounds(selector).expect("a folded empty day");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        app.read_with(cx, |app, _| app.store.is_draft(&PageId::for_date(day))),
+        "the click started a draft for the day"
+    );
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "starting a draft queues no write, so the index is not refreshed"
+    );
+}
+
 #[gpui::test]
 fn shortcuts_work_after_scrolling_the_caret_away(cx: &mut TestAppContext) {
     let (_app, ws, cx) = setup(cx);
@@ -3883,6 +4114,213 @@ fn shortcuts_work_after_scrolling_the_caret_away(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let shown = ws.update(cx, |w, cx| w.main_page(cx)).unwrap();
     assert_eq!(shown, PageId::for_date(today().pred_opt().unwrap()));
+}
+
+/// P2 of the draft-day review: the first keystroke on a draft whose day a remote copy
+/// already owns merges the draft into that page. The editor and the view still hold the
+/// draft's id; they must follow it, or every later keystroke would edit a shard that no
+/// longer exists (FR-1.2, rule 5).
+#[gpui::test]
+fn fr_1_2_typing_survives_a_merged_promotion(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let draft = app.update(cx, |app, _| app.store.draft_daily(day).unwrap());
+    // Show the day as a draft, caret in its first block, before the remote copy lands.
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(draft.clone()));
+    // Another device deleted the day's deterministic id and wrote it under a fresh one;
+    // only that page arrives, while the draft is still open here.
+    let live = app.update(cx, |app, _| {
+        let mut remote = Store::open_in_memory().unwrap();
+        remote.set_today(Some(day));
+        let gone = remote.ensure_daily_page(day).unwrap();
+        remote.delete_page(&gone).unwrap();
+        let live = remote.ensure_daily_page(day).unwrap();
+        let shard = remote.export_since(&live, &Default::default()).unwrap();
+        app.store.import_batch(&[(live.clone(), shard)]).unwrap();
+        live
+    });
+    app.update(cx, |app, cx| app.changed(Vec::new(), false, cx));
+    cx.run_until_parked();
+    // First keystroke: promotes the draft, merges it into the day's page and redirects.
+    cx.simulate_input("t");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(live.clone()),
+        "the view follows the day"
+    );
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.page.clone())),
+        Some(live.clone()),
+        "the editor follows the day"
+    );
+    // The second keystroke must land on the day, not on the discarded draft.
+    cx.simulate_input("y");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &live, cx), [("ty".to_string(), 0)]);
+}
+
+/// A view can still be showing a draft when the same day arrives from sync under another
+/// id. Opening the date elsewhere used to discard the draft's shard silently, leaving that
+/// view on a missing page (FR-1.2: a remote copy of the day replaces the draft).
+#[gpui::test]
+fn fr_1_2_opening_a_day_replaces_a_stale_draft_everywhere(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let draft = app.update(cx, |app, _| app.store.draft_daily(day).unwrap());
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(draft.clone()));
+    // Another device wrote the day under a fresh id while this draft was open.
+    let live = app.update(cx, |app, _| {
+        let mut remote = Store::open_in_memory().unwrap();
+        remote.set_today(Some(day));
+        let gone = remote.ensure_daily_page(day).unwrap();
+        remote.delete_page(&gone).unwrap();
+        let live = remote.ensure_daily_page(day).unwrap();
+        let shard = remote.export_since(&live, &Default::default()).unwrap();
+        app.store.import_batch(&[(live.clone(), shard)]).unwrap();
+        live
+    });
+    app.update(cx, |app, cx| app.changed(Vec::new(), false, cx));
+    cx.run_until_parked();
+    // Opening the date in a sidebar pane retires the stale draft.
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, true, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(live.clone()),
+        "the open draft follows the day that replaced it"
+    );
+    assert!(
+        app.update(cx, |app, _| app.store.page_state(&live).is_ok()),
+        "the main pane shows a page that loads"
+    );
+}
+
+/// The undo group saved the draft's id in its carets. Undo and redo put the editor back on
+/// that id while the feed renders the survivor, so `BlockEditor::is_editing` stops matching
+/// and the focused row disappears (FR-1.2, AGENTS.md "the list keeps rendering the row
+/// being edited").
+#[gpui::test]
+fn fr_1_2_undo_after_a_merged_promotion_keeps_the_editor(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let draft = app.update(cx, |app, _| app.store.draft_daily(day).unwrap());
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(draft.clone()));
+    // Another device wrote the day under a fresh id; only that page arrives.
+    let live = app.update(cx, |app, _| {
+        let mut remote = Store::open_in_memory().unwrap();
+        remote.set_today(Some(day));
+        let gone = remote.ensure_daily_page(day).unwrap();
+        remote.delete_page(&gone).unwrap();
+        let live = remote.ensure_daily_page(day).unwrap();
+        let shard = remote.export_since(&live, &Default::default()).unwrap();
+        app.store.import_batch(&[(live.clone(), shard)]).unwrap();
+        live
+    });
+    app.update(cx, |app, cx| app.changed(Vec::new(), false, cx));
+    cx.run_until_parked();
+    // One keystroke promotes the draft and merges it into the day's page.
+    cx.simulate_input("t");
+    cx.run_until_parked();
+    let target_page = |ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
+        ws.update(cx, |w, cx| {
+            w.editor().read(cx).target.as_ref().map(|t| t.page.clone())
+        })
+    };
+    // Undo restores the caret: it must point at the page that owns the day.
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(
+        target_page(&ws, cx),
+        Some(live.clone()),
+        "undo puts the caret back on the day"
+    );
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(live.clone()));
+    // So does redo.
+    cx.simulate_keystrokes("cmd-shift-z");
+    cx.run_until_parked();
+    assert_eq!(
+        target_page(&ws, cx),
+        Some(live.clone()),
+        "redo puts the caret back on the day"
+    );
+    // The focused row is drawn, so the next keystroke reaches the day.
+    cx.simulate_input("y");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &live, cx), [("ty".to_string(), 0)]);
+}
+
+/// P3 of the draft-day review: visiting a date writes nothing, so none of the visit paths
+/// may report a structural change (which forces a synchronous index flush and an
+/// `IndexUpdated` cycle) (FR-1.2, FR-1.5).
+#[gpui::test]
+fn fr_1_2_visiting_a_day_does_not_flush_the_index(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let before = app.read_with(cx, |app, _| app.refs_version);
+
+    // Quick jump / previous day (`open_date`): a draft until written.
+    let day = today() - chrono::Duration::days(6);
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(
+        app.read_with(cx, |app, _| app.store.is_draft(&PageId::for_date(day))),
+        "the day is a draft"
+    );
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "opening a draft day queues no write"
+    );
+
+    // The day header's calendar (`pick_date` on the page view).
+    let title = cx.debug_bounds("page-title").expect("the day's header");
+    cx.simulate_click(title.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    // The calendar opens on the day's own month (October, for `day` above).
+    let cell = cx
+        .debug_bounds("cal-pop-2026-10-15")
+        .expect("the header calendar opens");
+    cx.simulate_click(cell.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "the calendar queues no write"
+    );
+
+    // The Daily Notes feed (`open_journal`).
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "opening the feed queues no write"
+    );
 }
 
 #[gpui::test]

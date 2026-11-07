@@ -76,6 +76,9 @@ pub struct SyncSummary {
     pub pushed: u32,
     pub pulled_pages: u32,
     pub imported_pages: u32,
+    /// Pages that failed while the rest of the round applied (§12.6). The shell shows
+    /// the counts as a successful sync and this as a warning, instead of one error.
+    pub failed: u32,
 }
 
 /// An open graph. All calls are serialized on one store.
@@ -289,10 +292,17 @@ impl Graph {
         self.with(|s| {
             let mut client = SyncClient::new(transport, s).map_err(err)?;
             let r = client.sync_once(s).map_err(err)?;
+            let failed = r
+                .failed
+                .iter()
+                .map(|f| f.page.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
             Ok(SyncSummary {
                 pushed: r.pushed as u32,
                 pulled_pages: r.pulled_pages as u32,
                 imported_pages: r.imported.len() as u32,
+                failed: failed as u32,
             })
         })
     }

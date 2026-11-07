@@ -9,7 +9,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use utopia_core::PageId;
 
 use crate::wire::{Manifest, PullResponse, PushRequest, PushResponse};
-use crate::{Result, SyncError, Transport};
+use crate::{CursorSpace, Result, SyncError, Transport};
 
 /// Format tag so a future scheme can coexist (§12.6: never corrupt the log).
 const VERSION: u8 = 1;
@@ -103,6 +103,11 @@ impl<T: Transport> Encrypted<T> {
 }
 
 impl<T: Transport> Transport for Encrypted<T> {
+    fn cursor_space(&self) -> CursorSpace {
+        // Sealing changes payloads, not the relay's sequence.
+        self.inner.cursor_space()
+    }
+
     fn manifest(&mut self, if_none_match: Option<u64>) -> Result<Option<Manifest>> {
         self.inner.manifest(if_none_match)
     }

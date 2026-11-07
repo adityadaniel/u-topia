@@ -15,9 +15,9 @@ Fixed from the list below:
 | # | Issue | Fix |
 |---|---|---|
 | 1 | Two loops driving one runner | Runner owns its loop task (replacing the runner cancels the old loop *and* its in-flight exchange) plus a generation check per step (`workspace.rs:485-588`) |
-| 2 | A local store error reads as "Offline" | `SyncStatus::LocalError` (`crates/utopia-sync/src/lib.rs:148`), mapped in `from_result` (`:161`), rendered in `status_text` |
+| 2 | A local store error reads as "Offline" | `SyncStatus::LocalError` (`crates/utopia-sync/src/lib.rs:312`), mapped in `from_result` (`:340`), rendered in `status_text` |
 | 3 | No backoff after a prepare failure | `SyncRunner::round_failed` (`sync_runner.rs:236`) doubles the interval like a failed exchange |
-| 4 | `status` stale during a round | `status_line` (`sync_runner.rs:353`) reads the phase, like the dot |
+| 4 | `status` stale during a round | `status_line` (`sync_runner.rs:362`) reads the phase, like the dot |
 | 6 | Realtime 401 terminal, HTTP not | Polling now backs off to `SLOW` instead of ending: `SyncPhase::Refused` (`:143`) / `RefusalReason` (`:151`). A transient 403 heals, a revoked token stops the 5 s polling. The realtime thread still gives up for good — see below |
 | 7 | Prepared-`None` path skips the sleep reset | Unreachable: only `Idle`/`Refused` hold the transport, one loop owns it, and the setters are ordered |
 
@@ -61,10 +61,16 @@ Not fixed, deliberately:
   4). With #6's retry, HTTP recovers after a refusal while notices do not: that asymmetry is
   `realtime-listener.md` issue 2, unchanged from `main`.
 
-`LocalError` covers `SyncError::Store`, from `prepare` and from `apply` (a pulled update the
-store rejects). A local fault that surfaces as `SyncError::Transport` — the folder transport's
-own I/O errors — still reads as "Offline"; it is local, not the relay, but the two cannot be
-told apart from the error alone. Noted rather than guessed at.
+`LocalError` covers an `SyncError::Store` that stops the whole round — `prepare`'s
+`sync_index`, the apply-time bookkeeping (`outbox_mark_sent`, blobs, `sync_set`). A pulled
+update the store cannot import is *not* that any more: `apply` isolates it, keeps the rest of
+the round and reports the page in `report.failed`, which the runner shows as
+`SyncStatus::Partial` ("● Synced — N pages could not sync", dot red) and backs off on
+(`next_interval` only returns `FAST` when the round was busy *and* left no page failed). That
+per-page machine is `sync-engine-outbox-and-cursor.md`. A local fault that surfaces as
+`SyncError::Transport` — the folder transport's own I/O errors — still reads as "Offline"; it
+is local, not the relay, but the two cannot be told apart from the error alone. Noted rather
+than guessed at.
 
 Uncertain item resolved: `gpui::Task` wraps `async_task::Task`, whose `Drop` cancels the
 future, so dropping the runner (and its `loop_task`) does stop the old loop even when that
@@ -97,7 +103,7 @@ a single `cx.spawn` loop in `Workspace::enable_sync_with`.
 | Round phase, and where the transport is | `crates/utopia-ui/src/sync_runner.rs:129` `phase: SyncPhase` | `Idle { transport }` / `Refused { reason, transport }` = home; `Preparing` / `Exchanging` / `Applying` = the transport is with the UI thread, the background thread, the UI thread |
 | Last round's outcome | `sync_runner.rs:182` `last: Option<SyncStatus>` | `None` = no round finished yet ("connecting…"); survives every phase |
 | Poll cadence | `sync_runner.rs:184` `interval: Duration` | `FAST` 5 s … `SLOW` 60 s; pinned to `SLOW` while refused |
-| Merge banner | `sync_runner.rs:186` `notice: Option<(String, i64)>` | shown for 5 s after `at` (`workspace.rs:2711-2714`) |
+| Merge banner | `sync_runner.rs:186` `notice: Option<(String, i64)>` | shown for 5 s after `at` (`workspace.rs:2721-2726`) |
 | Wake-up from realtime | `sync_runner.rs:188` `nudge: Arc<AtomicBool>` | set by the WebSocket thread (`sync_runner.rs:113`), consumed in the wait loop (`workspace.rs:507-515`), ignored while refused |
 | Loop identity | `sync_runner.rs:191` `generation: u64` | a loop only drives the runner it was started for |
 | Loop task | `sync_runner.rs:195` `loop_task: Option<Task<()>>` | replaced (cancelled), never accumulated |
@@ -105,7 +111,7 @@ a single `cx.spawn` loop in `Workspace::enable_sync_with`.
 | Settings → Sync facts | `sync_runner.rs:36` `SyncFacts` global | set in `start_sync` (`workspace.rs:444`) |
 
 The derived "dot" and the status line are computed, not stored: `sync_dot()` at
-`sync_runner.rs:332` and `status_line()` at `:353` both match on `phase` (and read `last`
+`sync_runner.rs:340` and `status_line()` at `:353` both match on `phase` (and read `last`
 only when `Idle`/`Refused`).
 
 ## States (effective)
@@ -115,7 +121,7 @@ only when `Idle`/`Refused`).
 | Off | `sync = None` | – |
 | Connecting (never completed a round) | `Idle`, `last = None` | home |
 | Waiting (idle between polls) | `Idle`, `last = Some(Synced)` | home |
-| Backing off | `Idle`, `last = Some(Offline/LocalError)` | home |
+| Backing off | `Idle`, `last = Some(Offline/LocalError/Partial)` | home |
 | Refused (401/403, protocol mismatch) | `Refused`, `interval = SLOW` | home |
 | Preparing (UI thread, short) | `Preparing` | with the loop |
 | Exchanging (background thread) | `Exchanging` | with the background task |
@@ -133,7 +139,7 @@ only when `Idle`/`Refused`).
   loop; while `Refused`, nudges are ignored so a notice cannot restore the fast cadence.
 - **prepare** `runner.begin_round()?` (`workspace.rs:520`, `sync_runner.rs:221`) moves
   `Idle`/`Refused → Preparing` and hands out the transport; `engine.prepare`
-  (`workspace.rs:524`, which calls `store.sync_index()` at `crates/utopia-sync/src/lib.rs:295`)
+  (`workspace.rs:524`, which calls `store.sync_index()` at `crates/utopia-sync/src/lib.rs:598`)
   then runs.
   - prepare `Ok` → `runner.exchange()`: `Preparing → Exchanging` (`:248`).
   - prepare `Err` → `runner.round_failed(transport, status)` (`:236`): transport home,
@@ -143,9 +149,11 @@ only when `Idle`/`Refused`).
 - **apply** `runner.exchange_returned()` (`:255`, `Exchanging → Applying`), `engine.apply`
   (`workspace.rs:556`); imported pages raise `app.changed(.., structural=true)`; banner set if
   anything imported; `runner.end_round(transport, &report, status)` (`:264`):
-  `Applying → Idle` with `interval = FAST` if the round was busy else doubled
-  (`sync_runner.rs:288`), or `Applying → Refused` with `interval = SLOW` when the report is
-  `Unauthorized`/`ProtocolVersion` (`sync_runner.rs:274-278`).
+  `Applying → Idle` with `interval = FAST` only if the round was busy *and* left no page
+  failed, else doubled (`sync_runner.rs:296-303`), or `Applying → Refused` with
+  `interval = SLOW` when the report is `Unauthorized`/`ProtocolVersion`
+  (`sync_runner.rs:274-278`). A report whose `failed` list is not empty still ends in `Idle`,
+  with `last = Partial` (`partial_failed/queued`).
 - **quit / runner removed** Any `this.update` error breaks the loop (`workspace.rs:502`, `538`,
   `581`), as does a runner that is no longer this loop's generation.
 
@@ -155,11 +163,12 @@ only when `Idle`/`Refused`).
    `enable_sync_with` cancels the previous loop; every step also checks `generation`
    (`workspace.rs:494,519,550`). Tests: `enabling_sync_twice_keeps_one_poll_loop`,
    `replacing_the_runner_mid_exchange_discards_the_old_round`.
-2. ~~**A local store error reads as "Offline".**~~ Fixed: `SyncError::Store` maps to
-   `SyncStatus::LocalError` (`crates/utopia-sync/src/lib.rs:161`) and the line says
-   "● Sync: local error — …" rather than blaming the relay. Tests:
+2. ~~**A local store error reads as "Offline".**~~ Fixed: a whole-round `SyncError::Store`
+   maps to `SyncStatus::LocalError` (`crates/utopia-sync/src/lib.rs:340`) and the line says
+   "● Sync: local error — …" rather than blaming the relay; a pulled page the store rejects
+   is `Partial` (see above), never `Offline`. Tests:
    `a_local_store_error_is_not_reported_as_offline`,
-   `a_store_failure_after_the_network_is_a_local_error`.
+   `a_store_failure_after_the_network_is_not_offline`.
 3. ~~**Backoff is not applied on prepare failure.**~~ Fixed in `round_failed`
    (`sync_runner.rs:236`). Test: `a_failed_round_backs_off`.
 4. ~~**`status` goes stale during a round.**~~ Fixed: the line and the dot both read the
@@ -191,7 +200,8 @@ stateDiagram-v2
     Preparing --> Exchanging : prepare Ok (transport out)
     Preparing --> Idle : prepare Err (last = LocalError, interval x2 ≤ 60s)
     Exchanging --> Applying : background exchange returns
-    Applying --> Idle : report Ok (interval = FAST if busy else x2 ≤ 60s)
+    Applying --> Idle : report Ok, no failed page (FAST if busy else x2 ≤ 60s)
+    Applying --> Idle : report Ok with failed pages (last = Partial, interval x2 ≤ 60s)
     Applying --> Idle : report Err (last = Offline/LocalError, interval x2 ≤ 60s)
     Applying --> Refused : 401/403 | unsupported protocol (interval = SLOW)
     Idle --> [*] : workspace gone | runner replaced

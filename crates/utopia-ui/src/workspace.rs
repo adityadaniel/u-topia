@@ -1264,7 +1264,9 @@ impl Workspace {
         let page = self.app.update(cx, |app, cx| {
             let r = app.store.draft_daily(today);
             let p = app.report(r);
-            app.changed(Vec::new(), true, cx);
+            // A visit writes nothing (a draft, or a page already there): no structural
+            // change, so no synchronous index flush (FR-1.2).
+            app.changed(Vec::new(), false, cx);
             p
         });
         let Some(page) = page else { return };
@@ -1288,6 +1290,11 @@ impl Workspace {
         self.main.read(cx).journal_days()
     }
 
+    /// The oldest calendar day the feed has loaded (FR-1.2); `None` outside the feed.
+    pub fn journal_shown_through(&self, cx: &gpui::App) -> Option<NaiveDate> {
+        self.main.read(cx).journal_shown_through()
+    }
+
     /// The date whose heading is pinned at the top of the feed (DN-3), for scripts.
     pub fn main_sticky_day(&self, cx: &gpui::App) -> Option<NaiveDate> {
         self.main.read(cx).sticky_day()
@@ -1309,7 +1316,9 @@ impl Workspace {
         let page = self.app.update(cx, |app, cx| {
             let r = app.store.draft_daily(d);
             let p = app.report(r);
-            app.changed(Vec::new(), true, cx);
+            // A visit writes nothing (FR-1.2): the caret's own block, if one has to be
+            // created, reports its write from `focus_first`.
+            app.changed(Vec::new(), false, cx);
             p
         });
         if let Some(page) = page {

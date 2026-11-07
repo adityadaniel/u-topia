@@ -278,16 +278,24 @@ impl SyncRunner {
                 return;
             }
         }
-        self.interval = next_interval(self.interval, report);
+        self.interval = self.next_interval(report);
         self.last = Some(status);
         self.phase = SyncPhase::Idle { transport };
     }
+
+    /// The cadence that would follow `result`, from the interval in force. `end_round` uses
+    /// it; it is public for the tests that pin the backoff policy.
+    pub fn next_interval(&self, result: &Result<SyncReport, SyncError>) -> Duration {
+        next_interval(self.interval, result)
+    }
 }
 
-/// Next poll interval after a round: fast again when anything moved, else back off.
+/// Next poll interval after a round: fast again when anything moved, else back off. A round
+/// that moved something but left a page failed backs off like a failure: the failed page is
+/// retried, not spun on.
 fn next_interval(current: Duration, result: &Result<SyncReport, SyncError>) -> Duration {
     match result {
-        Ok(r) if !r.is_quiet() => FAST,
+        Ok(r) if !r.is_quiet() && r.failed.is_empty() => FAST,
         _ => back_off(current),
     }
 }
@@ -308,7 +316,8 @@ pub fn exchange_owned(
 
 /// What the sidebar's single sync dot says (SB-4): grey when sync is off, green when the
 /// last round finished, amber while a round is in flight or still connecting, red when the
-/// relay refused, was unreachable or speaks another protocol.
+/// relay refused, was unreachable or speaks another protocol, or when the round left a page
+/// that could not sync (`Partial`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncDot {
     Off,
@@ -341,7 +350,8 @@ pub fn sync_dot(runner: Option<&SyncRunner>) -> SyncDot {
         SyncPhase::Idle { .. } => match runner.last {
             None => SyncDot::Syncing,
             Some(SyncStatus::Synced { .. }) => SyncDot::Synced,
-            Some(SyncStatus::Offline { .. })
+            Some(SyncStatus::Partial { .. })
+            | Some(SyncStatus::Offline { .. })
             | Some(SyncStatus::LocalError { .. })
             | Some(SyncStatus::NeedsAuth)
             | Some(SyncStatus::Unsupported) => SyncDot::Error,
@@ -377,6 +387,17 @@ pub fn status_text(status: Option<&SyncStatus>, now_ms: i64) -> (String, bool) {
                 format!("{}h ago", secs / 3600)
             };
             (format!("Synced {ago}"), false)
+        }
+        Some(SyncStatus::Partial { failed, queued }) => {
+            let pages = if *failed == 1 { "page" } else { "pages" };
+            if *queued == 0 {
+                (format!("● Synced — {failed} {pages} could not sync"), true)
+            } else {
+                (
+                    format!("● {failed} {pages} could not sync — {queued} changes queued"),
+                    true,
+                )
+            }
         }
         Some(SyncStatus::Offline { queued }) => {
             (format!("● Offline — {queued} changes queued"), true)
@@ -444,6 +465,11 @@ mod tests {
         assert_eq!(sync_dot(Some(&runner)), SyncDot::Synced);
         runner.last = Some(SyncStatus::Offline { queued: 2 });
         assert_eq!(sync_dot(Some(&runner)), SyncDot::Error);
+        runner.last = Some(SyncStatus::Partial {
+            failed: 1,
+            queued: 0,
+        });
+        assert_eq!(sync_dot(Some(&runner)), SyncDot::Error);
         runner.last = Some(SyncStatus::LocalError {
             message: "database: disk I/O error".into(),
         });
@@ -455,6 +481,32 @@ mod tests {
     }
 
     #[test]
+    fn a_round_that_left_a_page_failed_backs_off() {
+        let engine = utopia_sync::SyncEngine::new(&utopia_store::Store::open_in_memory().unwrap())
+            .expect("engine");
+        let transport: BoxTransport = Box::new(utopia_sync::relay::RelayTransport::new(
+            utopia_sync::relay::Relay::new(),
+            "g",
+        ));
+        let runner = SyncRunner::new(engine, transport);
+        let report = SyncReport {
+            pushed: 1,
+            ..Default::default()
+        };
+        assert_eq!(runner.next_interval(&Ok(report.clone())), FAST);
+        let mut report = report;
+        report.failed.push(utopia_sync::Failure {
+            page: None,
+            kind: utopia_sync::FailureKind::Transport("HTTP 413".into()),
+        });
+        assert_ne!(
+            runner.next_interval(&Ok(report)),
+            FAST,
+            "a failed page is retried on the backoff, not spun on"
+        );
+    }
+
+    #[test]
     fn status_lines() {
         assert_eq!(
             status_text(Some(&SyncStatus::Synced { at_ms: 0 }), 150_000).0,
@@ -463,6 +515,24 @@ mod tests {
         let (s, warn) = status_text(Some(&SyncStatus::Offline { queued: 3 }), 0);
         assert_eq!(s, "● Offline — 3 changes queued");
         assert!(warn);
+        // A reachable relay that could not take one page is not "offline".
+        let (s, warn) = status_text(
+            Some(&SyncStatus::Partial {
+                failed: 1,
+                queued: 0,
+            }),
+            0,
+        );
+        assert_eq!(s, "● Synced — 1 page could not sync");
+        assert!(warn);
+        let (s, _) = status_text(
+            Some(&SyncStatus::Partial {
+                failed: 2,
+                queued: 5,
+            }),
+            0,
+        );
+        assert_eq!(s, "● 2 pages could not sync — 5 changes queued");
         // §12.6: a round that dies in the store is not the relay being offline.
         let local = SyncStatus::LocalError {
             message: "database: no such table: sync_state".into(),

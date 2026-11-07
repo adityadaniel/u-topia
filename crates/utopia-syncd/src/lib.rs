@@ -5,7 +5,7 @@
 
 pub mod lan;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS page_snapshot (
   PRIMARY KEY (graph_id, page_id)
 );
 CREATE TABLE IF NOT EXISTS graph_rev (graph_id TEXT PRIMARY KEY, rev INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS relay_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS blob (
   graph_id TEXT NOT NULL, hash TEXT NOT NULL,
   payload BLOB NOT NULL, received_at INTEGER NOT NULL,
@@ -99,9 +100,28 @@ impl Db {
 
     fn init(conn: Connection) -> ApiResult<Self> {
         conn.execute_batch(SCHEMA)?;
+        // One id per relay store, kept across restarts and replaced only by a wiped
+        // database, so a client can tell a restarted log from the one it pulled (§12.6).
+        conn.execute(
+            "INSERT OR IGNORE INTO relay_meta(key, value)
+             VALUES ('instance', lower(hex(randomblob(16))))",
+            [],
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// This relay store's instance id (stable for the life of the database).
+    fn instance(conn: &Connection) -> ApiResult<String> {
+        Ok(conn
+            .query_row(
+                "SELECT value FROM relay_meta WHERE key='instance'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
     }
 
     fn lock(&self) -> ApiResult<std::sync::MutexGuard<'_, Connection>> {
@@ -140,6 +160,10 @@ impl Db {
     /// Bytes stored for a graph (logs + snapshots + attachments), for quota.
     pub fn graph_bytes(&self, gid: &str) -> ApiResult<u64> {
         let conn = self.lock()?;
+        Self::graph_bytes_conn(&conn, gid)
+    }
+
+    fn graph_bytes_conn(conn: &Connection, gid: &str) -> ApiResult<u64> {
         Ok(conn.query_row(
             "SELECT ifnull((SELECT sum(length(payload)) FROM page_log WHERE graph_id=?1), 0)
                   + ifnull((SELECT sum(length(payload)) FROM page_snapshot WHERE graph_id=?1), 0)
@@ -252,6 +276,7 @@ impl Db {
             rev: Self::rev(&conn, gid)?,
             protocol_version: PROTOCOL_VERSION,
             pages: pages.into_values().collect(),
+            instance: Self::instance(&conn)?,
         })
     }
 
@@ -263,10 +288,6 @@ impl Db {
         req: PushRequest,
         quota: u64,
     ) -> ApiResult<PushResponse> {
-        let incoming: u64 = req.updates.iter().map(|u| u.payload.len() as u64).sum();
-        if self.graph_bytes(gid)? + incoming > quota {
-            return Err(ApiError::QuotaExceeded);
-        }
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
@@ -275,16 +296,32 @@ impl Db {
         )?;
         let mut head = Self::head(&tx, gid, pid)?;
         let (mut accepted, mut duplicate) = (0, 0);
+        // Dedupe inside the transaction, before quota: a re-pushed batch whose response
+        // was lost is entirely duplicates, and the bytes it would add are already stored.
+        // Counting them again would refuse it forever (§12.6).
+        let mut new_updates = Vec::new();
+        let mut new_bytes = 0u64;
+        let mut seen: HashSet<String> = HashSet::new();
         for u in req.updates {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM page_log WHERE change_id=?1)",
                 [&u.id],
                 |r| r.get(0),
             )?;
-            if exists {
+            // A change id repeated inside one request is a duplicate as well: the first
+            // copy is inserted below, and a second insert would break
+            // `page_log.change_id`'s UNIQUE index and roll the whole request back.
+            if exists || !seen.insert(u.id.clone()) {
                 duplicate += 1;
                 continue;
             }
+            new_bytes += u.payload.len() as u64;
+            new_updates.push(u);
+        }
+        if Self::graph_bytes_conn(&tx, gid)? + new_bytes > quota {
+            return Err(ApiError::QuotaExceeded);
+        }
+        for u in new_updates {
             head += 1;
             let client = u.id.split(':').next().unwrap_or_default().to_string();
             tx.execute(

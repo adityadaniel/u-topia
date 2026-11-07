@@ -1,5 +1,54 @@
 # Store commit pipeline: strict vs debounced, pending edits, writer progress
 
+## Status
+
+Updated on branch `fix/store-commit-pipeline`. The file:line references below describe the
+code before the fix; the states are now explicit in code:
+
+- `writer::WriterState` (`Healthy` | `Failed { error }`) is the writer's health. It is read
+  through `Persister::failure()` without being consumed, and `WriteTicket::wait()` returns
+  `Result<()>`: a waiter can no longer mistake a failure for a durable commit.
+- `DocEntry` separates `durable` (confirmed in `page_doc` + `page_update`) from
+  `in_flight: Option<InFlight>` (the last submitted job and the frontier it will reach).
+  `flush` records the job's sequence, `reconcile_writer` promotes only jobs the writer
+  confirmed, and a failed job is never promoted.
+- `Store::sync_index` treats a failure as a state to leave: it reconciles, requeues every
+  shard whose durable copy lags as a full snapshot, clears the failure only then, and still
+  reports the failure to the caller that needed the barrier.
+- `DocEntry.promoted` distinguishes a draft day whose first edit was queued (FR-1.2) from a
+  day that was only visited; `InFlight.enqueue` carries the queued job's outbox intent; and
+  `Progress.processed`/`stale_through` make skipped jobs release their tickets and keep a
+  repair from writing jobs submitted before it.
+
+Fixed: **1** (the durable frontier advances only on a confirmed commit), **2** (a failure
+stays until repaired; the UI reports it and does not emit `IndexUpdated` for the missing
+commit), **3** (repair keeps the loaded shards and restores promoted drafts instead of
+clearing them), **4** and **5** (`dirty_since` and `flush_task` are dropped together when
+nothing is pending), **8** (the writer drops jobs after a failure and `Store::flush` refuses
+new ones), **9** (jobs are prepared before `pending` is taken, and `pending` is restored on
+submit failure), **10** (a read no longer takes the error; the next barrier still reports it).
+
+Left as is:
+
+- **6**: `Store::conn()` still cannot return a `Result` (it is used everywhere as
+  `&Connection`), so a strict read can still proceed on a database that lacks the failed
+  commit. It no longer erases the failure, so the next `sync_index`/`read_barrier` reports it.
+- **7**: the `Inline` → `Thread` swap in `open_with_key` remains a convention; no job is
+  submitted between the two, so nothing is lost.
+
+Review follow-ups (branch review): a repair no longer writes days that were only visited
+(`fr_1_2_a_writer_failure_does_not_promote_unedited_drafts`), no longer echoes an imported
+page's ops to the outbox (`ac_13_3_repair_does_not_echo_remote_updates`), drops jobs submitted
+before the repair by sequence (`jobs_submitted_before_a_repair_are_stale`) instead of racing
+`clear_failure`, carries a superseded job's update row into the compaction count
+(`overlapping_jobs_keep_the_update_count`), and the UI keys `IndexUpdated` off the write
+ticket and backs off a failed repair instead of snapshotting on every keystroke
+(`a_failed_repair_does_not_claim_the_index_moved`,
+`a_failed_repair_backs_off_before_retrying`).
+
+Tests: `crates/utopia-store/tests/commit_pipeline.rs` (`ac_13_3_*`, `fr_1_2_*`), the
+`writer.rs` and `lib.rs` unit tests, and the `app_state` unit tests.
+
 ## What it controls
 
 How an in-memory CRDT edit becomes a durable SQLite transaction (AGENTS.md rule 2, PRD
@@ -144,30 +193,38 @@ stateDiagram-v2
     Pending --> Submitted : flush() (250 ms idle | 1 s max | structural | sync_index | quit)
     Submitted --> Durable : writer commits (completed = seq)
     Submitted --> Failed : write_job Err (error sticky)
-    Failed --> Clean : sync_index() -> wait() takes error, docs/pending/drafts cleared
-    Failed --> Submitted : plain-text flush() before any sync_index (frontier ahead of disk)
+    Failed --> Failed : flush() refused, pending kept
+    Failed --> Clean : sync_index() -> requeue snapshots, clear failure
     Durable --> Clean : IndexUpdated emitted
 ```
 
-## Would an explicit state type help?
+## The explicit state type
 
-Partly. The mode flag plus `pending` is simple enough, but the writer's failure state is
-the risky part: the shard's "persisted" bookkeeping should only advance when the job has
-actually committed, and a failed writer should be a state the store is *in*, not an
-`Option<String>` someone may or may not read.
+Landed as a smaller shape than the sketch, because the Store — not the writer thread — owns
+the shards and the promotion:
 
 ```rust
+// writer.rs: a failed commit is a state, not a string that one caller takes.
 enum WriterState {
-    Healthy { submitted: u64, completed: u64 },
-    Failed { at_seq: u64, error: StoreError },   // every submit/flush returns this until repaired
+    Healthy,
+    Failed { error: String },
 }
 
-enum ShardPersistence {
-    Fresh,                                       // no page_doc row yet: next flush must snapshot
-    Durable { frontier: Frontier, log_len: i64 },
-    Submitted { base: Frontier, head: Frontier, job: u64 },  // promote on completion, roll back on failure
+// lib.rs: durable bookkeeping vs. a submitted job, promoted on confirmation only.
+struct DocEntry {
+    durable: Frontier,                  // confirmed in page_doc + page_update
+    has_snapshot: bool,
+    pending_updates: i64,
+    in_flight: Option<InFlight>,        // seq + frontier + what it writes + outbox intent
+    promoted: bool,                     // a queued draft day; a visit is never written
 }
 ```
 
-With `Submitted` carrying the job number, the writer's completion callback can promote
-`persisted` and a failure can reset it, removing drift (1) at the source.
+`Persister::submit` returns the job's sequence (and never advances `completed` on failure),
+so `reconcile_writer` can promote `in_flight` only when `seq <= completed`. A failure rolls
+nothing forward: `repair_writer` drops the `in_flight` bookkeeping, sets `has_snapshot =
+false` for the divergent shards, and requeues them so the next `flush` writes a snapshot from
+memory. That removes the drift at its source without dropping the loaded shards (rule 5).
+A repair skips days that were only visited (`promoted == false`), keeps the queued outbox
+flag, and `clear_failure(submitted)` marks every earlier job stale so a job that was in the
+channel during the failure cannot run against a base that never landed.
