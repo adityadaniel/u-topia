@@ -103,6 +103,8 @@ struct InFlight {
     snapshot: bool,
     /// The job appends one `page_update` row.
     update: bool,
+    /// The queued entry wanted an outbox payload (local ops only; remote imports do not).
+    enqueue: bool,
 }
 
 /// One page's share of a commit, prepared before anything is taken from `pending`.
@@ -111,6 +113,7 @@ struct PreparedPage {
     frontier: utopia_doc::Frontier,
     writes_snapshot: bool,
     writes_update: bool,
+    enqueue: bool,
     job: PageJob,
 }
 
@@ -357,6 +360,7 @@ impl Store {
                     frontier,
                     writes_snapshot: snapshot.is_some(),
                     writes_update: log_update.is_some(),
+                    enqueue: *enqueue,
                     job: PageJob {
                         page: page.clone(),
                         state: entry.doc.state().clone(),
@@ -383,7 +387,13 @@ impl Store {
         let mut bookkeeping = Vec::with_capacity(prepared.len());
         for p in prepared {
             pages.push(p.job);
-            bookkeeping.push((p.page, p.frontier, p.writes_snapshot, p.writes_update));
+            bookkeeping.push((
+                p.page,
+                p.frontier,
+                p.writes_snapshot,
+                p.writes_update,
+                p.enqueue,
+            ));
         }
         if pages.is_empty() {
             return Ok(());
@@ -401,13 +411,14 @@ impl Store {
                 return Err(e);
             }
         };
-        for (page, frontier, snapshot, update) in bookkeeping {
+        for (page, frontier, snapshot, update, enqueue) in bookkeeping {
             if let Some(entry) = self.docs.get_mut(&page) {
                 entry.in_flight = Some(InFlight {
                     seq,
                     frontier,
                     snapshot,
                     update,
+                    enqueue,
                 });
             }
         }
@@ -447,12 +458,15 @@ impl Store {
         // from memory, and a repair must not write them. Only a draft that was promoted
         // (taken out of `drafts` by `queue`) is rewritten.
         let still_drafts: HashSet<PageId> = self.drafts.values().cloned().collect();
-        let mut requeued = Vec::new();
+        let mut requeued: Vec<(PageId, bool)> = Vec::new();
         let mut drafts = Vec::new();
         for (page, entry) in self.docs.iter_mut() {
             // A submitted job that was not confirmed cannot be trusted: the writer either
             // rolled it back or dropped it. The shard is rewritten whole below.
             let was_durable = entry.has_snapshot;
+            // Keep the job's outbox intent: a page queued from `import_batch` must not be
+            // echoed to the relay by the repair.
+            let enqueue = entry.in_flight.as_ref().is_some_and(|f| f.enqueue);
             entry.in_flight = None;
             if (still_drafts.contains(page) && !entry.promoted)
                 || (entry.has_snapshot && entry.doc.frontier() == entry.durable)
@@ -465,24 +479,24 @@ impl Store {
                 }
             }
             entry.has_snapshot = false;
-            requeued.push(page.clone());
+            requeued.push((page.clone(), enqueue));
         }
         // A draft whose first commit failed is still a draft (FR-1.2): the feed keeps its
         // page id, and the next edit does not mint a second page for the same day.
         for (date, page) in drafts {
             self.drafts.entry(date).or_insert(page);
         }
-        for page in &requeued {
+        for (page, enqueue) in &requeued {
             match self.pending.iter_mut().find(|(p, _, _)| p == page) {
-                Some((_, delta, enqueue)) => {
+                Some((_, delta, _)) => {
+                    // Keep the queued entry's own flag: it is newer than the in-flight job.
                     *delta = None;
-                    *enqueue = true;
                 }
-                None => self.pending.push((page.clone(), None, true)),
+                None => self.pending.push((page.clone(), None, *enqueue)),
             }
         }
         self.persister.clear_failure();
-        requeued
+        requeued.into_iter().map(|(page, _)| page).collect()
     }
 
     /// Wait until the index reflects every change (flush + wait). Required before

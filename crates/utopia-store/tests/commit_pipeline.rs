@@ -22,6 +22,18 @@ fn fail_commits(store: &Store) {
         .unwrap();
 }
 
+/// Fail the commit before its outbox row: block projections are written for every edit,
+/// including the imported ones that carry no outbox payload.
+fn fail_block_writes(store: &Store) {
+    store
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_commit BEFORE INSERT ON block
+             BEGIN SELECT RAISE(ABORT, 'injected commit failure'); END",
+        )
+        .unwrap();
+}
+
 fn allow_commits(store: &Store) {
     store
         .conn()
@@ -296,4 +308,66 @@ fn fr_1_2_a_writer_failure_does_not_promote_unedited_drafts() {
     );
     assert!(s.is_draft(&untouched), "the day is still only visited");
     assert!(s.page_state(&untouched).is_ok(), "the draft stays loaded");
+}
+
+/// Review P2: `import_batch` queues a remote page with `enqueue = false` so another
+/// device's ops are not echoed to the relay. A repair must keep that flag.
+#[test]
+fn ac_13_3_repair_does_not_echo_remote_updates() {
+    use utopia_core::BlockKind;
+    use utopia_core::Command;
+    use utopia_doc::Frontier;
+    use utopia_store::{EditOpts, Store as _Store};
+
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let mut a = Store::open(dir_a.path().join("g.utopia")).unwrap();
+    a.set_today(Some(date(2026, 11, 2)));
+    let page = a.create_page("Shared").unwrap();
+    let block = BlockId::new();
+    a.execute(
+        &page,
+        vec![Command::InsertBlock {
+            id: block.clone(),
+            parent: None,
+            after: None,
+            text: "one".into(),
+            kind: BlockKind::Bullet,
+        }],
+        EditOpts::default(),
+    )
+    .unwrap();
+    a.sync_index().unwrap();
+
+    // B receives the page from the relay, then a later remote edit.
+    let full = a.export_since(&page, &Frontier::default()).unwrap();
+    let mut b = _Store::open(dir_b.path().join("g.utopia")).unwrap();
+    b.set_today(Some(date(2026, 11, 2)));
+    b.import(&page, &full).unwrap();
+    b.sync_index().unwrap();
+    assert!(b.outbox_pending(100).unwrap().is_empty());
+
+    let base = a.frontier(&page).unwrap();
+    a.set_block_text(&page, &block, "two", None, None).unwrap();
+    a.sync_index().unwrap();
+    let update = a.export_since(&page, &base).unwrap();
+
+    fail_block_writes(&b);
+    let _ = b.import(&page, &update);
+    allow_commits(&b);
+    let _ = b.sync_index();
+    b.sync_index().unwrap();
+
+    assert_eq!(
+        text(&mut b, &page, &block),
+        "two",
+        "the remote edit is applied"
+    );
+    let echoed = b
+        .outbox_pending(100)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, p, _, _)| p == &page)
+        .count();
+    assert_eq!(echoed, 0, "a repair must not enqueue imported ops");
 }
