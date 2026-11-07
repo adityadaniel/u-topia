@@ -13,7 +13,9 @@ use utopia_core::inline::{extract_refs, plain_text};
 use utopia_core::outline::{self, Focus, Plan};
 use utopia_core::undo::Caret;
 use utopia_core::{BlockId, BlockKind, PageId, PageKind};
-use utopia_store::{BlockRefStatus, LinkedRefs, Mention, PageRow, RefHit, RefQuery, RefSort};
+use utopia_store::{
+    BlockRefStatus, LinkedRefs, Mention, PageRow, RefChildren, RefHit, RefQuery, RefSort,
+};
 
 use crate::app_state::{AppState, Changed, IndexUpdated};
 use crate::editor::{BlockEditor, EditTarget, EditorEvent};
@@ -305,6 +307,15 @@ pub struct PageView {
     /// Children per reference in force when `items` was built (LR-4); the setting can change
     /// while a page is open, which rebuilds once.
     ref_children_limit: usize,
+    /// How many `ref_children` reads this view has made. Debug builds only, so the
+    /// regression test can prove a keystroke rebuild does not query the database.
+    #[cfg(debug_assertions)]
+    ref_children_queries: std::cell::Cell<usize>,
+    /// Reference children already read, keyed by block and whether every child was asked
+    /// for (the "+N more" row). Cleared when the index version or the limit changes, so a
+    /// rebuild for an unrelated reason does not run the queries again (rule 10).
+    ref_children_cache: HashMap<(BlockId, bool), RefChildren>,
+    ref_children_cache_key: Option<(u64, usize)>,
     /// A reference control's menu is open (LR-1). Local view state, never persisted.
     controls_menu: Option<ControlMenu>,
     open_embeds: HashSet<(BlockId, String)>,
@@ -389,6 +400,10 @@ impl PageView {
             expanded_groups: HashSet::new(),
             expanded_children: HashSet::new(),
             ref_children_limit: crate::appearance::ref_children(cx),
+            #[cfg(debug_assertions)]
+            ref_children_queries: std::cell::Cell::new(0),
+            ref_children_cache: HashMap::new(),
+            ref_children_cache_key: None,
             controls_menu: None,
             open_embeds: HashSet::new(),
             rename: None,
@@ -435,6 +450,12 @@ impl PageView {
         });
         self.page = None;
         self.show(today, None, cx);
+    }
+
+    /// How many reference-children reads this view has made (debug builds only).
+    #[cfg(debug_assertions)]
+    pub fn ref_children_queries(&self) -> usize {
+        self.ref_children_queries.get()
     }
 
     pub fn is_journal(&self) -> bool {
@@ -1148,7 +1169,7 @@ impl PageView {
         }
     }
 
-    fn push_refs(&self, page: &PageId, items: &mut Vec<Item>, cx: &mut Context<Self>) {
+    fn push_refs(&mut self, page: &PageId, items: &mut Vec<Item>, cx: &mut Context<Self>) {
         let shown = self.refs.shown();
         let title = if self.zoom.is_some() {
             "Referenced by"
@@ -1167,13 +1188,15 @@ impl PageView {
             return;
         }
         let daily = self.header.kind == PageKind::Daily;
-        self.push_ref_groups(page, &self.refs, daily, items, cx);
+        let refs = std::mem::take(&mut self.refs);
+        self.push_ref_groups(page, &refs, daily, items, cx);
+        self.refs = refs;
     }
 
     /// One header per referencing page, then its hits (folded past `GROUP_PREVIEW`), each
     /// with its first children inline (LR-4).
     fn push_ref_groups(
-        &self,
+        &mut self,
         page: &PageId,
         refs: &LinkedRefs,
         daily: bool,
@@ -1199,19 +1222,65 @@ impl PageView {
                 }
             }
         }
+        // The showed children only change when the index does (or the setting does), so
+        // keep them across rebuilds instead of running SQL for every block on every edit.
+        let key = (self.app.read(cx).refs_version, self.ref_children_limit);
+        if self.ref_children_cache_key != Some(key) {
+            self.ref_children_cache.clear();
+            self.ref_children_cache_key = Some(key);
+        }
         let mut children = HashMap::new();
-        {
+        let mut missing_folded = Vec::new();
+        let mut missing_opened = Vec::new();
+        for id in &folded {
+            match self.ref_children_cache.get(&(id.clone(), false)) {
+                Some(c) => {
+                    children.insert(id.clone(), c.clone());
+                }
+                None => missing_folded.push(id.clone()),
+            }
+        }
+        for id in &opened {
+            match self.ref_children_cache.get(&(id.clone(), true)) {
+                Some(c) => {
+                    children.insert(id.clone(), c.clone());
+                }
+                None => missing_opened.push(id.clone()),
+            }
+        }
+        let (folded_read, opened_read) = {
             let store = &self.app.read(cx).store;
-            if !folded.is_empty() {
-                if let Ok(m) = store.ref_children(&folded, self.ref_children_limit) {
-                    children.extend(m);
-                }
-            }
-            if !opened.is_empty() {
-                if let Ok(m) = store.ref_children(&opened, usize::MAX) {
-                    children.extend(m);
-                }
-            }
+            let folded_read = if missing_folded.is_empty() {
+                HashMap::new()
+            } else {
+                #[cfg(debug_assertions)]
+                self.ref_children_queries
+                    .set(self.ref_children_queries.get() + 1);
+                store
+                    .ref_children(&missing_folded, self.ref_children_limit)
+                    .unwrap_or_default()
+            };
+            let opened_read = if missing_opened.is_empty() {
+                HashMap::new()
+            } else {
+                #[cfg(debug_assertions)]
+                self.ref_children_queries
+                    .set(self.ref_children_queries.get() + 1);
+                store
+                    .ref_children(&missing_opened, usize::MAX)
+                    .unwrap_or_default()
+            };
+            (folded_read, opened_read)
+        };
+        for (id, c) in folded_read {
+            self.ref_children_cache
+                .insert((id.clone(), false), c.clone());
+            children.insert(id, c);
+        }
+        for (id, c) in opened_read {
+            self.ref_children_cache
+                .insert((id.clone(), true), c.clone());
+            children.insert(id, c);
         }
         for g in &refs.groups {
             let scheduled = daily && g.page.id != *page;

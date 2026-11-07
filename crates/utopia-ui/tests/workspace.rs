@@ -1448,6 +1448,59 @@ fn search_scrolls_the_selected_block_into_view(cx: &mut TestAppContext) {
     );
 }
 
+/// LR-4/rule 10: a keystroke rebuild must not re-run the reference-children queries.
+/// Only a new index version (or a display change) needs new children; before the cache,
+/// every render of a page with backlinks issued two SQL queries per referencing block.
+#[gpui::test]
+fn typing_does_not_requery_reference_children(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (target, first) = app.update(cx, |app, _| {
+        let target = app.store.create_page("Target").unwrap();
+        let first = app.store.ensure_first_block(&target).unwrap();
+        let source = app.store.create_page("Source").unwrap();
+        let b = app.store.ensure_first_block(&source).unwrap();
+        app.store
+            .set_block_text(&source, &b, "see [[Target]]", None, None)
+            .unwrap();
+        app.store.commit_block(&source, &b).unwrap();
+        let plan =
+            utopia_core::outline::append_block(app.store.page_state(&source).unwrap(), Some(&b));
+        let child = app
+            .store
+            .execute_plan(&source, plan, None)
+            .unwrap()
+            .unwrap()
+            .block;
+        app.store
+            .set_block_text(&source, &child, "a child of the reference", None, None)
+            .unwrap();
+        app.store.commit_block(&source, &child).unwrap();
+        app.store.sync_index().unwrap();
+        (target, first)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, Some(first), false, window, cx)
+    });
+    cx.run_until_parked();
+    let view = ws.read_with(cx, |w, _| w.main_view());
+    let before = view.read_with(cx, |v, _| v.ref_children_queries());
+    assert!(before > 0, "the first build reads the children it shows");
+    let version = app.read_with(cx, |a, _| a.refs_version);
+
+    cx.simulate_input("x");
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |a, _| a.refs_version),
+        version,
+        "the edit has not reached the index yet"
+    );
+    let after = view.read_with(cx, |v, _| v.ref_children_queries());
+    assert_eq!(
+        after, before,
+        "a keystroke rebuild reuses the children for this refs_version"
+    );
+}
+
 #[gpui::test]
 fn full_search_and_quick_capture(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);

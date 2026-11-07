@@ -448,6 +448,12 @@ impl Workspace {
         self.editor.clone()
     }
 
+    /// The main pane's view, for debug-only probes (query counts).
+    #[cfg(debug_assertions)]
+    pub fn main_view(&self) -> Entity<PageView> {
+        self.main.clone()
+    }
+
     /// The page shown in the main pane.
     pub fn main_page(&self, cx: &gpui::App) -> Option<PageId> {
         self.main.read(cx).page.clone()
