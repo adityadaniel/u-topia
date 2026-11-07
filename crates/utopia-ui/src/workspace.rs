@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use chrono::NaiveDate;
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Entity, FocusHandle, Focusable, MouseButton,
-    MouseDownEvent, SharedString, Subscription, Task, Window,
+    anchored, deferred, div, prelude::*, px, AnyElement, Context, Entity, FocusHandle, Focusable,
+    MouseButton, MouseDownEvent, SharedString, Subscription, Task, Window,
 };
 use utopia_core::inline::{extract_refs, plain_text};
 use utopia_core::title::normalize_title;
@@ -17,13 +17,15 @@ use utopia_core::{BlockId, PageId};
 use utopia_store::{JournalEntry, OutgoingRef, PageRow, RefTarget};
 
 use crate::actions::*;
-use crate::app_state::AppState;
+use crate::app_state::{AppState, IndexUpdated};
 use crate::editor::{BlockEditor, EditorEvent};
 use crate::graph_view::{GraphEvent, GraphView};
 use crate::page_view::{PageView, PageViewEvent};
 use crate::pdf_view::{PdfEvent, PdfView};
 use crate::quick_jump::{JumpPalette, PaletteMode, QuickJumpEvent};
-use crate::sync_runner::{exchange_owned, status_line, BoxTransport, SyncRunner};
+use crate::sync_runner::{
+    exchange_owned, status_line, sync_dot, BoxTransport, SyncDot, SyncRunner,
+};
 use crate::theme::{quiet_control, theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +47,14 @@ enum JumpMode {
 #[derive(Default)]
 struct SidebarData {
     journal: Vec<JournalEntry>,
+    /// Every live page, daily ones included: pins resolve against this (§5.5).
+    all: Vec<PageRow>,
+    /// The ordinary Pages list: `all` without daily pages (they have their own lists).
     pages: Vec<PageRow>,
     days: HashSet<NaiveDate>,
+    /// Pages that exist only because of a `#tag` (SB-2). Display only: the list gets a
+    /// `#` glyph, the store and the resolver are untouched (FR-2.15).
+    tags: HashSet<PageId>,
 }
 
 #[derive(Default)]
@@ -55,6 +63,38 @@ struct InspectorData {
     outgoing: Vec<OutgoingRef>,
     /// Unresolved targets with a display title recovered from the source text.
     unresolved: Vec<(OutgoingRef, String)>,
+}
+
+/// `local_state` key holding the pages opened last, newest first (QJ-1). Device-local UI
+/// state like collapse, so it never syncs and never enters a shard (rule 9).
+const RECENT_KEY: &str = "recent_pages";
+/// How many ids are kept: Quick jump shows eight after today and yesterday, and pages
+/// deleted since the list was written are skipped, so a few spares are kept.
+const RECENT_KEEP: usize = 24;
+
+/// A recent day's first block, shown as a tooltip on its one-line row (SB-1). A real view
+/// rather than a styled div because gpui tooltips are views.
+struct SidebarTooltip {
+    text: SharedString,
+}
+
+impl Render for SidebarTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let th = theme(cx).clone();
+        div()
+            .debug_selector(|| "recent-day-preview".into())
+            .max_w(px(240.))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(th.surface)
+            .border_1()
+            .border_color(th.line)
+            .shadow_md()
+            .text_size(px(crate::theme::CAPTION_SIZE))
+            .text_color(th.text)
+            .child(self.text.clone())
+    }
 }
 
 pub struct Workspace {
@@ -72,16 +112,30 @@ pub struct Workspace {
     jump: Option<(Entity<JumpPalette>, JumpMode)>,
     /// The graph view, shown in place of the main page while open (P2).
     graph: Option<Entity<GraphView>>,
+    /// The local graph in the right sidebar, beside the page that stays editable (GR-5).
+    graph_panel: Option<Entity<GraphView>>,
     /// The PDF viewer, shown in place of the main page while open (P2).
     pdf: Option<Entity<PdfView>>,
     sidebar: SidebarData,
     sidebar_seen: Option<u64>,
     inspector: InspectorData,
     inspector_seen: Option<(PageId, u64)>,
+    /// Pages opened last, newest first, for the Quick jump empty state (QJ-1). Read from
+    /// and written back to `local_state`, never to a shard (rule 9).
+    recent: Vec<PageId>,
     month: NaiveDate,
     today: NaiveDate,
     new_day: bool,
     backup_dir: Option<PathBuf>,
+    /// The graph is encrypted at rest (SB-4): read once at startup, never in `render`.
+    encrypted: bool,
+    /// The sync target as a line without secrets (SB-4), e.g. "Relay · http://…".
+    sync_target: Option<String>,
+    /// The footer's sync view is open (SB-4); it floats above the footer.
+    sync_open: bool,
+    /// The dot state the last painted frame showed. Checked by tests to prove that a state
+    /// change actually repainted (debug bounds linger after an element stops being drawn).
+    rendered_sync_dot: Option<SyncDot>,
     sync: Option<SyncRunner>,
     focus: FocusHandle,
     subs: Vec<Subscription>,
@@ -129,6 +183,27 @@ impl Workspace {
                 .map_or(default, |v| v == "1")
         };
         let (left_open, calendar_open) = (flag("left_sidebar", true), flag("calendar", false));
+        let recent = app
+            .read(cx)
+            .store
+            .local_get(RECENT_KEY)
+            .ok()
+            .flatten()
+            .map(|v| {
+                v.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .take(RECENT_KEEP)
+                    .map(|l| PageId(l.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // `is_encrypted` opens the file, so it belongs here and not in `render` (rule 10).
+        let encrypted = app
+            .read(cx)
+            .store
+            .path()
+            .is_some_and(utopia_store::is_encrypted);
         let mut me = Self {
             app,
             editor,
@@ -142,20 +217,44 @@ impl Workspace {
             tab: InspectorTab::Incoming,
             jump: None,
             graph: None,
+            graph_panel: None,
             pdf: None,
             sidebar: SidebarData::default(),
             sidebar_seen: None,
             inspector: InspectorData::default(),
             inspector_seen: None,
+            recent,
             month: today,
             today,
             new_day: false,
             backup_dir,
+            encrypted,
+            sync_target: None,
+            sync_open: false,
+            rendered_sync_dot: None,
             sync: None,
             focus: cx.focus_handle(),
             subs,
             _tasks: Vec::new(),
         };
+        // GR-5: the sidebar graph follows the page open beside it, so "around this page"
+        // keeps meaning the page you are reading or editing.
+        let main = me.main.clone();
+        me.subs.push(cx.observe(&main, |this, main, cx| {
+            let page = main.read(cx).page.clone();
+            if let Some(panel) = this.graph_panel.clone() {
+                panel.update(cx, |graph, cx| graph.set_origin(page, cx));
+            }
+        }));
+        // GR-5: the panel is an index projection. In debounced mode links arrive after the
+        // keystroke, so reload when the writer has caught up, not only when the page changes.
+        let app = me.app.clone();
+        me.subs
+            .push(cx.subscribe(&app, |this, _, _: &IndexUpdated, cx| {
+                if let Some(panel) = this.graph_panel.clone() {
+                    panel.update(cx, |graph, cx| graph.refresh(cx));
+                }
+            }));
         me.spawn_timers(cx);
         me
     }
@@ -207,6 +306,12 @@ impl Workspace {
         cfg: crate::sync_runner::SyncConfig,
         cx: &mut Context<Self>,
     ) -> bool {
+        // Say where sync goes without the token or passphrase (never shown, §15.6); the
+        // sidebar names the target even when the transport below cannot be built.
+        self.sync_target = Some(match &cfg.target {
+            crate::sync_runner::SyncTarget::Relay { url, .. } => format!("Relay · {url}"),
+            crate::sync_runner::SyncTarget::Folder(dir) => format!("Folder · {}", dir.display()),
+        });
         let client = self.app.update(cx, |app, _| {
             utopia_sync::SyncEngine::new(&app.store).map(|e| e.client_id().to_string())
         });
@@ -302,6 +407,9 @@ impl Workspace {
                 let Workspace { app, sync, .. } = this;
                 let runner = sync.as_mut()?;
                 let transport = runner.transport.take()?;
+                // The footer's dot says "syncing" from now until the exchange returns; ask
+                // for the frame now, or an idle window keeps last round's green (SB-4).
+                cx.notify();
                 let out = app.update(cx, |app, _| runner.engine.prepare(&mut app.store));
                 match out {
                     Ok(out) => Some((out, transport)),
@@ -370,6 +478,9 @@ impl Workspace {
     /// Split panes (P1): an editable page beside the main one (Cmd+Shift+Click). At most
     /// two splits; the oldest closes first.
     pub fn open_split(&mut self, page: PageId, window: &mut Window, cx: &mut Context<Self>) {
+        // Cmd+Shift+Click opens a split without going through `open`, and it is still a page
+        // opened: the Quick jump empty state should offer it next time (QJ-1).
+        self.note_opened(&page, cx);
         let v = cx.new(|cx| PageView::new(self.app.clone(), self.editor.clone(), true, window, cx));
         self.subs
             .push(cx.subscribe_in(&v, window, Self::on_page_event));
@@ -389,6 +500,12 @@ impl Workspace {
     /// The shared block editor (startup/latency probe).
     pub fn editor(&self) -> Entity<BlockEditor> {
         self.editor.clone()
+    }
+
+    /// The main pane's view, for debug-only probes (query counts).
+    #[cfg(debug_assertions)]
+    pub fn main_view(&self) -> Entity<PageView> {
+        self.main.clone()
     }
 
     /// The page shown in the main pane.
@@ -448,6 +565,27 @@ impl Workspace {
         self.open_journal(window, cx);
     }
 
+    /// Remember that `page` was opened, for the Quick jump empty state (QJ-1). Local UI
+    /// state in `local_state` (rule 9): a page opened on another device is not reordered
+    /// here, and a write failure costs the ordering, never the page.
+    fn note_opened(&mut self, page: &PageId, cx: &mut Context<Self>) {
+        if self.recent.first() == Some(page) {
+            return;
+        }
+        self.recent.retain(|p| p != page);
+        self.recent.insert(0, page.clone());
+        self.recent.truncate(RECENT_KEEP);
+        let joined = self
+            .recent
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Err(e) = self.app.read(cx).store.local_set(RECENT_KEY, &joined) {
+            eprintln!("utopia: {e}");
+        }
+    }
+
     fn on_page_event(
         &mut self,
         view: &Entity<PageView>,
@@ -474,6 +612,10 @@ impl Workspace {
                 self.splits.retain(|p| p != view);
                 cx.notify();
             }
+            PageViewEvent::OpenGraph { page } => {
+                self.graph = None;
+                self.open_graph(Some(page.clone()), window, cx);
+            }
             PageViewEvent::OpenSplit { page } => self.open_split(page.clone(), window, cx),
             PageViewEvent::OpenPdf {
                 hash,
@@ -491,6 +633,7 @@ impl Workspace {
                     cx,
                 );
             }
+            PageViewEvent::TogglePin { page } => self.toggle_pin(page.clone(), cx),
         }
     }
 
@@ -504,6 +647,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.editor.update(cx, |e, cx| e.end(cx));
+        self.note_opened(&page, cx);
         if sidebar {
             // Shift-click stacks the page beside the current one (§0, W6).
             let existing = self
@@ -566,8 +710,17 @@ impl Workspace {
             JumpMode::Capture => ("Quick capture → today", PaletteMode::Capture),
             JumpMode::Extract { .. } => ("Extract block to page", PaletteMode::Text),
         };
+        // QJ-1: only "go to page" has an empty state worth having — today, yesterday and
+        // the pages opened last. Redirecting a link or naming an extracted page has
+        // nothing to do with where you have been.
+        let recent = match mode {
+            JumpMode::Open => Some(self.recent.clone()),
+            _ => None,
+        };
         let app = self.app.clone();
-        let jump = cx.new(|cx| JumpPalette::with_mode(app, title, palette, window, cx));
+        let editor = self.editor.clone();
+        let jump =
+            cx.new(|cx| JumpPalette::with_mode(app, editor, title, palette, recent, window, cx));
         self.subs.push(cx.subscribe_in(
             &jump,
             window,
@@ -591,6 +744,26 @@ impl Workspace {
                             app.report(r);
                             app.changed(Vec::new(), true, cx);
                         });
+                    }
+                    (QuickJumpEvent::ChosenDay { date, sidebar }, Some(JumpMode::Open)) => {
+                        this.open_date(*date, *sidebar, !*sidebar, window, cx)
+                    }
+                    // QJ-5: run the command exactly as its keystroke would, once the
+                    // palette is gone. Focus goes back where it was before the palette
+                    // opened: an editor command (`Indent`, `Bold`, …) is handled by the
+                    // block editor, and gpui dispatches through the focused element's
+                    // ancestors only, so the workspace would never reach it.
+                    (QuickJumpEvent::RunCommand(name), _) => {
+                        if this.editor.read(cx).target.is_some() {
+                            let handle = this.editor.read(cx).focus_handle(cx);
+                            window.focus(&handle);
+                        } else {
+                            window.focus(&this.focus);
+                        }
+                        match action_for(name) {
+                            Some(action) => window.dispatch_action(action, cx),
+                            None => eprintln!("utopia: no action named {name}"),
+                        }
                     }
                     (QuickJumpEvent::Text(text), Some(JumpMode::Capture)) => {
                         this.app.update(cx, |app, cx| {
@@ -628,30 +801,96 @@ impl Workspace {
         self.start_jump(JumpMode::Search, window, cx);
     }
 
-    /// Cmd+Shift+G: show or hide the graph view (P2).
+    /// Cmd+Shift+G: show or hide the full-screen graph (P2).
     pub fn show_graph(&mut self, _: &ShowGraph, window: &mut Window, cx: &mut Context<Self>) {
         if self.graph.take().is_some() {
             window.focus(&self.focus);
             cx.notify();
             return;
         }
-        self.editor.update(cx, |e, cx| e.end(cx));
+        self.open_graph_full(window, cx);
+    }
+
+    fn open_graph_full(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let origin = self.main.read(cx).page.clone();
-        let view = cx.new(|cx| GraphView::new(self.app.clone(), origin, cx));
-        self.subs.push(
-            cx.subscribe_in(&view, window, |this, _, e: &GraphEvent, window, cx| {
-                this.graph = None;
-                match e {
-                    GraphEvent::Open { page, sidebar } => {
-                        this.open(page.clone(), None, None, *sidebar, window, cx)
-                    }
-                    GraphEvent::Close => window.focus(&this.focus),
-                }
-                cx.notify();
-            }),
-        );
+        self.open_graph(origin, window, cx);
+    }
+
+    /// Show the graph view with `origin` (the page the user came from) highlighted (GR-1).
+    /// Cmd+Shift+G passes the main pane's page; the page menu's "Open in graph" (PG-2)
+    /// passes the page whose menu it was.
+    fn open_graph(&mut self, origin: Option<PageId>, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |e, cx| e.end(cx));
+        self.graph_panel = None;
+        let view = cx.new(|cx| GraphView::new(self.app.clone(), origin, false, cx));
+        self.subs
+            .push(cx.subscribe_in(&view, window, Self::on_graph_event));
         window.focus(&view.focus_handle(cx));
         self.graph = Some(view);
+        cx.notify();
+    }
+
+    /// GR-5: "Around this page" in the right sidebar. The main page stays editable.
+    fn open_graph_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(origin) = self.main.read(cx).page.clone() else {
+            return;
+        };
+        self.editor.update(cx, |e, cx| e.end(cx));
+        self.graph = None;
+        let view = cx.new(|cx| GraphView::new(self.app.clone(), Some(origin), true, cx));
+        self.subs
+            .push(cx.subscribe_in(&view, window, Self::on_graph_event));
+        self.right_open = true;
+        self.graph_panel = Some(view);
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn on_graph_event(
+        &mut self,
+        view: &Entity<GraphView>,
+        e: &GraphEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let from_panel = self.graph_panel.as_ref() == Some(view);
+        // AGENTS.md focus invariant: a removed element gets no keystrokes. If this graph
+        // owned focus, hand it back; otherwise leave an editor's focus untouched.
+        let had_focus = view.read(cx).focus_handle(cx).is_focused(window);
+        match e {
+            GraphEvent::Open {
+                page,
+                sidebar,
+                split,
+            } => {
+                if !from_panel {
+                    self.graph = None;
+                }
+                if *split {
+                    self.open_split(page.clone(), window, cx);
+                    if had_focus {
+                        window.focus(&self.focus);
+                    }
+                } else {
+                    self.open(page.clone(), None, None, *sidebar, window, cx);
+                }
+            }
+            GraphEvent::OpenPanel => {
+                self.graph = None;
+                self.open_graph_panel(window, cx);
+            }
+            GraphEvent::Expand => {
+                self.graph_panel = None;
+                self.open_graph_full(window, cx);
+            }
+            GraphEvent::Close => {
+                self.graph = None;
+                self.graph_panel = None;
+                if had_focus {
+                    window.focus(&self.focus);
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -748,6 +987,16 @@ impl Workspace {
 
     pub fn graph_view(&self) -> Option<Entity<GraphView>> {
         self.graph.clone()
+    }
+
+    /// The local graph panel in the right sidebar (GR-5).
+    pub fn graph_panel(&self) -> Option<Entity<GraphView>> {
+        self.graph_panel.clone()
+    }
+
+    /// The open palette, for tests that read the results it is showing.
+    pub fn jump_palette(&self) -> Option<Entity<JumpPalette>> {
+        self.jump.as_ref().map(|(j, _)| j.clone())
     }
 
     /// Full-text search with `text` already typed (`utopia://search`).
@@ -869,6 +1118,16 @@ impl Workspace {
         self.main.read(cx).journal_days()
     }
 
+    /// The date whose heading is pinned at the top of the feed (DN-3), for scripts.
+    pub fn main_sticky_day(&self, cx: &gpui::App) -> Option<NaiveDate> {
+        self.main.read(cx).sticky_day()
+    }
+
+    /// How many days the feed shows open, with a date heading (DN-1), for scripts.
+    pub fn open_journal_days(&self, cx: &gpui::App) -> usize {
+        self.main.read(cx).open_day_count()
+    }
+
     pub fn open_date(
         &mut self,
         d: NaiveDate,
@@ -933,6 +1192,22 @@ impl Workspace {
 
     pub fn calendar_open(&self) -> bool {
         self.calendar_open
+    }
+
+    /// Whether the footer's sync view is open (SB-4).
+    pub fn sync_view_open(&self) -> bool {
+        self.sync_open
+    }
+
+    /// The dot state from the runner right now (SB-4): off, synced, in flight or failed.
+    pub fn sync_dot(&self) -> SyncDot {
+        sync_dot(self.sync.as_ref())
+    }
+
+    /// The dot state the last painted frame showed (SB-4), for tests that must tell a
+    /// repaint from a stale one.
+    pub fn rendered_sync_dot(&self) -> Option<SyncDot> {
+        self.rendered_sync_dot
     }
 
     fn toggle_refs(&mut self, _: &ToggleReferences, _: &mut Window, cx: &mut Context<Self>) {
@@ -1003,10 +1278,15 @@ impl Workspace {
             self.sidebar_seen = Some(v);
             let store = &self.app.read(cx).store;
             let all = store.list_pages(true).unwrap_or_default();
+            // The tag classification is cached by `AppState` on the index feed, never
+            // computed from a frame (SB-2, rule 10).
+            let tags = self.app.read(cx).tag_pages.clone();
             self.sidebar = SidebarData {
                 journal: store.journal(14).unwrap_or_default(),
                 days: all.iter().filter_map(|p| p.daily_date).collect(),
-                pages: all.into_iter().filter(|p| !p.is_daily()).collect(),
+                tags,
+                pages: all.iter().filter(|p| !p.is_daily()).cloned().collect(),
+                all,
             };
         }
         let Some(page) = self.main.read(cx).page.clone() else {
@@ -1067,6 +1347,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let th = theme(cx).clone();
+        let density = crate::appearance::density(cx);
         let main = self.main.read(cx);
         let active = page.is_some() && !main.is_journal() && main.page == page;
         div()
@@ -1075,7 +1356,8 @@ impl Workspace {
             .py_0p5()
             .rounded_sm()
             .cursor_pointer()
-            .text_size(px(crate::theme::BODY_SIZE))
+            .text_size(px(density.text_size()))
+            .line_height(px(density.line_height()))
             .text_color(if active { th.accent } else { th.text })
             .when(active, |d| d.bg(th.hover))
             .hover(|s| s.bg(th.hover))
@@ -1088,6 +1370,162 @@ impl Workspace {
                     }),
                 )
             })
+    }
+
+    /// A page in the sidebar: one list for ordinary pages and tag pages (SB-2), the only
+    /// difference being the `#` glyph in the tag colour. `unpin` builds the row for the
+    /// Pinned group, which carries a control to take the page out of it again (SB-3).
+    fn sidebar_page_row(
+        &self,
+        index: usize,
+        page: &PageRow,
+        tagged: bool,
+        unpin: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let th = theme(cx).clone();
+        let density = crate::appearance::density(cx);
+        let main = self.main.read(cx);
+        let active = !main.is_journal() && main.page.as_ref() == Some(&page.id);
+        let id = page.id.clone();
+        let key = page.title_key.clone();
+        let group = if unpin { "pinned" } else { "page" };
+        div()
+            .id((group, index))
+            .debug_selector(move || format!("{group}-row-{index}"))
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_0p5()
+            .rounded_sm()
+            .cursor_pointer()
+            .text_size(px(density.text_size()))
+            .line_height(px(density.line_height()))
+            .text_color(if active { th.accent } else { th.text })
+            .when(active, |d| d.bg(th.hover))
+            .hover(|s| s.bg(th.hover))
+            .when(tagged, |d| {
+                d.child(
+                    div()
+                        .debug_selector(move || format!("tag-glyph-{key}"))
+                        .flex_none()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.tag)
+                        .child("#"),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(page.title.clone()),
+            )
+            .when(unpin, |d| {
+                let unpin_page = id.clone();
+                d.child(
+                    div()
+                        .id(("unpin", index))
+                        .debug_selector(move || format!("unpin-{index}"))
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.faint)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(th.line).text_color(th.text))
+                        .child("✕")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_pin(unpin_page.clone(), cx);
+                            }),
+                        ),
+                )
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    this.open(id.clone(), None, None, e.modifiers.shift, window, cx)
+                }),
+            )
+    }
+
+    /// SB-3: pin or unpin a page; the preference is local (`settings.json`, rule 9).
+    fn toggle_pin(&mut self, page: PageId, cx: &mut Context<Self>) {
+        match crate::appearance::toggle_pinned(cx, &page) {
+            Ok(_) => cx.notify(),
+            Err(e) => {
+                self.app.update(cx, |app, cx| {
+                    app.last_error =
+                        Some(format!("could not save {}: {e}", crate::appearance::FILE));
+                    cx.notify();
+                });
+            }
+        }
+    }
+
+    /// One line per day (SB-1): the date, then a muted count of its blocks. Two preview
+    /// lines used to make three days take the space ten now do; the first block is still
+    /// reachable, as a tooltip, so a compact row does not lose what the day is about.
+    fn recent_day_row(
+        &self,
+        index: usize,
+        entry: &JournalEntry,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let th = theme(cx).clone();
+        let main = self.main.read(cx);
+        let active = !main.is_journal() && main.page.as_ref() == Some(&entry.page.id);
+        let page = entry.page.id.clone();
+        let title = entry.page.title.clone();
+        let blocks = entry.blocks;
+        let first: SharedString = entry
+            .preview
+            .first()
+            .map(|p| p.chars().take(160).collect::<String>())
+            .unwrap_or_default()
+            .into();
+        // The list stays compact at either density: that is the point of SB-1.
+        let compact = crate::appearance::Density::Compact;
+        div()
+            .id(("recent-day", index))
+            .debug_selector(move || format!("recent-day-{index}"))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .rounded_sm()
+            .line_height(px(compact.line_height()))
+            .text_size(px(compact.text_size()))
+            .cursor_pointer()
+            .text_color(if active { th.accent } else { th.text })
+            .when(active, |d| d.bg(th.hover))
+            .hover(|s| s.bg(th.hover))
+            .child(div().flex_1().min_w_0().truncate().child(title))
+            .child(
+                div()
+                    .debug_selector(move || format!("recent-day-count-{index}"))
+                    .flex_none()
+                    .text_size(px(crate::theme::CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(blocks.to_string()),
+            )
+            .tooltip(move |_, cx| {
+                cx.new(|_| SidebarTooltip {
+                    text: first.clone(),
+                })
+                .into()
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    this.new_day = false;
+                    this.open(page.clone(), None, None, e.modifiers.shift, window, cx)
+                }),
+            )
     }
 
     fn render_left(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1175,71 +1613,48 @@ impl Workspace {
                 cx,
             ))
             .child(
-                self.nav_item(
-                    "toggle-calendar",
-                    if self.calendar_open {
-                        "▾ Calendar"
-                    } else {
-                        "▸ Calendar"
-                    },
-                    None,
-                    cx,
-                )
-                .text_color(th.muted)
-                .debug_selector(|| "toggle-calendar".into())
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_calendar(cx))),
-            )
-            .when(self.calendar_open, |col| {
-                col.child(
-                    div()
-                        .debug_selector(|| "left-calendar".into())
-                        .px_1()
-                        .py_2()
-                        .child(crate::calendar::render(
-                            cx,
-                            self.month,
-                            today,
-                            &self.sidebar.days,
-                            Self::pick_date,
-                            Self::shift_month,
-                        )),
-                )
-            });
+                div()
+                    .pt_1()
+                    .px_1()
+                    .child(crate::calendar::render_month_strip(
+                        cx,
+                        self.month,
+                        today,
+                        &self.sidebar.days,
+                        self.calendar_open,
+                        crate::calendar::StripActions {
+                            pick: Self::pick_date,
+                            shift: Self::shift_month,
+                            toggle: Self::toggle_calendar,
+                        },
+                    )),
+            );
         let mut scroll = div()
             .id("left-scroll")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll();
-        scroll = scroll.child(section("RECENT DAYS"));
-        let journal: Vec<(PageId, String, Vec<String>)> = self
-            .sidebar
-            .journal
-            .iter()
-            .map(|j| (j.page.id.clone(), j.page.title.clone(), j.preview.clone()))
-            .collect();
-        for (i, (id, title, preview)) in journal.into_iter().enumerate() {
-            let item = self.nav_item(("journal", i), title, Some(id), cx).child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .text_size(px(crate::theme::CAPTION_SIZE))
-                    .text_color(th.muted)
-                    .children(
-                        preview
-                            .into_iter()
-                            .take(2)
-                            .map(|p| p.chars().take(48).collect::<String>()),
-                    ),
-            );
-            scroll = scroll.child(item);
+        scroll =
+            scroll.child(section("RECENT DAYS").debug_selector(|| "recent-days-header".into()));
+        for (i, entry) in self.sidebar.journal.iter().enumerate() {
+            scroll = scroll.child(self.recent_day_row(i, entry, cx));
         }
-        scroll = scroll.child(section("PAGES"));
-        let pages: Vec<(PageId, String)> = self
-            .sidebar
-            .pages
+        let pages = self.sidebar.pages.clone();
+        let tags = self.sidebar.tags.clone();
+        // SB-3: pinned pages first, in pin order, above the ordinary list. A pin may point
+        // at a daily page, which is not in `pages` but is in `all`.
+        let pinned: Vec<PageRow> = crate::appearance::pinned(cx)
             .iter()
-            .map(|p| (p.id.clone(), p.title.clone()))
+            .filter_map(|id| self.sidebar.all.iter().find(|p| &p.id == id).cloned())
             .collect();
+        if !pinned.is_empty() {
+            scroll = scroll.child(section("PINNED").debug_selector(|| "pinned-header".into()));
+            for (i, page) in pinned.into_iter().enumerate() {
+                let tagged = tags.contains(&page.id);
+                scroll = scroll.child(self.sidebar_page_row(i, &page, tagged, true, cx));
+            }
+        }
+        scroll = scroll.child(section("PAGES").debug_selector(|| "pages-header".into()));
         if pages.is_empty() {
             scroll = scroll.child(
                 div()
@@ -1249,43 +1664,164 @@ impl Workspace {
                     .child("Type [[ or # to make a page."),
             );
         }
-        for (i, (id, title)) in pages.into_iter().enumerate() {
-            scroll = scroll.child(self.nav_item(("page", i), title, Some(id), cx));
+        for (i, page) in pages.into_iter().enumerate() {
+            let tagged = tags.contains(&page.id);
+            scroll = scroll.child(self.sidebar_page_row(i, &page, tagged, false, cx));
         }
         col = col.child(scroll);
-        let (file, err, notice) = {
-            let app = self.app.read(cx);
-            (
-                app.store
-                    .path()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "in-memory graph".into()),
-                app.last_error.clone(),
-                app.notice.clone(),
-            )
+        col.child(self.render_footer(cx)).into_any_element()
+    }
+
+    /// SB-4: one status row — a chip with the graph file's name, the sync dot and, when the
+    /// graph is encrypted at rest, a lock. Clicking it opens the sync view, which floats
+    /// above the footer so opening it never moves the page.
+    fn render_footer(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let th = theme(cx).clone();
+        let app = self.app.read(cx);
+        let file = app
+            .store
+            .path()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "in-memory graph".into());
+        let (err, notice) = (app.last_error.clone(), app.notice.clone());
+        let dot = sync_dot(self.sync.as_ref());
+        self.rendered_sync_dot = Some(dot);
+        let dot_color = match dot {
+            SyncDot::Off => th.faint,
+            SyncDot::Synced => th.success,
+            SyncDot::Syncing => th.warning,
+            SyncDot::Error => th.danger,
         };
-        col.child(
-            div()
-                .pt_2()
-                .px_2()
-                .border_t_1()
-                .border_color(th.line)
-                .text_size(px(crate::theme::CAPTION_SIZE))
-                .text_color(th.muted)
-                .child(format!("Local · {file}"))
-                .child(match &self.sync {
-                    None => div().child("Sync: off (local only)"),
-                    Some(runner) => {
-                        let (line, warn) =
-                            status_line(runner.status.as_ref(), self.app.read(cx).store.now());
-                        div().when(warn, |d| d.text_color(th.warning)).child(line)
-                    }
-                })
-                .when_some(notice, |d, n| d.child(div().text_color(th.text).child(n)))
-                .when_some(err, |d, e| d.child(div().text_color(th.danger).child(e))),
-        )
-        .into_any_element()
+        let open = self.sync_open;
+        div()
+            .relative()
+            .pt_2()
+            .px_2()
+            .border_t_1()
+            .border_color(th.line)
+            .text_size(px(crate::theme::CAPTION_SIZE))
+            .text_color(th.muted)
+            .child(
+                div()
+                    .id("sidebar-footer")
+                    .debug_selector(|| "sidebar-footer".into())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .rounded_sm()
+                    .hover(|d| d.bg(th.hover))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sync_open = !this.sync_open;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .debug_selector(|| "graph-chip".into())
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_md()
+                            .bg(th.chip_bg)
+                            .child(file),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("sync-dot-{}", dot.key()))
+                            .flex_none()
+                            .size(px(7.))
+                            .rounded_full()
+                            .bg(dot_color),
+                    )
+                    .when(self.encrypted, |d| {
+                        d.child(
+                            div()
+                                .id("encryption-lock")
+                                .debug_selector(|| "encryption-lock".into())
+                                .flex_none()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .tooltip(|_, cx| {
+                                    cx.new(|_| SidebarTooltip {
+                                        text: "Encrypted at rest".into(),
+                                    })
+                                    .into()
+                                })
+                                // A drawn lock: the bundled IBM Plex Sans has no 🔒 glyph.
+                                .child(
+                                    div()
+                                        .w(px(6.))
+                                        .h(px(4.))
+                                        .border_1()
+                                        .border_b_0()
+                                        .rounded_t_sm()
+                                        .border_color(th.muted),
+                                )
+                                .child(div().w(px(8.)).h(px(6.)).rounded_sm().bg(th.muted)),
+                        )
+                    })
+                    .children(open.then(|| {
+                        deferred(
+                            anchored()
+                                .anchor(gpui::Corner::BottomLeft)
+                                .offset(gpui::point(px(0.), px(-6.)))
+                                .child(self.sync_popover(cx)),
+                        )
+                        .with_priority(1)
+                    })),
+            )
+            .when_some(notice, |d, n| d.child(div().text_color(th.text).child(n)))
+            .when_some(err, |d, e| d.child(div().text_color(th.danger).child(e)))
+    }
+
+    /// The sync view the footer opens (SB-4): what sync is doing, where it goes and whether
+    /// this graph is encrypted at rest. Read-only; settings come from the environment (§15.6).
+    fn sync_popover(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let th = theme(cx).clone();
+        let (line, warn) = match &self.sync {
+            None => ("Off — this graph stays on this machine.".to_string(), false),
+            Some(runner) => status_line(runner.status.as_ref(), self.app.read(cx).store.now()),
+        };
+        let target = self
+            .sync_target
+            .clone()
+            .unwrap_or_else(|| "No relay or folder configured.".to_string());
+        div()
+            .id("sync-popover")
+            .debug_selector(|| "sync-popover".into())
+            .w(px(232.))
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .bg(th.surface)
+            .border_1()
+            .border_color(th.line)
+            .rounded_md()
+            .shadow_md()
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(th.text)
+                    .child("Sync"),
+            )
+            .child(div().when(warn, |d| d.text_color(th.warning)).child(line))
+            .child(div().child(target))
+            .child(div().child(if self.encrypted {
+                "Encrypted at rest."
+            } else {
+                "Not encrypted at rest."
+            }))
+            .when(self.sync.is_none(), |d| {
+                d.child(div().text_color(th.faint).child(
+                    "Set UTOPIA_SYNC_URL or UTOPIA_SYNC_FOLDER, then reopen the graph, to sync.",
+                ))
+            })
     }
 
     fn render_inspector(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1594,6 +2130,18 @@ impl Render for Workspace {
                 .bg(th.surface)
                 .border_l_1()
                 .border_color(th.line);
+            if let Some(panel) = &self.graph_panel {
+                col = col.child(
+                    div()
+                        .debug_selector(|| "graph-panel".into())
+                        .w_full()
+                        .h(px(400.))
+                        .flex_none()
+                        .border_b_1()
+                        .border_color(th.line)
+                        .child(panel.clone()),
+                );
+            }
             if self.panes.is_empty() && !self.inspector_open {
                 col = col.child(
                     div()
@@ -1623,22 +2171,36 @@ impl Render for Workspace {
                 .id("jump-overlay")
                 .absolute()
                 .size_full()
-                .flex()
-                .justify_center()
-                .pt(px(90.))
-                .bg(th.scrim)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.jump = None;
-                        window.focus(&this.focus);
-                        cx.notify();
-                    }),
+                // The scrim is a sibling behind the palette, not its background: a menu
+                // deferred out of the palette (the age menu) must not be dismissed by the
+                // same click that chooses an item.
+                .child(
+                    div()
+                        .id("jump-scrim")
+                        .absolute()
+                        .size_full()
+                        .bg(th.scrim)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.jump = None;
+                                window.focus(&this.focus);
+                                cx.notify();
+                            }),
+                        ),
                 )
                 .child(
                     div()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(j.clone()),
+                        .absolute()
+                        .size_full()
+                        .flex()
+                        .justify_center()
+                        .pt(px(90.))
+                        .child(
+                            div()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(j.clone()),
+                        ),
                 )
         });
         let _ = window;

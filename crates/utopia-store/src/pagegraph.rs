@@ -22,6 +22,10 @@ pub struct PageGraph {
     /// Undirected `(low, high)` node-index pairs with the number of references between
     /// them, sorted.
     pub edges: Vec<(usize, usize, usize)>,
+    /// Directed `(source, target, count)` node-index triples from the stored references,
+    /// sorted. The graph view uses these for arrowheads (GR-4); the layout still works on
+    /// the undirected `edges`.
+    pub directed: Vec<(usize, usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,8 +71,9 @@ impl Store {
                 pages.insert(id, (title, daily));
             }
         }
-        // Undirected weights between kept pages.
+        // Undirected weights between kept pages, plus the directed counts they came from.
         let mut weight: HashMap<(String, String), usize> = HashMap::new();
+        let mut directed_weight: Vec<(String, String, usize)> = Vec::new();
         {
             let mut stmt = self.conn.prepare_cached(
                 "SELECT src_page_id, dst_page_id, count(*) FROM ref
@@ -86,6 +91,7 @@ impl Store {
                 if !pages.contains_key(&a) || !pages.contains_key(&b) {
                     continue;
                 }
+                directed_weight.push((a.clone(), b.clone(), n as usize));
                 let key = if a < b { (a, b) } else { (b, a) };
                 *weight.entry(key).or_default() += n as usize;
             }
@@ -146,6 +152,18 @@ impl Store {
             })
             .collect();
         edges.sort_unstable();
-        Ok(PageGraph { nodes, edges })
+        let mut directed: Vec<(usize, usize, usize)> = directed_weight
+            .iter()
+            .filter_map(|(a, b, w)| {
+                let (i, j) = (*index.get(a.as_str())?, *index.get(b.as_str())?);
+                Some((i, j, *w))
+            })
+            .collect();
+        directed.sort_unstable();
+        Ok(PageGraph {
+            nodes,
+            edges,
+            directed,
+        })
     }
 }

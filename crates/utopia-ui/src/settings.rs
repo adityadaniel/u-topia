@@ -30,7 +30,7 @@ use crate::actions::{
     by_category, canonical_keys, doc, pretty_keys, reinstall, ActionDoc, Category, Overrides,
     CATALOG,
 };
-use crate::appearance::{self, Density, UiFont};
+use crate::appearance::{self, AttributeBlocks, Density, UiFont};
 use crate::help::{shot_image, TOPICS};
 use crate::line_input::{LineInput, LineInputEvent};
 use crate::sync_runner;
@@ -88,8 +88,8 @@ impl Tab {
     fn summary(self) -> &'static str {
         match self {
             Tab::Appearance => {
-                "The font your notes and the interface are set in, and how \
-                                tightly blocks are set."
+                "The font your notes and the interface are set in (code stays in Menlo), \
+                 and how tightly blocks are set."
             }
             Tab::Keybindings => {
                 "Every action in the app and the keys it answers to. Click a \
@@ -474,6 +474,39 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Settings → Appearance: how many children a reference shows inline (LR-4).
+    pub fn choose_ref_children(&mut self, count: usize, cx: &mut Context<Self>) {
+        let before = appearance::ref_children(cx);
+        self.status = Some(
+            match appearance::set_ref_children(cx, count, &self.config_dir) {
+                Err(e) => format!(
+                    "{count} applies now, but could not save {}: {e}",
+                    appearance::FILE
+                )
+                .into(),
+                Ok(()) if before == count => {
+                    format!("References already show {count} children.").into()
+                }
+                Ok(()) => format!("References now show {count} children.").into(),
+            },
+        );
+        cx.notify();
+    }
+
+    /// Settings → Appearance: remove every pinned page (SB-3). The pages are untouched;
+    /// only the sidebar's local order changes.
+    pub fn clear_pins(&mut self, cx: &mut Context<Self>) {
+        self.status = Some(match appearance::clear_pinned(cx) {
+            Ok(()) => "Unpinned every page.".into(),
+            Err(e) => format!(
+                "The pins are gone for this session, but could not save {}: {e}",
+                appearance::FILE
+            )
+            .into(),
+        });
+        cx.notify();
+    }
+
     /// Settings → Appearance: switch density in every window and remember it (ALL-5).
     pub fn choose_density(&mut self, density: Density, cx: &mut Context<Self>) {
         let before = appearance::density(cx);
@@ -491,6 +524,25 @@ impl SettingsView {
                 Ok(()) => format!("The density is now {}.", density.label()).into(),
             },
         );
+        cx.notify();
+    }
+
+    /// Settings → Appearance: how pages draw their attribute blocks (PG-1). The same
+    /// preference the page's "Show as blocks" toggle writes.
+    pub fn choose_attribute_blocks(&mut self, value: AttributeBlocks, cx: &mut Context<Self>) {
+        let before = appearance::attribute_blocks(cx);
+        self.status = Some(match appearance::set_attribute_blocks(cx, value) {
+            Err(e) => format!(
+                "{} applies now, but could not save {}: {e}",
+                value.label(),
+                appearance::FILE
+            )
+            .into(),
+            Ok(()) if before == value => {
+                format!("Attribute blocks are already {}.", value.label()).into()
+            }
+            Ok(()) => format!("Attribute blocks are now {}.", value.label()).into(),
+        });
         cx.notify();
     }
 }
@@ -791,6 +843,23 @@ fn key_pane(
         .px_6()
         .py_5()
         .track_scroll(handle)
+}
+
+/// A row of an Appearance card. Like the key list, the cards' rows are direct children of
+/// the scroll region (the header and the last row round the card's ends); a row is a touch
+/// tighter than a key row so all four preference cards fit one desktop screen.
+fn appearance_row<E: Styled + gpui::prelude::FluentBuilder>(row: E, last: bool, th: &Theme) -> E {
+    row.w_full()
+        .max_w(px(CONTENT_WIDTH))
+        .mx_auto()
+        .flex_shrink_0()
+        .px_4()
+        .py(px(8.))
+        .border_l_1()
+        .border_r_1()
+        .border_t_1()
+        .border_color(th.line)
+        .when(last, |d| d.border_b_1().rounded_b_lg())
 }
 
 /// The scroll region every pane shares: one centred readable column.
@@ -1152,27 +1221,14 @@ impl SettingsView {
 
     fn render_appearance(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
-        let density = appearance::density(cx);
         let current = appearance::ui_font(cx);
 
-        let mut fonts = card(&th)
-            .debug_selector(|| "settings-card-Font".into())
-            .child(card_title(&th, "Font"))
-            .child(card_row(
-                div()
-                    .text_size(px(crate::theme::CAPTION_SIZE))
-                    .text_color(th.muted)
-                    .child(
-                        "Used for your notes and the interface, in every window, as soon \
-                         as you pick it. Code blocks stay in Menlo.",
-                    ),
-                0,
-                &th,
-                density,
-            ));
+        let mut list = pane("settings-appearance", "settings-appearance")
+            .gap_0()
+            .child(card_top(&th, "Font"));
         for (i, &f) in UiFont::ALL.iter().enumerate() {
             let on = f == current;
-            fonts = fonts.child(card_row(
+            list = list.child(appearance_row(
                 div()
                     .id(SharedString::from(format!("font-{}", f.key())))
                     .debug_selector(move || format!("settings-font-{}", f.key()))
@@ -1199,32 +1255,17 @@ impl SettingsView {
                             ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.choose_font(f, cx))),
-                i + 1,
+                i + 1 == UiFont::ALL.len(),
                 &th,
-                density,
             ));
         }
 
         let current_density = appearance::density(cx);
-        let mut densities = card(&th)
-            .debug_selector(|| "settings-card-Density".into())
-            .child(card_title(&th, "Density"))
-            .child(card_row(
-                div()
-                    .text_size(px(crate::theme::CAPTION_SIZE))
-                    .text_color(th.muted)
-                    .child(
-                        "How much space your notes take. Local to this machine, kept in \
-                         settings.json, never synced.",
-                    ),
-                0,
-                &th,
-                density,
-            ));
+        list = list.child(card_top(&th, "Density").mt_4());
         for (i, &d) in Density::ALL.iter().enumerate() {
             let on = d == current_density;
             let th = th.clone();
-            densities = densities.child(card_row(
+            list = list.child(appearance_row(
                 div()
                     .id(SharedString::from(format!("density-{}", d.key())))
                     .debug_selector(move || format!("settings-density-{}", d.key()))
@@ -1254,15 +1295,157 @@ impl SettingsView {
                             ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.choose_density(d, cx))),
-                i + 1,
+                i + 1 == Density::ALL.len(),
                 &th,
-                density,
             ));
         }
 
-        pane("settings-appearance", "settings-appearance")
-            .child(fonts)
-            .child(densities)
+        // LR-4: how many children a Linked Reference shows inline, then PG-1's attribute
+        // rows, both local preferences.
+        let current_children = appearance::ref_children(cx);
+        list = list.child(card_top(&th, "References").mt_4());
+        list = list.child(appearance_row(
+            div()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted)
+                .child(
+                    "How many children a Linked Reference shows inline. 0 keeps them all \
+                     behind its \"+N more\" chip.",
+                ),
+            false,
+            &th,
+        ));
+        list = list.child(appearance_row(
+            {
+                let mut row = div().flex().items_center().gap_2().child(
+                    div()
+                        .flex_none()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.muted)
+                        .child("Children shown"),
+                );
+                for n in 0..=appearance::REF_CHILDREN_MAX {
+                    let on = n == current_children;
+                    let th = th.clone();
+                    row = row.child(
+                        div()
+                            .id(SharedString::from(format!("ref-children-{n}")))
+                            .debug_selector(move || format!("settings-ref-children-{n}"))
+                            .w(px(40.))
+                            .py_1()
+                            .flex()
+                            .justify_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if on { th.accent } else { th.line })
+                            .when(on, |d| d.bg(th.chip_bg).text_color(th.accent))
+                            .when(!on, |d| d.text_color(th.muted))
+                            .cursor_pointer()
+                            .hover(|x| x.bg(th.hover))
+                            .child(n.to_string())
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.choose_ref_children(n, cx)),
+                            ),
+                    );
+                }
+                row
+            },
+            false,
+            &th,
+        ));
+        list = list.child(appearance_row(
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(div().child("Attribute blocks"))
+                .child(
+                    div()
+                        .text_size(px(crate::theme::CAPTION_SIZE))
+                        .text_color(th.muted)
+                        .child(
+                            "A page's key:: value blocks also appear in the metadata header. \
+                             Compact rows draw them once, quietly, under it.",
+                        ),
+                ),
+            false,
+            &th,
+        ));
+        let current_attributes = appearance::attribute_blocks(cx);
+        for (i, &a) in AttributeBlocks::ALL.iter().enumerate() {
+            let on = a == current_attributes;
+            list = list.child(appearance_row(
+                div()
+                    .id(SharedString::from(format!("attributes-{}", a.key())))
+                    .debug_selector(move || format!("settings-attributes-{}", a.key()))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .when(on, |x| x.bg(th.chip_bg))
+                    .cursor_pointer()
+                    .hover(|x| x.bg(th.hover))
+                    .child(radio(on, &th))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .child(div().child(a.label()))
+                            .child(
+                                div()
+                                    .text_size(px(crate::theme::CAPTION_SIZE))
+                                    .text_color(th.muted)
+                                    .child(a.hint()),
+                            ),
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.choose_attribute_blocks(a, cx)),
+                    ),
+                i + 1 == AttributeBlocks::ALL.len(),
+                &th,
+            ));
+        }
+
+        // SB-3: the pages pinned to the sidebar live in settings.json.
+        let pinned = appearance::pinned(cx).len();
+        list = list.child(card_top(&th, "Pinned pages").mt_4());
+        list = list.child(appearance_row(
+            div()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted)
+                .child(
+                    "Pages pinned to the top of the sidebar (SB-3). Local to this machine, \
+                     kept in settings.json, never synced.",
+                ),
+            false,
+            &th,
+        ));
+        list.child(appearance_row(
+            div()
+                .debug_selector(|| "settings-pinned".into())
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .child(
+                    div()
+                        .text_color(if pinned == 0 { th.muted } else { th.text })
+                        .child(match pinned {
+                            0 => "No pinned pages".to_string(),
+                            1 => "1 pinned page".to_string(),
+                            n => format!("{n} pinned pages"),
+                        }),
+                )
+                .when(pinned > 0, |d| {
+                    d.child(
+                        quiet_control("settings-clear-pinned", "Clear", &th)
+                            .debug_selector(|| "settings-clear-pinned".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_pins(cx))),
+                    )
+                }),
+            true,
+            &th,
+        ))
     }
 
     /// The tour: one readable column of prose, with the topics as chips above it. The old

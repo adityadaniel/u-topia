@@ -164,6 +164,46 @@ pub fn exchange_owned(
     (r, t)
 }
 
+/// What the sidebar's single sync dot says (SB-4): grey when sync is off, green when the
+/// last round finished, amber while a round is in flight or still connecting, red when the
+/// relay refused, was unreachable or speaks another protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncDot {
+    Off,
+    Synced,
+    Syncing,
+    Error,
+}
+
+impl SyncDot {
+    /// Spelled into the element's debug selector, so a test can tell the states apart.
+    pub fn key(self) -> &'static str {
+        match self {
+            SyncDot::Off => "off",
+            SyncDot::Synced => "synced",
+            SyncDot::Syncing => "syncing",
+            SyncDot::Error => "error",
+        }
+    }
+}
+
+pub fn sync_dot(runner: Option<&SyncRunner>) -> SyncDot {
+    let Some(runner) = runner else {
+        return SyncDot::Off;
+    };
+    // The transport is checked out of the runner while the background thread exchanges.
+    if runner.transport.is_none() {
+        return SyncDot::Syncing;
+    }
+    match runner.status {
+        None => SyncDot::Syncing,
+        Some(SyncStatus::Synced { .. }) => SyncDot::Synced,
+        Some(SyncStatus::Offline { .. })
+        | Some(SyncStatus::NeedsAuth)
+        | Some(SyncStatus::Unsupported) => SyncDot::Error,
+    }
+}
+
 /// Human status line for the sidebar.
 pub fn status_line(status: Option<&SyncStatus>, now_ms: i64) -> (String, bool) {
     match status {
@@ -224,6 +264,28 @@ mod tests {
         assert!(!facts.encrypted);
 
         assert!(!SyncFacts::default().is_on(), "no config means sync is off");
+    }
+
+    #[test]
+    fn the_dot_tells_off_synced_syncing_and_error_apart() {
+        assert_eq!(sync_dot(None), SyncDot::Off);
+        // A runner with a transport and no round yet is connecting.
+        let engine = utopia_sync::SyncEngine::new(&utopia_store::Store::open_in_memory().unwrap())
+            .expect("engine");
+        let transport: BoxTransport = Box::new(utopia_sync::relay::RelayTransport::new(
+            utopia_sync::relay::Relay::new(),
+            "g",
+        ));
+        let mut runner = SyncRunner::new(engine, transport);
+        assert_eq!(sync_dot(Some(&runner)), SyncDot::Syncing);
+        runner.status = Some(SyncStatus::Synced { at_ms: 0 });
+        assert_eq!(sync_dot(Some(&runner)), SyncDot::Synced);
+        runner.status = Some(SyncStatus::Offline { queued: 2 });
+        assert_eq!(sync_dot(Some(&runner)), SyncDot::Error);
+        // An exchange in flight wins over the last round's status.
+        runner.status = Some(SyncStatus::Synced { at_ms: 0 });
+        runner.transport = None;
+        assert_eq!(sync_dot(Some(&runner)), SyncDot::Syncing);
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Month calendar used as the journal date picker (FR-1.3, FR-1.4).
+//! Month calendar used as the journal date picker (FR-1.3, FR-1.4): the page title's
+//! popover grid ([`render`]) and the left sidebar's quiet month strip ([`render_month_strip`]).
 
 use std::collections::HashSet;
 
@@ -112,6 +113,153 @@ pub fn render<V: 'static>(
         .child(header)
         .child(names)
         .children(rows)
+}
+
+/// The callbacks the sidebar's month strip needs, bundled so the render signature stays
+/// readable (pick a day, move a month, fold the strip).
+pub struct StripActions<V> {
+    pub pick: fn(&mut V, NaiveDate, bool, &mut Window, &mut Context<V>),
+    pub shift: fn(&mut V, i32, &mut Context<V>),
+    pub toggle: fn(&mut V, &mut Context<V>),
+}
+
+// Function pointers are `Copy` whatever `V` is, so each listener can take its own copy.
+impl<V> Clone for StripActions<V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<V> Copy for StripActions<V> {}
+
+/// The left sidebar's month strip (SB-5): a quiet 7-column grid under Journal. The month
+/// name is the collapse control — one click folds the grid away; the arrows still move
+/// between months either way. Days with an entry get a small dot under the number, and
+/// today is drawn in the accent colour. Display only: the days are existing daily pages
+/// (§5.5, rule 6), nothing is created by looking at the month.
+pub fn render_month_strip<V: 'static>(
+    cx: &mut Context<V>,
+    month: NaiveDate,
+    today: NaiveDate,
+    existing: &HashSet<NaiveDate>,
+    open: bool,
+    actions: StripActions<V>,
+) -> Div {
+    let th = theme(cx).clone();
+    let arrow = |id: &'static str, glyph: &'static str, delta: i32| {
+        div()
+            .id(id)
+            .px_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .text_size(px(crate::theme::CAPTION_SIZE))
+            .text_color(th.faint)
+            .hover(|d| d.bg(th.hover).text_color(th.text))
+            .child(glyph)
+            .on_click(cx.listener(move |v, _, _, cx| (actions.shift)(v, delta, cx)))
+    };
+    let header = div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(arrow("cal-prev", "‹", -1))
+        .child(
+            div()
+                .id("toggle-calendar")
+                .debug_selector(|| "toggle-calendar".into())
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.muted)
+                .hover(|d| d.bg(th.hover).text_color(th.text))
+                .child(if open { "▾" } else { "▸" })
+                .child(month.format("%B %Y").to_string())
+                .on_click(cx.listener(move |v, _, _, cx| (actions.toggle)(v, cx))),
+        )
+        .child(arrow("cal-next", "›", 1));
+    let mut strip = div().flex().flex_col().gap_0p5().child(header);
+    if !open {
+        return strip;
+    }
+    let names = div()
+        .flex()
+        .pt_1()
+        .children(["M", "T", "W", "T", "F", "S", "S"].iter().map(|n| {
+            div()
+                .flex_1()
+                .flex()
+                .justify_center()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .text_color(th.faint)
+                .child(*n)
+        }));
+    let cells: Vec<_> = grid(month)
+        .into_iter()
+        .map(|d| {
+            let in_month = d.month() == month.month();
+            let is_today = d == today;
+            let has = existing.contains(&d);
+            let iso = d.format("%Y-%m-%d").to_string();
+            let dot_iso = iso.clone();
+            div()
+                .id(gpui::ElementId::Name(iso.clone().into()))
+                .debug_selector(move || format!("cal-{iso}"))
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_size(px(crate::theme::CAPTION_SIZE))
+                .line_height(px(15.))
+                .text_color(if is_today {
+                    th.accent
+                } else if in_month {
+                    th.muted
+                } else {
+                    th.faint
+                })
+                .when(is_today, |d| d.font_weight(gpui::FontWeight::MEDIUM))
+                .hover(|d| d.bg(th.hover))
+                .child(d.day().to_string())
+                .child(div().h(px(5.)).flex().items_center().when(has, |d| {
+                    d.child(
+                        div()
+                            .debug_selector(move || format!("cal-dot-{dot_iso}"))
+                            .size(px(3.))
+                            .rounded_full()
+                            .bg(if is_today { th.accent } else { th.faint }),
+                    )
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |v, e: &MouseDownEvent, w, cx| {
+                        (actions.pick)(v, d, e.modifiers.shift, w, cx)
+                    }),
+                )
+        })
+        .collect();
+    let mut rows = Vec::new();
+    let mut it = cells.into_iter();
+    for _ in 0..6 {
+        rows.push(div().flex().children(it.by_ref().take(7)));
+    }
+    strip = strip.child(
+        div()
+            .debug_selector(|| "left-calendar".into())
+            .px_1()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .child(names)
+            .children(rows),
+    );
+    strip
 }
 
 #[cfg(test)]

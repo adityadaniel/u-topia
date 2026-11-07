@@ -204,6 +204,9 @@ pub struct Projector<'a> {
 pub struct ResolutionWork {
     pub keys: HashSet<String>,
     pub pages: HashSet<PageId>,
+    /// Destination pages whose reference edges this write changed (SB-2). Only these need
+    /// their tag-page classification revisited; the unchanged refs on the same page do not.
+    pub changed: HashSet<PageId>,
 }
 
 impl Projector<'_> {
@@ -216,7 +219,7 @@ impl Projector<'_> {
         work: &mut ResolutionWork,
     ) -> Result<()> {
         let flip = self.project_page(st, work)?;
-        self.project_blocks(st, delta, flip)
+        self.project_blocks(st, delta, flip, work)
     }
 
     /// The page and alias rows. Returns whether the page appeared or was (un)tombstoned,
@@ -251,9 +254,10 @@ impl Projector<'_> {
         st: &PageState,
         delta: Option<&DocDelta>,
         page_flip: bool,
+        work: &mut ResolutionWork,
     ) -> Result<()> {
         match delta.filter(|_| !page_flip) {
-            None => self.project_all_blocks(st),
+            None => self.project_all_blocks(st, work),
             Some(d) => {
                 let mut ids: Vec<BlockId> = Vec::new();
                 let mut seen: HashSet<BlockId> = HashSet::new();
@@ -269,14 +273,19 @@ impl Projector<'_> {
                         }
                     }
                 }
-                self.write_rows(st, ids)
+                self.write_rows(st, ids, work)
             }
         }
     }
 
     /// Write rows in an order that keeps foreign keys satisfied: deletions deepest first,
     /// then upserts parents first.
-    fn write_rows(&self, st: &PageState, ids: Vec<BlockId>) -> Result<()> {
+    fn write_rows(
+        &self,
+        st: &PageState,
+        ids: Vec<BlockId>,
+        work: &mut ResolutionWork,
+    ) -> Result<()> {
         let mut deletes = Vec::new();
         let mut upserts = Vec::new();
         for id in ids {
@@ -292,11 +301,11 @@ impl Projector<'_> {
         }
         deletes.sort_by_key(|(_, old)| std::cmp::Reverse(old.depth));
         for (id, old) in deletes {
-            self.write_row(st, &id, Some(&old), None)?;
+            self.write_row(st, &id, Some(&old), None, work)?;
         }
         upserts.sort_by_key(|(_, _, new)| new.depth);
         for (id, old, new) in upserts {
-            self.write_row(st, &id, old.as_ref(), Some(&new))?;
+            self.write_row(st, &id, old.as_ref(), Some(&new), work)?;
         }
         Ok(())
     }
@@ -354,7 +363,7 @@ impl Projector<'_> {
         Ok(())
     }
 
-    fn project_all_blocks(&self, st: &PageState) -> Result<()> {
+    fn project_all_blocks(&self, st: &PageState, work: &mut ResolutionWork) -> Result<()> {
         let existing = load_rows(self.conn, &st.page_id)?;
         // Stale rows first, deepest first, so no delete strands a child.
         let mut stale: Vec<(&String, &Row)> = existing
@@ -363,7 +372,7 @@ impl Projector<'_> {
             .collect();
         stale.sort_by_key(|(_, old)| std::cmp::Reverse(old.depth));
         for (id, old) in stale {
-            self.write_row(st, &BlockId(id.clone()), Some(old), None)?;
+            self.write_row(st, &BlockId(id.clone()), Some(old), None, work)?;
         }
         // Then upserts in document pre-order: parents before children.
         for r in &st.roots {
@@ -376,7 +385,7 @@ impl Projector<'_> {
                     // The row may currently belong to another page (merge, §8.6).
                     None => load_row(self.conn, &id)?,
                 };
-                self.write_row(st, &id, old.as_ref(), Some(&new))?;
+                self.write_row(st, &id, old.as_ref(), Some(&new), work)?;
             }
         }
         Ok(())
@@ -388,12 +397,16 @@ impl Projector<'_> {
         id: &BlockId,
         old: Option<&Row>,
         new: Option<&Row>,
+        work: &mut ResolutionWork,
     ) -> Result<()> {
         match (old, new) {
             (None, None) => Ok(()),
             (Some(old), None) => {
                 // Only drop rows this page owns; a moved block's row belongs to its new page.
                 if old.page_id == st.page_id.0 {
+                    // Its outgoing references disappear with the row: the destinations may
+                    // stop (or start) being hashtag-only (SB-2).
+                    work.changed.extend(self.dst_pages_of_block(id)?);
                     // The FTS row goes with it (trigger `block_fts_on_delete`).
                     self.conn
                         .prepare_cached("DELETE FROM block WHERE id=?1")?
@@ -435,7 +448,25 @@ impl Projector<'_> {
                         || o.block_type != new.block_type
                 });
                 if reparse {
+                    // Compare what each destination's references look like before and after
+                    // (SB-2). Only a page whose tag/link class changed needs reclassifying;
+                    // ordinary prose edits would otherwise rescan every tag it mentions.
+                    let before = match old {
+                        Some(o) => self.page_ref_classes(o)?,
+                        None => HashMap::new(),
+                    };
                     self.index_block(id, new)?;
+                    let after = self.page_ref_classes(new)?;
+                    for (page, all_tags) in &before {
+                        if after.get(page) != Some(all_tags) {
+                            work.changed.insert(page.clone());
+                        }
+                    }
+                    for page in after.keys() {
+                        if !before.contains_key(page) {
+                            work.changed.insert(page.clone());
+                        }
+                    }
                 } else if old.is_some_and(|o| o.page_id != new.page_id) {
                     // Moved to another page unchanged (merge): re-home its ref rows (the FTS row is
                     // keyed by rowid and carries no page).
@@ -449,6 +480,40 @@ impl Projector<'_> {
                 Ok(())
             }
         }
+    }
+
+    /// Page destinations of `row`'s text, mapped to whether every reference from this block
+    /// to that page is a hashtag (SB-2). Used to tell a tag-to-link change from a prose edit.
+    fn page_ref_classes(&self, row: &Row) -> Result<HashMap<PageId, bool>> {
+        let mut classes: HashMap<PageId, bool> = HashMap::new();
+        if row.deleted_at.is_some() || row.block_type == BlockKind::Code.type_str() {
+            return Ok(classes);
+        }
+        for r in extract_refs(&row.text) {
+            if !matches!(r.kind, RefKind::Page | RefKind::Tag) {
+                continue;
+            }
+            let key = normalize_title(&r.target);
+            if let Some(page) = resolve_page_key(self.conn, &key, self.fmt)? {
+                let all_tags = classes.entry(page).or_insert(true);
+                if r.kind == RefKind::Page {
+                    *all_tags = false;
+                }
+            }
+        }
+        Ok(classes)
+    }
+
+    /// The page destinations this block currently references, if any.
+    fn dst_pages_of_block(&self, id: &BlockId) -> Result<HashSet<PageId>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT dst_page_id FROM ref
+             WHERE src_block_id=?1 AND dst_kind='page' AND dst_page_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([id.as_str()], |r| r.get::<_, String>(0))?;
+        Ok(rows
+            .map(|r| r.map(PageId))
+            .collect::<rusqlite::Result<HashSet<_>>>()?)
     }
 
     /// Rewrite the ref edges and FTS row of one block (FR-3.8: only touched rows).
@@ -517,7 +582,7 @@ impl Projector<'_> {
 
     /// Re-resolve page refs affected by identity changes (FR-3.6, FR-3.12, AC-2.10).
     /// Bounded by the `dst_title_key` and `dst_page_id` indexes: no other rows are read.
-    pub fn reresolve(&self, work: &ResolutionWork) -> Result<usize> {
+    pub fn reresolve(&self, work: &mut ResolutionWork) -> Result<usize> {
         let mut candidates: Vec<(i64, String, Option<String>)> = Vec::new();
         {
             let mut by_key = self.conn.prepare_cached(
@@ -582,6 +647,9 @@ impl Projector<'_> {
         for (id, key, old) in candidates {
             let new = resolve_page_key(self.conn, &key, self.fmt)?.map(|p| p.0);
             if new != old {
+                for p in [old.as_deref(), new.as_deref()].into_iter().flatten() {
+                    work.changed.insert(PageId(p.to_string()));
+                }
                 changed += self.conn.execute(
                     "UPDATE OR IGNORE ref SET dst_page_id=?1 WHERE id=?2",
                     params![new, id],
