@@ -3348,6 +3348,48 @@ fn fr_1_2_typing_survives_a_merged_promotion(cx: &mut TestAppContext) {
     assert_eq!(rows(&app, &live, cx), [("ty".to_string(), 0)]);
 }
 
+/// A view can still be showing a draft when the same day arrives from sync under another
+/// id. Opening the date elsewhere used to discard the draft's shard silently, leaving that
+/// view on a missing page (FR-1.2: a remote copy of the day replaces the draft).
+#[gpui::test]
+fn fr_1_2_opening_a_day_replaces_a_stale_draft_everywhere(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let draft = app.update(cx, |app, _| app.store.draft_daily(day).unwrap());
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(draft.clone()));
+    // Another device wrote the day under a fresh id while this draft was open.
+    let live = app.update(cx, |app, _| {
+        let mut remote = Store::open_in_memory().unwrap();
+        remote.set_today(Some(day));
+        let gone = remote.ensure_daily_page(day).unwrap();
+        remote.delete_page(&gone).unwrap();
+        let live = remote.ensure_daily_page(day).unwrap();
+        let shard = remote.export_since(&live, &Default::default()).unwrap();
+        app.store.import_batch(&[(live.clone(), shard)]).unwrap();
+        live
+    });
+    app.update(cx, |app, cx| app.changed(Vec::new(), false, cx));
+    cx.run_until_parked();
+    // Opening the date in a sidebar pane retires the stale draft.
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, true, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(live.clone()),
+        "the open draft follows the day that replaced it"
+    );
+    assert!(
+        app.update(cx, |app, _| app.store.page_state(&live).is_ok()),
+        "the main pane shows a page that loads"
+    );
+}
+
 /// The undo group saved the draft's id in its carets. Undo and redo put the editor back on
 /// that id while the feed renders the survivor, so `BlockEditor::is_editing` stops matching
 /// and the focused row disappears (FR-1.2, AGENTS.md "the list keeps rendering the row

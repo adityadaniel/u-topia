@@ -108,10 +108,8 @@ impl Store {
     pub fn ensure_daily_page(&mut self, date: NaiveDate) -> Result<PageId> {
         self.sync_index()?;
         if let Some(p) = self.live_daily(date)? {
-            // A draft of a day that now has a page is stale: drop it (FR-1.2).
-            if let Some(draft) = self.draft_page(date) {
-                self.discard_draft(&draft);
-            }
+            // A draft of a day that now has a page is stale (FR-1.2): retire it for the day.
+            self.retire_stale_draft(date, &p);
             return Ok(p);
         }
         if let Some(p) = self.draft_page(date) {
@@ -143,10 +141,8 @@ impl Store {
     pub fn draft_daily(&mut self, date: NaiveDate) -> Result<PageId> {
         self.sync_index()?;
         if let Some(p) = self.live_daily(date)? {
-            // A draft of a day that now has a page is stale: drop it (FR-1.2).
-            if let Some(draft) = self.draft_page(date) {
-                self.discard_draft(&draft);
-            }
+            // A draft of a day that now has a page is stale (FR-1.2): retire it for the day.
+            self.retire_stale_draft(date, &p);
             return Ok(p);
         }
         if let Some(p) = self.draft_page(date) {
@@ -276,6 +272,27 @@ impl Store {
         self.drafts.remove(page);
     }
 
+    /// Retire a stale draft of `date` for the page that already owns the day (FR-1.2): its
+    /// shard was never written, so it is dropped, its id becomes a session alias for the
+    /// survivor, and views still showing it are told to retarget.
+    fn retire_stale_draft(&mut self, date: NaiveDate, survivor: &PageId) {
+        let Some(draft) = self.draft_page(date) else {
+            return;
+        };
+        if draft == *survivor {
+            return;
+        }
+        self.discard_draft(&draft);
+        self.promotions.insert(draft.clone(), survivor.clone());
+        self.replacements.push((draft, survivor.clone()));
+    }
+
+    /// Replacements the views have not been told about yet: `(from, to)`. The UI announces
+    /// them as page replacements so a view showing `from` follows `to` (FR-1.2).
+    pub fn take_replacements(&mut self) -> Vec<(PageId, PageId)> {
+        std::mem::take(&mut self.replacements)
+    }
+
     /// Where a promoted draft's page id went when another page already owned its day
     /// (FR-1.2). The id was never durable, so it is a session alias: views and the editor
     /// that still hold it follow the day instead of a shard that no longer exists (rule 5).
@@ -323,6 +340,7 @@ impl Store {
         }
         self.docs.remove(page);
         self.promotions.insert(page.clone(), live.clone());
+        self.replacements.push((page.clone(), live.clone()));
         Ok(Some(live))
     }
 
@@ -838,6 +856,7 @@ impl Store {
             // of its own again: drop the session alias, or identity logic (dedupe, restore)
             // would act on the day instead of the page this shard describes (rule 4).
             self.promotions.remove(page);
+            self.replacements.retain(|(from, _)| from != page);
             let did = if self.page_exists(page)? {
                 self.load_doc(page)?.doc.import(bytes)?
             } else {

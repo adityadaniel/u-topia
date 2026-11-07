@@ -166,6 +166,10 @@ pub struct Store {
     /// (FR-1.2). The ids were never durable, so this is a session alias for views and the
     /// editor that still hold one.
     promotions: HashMap<PageId, PageId>,
+    /// Replacements not yet announced to the views ([`Store::take_replacements`]): a stale
+    /// draft retired for the day's page (FR-1.2) can be shown by a view the caller did not
+    /// name.
+    replacements: Vec<(PageId, PageId)>,
     debounced: bool,
     /// Attachment bytes for in-memory graphs (file graphs use the blob directory).
     mem_blobs: HashMap<String, Vec<u8>>,
@@ -240,6 +244,7 @@ impl Store {
             pending: Vec::new(),
             drafts: HashMap::new(),
             promotions: HashMap::new(),
+            replacements: Vec::new(),
             debounced: false,
             mem_blobs: HashMap::new(),
             tag_page_scans: std::sync::atomic::AtomicU64::new(0),

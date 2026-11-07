@@ -104,22 +104,30 @@ impl AppState {
     }
 
     pub fn changed(&mut self, pages: Vec<PageId>, structural: bool, cx: &mut Context<Self>) {
-        // A promoted draft that merged into the day (FR-1.2) leaves its id as a session
-        // alias: announce the replacement so views and the editor retarget, and report the
-        // survivor in `Changed` so subscriptions keyed on the page match.
+        // A promoted draft that merged into the day, or a stale draft retired for it
+        // (FR-1.2), leaves its id as a session alias: announce the replacement so views and
+        // the editor retarget, and report the survivor in `Changed` so subscriptions keyed
+        // on the page match. Replacements the store made on its own reach views the caller
+        // did not name.
+        let mut replaced: Vec<(PageId, PageId)> = Vec::new();
         let pages: Vec<PageId> = pages
             .into_iter()
             .map(|page| match self.store.redirect(&page) {
                 Some(to) => {
-                    cx.emit(PageReplaced {
-                        from: page,
-                        to: to.clone(),
-                    });
+                    replaced.push((page, to.clone()));
                     to
                 }
                 None => page,
             })
             .collect();
+        for pair in self.store.take_replacements() {
+            if !replaced.iter().any(|(from, _)| *from == pair.0) {
+                replaced.push(pair);
+            }
+        }
+        for (from, to) in replaced {
+            cx.emit(PageReplaced { from, to });
+        }
         self.version += 1;
         cx.emit(Changed { pages, structural });
         if structural {
