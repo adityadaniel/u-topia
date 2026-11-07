@@ -17,7 +17,7 @@ use utopia_core::undo::Caret;
 use utopia_core::{BlockId, BlockKind, PageId};
 
 use crate::actions::*;
-use crate::app_state::AppState;
+use crate::app_state::{AppState, PageReplaced};
 use crate::field::{FieldElement, FieldHost, Goal, TextField};
 use crate::rich::source_highlights;
 use crate::theme::theme;
@@ -220,6 +220,7 @@ pub struct BlockEditor {
     idle: Option<Task<()>>,
     edits: u64,
     _sub: Subscription,
+    _page_sub: Subscription,
 }
 
 impl EventEmitter<EditorEvent> for BlockEditor {}
@@ -251,6 +252,20 @@ crate::impl_field_input_handler!(
 impl BlockEditor {
     pub fn new(app: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let sub = cx.observe(&app, |this, _, cx| this.sync_from_store(cx));
+        // The page this editor is typing into was merged into another one (FR-1.2): keep
+        // editing the same block, now on the page that owns the day, so the next keystroke
+        // does not go to a shard that no longer exists.
+        let page_sub = cx.subscribe(&app, |this, _, e: &PageReplaced, cx| {
+            let Some(target) = &mut this.target else {
+                return;
+            };
+            if target.page != e.from {
+                return;
+            }
+            target.page = e.to.clone();
+            this.anchor_caret(cx);
+            cx.notify();
+        });
         Self {
             app,
             field: TextField::new(true),
@@ -262,6 +277,7 @@ impl BlockEditor {
             idle: None,
             edits: 0,
             _sub: sub,
+            _page_sub: page_sub,
         }
     }
 

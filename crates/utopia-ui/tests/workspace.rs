@@ -3255,6 +3255,32 @@ fn folded_empty_day_opens_on_a_click(cx: &mut TestAppContext) {
     );
 }
 
+/// `docs/state-machines/draft-daily-page.md` issue 5: starting a day writes nothing, so it
+/// must not report a structural change, which forces an index flush and an `IndexUpdated`
+/// cycle for a commit that does not exist (FR-1.2).
+#[gpui::test]
+fn fr_1_2_starting_a_draft_does_not_flush_the_index(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let day = today() - chrono::Duration::days(4);
+    let before = app.read_with(cx, |app, _| app.refs_version);
+    let selector: &'static str =
+        Box::leak(format!("day-folded-{}", utopia_core::date::iso(day)).into_boxed_str());
+    let row = cx.debug_bounds(selector).expect("a folded empty day");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        app.read_with(cx, |app, _| app.store.is_draft(&PageId::for_date(day))),
+        "the click started a draft for the day"
+    );
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "starting a draft queues no write, so the index is not refreshed"
+    );
+}
+
 #[gpui::test]
 fn shortcuts_work_after_scrolling_the_caret_away(cx: &mut TestAppContext) {
     let (_app, ws, cx) = setup(cx);
@@ -3266,6 +3292,213 @@ fn shortcuts_work_after_scrolling_the_caret_away(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let shown = ws.update(cx, |w, cx| w.main_page(cx)).unwrap();
     assert_eq!(shown, PageId::for_date(today().pred_opt().unwrap()));
+}
+
+/// P2 of the draft-day review: the first keystroke on a draft whose day a remote copy
+/// already owns merges the draft into that page. The editor and the view still hold the
+/// draft's id; they must follow it, or every later keystroke would edit a shard that no
+/// longer exists (FR-1.2, rule 5).
+#[gpui::test]
+fn fr_1_2_typing_survives_a_merged_promotion(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let draft = app.update(cx, |app, _| app.store.draft_daily(day).unwrap());
+    // Show the day as a draft, caret in its first block, before the remote copy lands.
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(draft.clone()));
+    // Another device deleted the day's deterministic id and wrote it under a fresh one;
+    // only that page arrives, while the draft is still open here.
+    let live = app.update(cx, |app, _| {
+        let mut remote = Store::open_in_memory().unwrap();
+        remote.set_today(Some(day));
+        let gone = remote.ensure_daily_page(day).unwrap();
+        remote.delete_page(&gone).unwrap();
+        let live = remote.ensure_daily_page(day).unwrap();
+        let shard = remote.export_since(&live, &Default::default()).unwrap();
+        app.store.import_batch(&[(live.clone(), shard)]).unwrap();
+        live
+    });
+    app.update(cx, |app, cx| app.changed(Vec::new(), false, cx));
+    cx.run_until_parked();
+    // First keystroke: promotes the draft, merges it into the day's page and redirects.
+    cx.simulate_input("t");
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(live.clone()),
+        "the view follows the day"
+    );
+    assert_eq!(
+        ws.update(cx, |w, cx| w
+            .editor()
+            .read(cx)
+            .target
+            .as_ref()
+            .map(|t| t.page.clone())),
+        Some(live.clone()),
+        "the editor follows the day"
+    );
+    // The second keystroke must land on the day, not on the discarded draft.
+    cx.simulate_input("y");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &live, cx), [("ty".to_string(), 0)]);
+}
+
+/// A view can still be showing a draft when the same day arrives from sync under another
+/// id. Opening the date elsewhere used to discard the draft's shard silently, leaving that
+/// view on a missing page (FR-1.2: a remote copy of the day replaces the draft).
+#[gpui::test]
+fn fr_1_2_opening_a_day_replaces_a_stale_draft_everywhere(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let draft = app.update(cx, |app, _| app.store.draft_daily(day).unwrap());
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(draft.clone()));
+    // Another device wrote the day under a fresh id while this draft was open.
+    let live = app.update(cx, |app, _| {
+        let mut remote = Store::open_in_memory().unwrap();
+        remote.set_today(Some(day));
+        let gone = remote.ensure_daily_page(day).unwrap();
+        remote.delete_page(&gone).unwrap();
+        let live = remote.ensure_daily_page(day).unwrap();
+        let shard = remote.export_since(&live, &Default::default()).unwrap();
+        app.store.import_batch(&[(live.clone(), shard)]).unwrap();
+        live
+    });
+    app.update(cx, |app, cx| app.changed(Vec::new(), false, cx));
+    cx.run_until_parked();
+    // Opening the date in a sidebar pane retires the stale draft.
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, true, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        ws.update(cx, |w, cx| w.main_page(cx)),
+        Some(live.clone()),
+        "the open draft follows the day that replaced it"
+    );
+    assert!(
+        app.update(cx, |app, _| app.store.page_state(&live).is_ok()),
+        "the main pane shows a page that loads"
+    );
+}
+
+/// The undo group saved the draft's id in its carets. Undo and redo put the editor back on
+/// that id while the feed renders the survivor, so `BlockEditor::is_editing` stops matching
+/// and the focused row disappears (FR-1.2, AGENTS.md "the list keeps rendering the row
+/// being edited").
+#[gpui::test]
+fn fr_1_2_undo_after_a_merged_promotion_keeps_the_editor(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let draft = app.update(cx, |app, _| app.store.draft_daily(day).unwrap());
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, true, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(draft.clone()));
+    // Another device wrote the day under a fresh id; only that page arrives.
+    let live = app.update(cx, |app, _| {
+        let mut remote = Store::open_in_memory().unwrap();
+        remote.set_today(Some(day));
+        let gone = remote.ensure_daily_page(day).unwrap();
+        remote.delete_page(&gone).unwrap();
+        let live = remote.ensure_daily_page(day).unwrap();
+        let shard = remote.export_since(&live, &Default::default()).unwrap();
+        app.store.import_batch(&[(live.clone(), shard)]).unwrap();
+        live
+    });
+    app.update(cx, |app, cx| app.changed(Vec::new(), false, cx));
+    cx.run_until_parked();
+    // One keystroke promotes the draft and merges it into the day's page.
+    cx.simulate_input("t");
+    cx.run_until_parked();
+    let target_page = |ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
+        ws.update(cx, |w, cx| {
+            w.editor().read(cx).target.as_ref().map(|t| t.page.clone())
+        })
+    };
+    // Undo restores the caret: it must point at the page that owns the day.
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(
+        target_page(&ws, cx),
+        Some(live.clone()),
+        "undo puts the caret back on the day"
+    );
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(live.clone()));
+    // So does redo.
+    cx.simulate_keystrokes("cmd-shift-z");
+    cx.run_until_parked();
+    assert_eq!(
+        target_page(&ws, cx),
+        Some(live.clone()),
+        "redo puts the caret back on the day"
+    );
+    // The focused row is drawn, so the next keystroke reaches the day.
+    cx.simulate_input("y");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &live, cx), [("ty".to_string(), 0)]);
+}
+
+/// P3 of the draft-day review: visiting a date writes nothing, so none of the visit paths
+/// may report a structural change (which forces a synchronous index flush and an
+/// `IndexUpdated` cycle) (FR-1.2, FR-1.5).
+#[gpui::test]
+fn fr_1_2_visiting_a_day_does_not_flush_the_index(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let before = app.read_with(cx, |app, _| app.refs_version);
+
+    // Quick jump / previous day (`open_date`): a draft until written.
+    let day = today() - chrono::Duration::days(6);
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(
+        app.read_with(cx, |app, _| app.store.is_draft(&PageId::for_date(day))),
+        "the day is a draft"
+    );
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "opening a draft day queues no write"
+    );
+
+    // The day header's calendar (`pick_date` on the page view).
+    let title = cx.debug_bounds("page-title").expect("the day's header");
+    cx.simulate_click(title.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    // The calendar opens on the day's own month (October, for `day` above).
+    let cell = cx
+        .debug_bounds("cal-pop-2026-10-15")
+        .expect("the header calendar opens");
+    cx.simulate_click(cell.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "the calendar queues no write"
+    );
+
+    // The Daily Notes feed (`open_journal`).
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "opening the feed queues no write"
+    );
 }
 
 #[gpui::test]
