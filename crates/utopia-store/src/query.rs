@@ -291,6 +291,16 @@ impl SearchScope {
         }
     }
 
+    /// Whether a page title (or alias) may be listed in this scope (SR-3).
+    pub fn keeps_page(self, daily: bool) -> bool {
+        match self {
+            SearchScope::All => true,
+            SearchScope::Journal => daily,
+            SearchScope::Pages => !daily,
+            SearchScope::Todos => false,
+        }
+    }
+
     /// The SQL condition on `block b` / `page p` for this scope.
     fn condition(self) -> &'static str {
         match self {
@@ -613,6 +623,17 @@ impl Store {
 
     /// Quick jump (Cmd+K): fuzzy match over live titles and aliases (v1: no bodies).
     pub fn search_titles(&self, query: &str, limit: usize) -> Result<Vec<TitleHit>> {
+        self.search_titles_scoped(query, SearchScope::All, limit)
+    }
+
+    /// Title search narrowed by the scope chips before the result limit (SR-3): excluded
+    /// pages must not crowd eligible matches out of the candidate window.
+    pub fn search_titles_scoped(
+        &self,
+        query: &str,
+        scope: SearchScope,
+        limit: usize,
+    ) -> Result<Vec<TitleHit>> {
         self.read_barrier()?;
         let q = normalize_title(query);
         let mut best: HashMap<PageId, TitleHit> = HashMap::new();
@@ -674,7 +695,10 @@ impl Store {
                 }
             }
         }
-        let mut hits: Vec<TitleHit> = best.into_values().collect();
+        let mut hits: Vec<TitleHit> = best
+            .into_values()
+            .filter(|h| scope.keeps_page(h.daily))
+            .collect();
         hits.sort_by(|a, b| {
             b.score
                 .cmp(&a.score)

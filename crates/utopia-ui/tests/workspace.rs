@@ -1410,6 +1410,50 @@ fn search_scope_filters_page_titles(cx: &mut TestAppContext) {
     );
 }
 
+/// SR-3: the scope applies before the title limit, so ineligible days cannot crowd an
+/// ordinary page out of the twelve candidates.
+#[gpui::test]
+fn search_pages_scope_applies_before_the_title_limit(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        for day in 1..=12 {
+            let date = NaiveDate::from_ymd_opt(2026, 11, day).unwrap();
+            app.store.ensure_daily_page(date).unwrap();
+        }
+        app.store.create_page("Plans for November").unwrap();
+        app.store.sync_index().unwrap();
+    });
+
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("november");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("search is open");
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.page_titles()).len(),
+        12,
+        "the twelve matching days fill the title limit under All"
+    );
+    assert!(
+        !jump
+            .read_with(cx, |j, _| j.page_titles())
+            .contains(&"Plans for November".to_string()),
+        "the ordinary page is beyond the unfiltered limit"
+    );
+
+    let pages = cx
+        .debug_bounds("search-scope-pages")
+        .expect("the Pages chip");
+    cx.simulate_click(pages.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.page_titles()),
+        vec!["Plans for November".to_string()],
+        "Pages limits eligible titles, not the raw candidates"
+    );
+}
+
 /// SR-5: when page titles fill the results viewport, the block Cmd+Shift+F selects is
 /// scrolled into view; otherwise Enter opens a row the user cannot see.
 #[gpui::test]
