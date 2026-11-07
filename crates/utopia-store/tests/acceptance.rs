@@ -840,7 +840,9 @@ fn debounced_commits_reach_disk_on_flush() {
         }
         assert!(s.has_pending(), "keystrokes stay in memory until a flush");
         s.flush().unwrap();
-        s.write_ticket().wait();
+        s.write_ticket()
+            .wait()
+            .expect("the debounced commit reaches disk");
         assert!(!s.has_pending());
         page = p;
         // Dropping the store flushes, stops the writer and compacts.

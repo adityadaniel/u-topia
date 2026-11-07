@@ -14,6 +14,9 @@ use utopia_store::Store;
 
 const IDLE_FLUSH: Duration = Duration::from_millis(250);
 const MAX_FLUSH_DELAY: Duration = Duration::from_secs(1);
+/// A failed repair is not retried on every keystroke (it snapshots and waits on disk);
+/// wait this long before trying again.
+const REPAIR_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Emitted after every mutation so views refresh only what they show.
 #[derive(Debug, Clone)]
@@ -45,6 +48,9 @@ pub struct AppState {
     dirty_since: Option<Instant>,
     flush_task: Option<Task<()>>,
     wait_task: Option<Task<()>>,
+    /// When a failed writer may be repaired again (backoff, review P3).
+    repair_at: Option<Instant>,
+    repair_task: Option<Task<()>>,
     _quit: Option<Subscription>,
 }
 
@@ -70,6 +76,8 @@ impl AppState {
             dirty_since: None,
             flush_task: None,
             wait_task: None,
+            repair_at: None,
+            repair_task: None,
             _quit: None,
         }
     }
@@ -98,6 +106,10 @@ impl AppState {
 
     fn schedule_flush(&mut self, cx: &mut Context<Self>) {
         if !self.store.has_pending() {
+            // Nothing to flush: drop the timer *and* the clock that caps it. Keeping the
+            // old `dirty_since` would make the next keystroke flush at once (issue 4).
+            self.flush_task = None;
+            self.dirty_since = None;
             return;
         }
         let now = Instant::now();
@@ -115,18 +127,73 @@ impl AppState {
     pub fn flush_now(&mut self, cx: &mut Context<Self>) {
         self.flush_task = None;
         self.dirty_since = None;
-        let r = self.store.flush();
-        self.report(r);
+        if let Err(e) = self.store.flush() {
+            // A failed writer is a state: report it, repair from the retained shards once,
+            // and only claim the index moved when the repaired commit actually landed.
+            self.report::<()>(Err(e));
+            if self.repair_at.is_some_and(|at| Instant::now() < at) {
+                // A repair is already backing off: do not snapshot and wait on disk again
+                // from the keystroke path (rule 10, review P3).
+                cx.notify();
+                return;
+            }
+            let _ = self.store.sync_index();
+            // The repair's retry takes `pending` even when it fails, so an empty queue
+            // does not mean the index moved: ask the writer's ticket instead.
+            match self.store.write_ticket().wait() {
+                Ok(()) => {
+                    self.repair_at = None;
+                    self.repair_task = None;
+                    self.index_updated(cx);
+                }
+                Err(e) => {
+                    self.report::<()>(Err(e));
+                    self.repair_at = Some(Instant::now() + REPAIR_BACKOFF);
+                    self.schedule_repair(cx);
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        // The writer is healthy enough to take this edit; a scheduled repair is moot.
+        self.repair_at = None;
+        self.repair_task = None;
         let ticket = self.store.write_ticket();
         if ticket.is_done() {
-            self.index_updated(cx);
+            match ticket.wait() {
+                Ok(()) => self.index_updated(cx),
+                Err(e) => {
+                    self.report::<()>(Err(e));
+                    cx.notify();
+                }
+            }
             return;
         }
         self.wait_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
+            let outcome = cx
+                .background_executor()
                 .spawn(async move { ticket.wait() })
                 .await;
-            let _ = this.update(cx, |app, cx| app.index_updated(cx));
+            let _ = this.update(cx, |app, cx| match outcome {
+                Ok(()) => app.index_updated(cx),
+                Err(e) => {
+                    // The waiter resolved on a commit that did not happen: report it, but
+                    // do not emit `IndexUpdated`.
+                    app.report::<()>(Err(e));
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// Retry a failed repair after the backoff, without blocking the keystroke path.
+    fn schedule_repair(&mut self, cx: &mut Context<Self>) {
+        self.repair_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(REPAIR_BACKOFF).await;
+            let _ = this.update(cx, |app, cx| {
+                app.repair_task = None;
+                app.flush_now(cx);
+            });
         }));
     }
 
@@ -167,5 +234,143 @@ impl AppState {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use gpui::{AppContext as _, TestAppContext};
+
+    fn today() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()
+    }
+
+    /// A store with one durable daily block, ready for a text edit.
+    fn store() -> (Store, PageId, utopia_core::BlockId) {
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_today(Some(today()));
+        let (page, block) = store.open_daily(today()).unwrap();
+        store
+            .set_block_text(&page, &block, "a", None, None)
+            .unwrap();
+        store.sync_index().unwrap();
+        (store, page, block)
+    }
+
+    /// Issue 4: a change with nothing pending returned early and left `dirty_since` from an
+    /// earlier edit, so the next keystroke could flush immediately instead of debouncing.
+    #[gpui::test]
+    fn a_change_with_nothing_pending_forgets_the_dirty_clock(cx: &mut TestAppContext) {
+        let (store, _page, _block) = store();
+        let app = cx.new(|_| AppState::new(store));
+        app.update(cx, |app, cx| {
+            // A local-only change (no store write) after the timer was armed elsewhere.
+            app.dirty_since = Some(Instant::now() - Duration::from_secs(2));
+            app.changed(Vec::new(), false, cx);
+            assert!(
+                app.dirty_since.is_none(),
+                "the dirty clock follows the pending set"
+            );
+        });
+    }
+
+    const FAIL_COMMIT: &str = "CREATE TRIGGER fail_commit BEFORE INSERT ON outbox
+         BEGIN SELECT RAISE(ABORT, 'injected commit failure'); END";
+
+    /// Review P3: a persistent failure must not make every keystroke snapshot and block the
+    /// UI thread. The repair backs off; the edit stays queued for the retry.
+    #[gpui::test]
+    fn a_failed_repair_backs_off_before_retrying(cx: &mut TestAppContext) {
+        let (store, page, block) = store();
+        store.conn().execute_batch(FAIL_COMMIT).unwrap();
+        let app = cx.new(|_| AppState::new(store));
+        app.update(cx, |app, cx| {
+            app.store
+                .set_block_text(&page, &block, "ab", None, None)
+                .unwrap();
+            app.flush_now(cx);
+            assert!(app.last_error.is_some(), "the failure is reported");
+            assert!(app.store.has_pending(), "the edit is kept for the repair");
+        });
+        // The disk recovers, but the next keystroke arrives inside the backoff window.
+        app.update(cx, |app, _| {
+            app.store
+                .conn()
+                .execute_batch("DROP TRIGGER fail_commit")
+                .unwrap();
+        });
+        app.update(cx, |app, cx| {
+            app.store
+                .set_block_text(&page, &block, "abc", None, None)
+                .unwrap();
+            app.flush_now(cx);
+            assert!(
+                app.store.has_pending(),
+                "no synchronous repair inside the backoff window"
+            );
+            assert_eq!(app.refs_version, 0, "the index did not move");
+        });
+    }
+
+    /// Review P1: with the thread persister the repair's retry takes `pending` even when it
+    /// fails, so an empty queue does not mean the index moved. Key off the writer instead.
+    #[gpui::test]
+    fn a_failed_repair_does_not_claim_the_index_moved(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("g.utopia")).unwrap();
+        store.set_today(Some(today()));
+        let (page, block) = store.open_daily(today()).unwrap();
+        store
+            .set_block_text(&page, &block, "a", None, None)
+            .unwrap();
+        store.sync_index().unwrap();
+        store.conn().execute_batch(FAIL_COMMIT).unwrap();
+
+        let app = cx.new(|_| AppState::new(store));
+        app.update(cx, |app, cx| {
+            app.store
+                .set_block_text(&page, &block, "ab", None, None)
+                .unwrap();
+            app.flush_now(cx);
+        });
+        // The writer runs the first job and records the failure.
+        app.update(cx, |app, _| {
+            let _ = app.store.write_ticket().wait();
+        });
+        app.update(cx, |app, cx| {
+            app.store
+                .set_block_text(&page, &block, "abc", None, None)
+                .unwrap();
+            app.flush_now(cx);
+            assert!(app.last_error.is_some(), "the failure is reported");
+            assert_eq!(
+                app.refs_version, 0,
+                "a repair that also failed did not move the index"
+            );
+        });
+    }
+
+    /// Issue 2: the wait task resolves on a writer error, so the failure must be reported
+    /// and must not be announced as an index update for a commit that did not happen.
+    #[gpui::test]
+    fn a_failed_commit_does_not_claim_the_index_moved(cx: &mut TestAppContext) {
+        let (store, page, block) = store();
+        // Fail the commit through SQLite itself: the writer path runs unchanged.
+        store.conn().execute_batch(FAIL_COMMIT).unwrap();
+        let app = cx.new(|_| AppState::new(store));
+        app.update(cx, |app, cx| {
+            app.store
+                .set_block_text(&page, &block, "ab", None, None)
+                .unwrap();
+            assert!(app.store.has_pending());
+            app.flush_now(cx);
+            assert!(app.last_error.is_some(), "the failure is reported");
+            assert_eq!(
+                app.refs_version, 0,
+                "no IndexUpdated for a commit that did not happen"
+            );
+        });
     }
 }
