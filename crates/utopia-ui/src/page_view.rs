@@ -15,7 +15,7 @@ use utopia_core::undo::Caret;
 use utopia_core::{BlockId, BlockKind, PageId, PageKind};
 use utopia_store::{LinkedRefs, Mention, PageRow, RefChildren, RefHit, RefQuery, RefSort};
 
-use crate::app_state::{AppState, Changed, IndexUpdated};
+use crate::app_state::{AppState, Changed, IndexUpdated, PageReplaced};
 use crate::editor::{BlockEditor, EditTarget, EditorEvent};
 use crate::field::Goal;
 use crate::line_input::{LineInput, LineInputEvent};
@@ -514,6 +514,16 @@ impl PageView {
                     cx.notify();
                 }
             }),
+            // A promoted draft merged into the day's page (FR-1.2): this view may be
+            // showing the discarded id, so follow the page that owns the day.
+            cx.subscribe(&app, |this, _, e: &PageReplaced, cx| {
+                if this.page.as_ref() == Some(&e.from) {
+                    this.page = Some(e.to.clone());
+                    this.refs_key = None;
+                    this.dirty = true;
+                    cx.notify();
+                }
+            }),
             cx.subscribe(&app, |this, _, _: &IndexUpdated, cx| {
                 this.dirty = true;
                 // LR-5: the unlinked count is keyed by the index version, so it is refreshed
@@ -742,17 +752,21 @@ impl PageView {
                                 .page_state(&page)
                                 .map(|st| outline::append_block(st, Some(z)));
                             plan.and_then(|p| app.store.execute_plan(&page, p, None))
-                                .map(|f| f.map(|f| f.block))
+                                .map(|f| f.map(|f| (f.block, true)))
                         }
-                        None => start_note(&mut app.store, &page).map(Some),
+                        None => start_note(&mut app.store, &page).map(|n| Some((n.block, n.wrote))),
+                    };
+                    let structural = match &r {
+                        Ok(Some((_, wrote))) => *wrote,
+                        _ => true,
                     };
                     let b = app.report(r).flatten();
-                    app.changed(vec![page.clone()], true, cx);
+                    app.changed(vec![page.clone()], structural, cx);
                     b
                 });
                 self.rebuild(cx);
                 match created {
-                    Some(b) => b,
+                    Some((block, _)) => block,
                     None => return,
                 }
             }
@@ -1392,11 +1406,17 @@ impl PageView {
     fn start_day(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
         let target = self.app.update(cx, |app, cx| {
             let r = app.store.draft_daily(date).and_then(|page| {
-                let block = start_note(&mut app.store, &page)?;
-                Ok((page, block))
+                let note = start_note(&mut app.store, &page)?;
+                Ok((page, note))
             });
-            let t = app.report(r);
-            app.changed(Vec::new(), true, cx);
+            // The click writes nothing on a draft, so only a real write is structural
+            // (an index flush for a commit that does not exist is a wasted cycle).
+            let structural = match &r {
+                Ok((_, note)) => note.wrote,
+                Err(_) => true,
+            };
+            let t = app.report(r).map(|(page, note)| (page, note.block));
+            app.changed(Vec::new(), structural, cx);
             t
         });
         self.rebuild(cx);
@@ -2154,7 +2174,8 @@ impl PageView {
         let page = self.app.update(cx, |app, cx| {
             let r = app.store.draft_daily(d);
             let p = app.report(r);
-            app.changed(Vec::new(), true, cx);
+            // A visit writes nothing (FR-1.2): no structural change, no index flush.
+            app.changed(Vec::new(), false, cx);
             p
         });
         if let Some(page) = page {
@@ -3911,13 +3932,21 @@ impl PageView {
     }
 }
 
+/// What "Click to start writing" did: the block the caret goes to, and whether the store
+/// now has a write coming. Starting a draft (FR-1.2) writes nothing, so its caller must not
+/// report a structural change and force an index flush.
+struct StartedNote {
+    block: BlockId,
+    wrote: bool,
+}
+
 /// The block a "Click to start writing" prompt writes into (FR-1.2): a new root block after
 /// whatever the page already has. Not `ensure_first_block` alone — on a page whose only
 /// blocks are attributes that hands back the attribute, and typing rewrites its key (PG-1).
 fn start_note(
     store: &mut utopia_store::Store,
     page: &PageId,
-) -> Result<BlockId, utopia_store::StoreError> {
+) -> Result<StartedNote, utopia_store::StoreError> {
     let (reuse, has_roots) = {
         let st = store.page_state(page)?;
         let roots = st.live_roots();
@@ -3930,15 +3959,24 @@ fn start_note(
         (reuse, !roots.is_empty())
     };
     if let Some(block) = reuse {
-        return Ok(block);
+        return Ok(StartedNote {
+            block,
+            wrote: false,
+        });
     }
     if store.is_draft(page) {
         // A journal template already gave the draft blocks: adding the row the caret goes
         // to must not write the day, so it lives in the draft's memory until a keystroke.
-        return store.draft_append_block(page);
+        return Ok(StartedNote {
+            block: store.draft_append_block(page)?,
+            wrote: false,
+        });
     }
     if !has_roots {
-        return store.ensure_first_block(page);
+        return Ok(StartedNote {
+            block: store.ensure_first_block(page)?,
+            wrote: true,
+        });
     }
     // The borrow of the shard ends here, before the write.
     let after = store.page_state(page)?.last_child(None, false);
@@ -3957,7 +3995,10 @@ fn start_note(
             ..Default::default()
         },
     )?;
-    Ok(id)
+    Ok(StartedNote {
+        block: id,
+        wrote: true,
+    })
 }
 
 /// PG-1's one classification of page metadata: a root `key:: value` block is an attribute,

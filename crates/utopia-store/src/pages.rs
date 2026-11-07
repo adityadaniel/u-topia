@@ -15,7 +15,7 @@ use utopia_core::{BlockId, BlockKind, Command, DomainError, PageId, PageKind, Pa
 use utopia_doc::PageDoc;
 
 use crate::project::{display_title, resolve_page_key};
-use crate::{EditOpts, Result, Store, StoreError};
+use crate::{DraftDay, EditOpts, Result, Store, StoreError};
 
 impl Store {
     fn live_daily(&self, date: NaiveDate) -> Result<Option<PageId>> {
@@ -30,14 +30,42 @@ impl Store {
             .map(PageId))
     }
 
-    /// Whether `id` was ever used by a page on this device (live or tombstoned).
+    /// Whether `id` was ever used by a page on this device: live, tombstoned, an in-memory
+    /// shard that is queued or written, a durable shard (`page_doc`), or an id that is still
+    /// a session alias for the page a merged promotion moved to (FR-1.2). An alias is
+    /// reserved: reusing it would make every read of the new page follow the old survivor.
     fn id_taken(&self, id: &PageId) -> Result<bool> {
-        Ok(self.page_exists(id)?
+        Ok(self.promotions.contains_key(id)
+            || self.claims_id(id)
+            || self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM page_doc WHERE page_id=?1)",
+                [id.as_str()],
+                |r| r.get(0),
+            )?
             || self.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM page WHERE id=?1)",
                 [id.as_str()],
                 |r| r.get(0),
             )?)
+    }
+
+    /// Whether an in-memory shard for `id` counts as the page existing. A shard that was
+    /// built but never queued claims nothing: a page whose identity never applied must not
+    /// make the next create issue a fresh ULID for a title no page ever used (§10.3).
+    fn claims_id(&self, id: &PageId) -> bool {
+        self.docs.get(id).is_some_and(|e| e.has_snapshot)
+            || self.pending.iter().any(|(p, _, _)| p == id)
+    }
+
+    /// Build a page's shard with its identity metadata and put it in `docs`, ready to be
+    /// queued. Nothing enters `docs` before the metadata applied, so a failed build cannot
+    /// leave a shard that looks like an existing page (§10.3, `id_taken`).
+    fn install_new_page(&mut self, id: &PageId, meta: PageMetaPatch) -> Result<()> {
+        let now = self.now();
+        let mut entry = self.fresh_entry(id);
+        entry.doc.apply(&Command::SetPageMeta(meta), now)?;
+        self.docs.insert(id.clone(), entry);
+        Ok(())
     }
 
     /// Resolve `title` to a page, creating it if nothing matches (`CreatePage`, App. C).
@@ -61,15 +89,14 @@ impl Store {
             id = PageId::fresh();
         }
         let now = self.now();
-        let entry = self.new_doc(&id);
-        entry.doc.apply(
-            &Command::SetPageMeta(PageMetaPatch {
+        self.install_new_page(
+            &id,
+            PageMetaPatch {
                 title: Some(title),
                 kind: Some(PageKind::Page),
                 created_at: Some(now),
                 ..Default::default()
-            }),
-            now,
+            },
         )?;
         self.queue(&[(id.clone(), None)], true)?;
         self.flush()?;
@@ -81,29 +108,27 @@ impl Store {
     pub fn ensure_daily_page(&mut self, date: NaiveDate) -> Result<PageId> {
         self.sync_index()?;
         if let Some(p) = self.live_daily(date)? {
+            // A draft of a day that now has a page is stale (FR-1.2): retire it for the day.
+            self.retire_stale_draft(date, &p);
             return Ok(p);
         }
-        if let Some(p) = self.drafts.get(&date).cloned() {
-            if self.docs.contains_key(&p) {
-                self.queue(&[(p.clone(), None)], true)?;
-                return Ok(p);
-            }
-            self.drafts.remove(&date);
+        if let Some(p) = self.draft_page(date) {
+            self.queue(&[(p.clone(), None)], true)?;
+            return Ok(p);
         }
         let mut id = PageId::for_date(date);
         if self.id_taken(&id)? {
             id = PageId::fresh();
         }
         let now = self.now();
-        let entry = self.new_doc(&id);
-        entry.doc.apply(
-            &Command::SetPageMeta(PageMetaPatch {
+        self.install_new_page(
+            &id,
+            PageMetaPatch {
                 kind: Some(PageKind::Daily),
                 daily_date: Some(Some(date)),
                 created_at: Some(now),
                 ..Default::default()
-            }),
-            now,
+            },
         )?;
         self.queue(&[(id.clone(), None)], true)?;
         self.flush()?;
@@ -116,12 +141,12 @@ impl Store {
     pub fn draft_daily(&mut self, date: NaiveDate) -> Result<PageId> {
         self.sync_index()?;
         if let Some(p) = self.live_daily(date)? {
+            // A draft of a day that now has a page is stale (FR-1.2): retire it for the day.
+            self.retire_stale_draft(date, &p);
             return Ok(p);
         }
-        if let Some(p) = self.drafts.get(&date) {
-            if self.docs.contains_key(p) {
-                return Ok(p.clone());
-            }
+        if let Some(p) = self.draft_page(date) {
+            return Ok(p);
         }
         let mut id = PageId::for_date(date);
         if self.id_taken(&id)? {
@@ -142,7 +167,7 @@ impl Store {
             });
         }
         let now = self.now();
-        let entry = self.new_doc(&id);
+        let mut entry = self.fresh_entry(&id);
         entry.doc.apply(
             &Command::SetPageMeta(PageMetaPatch {
                 kind: Some(PageKind::Daily),
@@ -153,12 +178,10 @@ impl Store {
             now,
         )?;
         for cmd in &cmds {
-            if let Err(e) = entry.doc.apply(cmd, now) {
-                self.docs.remove(&id);
-                return Err(e.into());
-            }
+            // Nothing was inserted into `drafts` yet, so a failure leaves no trace.
+            entry.doc.apply(cmd, now)?;
         }
-        self.drafts.insert(date, id.clone());
+        self.drafts.insert(id.clone(), DraftDay { date, entry });
         Ok(id)
     }
 
@@ -174,10 +197,10 @@ impl Store {
         let id = BlockId::new();
         let now = self.now();
         let entry = self
-            .docs
+            .drafts
             .get_mut(page)
             .ok_or_else(|| StoreError::NotFound(format!("draft {page}")))?;
-        entry.doc.apply(
+        entry.entry.doc.apply(
             &Command::InsertBlock {
                 id: id.clone(),
                 parent: None,
@@ -230,24 +253,112 @@ impl Store {
                 out.insert(d, PageId(id));
             }
         }
-        for (d, p) in &self.drafts {
-            if (from..=to).contains(d) && self.docs.contains_key(p) {
-                out.entry(*d).or_insert_with(|| p.clone());
+        for (p, d) in &self.drafts {
+            if (from..=to).contains(&d.date) {
+                out.entry(d.date).or_insert_with(|| p.clone());
             }
         }
         Ok(out)
     }
 
-    /// Whether `page` is a draft day (shown, never written).
+    /// Whether `page` is a draft day (shown, never written). A draft always has its shard:
+    /// it lives inside the draft entry (FR-1.2).
     pub fn is_draft(&self, page: &PageId) -> bool {
-        self.drafts.values().any(|p| p == page)
+        self.drafts.contains_key(page)
     }
 
-    /// Stop tracking `page` as a draft; true if it was one.
-    pub(crate) fn take_draft(&mut self, page: &PageId) -> bool {
-        let before = self.drafts.len();
-        self.drafts.retain(|_, p| p != page);
-        self.drafts.len() != before
+    /// The draft for `date`, if the day has been looked at but never written (FR-1.2).
+    pub fn draft_page(&self, date: NaiveDate) -> Option<PageId> {
+        self.drafts
+            .iter()
+            .find(|(_, d)| d.date == date)
+            .map(|(p, _)| p.clone())
+    }
+
+    /// Promote a draft (FR-1.2): the shard moves from the draft entry into `docs`, so the
+    /// next commit writes the whole page. Returns the day it belonged to. This is the only
+    /// Draft → Live transition.
+    pub(crate) fn promote_draft(&mut self, page: &PageId) -> Option<NaiveDate> {
+        let draft = self.drafts.remove(page)?;
+        self.docs.insert(page.clone(), draft.entry);
+        Some(draft.date)
+    }
+
+    /// Forget a draft without writing it: its shard was only ever in memory.
+    pub(crate) fn discard_draft(&mut self, page: &PageId) {
+        self.drafts.remove(page);
+    }
+
+    /// Retire a stale draft of `date` for the page that already owns the day (FR-1.2): its
+    /// shard was never written, so it is dropped, its id becomes a session alias for the
+    /// survivor, and views still showing it are told to retarget.
+    fn retire_stale_draft(&mut self, date: NaiveDate, survivor: &PageId) {
+        let Some(draft) = self.draft_page(date) else {
+            return;
+        };
+        if draft == *survivor {
+            return;
+        }
+        self.discard_draft(&draft);
+        self.promotions.insert(draft.clone(), survivor.clone());
+        self.replacements.push((draft, survivor.clone()));
+    }
+
+    /// Replacements the views have not been told about yet: `(from, to)`. The UI announces
+    /// them as page replacements so a view showing `from` follows `to` (FR-1.2).
+    pub fn take_replacements(&mut self) -> Vec<(PageId, PageId)> {
+        std::mem::take(&mut self.replacements)
+    }
+
+    /// Where a promoted draft's page id went when another page already owned its day
+    /// (FR-1.2). The id was never durable, so it is a session alias: views and the editor
+    /// that still hold it follow the day instead of a shard that no longer exists (rule 5).
+    /// `None` for every page that is not such an alias.
+    pub fn redirect(&self, page: &PageId) -> Option<PageId> {
+        let mut at = page.clone();
+        for _ in 0..8 {
+            match self.promotions.get(&at) {
+                Some(to) => at = to.clone(),
+                None => return (at != *page).then_some(at),
+            }
+        }
+        None
+    }
+
+    /// A promoted draft (FR-1.2) may belong to a day another page already owns: a remote
+    /// device wrote the date under a fresh id because this device's uuidv5 is tombstoned
+    /// there (rule 4). Writing the draft as a second live daily page would violate
+    /// `page_daily_uq` and fail the commit, so its blocks move into the page that has the
+    /// day instead (§8.6).
+    ///
+    /// The draft's shard is dropped, not written as a `merged_into` tombstone: a draft was
+    /// never durable, so it has no identity to merge away, and a tombstone for the same id
+    /// would let `reconcile_merged` drag the remote's still-trashed blocks into the live day
+    /// (rule 5). The discarded id is remembered as a session alias ([`Store::redirect`]) so
+    /// the editor and the views editing it follow the day. Returns the surviving page, which
+    /// the caller must commit instead.
+    pub(crate) fn resolve_promotion(
+        &mut self,
+        page: &PageId,
+        date: NaiveDate,
+    ) -> Result<Option<PageId>> {
+        let Some(live) = self.live_daily(date)? else {
+            return Ok(None);
+        };
+        if live == *page {
+            return Ok(None);
+        }
+        let from = self.page_state(page)?.clone();
+        let into = self.page_state(&live)?.clone();
+        let (cmds, _moved) = Self::plan_block_moves(&from, &into);
+        let now = self.now();
+        if !cmds.is_empty() {
+            self.apply_cmds(&live, &cmds, now, false)?;
+        }
+        self.docs.remove(page);
+        self.promotions.insert(page.clone(), live.clone());
+        self.replacements.push((page.clone(), live.clone()));
+        Ok(Some(live))
     }
 
     /// Visiting a page: make sure there is a block to type into (§9.3) and return the
@@ -757,9 +868,12 @@ impl Store {
         for (page, bytes) in batch {
             // Another device wrote this day first: drop the local draft so its unsent
             // empty block never merges into theirs.
-            if self.take_draft(page) {
-                self.docs.remove(page);
-            }
+            self.discard_draft(page);
+            // A shard for the id of a draft that promotion merged away makes that id a page
+            // of its own again: drop the session alias, or identity logic (dedupe, restore)
+            // would act on the day instead of the page this shard describes (rule 4).
+            self.promotions.remove(page);
+            self.replacements.retain(|(from, _)| from != page);
             let did = if self.page_exists(page)? {
                 self.load_doc(page)?.doc.import(bytes)?
             } else {
@@ -789,5 +903,24 @@ impl Store {
             self.reconcile_merged(page)?;
         }
         Ok(changed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `docs/state-machines/draft-daily-page.md` issue 4: a shard built for a page whose
+    /// metadata never applied stayed in `docs`, so `id_taken` reported the title's
+    /// deterministic id taken and the next create issued a fresh ULID for a page that was
+    /// never tombstoned (rule 4). An in-memory shard that was never written claims nothing.
+    #[test]
+    fn fr_1_2_unwritten_shard_does_not_claim_its_id() {
+        let mut s = Store::open_in_memory().unwrap();
+        let id = PageId::for_title_key(&normalize_title("Ana"));
+        // The shape the error path used to leave behind: a built shard that was never
+        // queued for writing.
+        s.new_doc(&id);
+        assert_eq!(s.create_page("Ana").unwrap(), id);
     }
 }
