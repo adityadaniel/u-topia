@@ -383,6 +383,49 @@ fn fr_1_2_undo_after_a_merged_promotion_reaches_the_day() {
     assert_doctor(&mut s);
 }
 
+/// An id that is still a session alias must stay reserved. Once the merged promotion's
+/// survivor is deleted, reusing the discarded id for a recreated day would shadow the new
+/// draft behind the deleted page (`Store::redirect`, rule 4).
+#[test]
+fn fr_1_2_a_recreated_day_does_not_reuse_a_live_alias() {
+    let d = date(2026, 11, 2);
+    let mut remote = store();
+    let gone = remote.ensure_daily_page(d).unwrap();
+    remote.delete_page(&gone).unwrap();
+    let live = remote.ensure_daily_page(d).unwrap();
+    write(&mut remote, &live, "remote two");
+    let shard = remote.export_since(&live, &Frontier::default()).unwrap();
+
+    let mut s = store();
+    let draft = s.draft_daily(d).unwrap();
+    s.import_batch(&[(live.clone(), shard)]).unwrap();
+    let block = s.page_state(&draft).unwrap().live_roots()[0].clone();
+    s.set_block_text(&draft, &block, "t", None, None).unwrap();
+    s.sync_index().unwrap();
+    assert_eq!(
+        s.redirect(&draft),
+        Some(live.clone()),
+        "the draft's id is an alias for the day"
+    );
+
+    // The survivor is deleted before the remote tombstone for the draft's id arrives.
+    s.delete_page(&live).unwrap();
+    // Revisiting the date must not reuse an id that redirects to the deleted page.
+    let again = s.draft_daily(d).unwrap();
+    assert_ne!(again, draft, "an id that is still an alias is reserved");
+    let (deleted, live_count) = {
+        let st = s.page_state(&again).unwrap();
+        (st.meta.deleted_at.is_some(), st.live_count())
+    };
+    assert!(
+        !deleted,
+        "the recreated day is a usable draft, not a deleted page"
+    );
+    assert!(s.is_draft(&again));
+    assert_eq!(live_count, 1);
+    assert_doctor(&mut s);
+}
+
 #[test]
 fn ac_1_5_deleted_daily_is_recreated_and_recoverable() {
     let mut s = store();

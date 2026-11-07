@@ -31,9 +31,12 @@ impl Store {
     }
 
     /// Whether `id` was ever used by a page on this device: live, tombstoned, an in-memory
-    /// shard that is queued or written, or a durable shard (`page_doc`).
+    /// shard that is queued or written, a durable shard (`page_doc`), or an id that is still
+    /// a session alias for the page a merged promotion moved to (FR-1.2). An alias is
+    /// reserved: reusing it would make every read of the new page follow the old survivor.
     fn id_taken(&self, id: &PageId) -> Result<bool> {
-        Ok(self.claims_id(id)
+        Ok(self.promotions.contains_key(id)
+            || self.claims_id(id)
             || self.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM page_doc WHERE page_id=?1)",
                 [id.as_str()],
