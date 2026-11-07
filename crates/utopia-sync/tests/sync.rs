@@ -169,6 +169,86 @@ impl utopia_sync::Transport for Flaky {
     }
 }
 
+/// Records how the manifest and pulls were asked for, to prove the conditional request.
+struct Conditional {
+    inner: RelayTransport,
+    asked: std::sync::Arc<std::sync::Mutex<Vec<Option<u64>>>>,
+    pulls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl utopia_sync::Transport for Conditional {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.asked.lock().unwrap().push(if_none_match);
+        self.inner.manifest(if_none_match)
+    }
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        self.inner.push(page, req)
+    }
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.pulls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.pull(page, since_seq)
+    }
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// §12.3 step 1: an idle round asks with `If-None-Match: <applied rev>` and does no pulls
+/// when the relay has not moved.
+#[test]
+fn ac_12_3_an_unchanged_manifest_is_asked_for_conditionally() {
+    let relay = Relay::new();
+    let mut a = Store::open_in_memory().unwrap();
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pulls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut ca = SyncClient::new(
+        Conditional {
+            inner: RelayTransport::new(relay.clone(), "g1"),
+            asked: asked.clone(),
+            pulls: pulls.clone(),
+        },
+        &a,
+    )
+    .unwrap();
+    let page = a.create_page("Once").unwrap();
+    write(&mut a, &page, "hello");
+    ca.sync_once(&mut a).unwrap();
+    let rev: u64 = a.sync_get("rev").unwrap().unwrap().parse().unwrap();
+
+    let before = asked.lock().unwrap().len();
+    ca.sync_once(&mut a).unwrap();
+    let asked_all = asked.lock().unwrap().clone();
+    assert_eq!(
+        asked_all[before],
+        Some(rev),
+        "the second round sends the applied rev: {asked_all:?}"
+    );
+    assert_eq!(
+        pulls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the first round pulled"
+    );
+}
+
 /// A relay whose pull payloads for one page are corrupt: a shard the relay accepted but
 /// this device cannot import.
 struct Corrupt {

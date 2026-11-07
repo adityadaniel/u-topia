@@ -351,7 +351,10 @@ fn cursor_key(page: &PageId) -> String {
 pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incoming> {
     let mut inc = Incoming::default();
     let space = t.cursor_space();
-    let first = t.manifest(None)?;
+    // Ask conditionally with the rev of the last manifest this client fully applied: an
+    // unchanged relay answers 304/Nothing, so an idle round costs one small request instead
+    // of the whole manifest (§12.3 step 1).
+    let first = t.manifest(out.rev)?;
     if let Some(m) = &first {
         if m.protocol_version != PROTOCOL_VERSION {
             return Err(SyncError::ProtocolVersion(m.protocol_version));
@@ -416,11 +419,11 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
         }
     }
     let manifest = if inc.pages.values().all(|p| p.sent.is_empty()) && inc.snapshots_sent == 0 {
-        match first {
-            Some(m) if Some(m.rev) != out.rev => Some(m),
-            _ => None,
-        }
+        // `first` is already `None` when the manifest was unchanged, and carries the newer
+        // rev otherwise.
+        first
     } else {
+        // What was pushed may have changed the manifest, so ask again unconditionally.
         t.manifest(None)?
     };
     if let Some(m) = &manifest {
