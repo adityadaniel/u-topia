@@ -9,7 +9,7 @@ use serde::Serialize;
 use utopia_core::PageId;
 
 use crate::wire::{Manifest, PullResponse, PushRequest, PushResponse, SnapshotRequest};
-use crate::{Result, SyncError, Transport};
+use crate::{CursorKind, CursorSpace, Result, SyncError, Transport};
 
 /// Largest response body accepted (a page snapshot plus its tail).
 const MAX_BODY: u64 = 256 << 20;
@@ -98,6 +98,15 @@ impl HttpTransport {
 }
 
 impl Transport for HttpTransport {
+    fn cursor_space(&self) -> CursorSpace {
+        // The relay URL and graph id: a fresh relay starts its sequence at 1, so its
+        // cursors are only meaningful against the relay that produced them.
+        CursorSpace::new(
+            format!("relay:{}#{}", self.base, self.graph),
+            CursorKind::Seq,
+        )
+    }
+
     fn manifest(&mut self, if_none_match: Option<u64>) -> Result<Option<Manifest>> {
         let mut req = self.request("GET", &self.url("manifest"));
         if let Some(rev) = if_none_match {

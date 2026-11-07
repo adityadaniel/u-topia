@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use utopia_core::PageId;
 
 use crate::wire::{Manifest, ManifestPage, PullResponse, PushRequest, PushResponse, UpdateOut};
-use crate::{Result, SyncError, Transport, PROTOCOL_VERSION};
+use crate::{CursorKind, CursorSpace, Result, SyncError, Transport, PROTOCOL_VERSION};
 
 #[derive(Debug, Default)]
 struct PageLog {
@@ -160,6 +160,19 @@ impl RelayTransport {
 }
 
 impl Transport for RelayTransport {
+    fn cursor_space(&self) -> CursorSpace {
+        // The in-process relay instance and graph: two separate relays with the same
+        // graph name do not share a sequence.
+        CursorSpace::new(
+            format!(
+                "memory:{:p}#{}",
+                std::sync::Arc::as_ptr(&self.relay),
+                self.graph
+            ),
+            CursorKind::Seq,
+        )
+    }
+
     fn manifest(&mut self, if_none_match: Option<u64>) -> Result<Option<Manifest>> {
         self.check()?;
         let m = self.relay.manifest(&self.graph);

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use utopia_core::PageId;
 
 use crate::wire::{Manifest, ManifestPage, PullResponse, PushRequest, PushResponse, UpdateOut};
-use crate::{Result, SyncError, Transport, PROTOCOL_VERSION};
+use crate::{CursorKind, CursorSpace, Result, SyncError, Transport, PROTOCOL_VERSION};
 
 pub struct FolderTransport {
     root: PathBuf,
@@ -75,6 +75,15 @@ impl FolderTransport {
 }
 
 impl Transport for FolderTransport {
+    fn cursor_space(&self) -> CursorSpace {
+        // A folder has no global order: its `head_seq` is a digest of the file list, so
+        // it is a revision, not a monotonic sequence.
+        CursorSpace::new(
+            format!("folder:{}", self.root.display()),
+            CursorKind::Revision,
+        )
+    }
+
     fn manifest(&mut self, if_none_match: Option<u64>) -> Result<Option<Manifest>> {
         let mut pages = Vec::new();
         let mut rev: u64 = 0;

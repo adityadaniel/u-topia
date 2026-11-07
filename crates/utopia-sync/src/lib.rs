@@ -24,6 +24,7 @@ pub use utopia_proto as wire;
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use utopia_core::PageId;
 use utopia_doc::Frontier;
@@ -59,9 +60,111 @@ pub enum SyncError {
 
 pub type Result<T, E = SyncError> = std::result::Result<T, E>;
 
+/// A failure that stopped one page in a round that kept running (§12.3). The page's
+/// outbox rows stay queued and the next round retries them; the other pages are
+/// already done and stay done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// The page that failed; `None` for the manifest or an attachment.
+    pub page: Option<PageId>,
+    pub kind: FailureKind,
+}
+
+/// Why one page failed, flattened so a report can be compared and shown without
+/// carrying a whole [`SyncError`] (which may wrap a store error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailureKind {
+    Unauthorized,
+    ProtocolVersion(u32),
+    /// Retryable: transport, store or payload problem.
+    Transport(String),
+    Store(String),
+}
+
+impl FailureKind {
+    pub fn of(e: &SyncError) -> Self {
+        match e {
+            SyncError::Unauthorized => FailureKind::Unauthorized,
+            SyncError::ProtocolVersion(v) => FailureKind::ProtocolVersion(*v),
+            SyncError::Transport(m) => FailureKind::Transport(m.clone()),
+            SyncError::Store(e) => FailureKind::Store(e.to_string()),
+        }
+    }
+}
+
+impl Failure {
+    pub fn page(page: &PageId, e: &SyncError) -> Self {
+        Self {
+            page: Some(page.clone()),
+            kind: FailureKind::of(e),
+        }
+    }
+}
+
+/// How a transport's `head_seq` values are compared with a stored [`Cursor`]
+/// (§12.3 step 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorKind {
+    /// A monotonic relay sequence: pull when `head > local`.
+    Seq,
+    /// A content revision (the folder transport's file digest): pull when `head != local`.
+    Revision,
+}
+
+/// Which transport measured a `head_seq`, and how to compare it. A cursor is only
+/// compared with a `head_seq` from the same space, so switching from a folder to a relay
+/// (or to another relay) pulls everything once instead of comparing a file count with a
+/// relay sequence (or a fresh relay's `3` with an old one's `500`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorSpace {
+    /// This transport's identity, e.g. `relay:https://host#graph` or `folder:/path`.
+    pub transport: String,
+    pub kind: CursorKind,
+}
+
+impl CursorSpace {
+    pub fn new(transport: impl Into<String>, kind: CursorKind) -> Self {
+        Self {
+            transport: transport.into(),
+            kind,
+        }
+    }
+}
+
+/// The pull position of one page (§12.3 step 4), tagged with the space it lives in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cursor {
+    pub space: CursorSpace,
+    pub pos: u64,
+}
+
+impl Cursor {
+    pub fn encode(&self) -> String {
+        // A plain struct of a string, an enum tag and a u64 cannot fail to serialize.
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn decode(raw: &str) -> Option<Self> {
+        serde_json::from_str(raw).ok()
+    }
+
+    /// Whether `head` in `space` is already covered by this cursor.
+    pub fn covers(&self, space: &CursorSpace, head: u64) -> bool {
+        &self.space == space
+            && match space.kind {
+                CursorKind::Seq => head <= self.pos,
+                CursorKind::Revision => head == self.pos,
+            }
+    }
+}
+
 impl<T: Transport + ?Sized> Transport for Box<T> {
     fn manifest(&mut self, if_none_match: Option<u64>) -> Result<Option<Manifest>> {
         (**self).manifest(if_none_match)
+    }
+    fn cursor_space(&self) -> CursorSpace {
+        (**self).cursor_space()
     }
     fn push(&mut self, page: &PageId, req: PushRequest) -> Result<PushResponse> {
         (**self).push(page, req)
@@ -84,6 +187,9 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
 pub trait Transport {
     /// `GET manifest` with `If-None-Match: rev`; `None` means 304 Not Modified.
     fn manifest(&mut self, if_none_match: Option<u64>) -> Result<Option<Manifest>>;
+    /// The space this transport's `head_seq` values are measured in. Two transports of
+    /// different kinds (or different relays) never share a cursor.
+    fn cursor_space(&self) -> CursorSpace;
     /// `POST pages/{pid}/updates`.
     fn push(&mut self, page: &PageId, req: PushRequest) -> Result<PushResponse>;
     /// `GET pages/{pid}/updates?since={seq}`.
@@ -109,6 +215,8 @@ pub struct SyncReport {
     pub snapshots: usize,
     pub blobs_up: usize,
     pub blobs_down: usize,
+    /// Pages that failed while the rest of the round carried on; empty on a clean round.
+    pub failed: Vec<Failure>,
 }
 
 impl SyncReport {
@@ -124,6 +232,7 @@ impl SyncReport {
                 self.imported.push(p);
             }
         }
+        self.failed.extend(other.failed);
     }
 
     /// Whether anything moved in either direction.
@@ -169,15 +278,27 @@ pub struct Outgoing {
     pub blob_wants: Vec<String>,
 }
 
-/// What came back from the relay; applied on the store's thread.
+/// What one exchange did to one page (§12.3 steps 2–4): the one place the round's
+/// per-page outcome lives, instead of three loose lists on [`Incoming`].
 #[derive(Debug, Clone, Default)]
-pub struct Incoming {
+pub struct PageExchange {
+    /// Outbox rows this page's pushes were acknowledged for (accepted or duplicate).
     pub sent: Vec<i64>,
     pub accepted: usize,
     pub duplicates: usize,
+    /// This page's pull result when the relay was ahead of the local cursor.
+    pub pull: Option<PullResponse>,
+}
+
+/// What came back from the relay; applied on the store's thread.
+#[derive(Debug, Clone, Default)]
+pub struct Incoming {
+    /// Per-page outcome, keyed by page.
+    pub pages: BTreeMap<PageId, PageExchange>,
     pub snapshots_sent: usize,
     pub manifest: Option<Manifest>,
-    pub pulls: Vec<(PageId, PullResponse)>,
+    /// The space the `head_seq` values above were measured in.
+    pub cursor_space: Option<CursorSpace>,
     /// Pages whose server tail is long enough to compact.
     pub compact: Vec<(PageId, u64)>,
     /// Uploaded attachment hashes.
@@ -203,9 +324,10 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
     for (page, seqs, req) in out.pushes {
         let resp = t.push(&page, req)?;
         // Duplicates are success: the relay already has them (§12.6, 409).
-        inc.sent.extend(seqs);
-        inc.accepted += resp.accepted;
-        inc.duplicates += resp.duplicate;
+        let done = inc.pages.entry(page).or_default();
+        done.sent.extend(seqs);
+        done.accepted += resp.accepted;
+        done.duplicates += resp.duplicate;
     }
     for (page, covers, payload) in out.snapshots {
         t.put_snapshot(&page, covers, payload)?;
@@ -221,7 +343,7 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
             inc.blobs_got.push((hash, bytes));
         }
     }
-    let manifest = if inc.sent.is_empty() && inc.snapshots_sent == 0 {
+    let manifest = if inc.pages.values().all(|p| p.sent.is_empty()) && inc.snapshots_sent == 0 {
         match first {
             Some(m) if Some(m.rev) != out.rev => Some(m),
             _ => None,
@@ -235,7 +357,7 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
             let local = out.local_seqs.get(&page).copied().unwrap_or(0);
             if p.head_seq > local {
                 let resp = t.pull(&page, local)?;
-                inc.pulls.push((page.clone(), resp));
+                inc.pages.entry(page.clone()).or_default().pull = Some(resp);
             }
             let tail = p.head_seq.saturating_sub(p.snapshot_seq);
             if p.tail_bytes > SNAPSHOT_TAIL_BYTES || tail > SNAPSHOT_TAIL_UPDATES {
@@ -243,6 +365,7 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
             }
         }
     }
+    inc.cursor_space = Some(t.cursor_space());
     inc.manifest = manifest;
     Ok(inc)
 }
@@ -330,7 +453,12 @@ impl SyncEngine {
     /// Mark pushes sent, import pulled updates (idempotent), record positions, and queue
     /// compaction snapshots for pages this client is fully caught up on.
     pub fn apply(&mut self, store: &mut Store, inc: Incoming) -> Result<SyncReport> {
-        store.outbox_mark_sent(&inc.sent)?;
+        let sent: Vec<i64> = inc
+            .pages
+            .values()
+            .flat_map(|p| p.sent.iter().copied())
+            .collect();
+        store.outbox_mark_sent(&sent)?;
         store.mark_blobs_uploaded(&inc.blobs_put)?;
         let mut blobs_in = 0;
         for (hash, bytes) in &inc.blobs_got {
@@ -342,17 +470,18 @@ impl SyncEngine {
             }
         }
         let mut report = SyncReport {
-            pushed: inc.accepted,
-            duplicates: inc.duplicates,
+            pushed: inc.pages.values().map(|p| p.accepted).sum(),
+            duplicates: inc.pages.values().map(|p| p.duplicates).sum(),
             snapshots: inc.snapshots_sent,
-            pulled_pages: inc.pulls.len(),
+            pulled_pages: inc.pages.values().filter(|p| p.pull.is_some()).count(),
             blobs_up: inc.blobs_put.len(),
             blobs_down: blobs_in,
             ..Default::default()
         };
         let mut batch: Vec<(PageId, Vec<u8>)> = Vec::new();
         let mut heads: Vec<(PageId, u64)> = Vec::new();
-        for (page, resp) in inc.pulls {
+        for (page, done) in inc.pages {
+            let Some(resp) = done.pull else { continue };
             if let Some(snap) = resp.snapshot {
                 batch.push((page.clone(), snap));
             }
