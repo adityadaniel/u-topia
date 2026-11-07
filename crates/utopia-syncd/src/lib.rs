@@ -5,7 +5,7 @@
 
 pub mod lan;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -301,13 +301,17 @@ impl Db {
         // Counting them again would refuse it forever (§12.6).
         let mut new_updates = Vec::new();
         let mut new_bytes = 0u64;
+        let mut seen: HashSet<String> = HashSet::new();
         for u in req.updates {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM page_log WHERE change_id=?1)",
                 [&u.id],
                 |r| r.get(0),
             )?;
-            if exists {
+            // A change id repeated inside one request is a duplicate as well: the first
+            // copy is inserted below, and a second insert would break
+            // `page_log.change_id`'s UNIQUE index and roll the whole request back.
+            if exists || !seen.insert(u.id.clone()) {
                 duplicate += 1;
                 continue;
             }

@@ -197,6 +197,33 @@ fn auth_is_enforced() {
     assert_eq!(SyncClient::<HttpTransport>::queued(&mut b).unwrap(), 0);
 }
 
+/// §12.3 step 2: the same new change id twice in one request is accepted once, counted as
+/// a duplicate and charged to the quota once — a second insert would break the UNIQUE
+/// index and fail the whole request.
+#[test]
+fn ac_12_3_a_change_id_repeated_in_one_batch_is_a_duplicate() {
+    use utopia_sync::{PushRequest, UpdateIn};
+    let db = Db::open_in_memory().unwrap();
+    let one = UpdateIn {
+        id: "client:1".into(),
+        client_seq: 1,
+        frontier: String::new(),
+        payload: vec![7u8; 100],
+    };
+    let req = PushRequest {
+        updates: vec![one.clone(), one],
+    };
+    let r = db
+        .push("graph-1", "page-1", "owner", req, 10_000)
+        .expect("a repeated change id is a duplicate, not a constraint violation");
+    assert_eq!((r.accepted, r.duplicate), (1, 1));
+    assert_eq!(
+        db.graph_bytes("graph-1").unwrap(),
+        100,
+        "the payload is stored and charged once"
+    );
+}
+
 /// §12.6: a batch the relay stored but whose response was lost is re-pushed. Dedupe runs
 /// before quota, so its own bytes cannot make it a permanent 413.
 #[test]
