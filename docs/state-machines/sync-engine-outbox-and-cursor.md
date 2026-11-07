@@ -22,10 +22,17 @@ in `crates/utopia-syncd`):
   `rev` are FNV-1a digests over each page's update files (relative path, length, mtime) and
   over the sorted page list, so a peer that drops two files and adds two others moves the
   revision even though the file count is unchanged.
-- **Conditional manifest, tagged rev.** `exchange` asks with the rev of the last fully
-  applied manifest (`ManifestRev { space, rev }`), so the `If-None-Match`/304 path is
-  reachable; a rev from another space is not sent, and `rev` is stored only when no page
-  failed, so a failed page is retried against a fresh manifest.
+- **Conditional manifest, tagged rev, write-safe.** `exchange` asks with the rev of the
+  last fully applied manifest (`ManifestRev { space, rev }`), so the `If-None-Match`/304
+  path is reachable; a rev from another space is not sent, and `rev` is stored only when no
+  page failed, so a failed page is retried against a fresh manifest. A round with pushes or
+  snapshots fetches the manifest unconditionally first, because a relay's 304 compares only
+  the rev: an in-place protocol upgrade that keeps the rev would otherwise skip the version
+  check and let this client write to an unsupported relay.
+- **Causally ordered batches.** `prepare` splits a page's outbox by `MAX_PUSH_BYTES`. Once
+  one batch for a page is refused, the later batches of that page are skipped for the round
+  (other pages still push), so the relay never holds later updates without their
+  predecessors.
 - **Relay store identity.** `Manifest.instance` (additive, `serde(default)`) is a random id
   per relay database, sent by `utopia-syncd` and the reference `Relay`; it is part of
   `CursorSpace` (`relay:<instance>#<graph>`). A wiped relay therefore gets a new space and
@@ -45,12 +52,12 @@ Issues, as numbered below:
 
 | # | Issue | State |
 |---|---|---|
-| 1 | All-or-nothing exchange loses acks / head-of-line | **Fixed**: pushes, snapshots and blobs are per page/object; a refused page no longer loses other pages' acks or stops the pulls, and a failed manifest reread after the pushes no longer drops their acks. Tested by `ac_12_3_a_refused_page_keeps_the_other_acks_and_the_pulls` and `ac_12_3_a_failed_second_manifest_keeps_the_acks`. |
+| 1 | All-or-nothing exchange loses acks / head-of-line | **Fixed**: pushes, snapshots and blobs are per page/object; a refused page no longer loses other pages' acks or stops the pulls, a failed manifest reread after the pushes no longer drops their acks, and a page's later batches are skipped once one is refused (a multi-batch page cannot reach the relay out of causal order). Tested by `ac_12_3_a_refused_page_keeps_the_other_acks_and_the_pulls`, `ac_12_3_a_failed_second_manifest_keeps_the_acks` and `ac_12_3_a_refused_batch_stops_the_pages_later_batches`. |
 | 2 | Permanent 413 after a lost ack | **Fixed** at the relay: `syncd` dedupes inside the push transaction and counts only new bytes against the quota, so a replayed batch is a duplicate, not a 413. Tested by `ac_12_6_a_replayed_batch_is_a_duplicate_even_at_the_quota` and, end to end over HTTP with the response dropped, `ac_12_6_a_lost_ack_is_replayed_not_rejected_by_quota`. A genuinely full quota still retries on the backoff (no `Halted` state; see 9). |
 | 3 | Cursor means different things per transport | **Fixed**: cursors are tagged with `CursorSpace`, the folder reports a revision digest, and a relay carries an instance id. Tested by `ac_12_3_a_folder_revision_with_an_unchanged_file_count_still_pulls`, `ac_12_3_switching_transport_pulls_the_new_transport_from_zero`, `ac_12_3_switching_relay_at_the_same_revision_still_pulls`, `ac_12_6_a_wiped_relay_is_a_new_cursor_space`, and `ac_12_3_legacy_seq_positions_are_removed`. The stored `rev` is tagged with the same space. |
 | 4 | Poison page halts every round | **Fixed** for the halt: a pull that fails (E2E `open`, corrupt payload) is recorded per page and the other pages' cursors and the manifest progress are kept; the poisoned page is retried alone, and a partial round reads `Partial` rather than "Offline — 0 queued". Tested by `ac_12_6_one_unreadable_page_does_not_halt_the_others` and `ac_12_6_a_partial_round_has_its_own_status`. **Left**: no persistent "this relay holds mixed payloads" flag beyond `SyncReport.failed`/`SyncStatus::Partial`. |
 | 5 | Partial apply | **Fixed**: `apply` imports first and records acks/cursors per page only when the payload was stored; a batch import that fails drops every page's cached shard so the per-page retry really re-imports and commits; the manifest rev is not remembered on a failed round. Tested by `ac_12_3_a_failed_import_does_not_mark_the_page_synced`, `ac_12_3_a_failed_batch_import_still_stores_the_readable_pages` (reopened from disk, corrupt page first and last), and `ac_12_3_a_page_can_be_pulled_and_still_queued_for_its_push`. |
-| 6 | Conditional manifest is dead code | **Fixed**: the `If-None-Match`/304 path is used, with a space-tagged rev, and tested by `ac_12_3_an_unchanged_manifest_is_asked_for_conditionally` and `ac_12_3_switching_relay_at_the_same_revision_still_pulls`. |
+| 6 | Conditional manifest is dead code | **Fixed**: the `If-None-Match`/304 path is used on read-only rounds, with a space-tagged rev, and tested by `ac_12_3_an_unchanged_manifest_is_asked_for_conditionally` and `ac_12_3_switching_relay_at_the_same_revision_still_pulls`. A round that writes fetches unconditionally, so an in-place protocol upgrade is caught before pushing (`ac_12_6_a_protocol_upgrade_is_seen_before_pushing`). |
 | 7 | Outbox echoes remote ops | **Left**: the outbox payload is still `export_since(persisted)`, so a merge queued after an import pushes the imported ops back too. Fixing it means carrying the committing delta's frontier into `flush`/`outbox`, which is the store commit pipeline (a different machine, `store-commit-pipeline.md`), and every relay dedupes by change id, so it costs bandwidth only. |
 | 8 | `SyncClient::queued` skips `sync_index` | **Fixed**: it flushes first (and takes `&mut Store`). Tested by `ac_12_3_queued_counts_edits_still_waiting_for_the_writer`. |
 | 9 | PRD §12.6 vs code | **Partly left**: a literal HTTP 409 is still a transport error (no shipped relay sends one; duplicates come back as a 200 body), 4xx/5xx are still one variant with no jitter, and "corrupt local snapshot → quarantine, read-only" is not implemented. Those belong to the runner's backoff/health machine (`sync-runner-round.md`) and to snapshot compaction (`sync-compaction-snapshots.md`); the `Halted` variant sketched below was not added. |
@@ -96,10 +103,12 @@ or `Offline { queued }`.
 - `prepare` (`utopia-sync/src/lib.rs`): `sync_index`; read `outbox_pending(10_000)`; batch
   per page under `MAX_PUSH_BYTES`; read `cursor:<page>` values; drain `pending_snapshots`;
   pick ≤8 blobs each way.
-- `exchange`: conditional manifest with the last applied rev; version check; push each page
-  (a retryable failure is recorded and the loop continues); snapshots; blobs; second
-  manifest only if something was sent; pull pages whose `head_seq` is not covered by a
-  cursor in the same `CursorSpace` (each pull isolated); collect compaction wants.
+- `exchange`: conditional manifest with the last applied rev on a read-only round, an
+  unconditional one when the round writes; version check; push each page's batches in order
+  (a retryable failure marks the page and its later batches are skipped; other pages
+  continue); snapshots; blobs; second manifest only if something was sent; pull pages whose
+  `head_seq` is not covered by a cursor in the same `CursorSpace` (each pull isolated);
+  collect compaction wants.
 - `apply`: mark blobs, store verified blobs, import all pulls in one batch (falling back to
   per-page imports to isolate a corrupt one), then per page record acks and cursor,
   `synced_at`, and queue snapshots. `rev` is stored only if no page failed.
