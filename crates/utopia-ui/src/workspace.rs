@@ -1246,7 +1246,9 @@ impl Workspace {
         let page = self.app.update(cx, |app, cx| {
             let r = app.store.draft_daily(today);
             let p = app.report(r);
-            app.changed(Vec::new(), true, cx);
+            // A visit writes nothing (a draft, or a page already there): no structural
+            // change, so no synchronous index flush (FR-1.2).
+            app.changed(Vec::new(), false, cx);
             p
         });
         let Some(page) = page else { return };
@@ -1291,7 +1293,9 @@ impl Workspace {
         let page = self.app.update(cx, |app, cx| {
             let r = app.store.draft_daily(d);
             let p = app.report(r);
-            app.changed(Vec::new(), true, cx);
+            // A visit writes nothing (FR-1.2): the caret's own block, if one has to be
+            // created, reports its write from `focus_first`.
+            app.changed(Vec::new(), false, cx);
             p
         });
         if let Some(page) = page {

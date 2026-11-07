@@ -79,7 +79,11 @@ pub fn render<V: 'static>(
         let in_month = d.month() == month.month();
         let is_today = d == today;
         let has = existing.contains(&d);
+        let iso = d.format("%Y-%m-%d").to_string();
         div()
+            // The strip's cells are `cal-<iso>` (a click target for tests); the popover's
+            // share the grid but get their own name so both can be open at once.
+            .debug_selector(move || format!("cal-pop-{iso}"))
             .w(px(26.))
             .h(px(22.))
             .flex()

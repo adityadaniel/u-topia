@@ -3348,6 +3348,58 @@ fn fr_1_2_typing_survives_a_merged_promotion(cx: &mut TestAppContext) {
     assert_eq!(rows(&app, &live, cx), [("ty".to_string(), 0)]);
 }
 
+/// P3 of the draft-day review: visiting a date writes nothing, so none of the visit paths
+/// may report a structural change (which forces a synchronous index flush and an
+/// `IndexUpdated` cycle) (FR-1.2, FR-1.5).
+#[gpui::test]
+fn fr_1_2_visiting_a_day_does_not_flush_the_index(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let before = app.read_with(cx, |app, _| app.refs_version);
+
+    // Quick jump / previous day (`open_date`): a draft until written.
+    let day = today() - chrono::Duration::days(6);
+    ws.update_in(cx, |w, window, cx| {
+        w.open_date(day, false, false, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(
+        app.read_with(cx, |app, _| app.store.is_draft(&PageId::for_date(day))),
+        "the day is a draft"
+    );
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "opening a draft day queues no write"
+    );
+
+    // The day header's calendar (`pick_date` on the page view).
+    let title = cx.debug_bounds("page-title").expect("the day's header");
+    cx.simulate_click(title.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    // The calendar opens on the day's own month (October, for `day` above).
+    let cell = cx
+        .debug_bounds("cal-pop-2026-10-15")
+        .expect("the header calendar opens");
+    cx.simulate_click(cell.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "the calendar queues no write"
+    );
+
+    // The Daily Notes feed (`open_journal`).
+    ws.update_in(cx, |w, window, cx| w.open_journal(window, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |app, _| app.refs_version),
+        before,
+        "opening the feed queues no write"
+    );
+}
+
 #[gpui::test]
 fn fr_1_2_a_day_becomes_a_page_when_written(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);

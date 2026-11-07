@@ -2067,7 +2067,8 @@ impl PageView {
         let page = self.app.update(cx, |app, cx| {
             let r = app.store.draft_daily(d);
             let p = app.report(r);
-            app.changed(Vec::new(), true, cx);
+            // A visit writes nothing (FR-1.2): no structural change, no index flush.
+            app.changed(Vec::new(), false, cx);
             p
         });
         if let Some(page) = page {
