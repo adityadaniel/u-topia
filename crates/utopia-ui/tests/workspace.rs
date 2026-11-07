@@ -3982,8 +3982,9 @@ fn ac_13_5_ime_composition_ends_when_its_block_is_deleted(cx: &mut TestAppContex
         let st = app.store.page_state(&page).unwrap();
         assert_eq!(
             st.block(&block).unwrap().text,
-            "ab",
-            "a tombstoned block is never edited (rule 5)"
+            "abにほ",
+            "the composed characters stay in the tombstone, where undo and the trash can \
+             bring them back (rule 5)"
         );
     });
 }

@@ -599,7 +599,12 @@ impl BlockEditor {
                 .clone()
                 .is_some_and(|t| self.stored_text(&t, cx).is_none());
             if gone {
+                // Keep what the input method typed (rule 5): the block is tombstoned but
+                // still in the store, so an undo or the trash brings the characters back,
+                // and only emptying the trash loses them. Then stop editing it.
+                self.persist(cx);
                 self.detach(cx);
+                return;
             }
         }
         self.persist(cx);
