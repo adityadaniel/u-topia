@@ -189,6 +189,30 @@ fn fr_1_2_failed_command_leaves_no_ghost_draft() {
     assert_doctor(&mut s);
 }
 
+/// `docs/state-machines/draft-daily-page.md` issue 2: a writer failure clears the in-memory
+/// shards so they reload from disk. A draft has no disk state to disagree with, so clearing
+/// it too threw away the day the view was still showing (FR-1.2).
+#[test]
+fn fr_1_2_writer_failure_keeps_the_draft() {
+    let mut s = store();
+    let live = s.create_page("Ana").unwrap();
+    let d = date(2026, 11, 2);
+    let draft = s.draft_daily(d).unwrap();
+    // Fault injection: the next commit cannot write its outbox row, so the writer thread
+    // records an error and `sync_index` drops the shards that have a durable counterpart.
+    s.conn().execute_batch("DROP TABLE outbox").unwrap();
+    let plan = outline::append_block(s.page_state(&live).unwrap(), None);
+    run(&mut s, &live, plan);
+    assert!(s.sync_index().is_err(), "the writer reported the failure");
+    assert!(
+        s.is_draft(&draft),
+        "a draft has no durable state to reload, so it survives"
+    );
+    assert_eq!(s.page_state(&draft).unwrap().live_count(), 1);
+    let appended = s.draft_append_block(&draft).unwrap();
+    assert!(s.page_state(&draft).unwrap().block(&appended).is_some());
+}
+
 #[test]
 fn ac_1_5_deleted_daily_is_recreated_and_recoverable() {
     let mut s = store();

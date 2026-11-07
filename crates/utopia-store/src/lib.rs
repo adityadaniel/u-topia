@@ -346,9 +346,10 @@ impl Store {
         let r = self.persister.wait();
         if r.is_err() {
             // The disk lags the in-memory shards: drop them so they reload consistently.
+            // Draft days (FR-1.2) stay: they have no durable state to disagree with, and
+            // clearing them would throw away a day the view is still showing.
             self.docs.clear();
             self.pending.clear();
-            self.drafts.clear();
         }
         r
     }
