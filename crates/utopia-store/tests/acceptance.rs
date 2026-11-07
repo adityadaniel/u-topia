@@ -257,6 +257,68 @@ fn fr_1_2_promoted_draft_merges_into_the_days_page() {
     assert_doctor(&mut s);
 }
 
+/// Continuing issue 3: the only way a draft's date is owned by another page is that the
+/// remote *deleted* the deterministic id (rule 4). Writing the draft's shard as a
+/// `merged_into` tombstone then lets `reconcile_merged` move the trashed blocks into the
+/// live day, on both devices. A draft has no durable identity, so its shard must never be
+/// written when the date is owned (rule 5).
+#[test]
+fn fr_1_2_promoted_draft_does_not_resurrect_a_deleted_page() {
+    let d = date(2026, 11, 2);
+    // Remote: "remote one" was written on uuidv5(D), then trashed; the live page for the
+    // date is a fresh ULID.
+    let mut remote = store();
+    let gone = remote.ensure_daily_page(d).unwrap();
+    write(&mut remote, &gone, "remote one");
+    remote.delete_page(&gone).unwrap();
+    let live = remote.ensure_daily_page(d).unwrap();
+    write(&mut remote, &live, "remote two");
+    let gone_shard = remote.export_since(&gone, &Frontier::default()).unwrap();
+    let live_shard = remote.export_since(&live, &Frontier::default()).unwrap();
+
+    // This device drafts the day and receives only the live page (batches are per round).
+    let mut local = store();
+    let draft = local.draft_daily(d).unwrap();
+    assert_eq!(draft, gone);
+    local.import_batch(&[(live.clone(), live_shard)]).unwrap();
+    let block = local.page_state(&draft).unwrap().live_roots()[0].clone();
+    local
+        .set_block_text(&draft, &block, "typed here", None, None)
+        .unwrap();
+    local.sync_index().unwrap();
+
+    // The trashed uuidv5(D) shard arrives in the next round: it stays deleted.
+    local.import_batch(&[(gone.clone(), gone_shard)]).unwrap();
+    let texts = live_texts(&mut local, &live);
+    assert!(texts.iter().any(|(t, _)| t == "typed here"), "{texts:?}");
+    assert!(
+        !texts.iter().any(|(t, _)| t == "remote one"),
+        "a trashed page's blocks came back on this device: {texts:?}"
+    );
+    // Imported tombstones do not create a local trash row, but the shard stays deleted.
+    assert!(
+        local.page_state(&gone).unwrap().meta.deleted_at.is_some(),
+        "the trashed page stays deleted"
+    );
+
+    // And our shards must not bring them back on the other device either.
+    push(&mut local, &mut remote);
+    let texts = live_texts(&mut remote, &live);
+    assert!(texts.iter().any(|(t, _)| t == "typed here"), "{texts:?}");
+    assert!(
+        !texts.iter().any(|(t, _)| t == "remote one"),
+        "a trashed page's blocks came back on the other device: {texts:?}"
+    );
+    assert!(
+        remote
+            .list_trash()
+            .unwrap()
+            .iter()
+            .any(|(id, ..)| *id == gone),
+        "the trashed page stays trashed"
+    );
+}
+
 #[test]
 fn ac_1_5_deleted_daily_is_recreated_and_recoverable() {
     let mut s = store();

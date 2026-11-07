@@ -132,6 +132,10 @@ pub struct Store {
     /// Daily pages shown but never written (FR-1.2), by page id: in memory only until
     /// their first edit.
     drafts: HashMap<PageId, DraftDay>,
+    /// Draft ids whose promotion merged them into the page that already owned the day
+    /// (FR-1.2). The ids were never durable, so this is a session alias for views and the
+    /// editor that still hold one.
+    promotions: HashMap<PageId, PageId>,
     debounced: bool,
     /// Attachment bytes for in-memory graphs (file graphs use the blob directory).
     mem_blobs: HashMap<String, Vec<u8>>,
@@ -205,6 +209,7 @@ impl Store {
             persister: Persister::inline(),
             pending: Vec::new(),
             drafts: HashMap::new(),
+            promotions: HashMap::new(),
             debounced: false,
             mem_blobs: HashMap::new(),
             tag_page_scans: std::sync::atomic::AtomicU64::new(0),
@@ -374,9 +379,11 @@ impl Store {
                 Some(date) => {
                     promoted = true;
                     // One page per date (rule 4): if a remote copy of the day already
-                    // owns it under another id, the draft's blocks move into that page.
+                    // owns it under another id, the draft's blocks move into that page
+                    // and its own shard is dropped (nothing to write).
                     if let Some(live) = self.resolve_promotion(page, date)? {
                         merged_into.push(live);
+                        continue;
                     }
                     None
                 }

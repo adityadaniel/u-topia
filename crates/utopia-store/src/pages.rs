@@ -273,12 +273,33 @@ impl Store {
         self.drafts.remove(page);
     }
 
+    /// Where a promoted draft's page id went when another page already owned its day
+    /// (FR-1.2). The id was never durable, so it is a session alias: views and the editor
+    /// that still hold it follow the day instead of a shard that no longer exists (rule 5).
+    /// `None` for every page that is not such an alias.
+    pub fn redirect(&self, page: &PageId) -> Option<PageId> {
+        let mut at = page.clone();
+        for _ in 0..8 {
+            match self.promotions.get(&at) {
+                Some(to) => at = to.clone(),
+                None => return (at != *page).then_some(at),
+            }
+        }
+        None
+    }
+
     /// A promoted draft (FR-1.2) may belong to a day another page already owns: a remote
     /// device wrote the date under a fresh id because this device's uuidv5 is tombstoned
     /// there (rule 4). Writing the draft as a second live daily page would violate
     /// `page_daily_uq` and fail the commit, so its blocks move into the page that has the
-    /// day instead (§8.6) and the draft's shard gets the merge tombstone. Returns the
-    /// surviving page, which the caller must commit as well.
+    /// day instead (§8.6).
+    ///
+    /// The draft's shard is dropped, not written as a `merged_into` tombstone: a draft was
+    /// never durable, so it has no identity to merge away, and a tombstone for the same id
+    /// would let `reconcile_merged` drag the remote's still-trashed blocks into the live day
+    /// (rule 5). The discarded id is remembered as a session alias ([`Store::redirect`]) so
+    /// the editor and the views editing it follow the day. Returns the surviving page, which
+    /// the caller must commit instead.
     pub(crate) fn resolve_promotion(
         &mut self,
         page: &PageId,
@@ -290,10 +311,15 @@ impl Store {
         if live == *page {
             return Ok(None);
         }
+        let from = self.page_state(page)?.clone();
+        let into = self.page_state(&live)?.clone();
+        let (cmds, _moved) = Self::plan_block_moves(&from, &into);
         let now = self.now();
-        for (p, cmds) in self.plan_merge(page, &live)? {
-            self.apply_cmds(&p, &cmds, now, false)?;
+        if !cmds.is_empty() {
+            self.apply_cmds(&live, &cmds, now, false)?;
         }
+        self.docs.remove(page);
+        self.promotions.insert(page.clone(), live.clone());
         Ok(Some(live))
     }
 
