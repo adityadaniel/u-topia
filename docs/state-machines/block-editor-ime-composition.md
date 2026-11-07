@@ -34,6 +34,10 @@ Left as it was, deliberately:
   machine; changing it means concurrent-edit merging, which the PRD puts on the CRDT side.
 - `LineInput` still emits no `Changed` for composition text itself (only for the commit).
   That is right: a query should not filter on glyphs the IME has not committed.
+- `LineInput::set_text` still replaces the buffer even while the user composes in it, so a
+  `utopia://search` link that arrives mid-composition drops the composition (the field
+  cannot queue host writes the way the block editor does). It is not on the doc's list and
+  needs a deferral the single-line input does not have; recorded rather than guessed at.
 - Caret moves (`mouse_down`, left/right/home/end) still move `sel` while composing if the
   platform lets the key through. The composition text survives; the reported selection is
   then outside the marked range, which macOS takes as "the IME's selection changed". No
@@ -115,10 +119,11 @@ The five the old flags allowed, now closed (tests above; numbers are the doc's):
 5. **`LineInput` was silent for `set_text`.** Closed by emitting `Changed`.
 
 What remains possible: the platform can still send IME events after we stopped composing
-only if something outside this machine ends the composition without the IME — there is no
-such path left in the editor, but `TextField::set_text`/`replace` remain public and a future
-caller that skips `composing()` would recreate `NotComposingDetached`. That is the residual
-risk of keeping the check at the call site (see Status for why the type cannot enforce it).
+only if something outside this machine ends the composition without the IME — the block
+editor has no such path left, but `LineInput::set_text` (see above) and any future caller
+of `TextField::set_text`/`replace` that skips `composing()` would recreate
+`NotComposingDetached`. That is the residual risk of keeping the check at the call site
+(see Status for why the type cannot enforce it).
 
 ## Diagram
 
@@ -134,5 +139,5 @@ stateDiagram-v2
 ```
 
 `NotComposingDetached` — our composition ended while the OS composition was still live — is
-now unreachable from the editor's own paths; the remaining way in is a future caller that
-writes `TextField` without asking `composing()`.
+now unreachable from the block editor's own paths; the remaining way in is a caller that
+writes `TextField` without asking `composing()` (`LineInput::set_text` today).
