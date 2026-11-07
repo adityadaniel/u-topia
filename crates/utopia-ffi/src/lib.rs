@@ -289,6 +289,12 @@ impl Graph {
         self.with(|s| {
             let mut client = SyncClient::new(transport, s).map_err(err)?;
             let r = client.sync_once(s).map_err(err)?;
+            // A round can apply most pages and still leave one failed (a page this device
+            // cannot read, a store error): the shell has one summary and no per-page state,
+            // so it keeps the old "a round with a failure is an error" contract (§12.6).
+            if let Some(f) = r.failed.first() {
+                return Err(err(f.to_error()));
+            }
             Ok(SyncSummary {
                 pushed: r.pushed as u32,
                 pulled_pages: r.pulled_pages as u32,
