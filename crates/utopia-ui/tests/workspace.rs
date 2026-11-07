@@ -1512,6 +1512,60 @@ impl utopia_sync::Transport for CountingTransport {
     }
 }
 
+/// A transport that refuses the first `refusals` rounds with 401, then behaves like a real
+/// relay: the transient refusal a proxy hiccup or a restarting relay produces.
+struct FlakyTransport {
+    inner: utopia_sync::relay::RelayTransport,
+    refusals: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl utopia_sync::Transport for FlakyTransport {
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .refusals
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(utopia_sync::SyncError::Unauthorized);
+        }
+        self.inner.manifest(if_none_match)
+    }
+
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        self.inner.push(page, req)
+    }
+
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.inner.pull(page, since_seq)
+    }
+
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
 /// A transport that refuses every round with a fixed error.
 struct Refusing {
     err: fn() -> utopia_sync::SyncError,
@@ -1688,10 +1742,10 @@ fn a_failed_round_backs_off(cx: &mut TestAppContext) {
     );
 }
 
-/// §12.6: 401/403 halts sync instead of retrying. The relay is only retried once it says
-/// something else.
+/// §12.6: a refusal stops the fast polls. One retry per slow interval, not every 5 s — the
+/// relay refused this device, so hammering it is exactly wrong.
 #[gpui::test]
-fn unauthorized_halts_the_poll_loop(cx: &mut TestAppContext) {
+fn a_refusal_retries_only_at_the_slow_cadence(cx: &mut TestAppContext) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1714,17 +1768,116 @@ fn unauthorized_halts_the_poll_loop(cx: &mut TestAppContext) {
         ws.read_with(cx, |w, _| w.sync_status()),
         Some(utopia_sync::SyncStatus::NeedsAuth)
     );
-    cx.executor().advance_clock(Duration::from_secs(120));
-    cx.run_until_parked();
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "a 401 halts sync (§12.6); it must not keep polling"
-    );
     assert_eq!(
         ws.update(cx, |w, _| w.sync_dot()),
         utopia_ui::sync_runner::SyncDot::Error
     );
+    // Well inside the slow interval: the refusal must not be retried at 5 s.
+    cx.executor().advance_clock(Duration::from_secs(30));
+    cx.run_until_parked();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a refused relay must not be polled every 5 s"
+    );
+}
+
+/// §12.6: a *transient* refusal (a proxy hiccup, a relay restarting before it has loaded its
+/// token file) must not end sync for the session. Polling retries at the slow cadence, so it
+/// heals by itself; a 401 that never clears just stays red.
+#[gpui::test]
+fn a_refusal_recovers_without_a_restart(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    let (_app, ws, cx) = setup(cx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let refusals = Arc::new(AtomicUsize::new(1));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(FlakyTransport {
+                inner: RelayTransport::new(Relay::new(), "g"),
+                refusals: refusals.clone(),
+                calls: calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert_eq!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(utopia_sync::SyncStatus::NeedsAuth),
+        "the first round was refused"
+    );
+    // The next attempt is a slow interval away, not immediate.
+    cx.executor().advance_clock(Duration::from_secs(30));
+    cx.run_until_parked();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no 5 s hammering");
+    // After the slow interval the relay answers again and sync resumes by itself.
+    cx.executor().advance_clock(Duration::from_secs(40));
+    cx.run_until_parked();
+    assert!(calls.load(Ordering::SeqCst) >= 2, "the slow retry happened");
+    assert!(
+        matches!(
+            ws.read_with(cx, |w, _| w.sync_status()),
+            Some(utopia_sync::SyncStatus::Synced { .. })
+        ),
+        "a transient 401 must not kill sync until the app is relaunched"
+    );
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Synced
+    );
+}
+
+/// §12.6: starting sync again is the explicit way out of a refusal, and it must not need a
+/// new Workspace. The replacement runner polls immediately.
+#[gpui::test]
+fn restarting_sync_after_a_refusal_polls_again(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    let (_app, ws, cx) = setup(cx);
+    let refused = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(Refusing {
+                err: || utopia_sync::SyncError::Unauthorized,
+                calls: refused.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert_eq!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(utopia_sync::SyncStatus::NeedsAuth)
+    );
+    // The user fixes the token; the app starts sync again on the same workspace.
+    let calls = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(Relay::new(), "g"),
+                calls: calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert!(calls.load(Ordering::SeqCst) >= 1, "the new runner polled");
+    assert!(matches!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(utopia_sync::SyncStatus::Synced { .. })
+    ));
 }
 
 // ---------------------------------------------------------------- v1.1 (P1)

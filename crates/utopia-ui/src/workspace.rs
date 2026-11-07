@@ -492,23 +492,24 @@ impl Workspace {
                 this.sync
                     .as_ref()
                     .filter(|s| s.is_generation(generation))
-                    .and_then(|s| match s.phase {
-                        // §12.6: a refusal or a protocol mismatch halts sync; the loop ends
-                        // and the dot stays red until sync is started again.
-                        SyncPhase::Halted { .. } => None,
-                        _ => Some((s.interval, s.nudge.clone())),
+                    .map(|s| {
+                        // §12.6: a refused relay gets the slow cadence and no notice-driven
+                        // rounds, but it is retried, so a transient refusal heals.
+                        let refused = matches!(s.phase, SyncPhase::Refused { .. });
+                        (s.interval, s.nudge.clone(), refused)
                     })
             });
-            let Ok(Some((interval, nudge))) = wait else {
+            let Ok(Some((interval, nudge, refused))) = wait else {
                 break;
             };
-            // Poll interval, cut short by a realtime notice.
+            // Poll interval, cut short by a realtime notice — except while refused, where a
+            // notice must not bring the fast polling back.
             let mut waited = Duration::ZERO;
             while waited < interval {
                 let step = Duration::from_millis(250).min(interval - waited);
                 cx.background_executor().timer(step).await;
                 waited += step;
-                if nudge.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                if !refused && nudge.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
             }

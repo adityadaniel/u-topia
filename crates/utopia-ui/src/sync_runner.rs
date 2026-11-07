@@ -136,21 +136,27 @@ pub enum SyncPhase {
     /// The exchange returned; the UI thread holds the transport and imports the result.
     Applying,
     /// The relay refused this device (401/403) or speaks a protocol this client does not
-    /// (§12.6): sync halts until it is started again. Editing continues locally.
-    Halted { reason: HaltReason },
+    /// (§12.6). The transport is still home: rounds continue at [`SLOW`] only, and realtime
+    /// notices are ignored, so a transient refusal (a proxy hiccup, a relay starting before
+    /// it has loaded its token file) heals by itself while a revoked token stops the 5 s
+    /// polling. There is no in-app re-auth prompt yet, so this is the prompt's stand-in.
+    Refused {
+        reason: RefusalReason,
+        transport: BoxTransport,
+    },
 }
 
-/// Why sync halted: terminal for this runner, not a backoff (§12.6).
+/// Why the relay refused us: the two answers that retrying quickly cannot fix (§12.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HaltReason {
-    /// 401/403: sign in again, then start sync.
+pub enum RefusalReason {
+    /// 401/403: the token is wrong or revoked.
     NeedsAuth,
     /// The relay's `protocol_version` is not the one this client speaks.
     Unsupported,
 }
 
-impl HaltReason {
-    /// The terminal reason in `error`, if it has one: these are never retried.
+impl RefusalReason {
+    /// The refusal in `error`, if it has one.
     pub fn of(error: &SyncError) -> Option<Self> {
         match error {
             SyncError::Unauthorized => Some(Self::NeedsAuth),
@@ -159,7 +165,7 @@ impl HaltReason {
         }
     }
 
-    /// The outcome to show while halted.
+    /// The outcome to show while refused.
     pub fn status(self) -> SyncStatus {
         match self {
             Self::NeedsAuth => SyncStatus::NeedsAuth,
@@ -209,23 +215,19 @@ impl SyncRunner {
         self.generation == generation
     }
 
-    /// Start a round: take the transport out of [`SyncPhase::Idle`]. `None` when a round is
-    /// already running, which the loop treats as someone else's round and leaves alone.
+    /// Start a round: take the transport out of [`SyncPhase::Idle`], or out of
+    /// [`SyncPhase::Refused`] for the slow retry. `None` when a round is already running,
+    /// which the loop treats as someone else's round and leaves alone.
     pub fn begin_round(&mut self) -> Option<BoxTransport> {
-        if !matches!(self.phase, SyncPhase::Idle { .. }) {
-            return None;
-        }
-        match std::mem::replace(&mut self.phase, SyncPhase::Exchanging) {
-            SyncPhase::Idle { transport } => {
-                self.phase = SyncPhase::Preparing;
-                Some(transport)
-            }
-            // Not reachable: the guard above proved `Idle`. Kept panic-free (rule 11).
+        let transport = match std::mem::replace(&mut self.phase, SyncPhase::Exchanging) {
+            SyncPhase::Idle { transport } | SyncPhase::Refused { transport, .. } => transport,
             other => {
                 self.phase = other;
-                None
+                return None;
             }
-        }
+        };
+        self.phase = SyncPhase::Preparing;
+        Some(transport)
     }
 
     /// The round's store work failed, so nothing left the device: the transport comes home
@@ -248,7 +250,8 @@ impl SyncRunner {
     }
 
     /// The round is over: remember what to show and how soon to poll again. A refusal or a
-    /// protocol mismatch halts sync instead of backing off (§12.6).
+    /// protocol mismatch pins the cadence to [`SLOW`] (§12.6): no fast polling, one retry
+    /// per slow interval, and the transport stays so the retry can happen.
     pub fn end_round(
         &mut self,
         transport: BoxTransport,
@@ -256,9 +259,10 @@ impl SyncRunner {
         status: SyncStatus,
     ) {
         if let Err(e) = report {
-            if let Some(reason) = HaltReason::of(e) {
+            if let Some(reason) = RefusalReason::of(e) {
+                self.interval = SLOW;
                 self.last = Some(reason.status());
-                self.phase = SyncPhase::Halted { reason };
+                self.phase = SyncPhase::Refused { reason, transport };
                 return;
             }
         }
@@ -318,7 +322,8 @@ pub fn sync_dot(runner: Option<&SyncRunner>) -> SyncDot {
         return SyncDot::Off;
     };
     match &runner.phase {
-        SyncPhase::Halted { .. } => SyncDot::Error,
+        // Refused is not a round: the dot shows the refusal, not "syncing".
+        SyncPhase::Refused { .. } => SyncDot::Error,
         // A round in flight wins over the last round's outcome.
         SyncPhase::Preparing | SyncPhase::Exchanging | SyncPhase::Applying => SyncDot::Syncing,
         SyncPhase::Idle { .. } => match runner.last {
@@ -340,7 +345,7 @@ pub fn status_line(runner: &SyncRunner, now_ms: i64) -> (String, bool) {
         SyncPhase::Preparing | SyncPhase::Exchanging | SyncPhase::Applying => {
             ("Sync: syncing…".into(), false)
         }
-        SyncPhase::Idle { .. } | SyncPhase::Halted { .. } => {
+        SyncPhase::Idle { .. } | SyncPhase::Refused { .. } => {
             status_text(runner.last.as_ref(), now_ms)
         }
     }
@@ -458,10 +463,11 @@ mod tests {
         assert!(warn);
     }
 
-    /// §12.6: 401/403 halts sync instead of backing off, and a protocol mismatch does the
-    /// same. The transport is gone, so no round can start again on this runner.
+    /// §12.6: a refusal is not retried at the fast cadence, but it is not the end of sync
+    /// either: the transport stays home and one slow retry follows, so a transient refusal
+    /// heals while a revoked token just keeps the dot red.
     #[test]
-    fn a_refusal_halts_instead_of_retrying() {
+    fn a_refusal_slows_down_and_can_recover() {
         fn store() -> utopia_store::Store {
             utopia_store::Store::open_in_memory().unwrap()
         }
@@ -492,14 +498,24 @@ mod tests {
                 &report,
                 SyncStatus::from_result(&report, &store()),
             );
-            assert!(matches!(runner.phase, SyncPhase::Halted { .. }));
+            assert!(matches!(runner.phase, SyncPhase::Refused { .. }));
             assert_eq!(runner.last, Some(status));
             assert_eq!(sync_dot(Some(&runner)), SyncDot::Error);
             assert_eq!(status_line(&runner, 0).0, line);
-            assert!(
-                runner.begin_round().is_none(),
-                "halted sync has no transport to start a round with"
+            assert_eq!(
+                runner.interval, SLOW,
+                "a refused relay is only polled at the slowest cadence"
             );
+            // The refusal is not a dead end: another round can start with the same transport.
+            let transport = runner
+                .begin_round()
+                .expect("a refused runner can retry later");
+            runner.exchange();
+            runner.exchange_returned();
+            let ok: Result<SyncReport, SyncError> = Ok(SyncReport::default());
+            runner.end_round(transport, &ok, SyncStatus::Synced { at_ms: 1 });
+            assert!(matches!(runner.phase, SyncPhase::Idle { .. }));
+            assert_eq!(sync_dot(Some(&runner)), SyncDot::Synced);
         }
     }
 
