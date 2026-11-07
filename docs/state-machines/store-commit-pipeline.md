@@ -15,6 +15,10 @@ code before the fix; the states are now explicit in code:
 - `Store::sync_index` treats a failure as a state to leave: it reconciles, requeues every
   shard whose durable copy lags as a full snapshot, clears the failure only then, and still
   reports the failure to the caller that needed the barrier.
+- `DocEntry.promoted` distinguishes a draft day whose first edit was queued (FR-1.2) from a
+  day that was only visited; `InFlight.enqueue` carries the queued job's outbox intent; and
+  `Progress.processed`/`stale_through` make skipped jobs release their tickets and keep a
+  repair from writing jobs submitted before it.
 
 Fixed: **1** (the durable frontier advances only on a confirmed commit), **2** (a failure
 stays until repaired; the UI reports it and does not emit `IndexUpdated` for the missing
@@ -32,8 +36,18 @@ Left as is:
 - **7**: the `Inline` → `Thread` swap in `open_with_key` remains a convention; no job is
   submitted between the two, so nothing is lost.
 
-Tests: `crates/utopia-store/tests/commit_pipeline.rs` (`ac_13_3_*`) and the `app_state` unit
-tests in `crates/utopia-ui/src/app_state.rs`.
+Review follow-ups (branch review): a repair no longer writes days that were only visited
+(`fr_1_2_a_writer_failure_does_not_promote_unedited_drafts`), no longer echoes an imported
+page's ops to the outbox (`ac_13_3_repair_does_not_echo_remote_updates`), drops jobs submitted
+before the repair by sequence (`jobs_submitted_before_a_repair_are_stale`) instead of racing
+`clear_failure`, carries a superseded job's update row into the compaction count
+(`overlapping_jobs_keep_the_update_count`), and the UI keys `IndexUpdated` off the write
+ticket and backs off a failed repair instead of snapshotting on every keystroke
+(`a_failed_repair_does_not_claim_the_index_moved`,
+`a_failed_repair_backs_off_before_retrying`).
+
+Tests: `crates/utopia-store/tests/commit_pipeline.rs` (`ac_13_3_*`, `fr_1_2_*`), the
+`writer.rs` and `lib.rs` unit tests, and the `app_state` unit tests.
 
 ## What it controls
 
@@ -201,7 +215,8 @@ struct DocEntry {
     durable: Frontier,                  // confirmed in page_doc + page_update
     has_snapshot: bool,
     pending_updates: i64,
-    in_flight: Option<InFlight>,        // seq + frontier + what the job writes
+    in_flight: Option<InFlight>,        // seq + frontier + what it writes + outbox intent
+    promoted: bool,                     // a queued draft day; a visit is never written
 }
 ```
 
@@ -210,3 +225,6 @@ so `reconcile_writer` can promote `in_flight` only when `seq <= completed`. A fa
 nothing forward: `repair_writer` drops the `in_flight` bookkeeping, sets `has_snapshot =
 false` for the divergent shards, and requeues them so the next `flush` writes a snapshot from
 memory. That removes the drift at its source without dropping the loaded shards (rule 5).
+A repair skips days that were only visited (`promoted == false`), keeps the queued outbox
+flag, and `clear_failure(submitted)` marks every earlier job stale so a job that was in the
+channel during the failure cannot run against a base that never landed.
