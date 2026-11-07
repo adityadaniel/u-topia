@@ -1047,7 +1047,15 @@ impl BlockEditor {
         self.set_kind(&t, next.0, next.1, cx);
     }
 
+    /// A structural host gesture (split, delete, move, zoom, paste outline): the host is
+    /// about to change the rows under the editor, so the input method's marked text is
+    /// taken as committed first (§13.5). Deferring the commit instead would let the host
+    /// remove the row being composed and then queue a `begin` on its neighbour, which the
+    /// focus change from that removal discards — the caret would not continue next door.
     fn emit_after_commit(&mut self, e: EditorEvent, cx: &mut Context<Self>) {
+        if self.field.composing() {
+            self.accept_composition(cx);
+        }
         self.commit(cx);
         cx.emit(e);
     }

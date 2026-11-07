@@ -5227,6 +5227,52 @@ fn ac_13_5_focus_out_without_end_keeps_the_composed_text(cx: &mut TestAppContext
     assert_eq!(rows(&app, &page, cx)[0].0, "abにほ!?");
 }
 
+/// §13.5: deleting the block being composed must still hand the caret to the neighbour the
+/// host picks. The delete removes the row the editor renders, so focus leaves it; the
+/// neighbour is a valid continuation, not a stale request. Taking the composition as
+/// committed before the host changes the rows keeps both the text and that navigation
+/// (AGENTS.md: a focused element that is not rendered gets no keystrokes).
+#[gpui::test]
+fn ac_13_5_deleting_a_composing_block_keeps_typing_in_its_neighbour(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("first");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("second");
+    cx.run_until_parked();
+    // The window has to be active for gpui to report the focus change the row removal
+    // causes (the test platform leaves it inactive until asked).
+    ws.update_in(cx, |_, window, _| window.activate_window());
+    cx.run_until_parked();
+    let editor = ws.update(cx, |w, _| w.editor());
+    let deleted = editor.read_with(cx, |e, _| e.target.clone().expect("editing").block);
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "にほ", None, window, cx)
+    });
+    cx.run_until_parked();
+    // Cmd+Shift+Backspace deletes it; the block above is where editing continues.
+    cx.simulate_keystrokes("cmd-shift-backspace");
+    cx.run_until_parked();
+    assert_eq!(rows_str(&rows(&app, &page, cx)), vec![("first", 0)]);
+    let first = app.update(cx, |app, _| {
+        app.store.page_state(&page).unwrap().live_roots()[0].clone()
+    });
+    assert_eq!(
+        editor.read_with(cx, |e, _| e.target.as_ref().map(|t| t.block.clone())),
+        Some(first.clone()),
+        "the caret continues in the block the host chose"
+    );
+    cx.simulate_input("!");
+    cx.run_until_parked();
+    assert_eq!(rows(&app, &page, cx)[0].0, "first!");
+    // And the composition was kept with the block it belonged to, in its tombstone.
+    app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).unwrap();
+        assert_eq!(st.block(&deleted).unwrap().text, "secondにほ");
+    });
+}
+
 /// §13.5: the idle commit a host queued before the composition does not run on top of the
 /// IME's own persist. It waits for the 300 ms timer that persist re-arms, as it would
 /// without a composition; otherwise every IME phrase runs the commit (NFC, hashtags, page

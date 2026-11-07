@@ -9,28 +9,29 @@ Composition is now one explicit state, not a range anybody may clear:
   its commit (`replace_text_in_range` → `TextField::replace`, `field.rs:142`), its unmark
   (`unmark_text` → `TextField::end_composition`, `field.rs:95`) or by the editor taking the
   marked text as committed when the field stops being the input handler
-  (`accept_composition`, `editor.rs:616`; `focus_lost`, `editor.rs:625`). Every host path
+  (`accept_composition`, `editor.rs:632`; `focus_lost`, `editor.rs:641`). Every host path
   asks `TextField::composing()` (`field.rs:84`) before touching the buffer.
 - The editor does not *refuse* a host request while composing, it **queues** it:
   `Deferred` (`editor.rs:220`) holds `Commit { finished }` or `Begin`, and
-  `after_composition` (`editor.rs:642`) runs it when the input method lets go. The latest
+  `after_composition` (`editor.rs:658`) runs it when the input method lets go. The latest
   request wins, except the idle commit, which never displaces one (`defer`,
-  `editor.rs:634`). A store change that arrived meanwhile sets `pending_sync`
-  (`editor.rs:254`) and `settle` (`editor.rs:587`) looks at it.
-- `end` (`editor.rs:365`) and a focus move do **not** queue: they take the marked text as
+  `editor.rs:650`). A store change that arrived meanwhile sets `pending_sync`
+  (`editor.rs:254`) and `settle` (`editor.rs:603`) looks at it.
+- `end` (`editor.rs:381`), a focus move and every structural host gesture
+  (`emit_after_commit`, `editor.rs:1055`) do **not** queue: they take the marked text as
   committed and persist it, because the platform never delivers another IME event to a field
-  that is no longer its input handler. `Workspace::new` registers the focus-out listener
-  (`workspace.rs:271`).
+  that is no longer its input handler, and the host is about to change the rows under it.
+  `Workspace::new` registers the focus-out listener (`workspace.rs:271`).
 
 Fixed, each with a failing-first acceptance test in `crates/utopia-ui/tests/workspace.rs`
 (named after §13.5):
 
 | Issue | Test | Fix |
 |---|---|---|
-| 1 host-driven commit mid-composition | `ac_13_5_host_commit_waits_for_the_ime` (idle commit) and `ac_13_5_focus_leaving_commits_the_ime_composition` (end / focus move) | `commit_block` (`editor.rs:721`) and `begin` (`editor.rs:323`) defer; `end` and `focus_lost` take the marked text as committed and persist it (`settle`) instead of rewriting the buffer. |
-| 2 destructive actions clear `marked` | `ac_13_5_destructive_actions_leave_ime_composition_alone` | `backspace` (`editor.rs:1099`), `delete` (`:1129`), `soft_break` (`:1079`), `paste` (`:1371`), `cut` (`:1355`), `insert_text` (`:494`), menu `accept` (`:893`) and `newline` (`:1041`) return early; the IME's own edit arrives through `replace_and_mark_text_in_range`. |
-| 3 `mark()` shifts text under a stale range | `ac_13_5_mark_leaves_ime_composition_alone` | `mark` (`editor.rs:1299`) returns early. |
-| 4 remote/undo change dropped mid-composition | `ac_13_5_ime_composition_ends_when_its_block_is_deleted`; `ac_13_5_a_live_store_change_under_a_composition_keeps_the_users_text` pins what is *not* fixed | `sync_from_store` (`editor.rs:382`) sets `pending_sync`; `settle` re-reads. **Partially fixed**: a block that went away ends the edit, after persisting so the composed characters stay in the tombstone; a block that is still live keeps the user's just-committed text (see below). |
+| 1 host-driven commit mid-composition | `ac_13_5_host_commit_waits_for_the_ime` (idle commit) and `ac_13_5_focus_leaving_commits_the_ime_composition` (end / focus move) | `commit_block` (`editor.rs:737`) and `begin` (`editor.rs:339`) defer; `end` and `focus_lost` take the marked text as committed and persist it (`settle`) instead of rewriting the buffer. |
+| 2 destructive actions clear `marked` | `ac_13_5_destructive_actions_leave_ime_composition_alone` | `backspace` (`editor.rs:1123`), `delete` (`:1153`), `soft_break` (`:1103`), `paste` (`:1395`), `cut` (`:1379`), `insert_text` (`:510`), menu `accept` (`:909`) and `newline` (`:1065`) return early; the IME's own edit arrives through `replace_and_mark_text_in_range`. |
+| 3 `mark()` shifts text under a stale range | `ac_13_5_mark_leaves_ime_composition_alone` | `mark` (`editor.rs:1323`) returns early. |
+| 4 remote/undo change dropped mid-composition | `ac_13_5_ime_composition_ends_when_its_block_is_deleted`; `ac_13_5_a_live_store_change_under_a_composition_keeps_the_users_text` pins what is *not* fixed | `sync_from_store` (`editor.rs:398`) sets `pending_sync`; `settle` re-reads. **Partially fixed**: a block that went away ends the edit, after persisting so the composed characters stay in the tombstone; a block that is still live keeps the user's just-committed text (see below). |
 | 5 `LineInput::set_text` never emits | `ac_13_5_line_input_set_text_notifies_the_host` | `line_input.rs:80` emits `Changed` on a real change, so `utopia://search` filters on the text it put in the box. |
 
 Added after review:
@@ -40,6 +41,10 @@ Added after review:
   `ac_13_5_ime_ranges_and_unmark_commit_cleanly` (explicit UTF-16 ranges over a non-BMP
   character, a dead key, `unmark_text`), `ac_13_5_empty_marked_text_ends_the_composition`,
   and `line_input_set_text_notifies_only_a_change` (`crates/utopia-ui/tests/line_input.rs`).
+- `ac_13_5_deleting_a_composing_block_keeps_typing_in_its_neighbour`: deleting the block
+  being composed used to remove the row, lose the neighbour `begin` the host had queued to
+  the focus change, and leave nothing focused. Structural gestures now settle the
+  composition first (`emit_after_commit`, `editor.rs:1055`).
 
 Left as it was, deliberately:
 
@@ -91,17 +96,17 @@ Lives in `crates/utopia-ui/src/field.rs` (`TextField`) and is consumed by
 
 | Piece | Location | Set | Cleared |
 |---|---|---|---|
-| Composition | `field.rs:60` `composition: Composition` | `replace_and_mark_text_in_range :396` → `begin_composition :89` | `replace_and_mark_text_in_range` with empty text, `replace :142` (the IME's commit), `set_text :101`, `unmark_text :366` → `end_composition :95`, `editor.rs:616` (focus leaving) |
+| Composition | `field.rs:60` `composition: Composition` | `replace_and_mark_text_in_range :396` → `begin_composition :89` | `replace_and_mark_text_in_range` with empty text, `replace :142` (the IME's commit), `set_text :101`, `unmark_text :366` → `end_composition :95`, `editor.rs:632` (focus leaving) |
 | Selection | `field.rs:58-59` `sel`, `reversed` | IME sets at `:440-441` | – |
-| Store copy of the text | via `persist` (`editor.rs:660`) | every `settle` | – |
-| Persist gate | `editor.rs:577` `after_edit` returns early while composing | – | – |
-| Store→field gate | `editor.rs:384` `sync_from_store` defers while composing | – | – |
-| Queued host request | `editor.rs:254` `deferred: Option<Deferred>` | `defer :634` | `after_composition :642`, `accept_composition :616` |
-| Queued store read | `editor.rs:254` `pending_sync: bool` | `sync_from_store :387` | `settle :587` |
+| Store copy of the text | via `persist` (`editor.rs:676`) | every `settle` | – |
+| Persist gate | `editor.rs:593` `after_edit` returns early while composing | – | – |
+| Store→field gate | `editor.rs:400` `sync_from_store` defers while composing | – | – |
+| Queued host request | `editor.rs:254` `deferred: Option<Deferred>` | `defer :650` | `after_composition :658`, `accept_composition :632` |
+| Queued store read | `editor.rs:254` `pending_sync: bool` | `sync_from_store :403` | `settle :603` |
 | Focus-out listener | `workspace.rs:271` | `Workspace::new` | with the workspace |
 
 Read outside: only through `EntityInputHandler` (`field.rs:357, 366, 371, 396`) and editor
-render (`editor.rs:1556`).
+render (`editor.rs:1580`).
 
 ## States
 
@@ -119,7 +124,9 @@ render (`editor.rs:1556`).
 - `replace_text_in_range` / `unmark_text` → Not composing, then `after_edit` persists and
   runs the deferred request.
 - `commit_block` / `begin` while composing → stays Composing, queues the request (the
-  editor keeps focus).
+  editor keeps focus). A structural gesture (delete, insert above, move, zoom, paste
+  outline) → Not composing first: the marked text is committed and persisted, then the host
+  changes the rows and may move the caret to a neighbour.
 - `end` / focus moving off the editor's handle while composing → Not composing; the marked
   text is persisted and anything queued for the field is dropped.
 - A store change while composing → stays Composing, sets `pending_sync`.
