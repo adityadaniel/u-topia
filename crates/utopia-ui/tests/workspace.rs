@@ -934,6 +934,573 @@ fn slash_extract_block_to_page(cx: &mut TestAppContext) {
     );
 }
 
+/// SR-2: full-text results sit under a header per page, with the page's blocks indented
+/// beneath and the icon on the header's first line.
+#[gpui::test]
+fn search_groups_results_under_their_page(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        let notes = app.store.create_page("Notes").unwrap();
+        let b = app.store.ensure_first_block(&notes).unwrap();
+        app.store
+            .set_block_text(&notes, &b, "the atlas is late", None, None)
+            .unwrap();
+        app.store.commit_block(&notes, &b).unwrap();
+        let atlas = app.store.create_page("Atlas").unwrap();
+        for text in ["atlas launch plan", "atlas risks"] {
+            let plan =
+                utopia_core::outline::append_block(app.store.page_state(&atlas).unwrap(), None);
+            let b = app
+                .store
+                .execute_plan(&atlas, plan, None)
+                .unwrap()
+                .unwrap()
+                .block;
+            app.store
+                .set_block_text(&atlas, &b, text, None, None)
+                .unwrap();
+            app.store.commit_block(&atlas, &b).unwrap();
+            app.store.sync_index().unwrap();
+        }
+    });
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("jump-palette").is_some(),
+        "the search palette opened"
+    );
+    cx.simulate_input("atlas");
+    cx.run_until_parked();
+    let atlas_header = cx
+        .debug_bounds("search-group-0")
+        .expect("a header per page");
+    let icon = cx.debug_bounds("search-group-icon-0").expect("an icon");
+    let title = cx
+        .debug_bounds("search-group-title-0")
+        .expect("the page name");
+    assert!(
+        (f32::from(icon.origin.y) - f32::from(title.origin.y)).abs() < 1.5,
+        "the icon aligns with the top line (SR-2): {icon:?} {title:?}"
+    );
+    let hit = cx
+        .debug_bounds("search-hit-text-0-0")
+        .expect("the first block of the page");
+    let hit2 = cx
+        .debug_bounds("search-hit-0-1")
+        .expect("the page's second block in the same group");
+    assert!(
+        f32::from(hit.origin.x) > f32::from(title.origin.x) + 8.0,
+        "blocks are indented under their page: {hit:?} {title:?}"
+    );
+    assert!(
+        hit.origin.y > atlas_header.origin.y && hit2.origin.y > hit.origin.y,
+        "the group's blocks stack below its header: {atlas_header:?} {hit:?} {hit2:?}"
+    );
+    assert!(
+        cx.debug_bounds("search-hit-1-0").is_some(),
+        "the next page starts a new group"
+    );
+}
+
+/// SR-3: the scope chips narrow the grouped results; the age menu drops older hits,
+/// and opening it is the only thing that happens (the chips do not move).
+#[gpui::test]
+fn search_scope_and_age_filter_the_results(cx: &mut TestAppContext) {
+    use utopia_core::BlockKind;
+    let (app, ws, cx) = setup(cx);
+    // Local noon, so the block's local edit date is the intended day in every timezone.
+    let ts = |m: u32, d: u32, h| {
+        NaiveDate::from_ymd_opt(2026, m, d)
+            .unwrap()
+            .and_hms_opt(h, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap()
+            .timestamp_millis()
+    };
+    app.update(cx, |app, _| {
+        // Now: a page and today's day both mention the zebra.
+        app.store.set_clock(Some(ts(11, 2, 12)));
+        let atlas = app.store.create_page("Atlas").unwrap();
+        let b = app.store.ensure_first_block(&atlas).unwrap();
+        app.store
+            .set_block_text(&atlas, &b, "zebra plan", None, None)
+            .unwrap();
+        app.store.commit_block(&atlas, &b).unwrap();
+        let (day, db) = app.store.open_daily(today()).unwrap();
+        app.store
+            .set_block_text(&day, &db, "zebra day", None, None)
+            .unwrap();
+        app.store.commit_block(&day, &db).unwrap();
+        // Last month: an old note outside the Today window.
+        app.store.set_clock(Some(ts(10, 1, 12)));
+        let old = app.store.create_page("Old").unwrap();
+        let b = app.store.ensure_first_block(&old).unwrap();
+        app.store
+            .set_block_text(&old, &b, "zebra old", None, None)
+            .unwrap();
+        app.store
+            .set_block_kind(&old, &b, BlockKind::Todo, false)
+            .unwrap();
+        app.store.set_clock(Some(ts(11, 2, 12)));
+        app.store.sync_index().unwrap();
+    });
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("the palette is open");
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.groups().len()),
+        3,
+        "three pages, grouped"
+    );
+
+    let journal = cx
+        .debug_bounds("search-scope-journal")
+        .expect("the Journal chip");
+    cx.simulate_click(journal.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.scope()),
+        utopia_store::SearchScope::Journal
+    );
+    let groups = jump.read_with(cx, |j, _| j.groups().to_vec());
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    assert!(groups[0].daily, "only the day is left: {groups:?}");
+
+    // Pages + Today keeps the current page and drops last month's note.
+    let pages = cx
+        .debug_bounds("search-scope-pages")
+        .expect("the Pages chip");
+    cx.simulate_click(pages.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let age = cx.debug_bounds("search-age").expect("the age control");
+    cx.simulate_click(age.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let today_item = cx
+        .debug_bounds("search-age-today")
+        .expect("Today in the age menu");
+    cx.simulate_click(today_item.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        ws.read_with(cx, |w, _| w.jump_palette().is_some()),
+        "the palette is still open (the scrim did not swallow the menu click)"
+    );
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.age()),
+        utopia_store::SearchAge::Today
+    );
+    let titles: Vec<String> = jump.read_with(cx, |j, _| {
+        j.groups().iter().map(|g| g.title.clone()).collect()
+    });
+    assert_eq!(titles, vec!["Atlas".to_string()], "October is out of Today");
+}
+
+/// SR-4: the selected block's preview carries its path, state and children, and moving
+/// the selection (arrow keys) reads the next block's preview.
+#[gpui::test]
+fn search_preview_follows_the_selection(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        let atlas = app.store.create_page("Atlas").unwrap();
+        let risks = app.store.ensure_first_block(&atlas).unwrap();
+        app.store
+            .set_block_text(&atlas, &risks, "Risks", None, None)
+            .unwrap();
+        app.store.commit_block(&atlas, &risks).unwrap();
+        for text in ["zebra migration", "zebra budget"] {
+            let plan = utopia_core::outline::append_block(
+                app.store.page_state(&atlas).unwrap(),
+                Some(&risks),
+            );
+            let b = app
+                .store
+                .execute_plan(&atlas, plan, None)
+                .unwrap()
+                .unwrap()
+                .block;
+            app.store
+                .set_block_text(&atlas, &b, text, None, None)
+                .unwrap();
+            app.store.commit_block(&atlas, &b).unwrap();
+        }
+        app.store.sync_index().unwrap();
+    });
+    // A page row selected in quick jump has no block to preview.
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("quick jump is open");
+    assert!(jump.read_with(cx, |j, _| j.preview().is_none()));
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("search is open");
+    let first = jump
+        .read_with(cx, |j, _| j.preview().cloned())
+        .expect("the first hit is a block, so it has a preview");
+    assert!(
+        cx.debug_bounds("search-preview-state").is_some(),
+        "the preview names the block's state"
+    );
+    assert_eq!(first.page_title, "Atlas");
+    assert_eq!(
+        first
+            .path
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Risks"],
+        "the block's path from the root"
+    );
+    assert_eq!(first.child_count, 0);
+    assert_eq!(
+        utopia_core::inline::plain_text(&first.text),
+        "zebra budget",
+        "the newest block is selected first"
+    );
+    let preview = cx.debug_bounds("search-preview").expect("the pane");
+    let results = cx.debug_bounds("jump-results").expect("the list");
+    assert!(
+        preview.origin.x >= results.origin.x + results.size.width,
+        "the preview is beside the list: {preview:?} {results:?}"
+    );
+
+    // Down moves to the other hit and the preview follows it.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    let second = jump
+        .read_with(cx, |j, _| j.preview().cloned())
+        .expect("the second hit is a block too");
+    assert_eq!(
+        utopia_core::inline::plain_text(&second.text),
+        "zebra migration"
+    );
+    assert_eq!(second.path.len(), 1, "still under Risks");
+    assert_ne!(first.block, second.block);
+}
+
+/// SR-5: Cmd+K and Cmd+Shift+F open the same palette. Pages come first, then grouped
+/// blocks; Cmd+K selects the page, Cmd+Shift+F the first block.
+#[gpui::test]
+fn one_palette_opens_on_pages_or_blocks(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        let page = app.store.create_page("Zebra Notes").unwrap();
+        let b = app.store.ensure_first_block(&page).unwrap();
+        app.store
+            .set_block_text(&page, &b, "zebra in the wild", None, None)
+            .unwrap();
+        app.store.commit_block(&page, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+
+    // Cmd+K: pages first, and the selection starts on the page (no block to preview).
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("quick jump is open");
+    assert!(
+        jump.read_with(cx, |j, _| j.preview().is_none()),
+        "Cmd+K opens on the page row"
+    );
+    let page_row = cx.debug_bounds("qj-row-0").expect("the page row");
+    let group = cx
+        .debug_bounds("search-group-0")
+        .expect("the block result is grouped below the pages");
+    assert!(
+        group.origin.y > page_row.origin.y,
+        "pages come first, then blocks: {page_row:?} {group:?}"
+    );
+
+    // Down steps over the group header to the block. Cmd+K is a jump list, so it does
+    // not open the search preview (SR-4 belongs to the search dialog).
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert!(
+        jump.read_with(cx, |j, _| j.preview().is_none()),
+        "quick jump opens blocks without a preview pane"
+    );
+
+    // Cmd+Shift+F is the same palette, opened on the first block.
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("search is open");
+    let preview = jump
+        .read_with(cx, |j, _| j.preview().cloned())
+        .expect("Cmd+Shift+F opens on the block");
+    assert_eq!(preview.page_title, "Zebra Notes");
+    assert!(
+        !jump.read_with(cx, |j, _| j.offers_create()),
+        "block search lists existing blocks, it does not offer to create a page"
+    );
+}
+
+/// SR-2's decision: when a page name wraps to two lines, the group's icon stays on the
+/// top line with the first line of the name, not centred against both.
+#[gpui::test]
+fn group_icon_stays_on_the_top_line_when_a_name_wraps(cx: &mut TestAppContext) {
+    let (app, _ws, cx) = setup(cx);
+    let long = "Atlas Launch Coordination Notes for the Beta Programme, Migration Planning and \
+                the Twenty Testers Invited by Hand";
+    app.update(cx, |app, _| {
+        let page = app.store.create_page(long).unwrap();
+        let b = app.store.ensure_first_block(&page).unwrap();
+        app.store
+            .set_block_text(&page, &b, "zebra crossing", None, None)
+            .unwrap();
+        app.store.commit_block(&page, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let icon = cx
+        .debug_bounds("search-group-icon-0")
+        .expect("the group icon");
+    let title = cx
+        .debug_bounds("search-group-title-0")
+        .expect("the page name");
+    assert!(
+        title.size.height >= gpui::px(36.),
+        "the name wraps onto two lines: {title:?}"
+    );
+    assert!(
+        (f32::from(icon.origin.y) - f32::from(title.origin.y)).abs() < 1.5,
+        "the icon aligns with the first line: {icon:?} {title:?}"
+    );
+}
+
+/// SR-3: the scope chips filter page-title rows too, not only the grouped blocks. The
+/// separately inserted date match is filtered the same way.
+#[gpui::test]
+fn search_scope_filters_page_titles(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let day = today();
+    let day_title = app.update(cx, |app, _| {
+        let page = app.store.create_page("Atlas November").unwrap();
+        let b = app.store.ensure_first_block(&page).unwrap();
+        app.store
+            .set_block_text(&page, &b, "zebra plan", None, None)
+            .unwrap();
+        app.store.commit_block(&page, &b).unwrap();
+        let (d, db) = app.store.open_daily(day).unwrap();
+        app.store
+            .set_block_text(&d, &db, "zebra day", None, None)
+            .unwrap();
+        app.store.commit_block(&d, &db).unwrap();
+        app.store.sync_index().unwrap();
+        app.store.page_row(&d).unwrap().unwrap().title
+    });
+
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("november");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("search is open");
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.page_titles()),
+        vec![day_title.clone(), "Atlas November".to_string()],
+        "All shows both the page and the day"
+    );
+
+    let journal = cx
+        .debug_bounds("search-scope-journal")
+        .expect("the Journal chip");
+    cx.simulate_click(journal.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.page_titles()),
+        vec![day_title.clone()],
+        "Journal keeps the day and drops the ordinary page"
+    );
+
+    let pages = cx
+        .debug_bounds("search-scope-pages")
+        .expect("the Pages chip");
+    cx.simulate_click(pages.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.page_titles()),
+        vec!["Atlas November".to_string()],
+        "Pages keeps the ordinary page and drops the day"
+    );
+    assert!(
+        ws.read_with(cx, |w, _| w.jump_palette().is_some()),
+        "the palette is open after the Pages click"
+    );
+
+    let todos = cx
+        .debug_bounds("search-scope-to-dos")
+        .expect("the To-dos chip");
+    cx.simulate_click(todos.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        jump.read_with(cx, |j, _| j.page_titles()).is_empty(),
+        "a page title is not a to-do"
+    );
+
+    // The parser also inserts a date hit that fuzzy titles never matched; it obeys the
+    // same scope.
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("2026-11-02");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("search reopened");
+    assert!(
+        jump.read_with(cx, |j, _| j.page_titles())
+            .contains(&day_title),
+        "the ISO date resolves to the day in All"
+    );
+    let pages = cx
+        .debug_bounds("search-scope-pages")
+        .expect("the Pages chip");
+    cx.simulate_click(pages.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        jump.read_with(cx, |j, _| j.page_titles()).is_empty(),
+        "Pages must not keep the inserted daily date"
+    );
+
+    // With no eligible row, Enter must not create a page outside the chosen scope.
+    cx.simulate_keystrokes("escape cmd-k");
+    cx.simulate_input("novelpage");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("quick jump reopened");
+    let journal = cx
+        .debug_bounds("search-scope-journal")
+        .expect("the Journal chip");
+    cx.simulate_click(journal.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.scope()),
+        utopia_store::SearchScope::Journal
+    );
+    assert!(
+        jump.read_with(cx, |j, _| j.page_titles()).is_empty(),
+        "Journal has no title row for a novel ordinary page"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        app.update(cx, |app, _| app
+            .store
+            .find_page("novelpage")
+            .unwrap()
+            .is_none()),
+        "Journal scope has no page to create"
+    );
+}
+
+/// SR-5: when page titles fill the results viewport, the block Cmd+Shift+F selects is
+/// scrolled into view; otherwise Enter opens a row the user cannot see.
+#[gpui::test]
+fn search_scrolls_the_selected_block_into_view(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        for i in 1..=12 {
+            app.store
+                .create_page(&format!("Zebra Page {i:02}"))
+                .unwrap();
+        }
+        let atlas = app.store.create_page("Atlas").unwrap();
+        let b = app.store.ensure_first_block(&atlas).unwrap();
+        app.store
+            .set_block_text(&atlas, &b, "zebra block", None, None)
+            .unwrap();
+        app.store.commit_block(&atlas, &b).unwrap();
+        app.store.sync_index().unwrap();
+    });
+    cx.simulate_keystrokes("escape cmd-shift-f");
+    cx.simulate_input("zebra");
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("search is open");
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.page_titles()).len(),
+        12,
+        "twelve page rows fill the viewport before the group"
+    );
+    let results = cx.debug_bounds("jump-results").expect("the results list");
+    let hit = cx
+        .debug_bounds("search-hit-0-0")
+        .expect("the selected block row");
+    assert!(
+        hit.origin.y >= results.origin.y - gpui::px(0.5)
+            && hit.origin.y + hit.size.height <= results.bottom() + gpui::px(0.5),
+        "the selected block is visible in the list: {hit:?} {results:?}"
+    );
+}
+
+/// LR-4/rule 10: a keystroke rebuild must not re-run the reference-children queries.
+/// Only a new index version (or a display change) needs new children; before the cache,
+/// every render of a page with backlinks issued two SQL queries per referencing block.
+#[gpui::test]
+fn typing_does_not_requery_reference_children(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (target, first) = app.update(cx, |app, _| {
+        let target = app.store.create_page("Target").unwrap();
+        let first = app.store.ensure_first_block(&target).unwrap();
+        let source = app.store.create_page("Source").unwrap();
+        let b = app.store.ensure_first_block(&source).unwrap();
+        app.store
+            .set_block_text(&source, &b, "see [[Target]]", None, None)
+            .unwrap();
+        app.store.commit_block(&source, &b).unwrap();
+        let plan =
+            utopia_core::outline::append_block(app.store.page_state(&source).unwrap(), Some(&b));
+        let child = app
+            .store
+            .execute_plan(&source, plan, None)
+            .unwrap()
+            .unwrap()
+            .block;
+        app.store
+            .set_block_text(&source, &child, "a child of the reference", None, None)
+            .unwrap();
+        app.store.commit_block(&source, &child).unwrap();
+        app.store.sync_index().unwrap();
+        (target, first)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(target, None, Some(first), false, window, cx)
+    });
+    cx.run_until_parked();
+    let view = ws.read_with(cx, |w, _| w.main_view());
+    let before = view.read_with(cx, |v, _| v.ref_children_queries());
+    assert!(before > 0, "the first build reads the children it shows");
+    let version = app.read_with(cx, |a, _| a.refs_version);
+
+    cx.simulate_input("x");
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |a, _| a.refs_version),
+        version,
+        "the edit has not reached the index yet"
+    );
+    let after = view.read_with(cx, |v, _| v.ref_children_queries());
+    assert_eq!(
+        after, before,
+        "a keystroke rebuild reuses the children for this refs_version"
+    );
+}
+
 #[gpui::test]
 fn full_search_and_quick_capture(cx: &mut TestAppContext) {
     let (app, ws, cx) = setup(cx);

@@ -684,3 +684,30 @@ fn export_snapshot_is_written_off_the_store() {
         );
     }
 }
+
+/// SB-2: a widely used tag on an edited page must not be reclassified on every flush.
+/// Editing a block that has no references leaves every incoming `#tag` edge untouched;
+/// only the page the job wrote needs its (cheap) classification check.
+#[test]
+fn unrelated_edits_do_not_reclassify_a_busy_tag() {
+    let (mut s, _d) = store();
+    let notes = s.create_page("Notes").unwrap();
+    write(&mut s, &notes, "a standing tag #todo");
+    for i in 0..40 {
+        let page = s.create_page(&format!("Task {i}")).unwrap();
+        write(&mut s, &page, "another #todo task");
+    }
+    let unrelated = write(&mut s, &notes, "an unrelated note");
+    s.sync_index().unwrap();
+    let before = s.tag_page_classifications();
+
+    s.set_block_text(&notes, &unrelated, "an unrelated note, edited", None, None)
+        .unwrap();
+    s.commit_block(&notes, &unrelated).unwrap();
+    s.sync_index().unwrap();
+    assert_eq!(
+        s.tag_page_classifications(),
+        before + 1,
+        "only the written page is classified; the tag's graph-wide refs are not rescanned"
+    );
+}

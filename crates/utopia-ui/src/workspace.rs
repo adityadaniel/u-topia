@@ -448,6 +448,12 @@ impl Workspace {
         self.editor.clone()
     }
 
+    /// The main pane's view, for debug-only probes (query counts).
+    #[cfg(debug_assertions)]
+    pub fn main_view(&self) -> Entity<PageView> {
+        self.main.clone()
+    }
+
     /// The page shown in the main pane.
     pub fn main_page(&self, cx: &gpui::App) -> Option<PageId> {
         self.main.read(cx).page.clone()
@@ -868,6 +874,11 @@ impl Workspace {
 
     pub fn graph_view(&self) -> Option<Entity<GraphView>> {
         self.graph.clone()
+    }
+
+    /// The open palette, for tests that read the results it is showing.
+    pub fn jump_palette(&self) -> Option<Entity<JumpPalette>> {
+        self.jump.as_ref().map(|(j, _)| j.clone())
     }
 
     /// Full-text search with `text` already typed (`utopia://search`).
@@ -2030,22 +2041,36 @@ impl Render for Workspace {
                 .id("jump-overlay")
                 .absolute()
                 .size_full()
-                .flex()
-                .justify_center()
-                .pt(px(90.))
-                .bg(th.scrim)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.jump = None;
-                        window.focus(&this.focus);
-                        cx.notify();
-                    }),
+                // The scrim is a sibling behind the palette, not its background: a menu
+                // deferred out of the palette (the age menu) must not be dismissed by the
+                // same click that chooses an item.
+                .child(
+                    div()
+                        .id("jump-scrim")
+                        .absolute()
+                        .size_full()
+                        .bg(th.scrim)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.jump = None;
+                                window.focus(&this.focus);
+                                cx.notify();
+                            }),
+                        ),
                 )
                 .child(
                     div()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(j.clone()),
+                        .absolute()
+                        .size_full()
+                        .flex()
+                        .justify_center()
+                        .pt(px(90.))
+                        .child(
+                            div()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(j.clone()),
+                        ),
                 )
         });
         let _ = window;

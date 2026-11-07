@@ -221,6 +221,192 @@ pub struct BlockHit {
     pub page: PageId,
     pub page_title: String,
     pub text: String,
+    /// Byte ranges of the matched terms in the plain text the UI draws (SR-1).
+    pub anchors: Vec<(usize, usize)>,
+}
+
+/// Search results for one page or day (SR-2): the header's name and count, then its blocks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockGroup {
+    pub page: PageId,
+    pub title: String,
+    pub daily: bool,
+    pub hits: Vec<BlockHit>,
+}
+
+/// One child of a previewed block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewChild {
+    pub block: BlockId,
+    pub text: String,
+    pub kind: BlockKind,
+    pub checked: bool,
+}
+
+/// The selected search result, in full (SR-4): its source text, path from the root, state
+/// and first few children. Read in the palette's handler, never in `render` (rule 10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockPreview {
+    pub block: BlockId,
+    pub page: PageId,
+    pub page_title: String,
+    pub daily: bool,
+    pub text: String,
+    pub kind: BlockKind,
+    pub checked: bool,
+    pub updated_at: i64,
+    /// Ancestors, root first. The page title is `page_title`, not part of this list.
+    pub path: Vec<(BlockId, String)>,
+    pub children: Vec<PreviewChild>,
+    pub child_count: usize,
+}
+
+/// Where a search may look (SR-3). The chips under the field: All · Journal · Pages · To-dos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum SearchScope {
+    #[default]
+    All,
+    /// Blocks on daily pages.
+    Journal,
+    /// Blocks on ordinary pages.
+    Pages,
+    /// To-do blocks, done and not done.
+    Todos,
+}
+
+impl SearchScope {
+    pub const ALL: &'static [SearchScope] = &[
+        SearchScope::All,
+        SearchScope::Journal,
+        SearchScope::Pages,
+        SearchScope::Todos,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchScope::All => "All",
+            SearchScope::Journal => "Journal",
+            SearchScope::Pages => "Pages",
+            SearchScope::Todos => "To-dos",
+        }
+    }
+
+    /// The SQL condition on `block b` / `page p` for this scope.
+    fn condition(self) -> &'static str {
+        match self {
+            SearchScope::All => "1",
+            SearchScope::Journal => "p.kind='daily'",
+            SearchScope::Pages => "p.kind='page'",
+            SearchScope::Todos => "b.block_type='todo'",
+        }
+    }
+}
+
+/// How far back a search looks (SR-3's "Any time" menu). Daily hits are dated by their
+/// day; other blocks by the local date of their last edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum SearchAge {
+    #[default]
+    AnyTime,
+    Today,
+    Week,
+    Month,
+    Year,
+}
+
+impl SearchAge {
+    pub const ALL: &'static [SearchAge] = &[
+        SearchAge::AnyTime,
+        SearchAge::Today,
+        SearchAge::Week,
+        SearchAge::Month,
+        SearchAge::Year,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchAge::AnyTime => "Any time",
+            SearchAge::Today => "Today",
+            SearchAge::Week => "Past week",
+            SearchAge::Month => "Past month",
+            SearchAge::Year => "Past year",
+        }
+    }
+
+    /// First day that still counts, `today - n` for the windows (both ends included).
+    pub fn since(self, today: NaiveDate) -> Option<NaiveDate> {
+        let back = |n: u64| today.checked_sub_days(chrono::Days::new(n));
+        match self {
+            SearchAge::AnyTime => None,
+            SearchAge::Today => Some(today),
+            SearchAge::Week => back(6),
+            SearchAge::Month => back(29),
+            SearchAge::Year => back(364),
+        }
+    }
+
+    /// Last day that still counts: today for every window, `None` for Any time. A future
+    /// daily page is reachable by navigation, so it must not pass "Today" or "Past week".
+    pub fn until(self, today: NaiveDate) -> Option<NaiveDate> {
+        match self {
+            SearchAge::AnyTime => None,
+            _ => Some(today),
+        }
+    }
+}
+
+/// Byte ranges in `plain` matched by `query`'s terms, for search highlighting (SR-1).
+///
+/// FTS5 picks *which* blocks match; this locates the same prefix terms in the plain text
+/// the result row shows. Matching the drawn text rather than the source markup means a
+/// range can never point into `[[brackets]]` the renderer drops. Terms start at a word
+/// boundary and match case-insensitively, like the index's `unicode61` tokenizer; a term
+/// longer than the word it starts in does not match. The range covers the whole word, not
+/// just the typed prefix, because the wash marks matched words (SR-1). Diacritics are not
+/// folded here.
+pub fn match_anchors(plain: &str, query: &str) -> Vec<(usize, usize)> {
+    let terms: Vec<Vec<char>> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.chars().collect())
+        .collect();
+    let chars: Vec<(usize, char)> = plain.char_indices().collect();
+    let fold = |a: char, b: char| a.to_lowercase().eq(b.to_lowercase());
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for term in &terms {
+        for (i, &(start, first)) in chars.iter().enumerate() {
+            if i > 0 && chars[i - 1].1.is_alphanumeric() {
+                continue; // must start a word, as the tokenizer does
+            }
+            if !fold(first, term[0]) {
+                continue;
+            }
+            let fits = term
+                .iter()
+                .enumerate()
+                .all(|(k, &c)| chars.get(i + k).is_some_and(|&(_, h)| fold(h, c)));
+            if !fits {
+                continue;
+            }
+            let end = {
+                let mut k = i + term.len();
+                while chars.get(k).is_some_and(|&(_, c)| c.is_alphanumeric()) {
+                    k += 1;
+                }
+                chars.get(k).map_or(plain.len(), |&(off, _)| off)
+            };
+            out.push((start, end));
+        }
+    }
+    out.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in out {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -263,6 +449,16 @@ pub fn fuzzy_score(needle: &str, hay: &str) -> Option<i64> {
         }
     }
     Some(score - hay.len() as i64)
+}
+
+/// How many children the search preview lists before "+N more" (SR-4).
+pub const PREVIEW_CHILDREN: usize = 6;
+
+/// A raw search row before grouping or truncation: the hit plus the day an age window
+/// is measured against.
+struct SearchRow {
+    hit: BlockHit,
+    daily: Option<NaiveDate>,
 }
 
 impl Store {
@@ -492,45 +688,212 @@ impl Store {
 
     /// Block search for `((` autocomplete (FR-4.2): FTS5 prefix match over live bodies.
     pub fn search_blocks(&self, query: &str, limit: usize) -> Result<Vec<BlockHit>> {
+        self.search_blocks_filtered(query, SearchScope::All, SearchAge::AnyTime, limit)
+    }
+
+    /// Block search through the scope and age chips (SR-3). The scope narrows the SQL
+    /// query; the age window is applied to the hit's day (a daily page's date, or the
+    /// local date of the block's last edit) before the limit cuts the list.
+    pub fn search_blocks_filtered(
+        &self,
+        query: &str,
+        scope: SearchScope,
+        age: SearchAge,
+        limit: usize,
+    ) -> Result<Vec<BlockHit>> {
+        Ok(self
+            .search_raw(query, scope, age, limit)?
+            .into_iter()
+            .map(|r| r.hit)
+            .collect())
+    }
+
+    fn search_raw(
+        &self,
+        query: &str,
+        scope: SearchScope,
+        age: SearchAge,
+        limit: usize,
+    ) -> Result<Vec<SearchRow>> {
         self.read_barrier()?;
         let terms: Vec<String> = query
             .split(|c: char| !c.is_alphanumeric())
             .filter(|t| !t.is_empty())
             .map(|t| format!("\"{}\"*", t.replace('"', "")))
             .collect();
-        let sql_recent =
-            "SELECT b.id, b.page_id, p.title, b.text FROM block b JOIN page p ON p.id=b.page_id
-             WHERE b.deleted_at IS NULL AND b.text <> '' ORDER BY b.updated_at DESC LIMIT ?1";
         let map = |r: &Row<'_>| {
-            Ok(BlockHit {
-                block: BlockId(r.get(0)?),
-                page: PageId(r.get(1)?),
-                page_title: r.get(2)?,
-                text: r.get(3)?,
+            let text: String = r.get(3)?;
+            Ok(SearchRow {
+                hit: BlockHit {
+                    block: BlockId(r.get(0)?),
+                    page: PageId(r.get(1)?),
+                    page_title: r.get(2)?,
+                    anchors: match_anchors(&plain_text(&text), query),
+                    text,
+                },
+                daily: r
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|d| utopia_core::date::parse_iso(&d)),
             })
         };
-        if terms.is_empty() {
-            let mut stmt = self.conn.prepare(sql_recent)?;
+        // The age window is part of the query, not a filter applied after the limit: a
+        // handful of old matches must never push an eligible one out of the candidates.
+        // Daily hits are dated by their day, other blocks by the local date of their last
+        // edit (the same day `RefQuery::since` uses).
+        let today = self.today();
+        let since = age.since(today).map(|d| d.to_string());
+        let until = age.until(today).map(|d| d.to_string());
+        let fetch = (limit.max(1) * 10) as i64;
+        let window = "AND (:since IS NULL
+                        OR COALESCE(p.daily_date,
+                             date(b.updated_at / 1000, 'unixepoch', 'localtime')) >= :since)
+                     AND (:until IS NULL
+                        OR COALESCE(p.daily_date,
+                             date(b.updated_at / 1000, 'unixepoch', 'localtime')) <= :until)";
+        let mut rows = if terms.is_empty() {
+            let sql = format!(
+                "SELECT b.id, b.page_id, p.title, b.text, p.daily_date
+                 FROM block b JOIN page p ON p.id=b.page_id
+                 WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL AND b.text <> ''
+                   AND {} {window} ORDER BY b.updated_at DESC LIMIT :limit",
+                scope.condition()
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt
-                .query_map([limit as i64], map)?
+                .query_map(
+                    rusqlite::named_params! {
+                        ":since": since,
+                        ":until": until,
+                        ":limit": fetch,
+                    },
+                    map,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            return Ok(rows);
-        }
-        // Newest matches first, straight off the FTS doclist (no scoring of every match,
-        // which is what made common terms slow); then prefer blocks containing the whole
-        // query as typed.
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT f.block_id, b.page_id, p.title, b.text FROM block_fts f
-             JOIN block b ON b.rowid=f.rowid JOIN page p ON p.id=b.page_id
-             WHERE block_fts MATCH ?1 ORDER BY f.rowid DESC LIMIT ?2",
-        )?;
-        let mut rows = stmt
-            .query_map(params![terms.join(" "), (limit.max(1) * 10) as i64], map)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let needle = query.trim().to_lowercase();
-        rows.sort_by_key(|h| !h.text.to_lowercase().contains(&needle));
+            rows
+        } else {
+            // Newest matches first, straight off the FTS doclist (no scoring of every
+            // match, which is what made common terms slow); then prefer blocks containing
+            // the whole query as typed.
+            let sql = format!(
+                "SELECT f.block_id, b.page_id, p.title, b.text, p.daily_date
+                 FROM block_fts f
+                 JOIN block b ON b.rowid=f.rowid JOIN page p ON p.id=b.page_id
+                 WHERE block_fts MATCH :q AND b.deleted_at IS NULL AND p.deleted_at IS NULL
+                   AND {} {window} ORDER BY f.rowid DESC LIMIT :limit",
+                scope.condition()
+            );
+            let mut stmt = self.conn.prepare_cached(&sql)?;
+            let mut rows = stmt
+                .query_map(
+                    rusqlite::named_params! {
+                        ":q": terms.join(" "),
+                        ":since": since,
+                        ":until": until,
+                        ":limit": fetch,
+                    },
+                    map,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let needle = query.trim().to_lowercase();
+            rows.sort_by_key(|h| !h.hit.text.to_lowercase().contains(&needle));
+            rows
+        };
         rows.truncate(limit);
         Ok(rows)
+    }
+
+    /// Block search grouped under the page or day each hit lives on (SR-2, SR-3). Groups
+    /// keep the order of their best hit, so the newest page stays first; hits inside a
+    /// group keep the flat search order.
+    pub fn search_groups(&self, query: &str, limit: usize) -> Result<Vec<BlockGroup>> {
+        self.search_groups_filtered(query, SearchScope::All, SearchAge::AnyTime, limit)
+    }
+
+    /// [`Store::search_groups`] through the scope and age chips (SR-3).
+    pub fn search_groups_filtered(
+        &self,
+        query: &str,
+        scope: SearchScope,
+        age: SearchAge,
+        limit: usize,
+    ) -> Result<Vec<BlockGroup>> {
+        let rows = self.search_raw(query, scope, age, limit)?;
+        let mut groups: Vec<BlockGroup> = Vec::new();
+        let mut index: HashMap<PageId, usize> = HashMap::new();
+        for row in rows {
+            let hit = row.hit;
+            if let Some(&i) = index.get(&hit.page) {
+                groups[i].hits.push(hit);
+                continue;
+            }
+            index.insert(hit.page.clone(), groups.len());
+            groups.push(BlockGroup {
+                page: hit.page.clone(),
+                title: hit.page_title.clone(),
+                daily: row.daily.is_some(),
+                hits: vec![hit],
+            });
+        }
+        Ok(groups)
+    }
+
+    /// The block behind a search result, with its path, state and first children (SR-4).
+    /// Returns `None` for a tombstone or a block that is not in the index.
+    pub fn preview_block(&self, block: &BlockId) -> Result<Option<BlockPreview>> {
+        let Some(row) = self.block_row(block)? else {
+            return Ok(None);
+        };
+        let Some(page) = self.page_row(&row.page_id)? else {
+            return Ok(None);
+        };
+        if row.deleted_at.is_some() || page.deleted_at.is_some() {
+            return Ok(None);
+        }
+        let path = match &row.parent_id {
+            Some(parent) => self
+                .ancestry(&mut HashMap::new(), parent.as_str())?
+                .into_iter()
+                .map(|(id, text, _)| (BlockId(id), plain_text(&text)))
+                .collect(),
+            None => Vec::new(),
+        };
+        let map_child = |r: &Row<'_>| {
+            Ok(PreviewChild {
+                block: BlockId(r.get(0)?),
+                text: r.get(1)?,
+                kind: BlockKind::from_parts(
+                    &r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?.map(|l| l as u8),
+                ),
+                checked: r.get(4)?,
+            })
+        };
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, text, block_type, heading_level, checked FROM block
+             WHERE parent_id=?1 AND deleted_at IS NULL ORDER BY position LIMIT ?2",
+        )?;
+        let children = stmt
+            .query_map(params![block.as_str(), PREVIEW_CHILDREN as i64], map_child)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let child_count: i64 = self.conn.query_row(
+            "SELECT count(*) FROM block WHERE parent_id=?1 AND deleted_at IS NULL",
+            [block.as_str()],
+            |r| r.get(0),
+        )?;
+        let daily = page.is_daily();
+        Ok(Some(BlockPreview {
+            block: block.clone(),
+            page: page.id.clone(),
+            page_title: page.title,
+            daily,
+            text: row.text,
+            kind: row.kind,
+            checked: row.checked,
+            updated_at: row.updated_at,
+            path,
+            children,
+            child_count: child_count as usize,
+        }))
     }
 
     /// Status of a `((uid))` target, including tombstones (§10.3.1).
@@ -1012,25 +1375,6 @@ pub(crate) fn classify_tag_page(conn: &Connection, page: &PageId) -> Result<Opti
         }
     }
     Ok(Some(any && all_tags))
-}
-
-/// Pages referenced by any block of `sources` right now (SB-2): a commit can change the
-/// classification of these, so the writer updates just their entries.
-pub(crate) fn dst_pages_of_sources(
-    conn: &Connection,
-    sources: &[PageId],
-) -> Result<HashSet<PageId>> {
-    let mut out = HashSet::new();
-    let mut stmt = conn.prepare_cached(
-        "SELECT DISTINCT dst_page_id FROM ref
-         WHERE src_page_id=?1 AND dst_kind='page' AND dst_page_id IS NOT NULL",
-    )?;
-    for page in sources {
-        for row in stmt.query_map([page.as_str()], |r| r.get::<_, String>(0))? {
-            out.insert(PageId(row?));
-        }
-    }
-    Ok(out)
 }
 
 /// Whether anything references `page` at all (SB-2): a published tag page whose last

@@ -37,15 +37,13 @@ pub(crate) struct Job {
 
 /// Write one job in one transaction (§11.2: shard, outbox and projections together).
 ///
-/// Returns the pages the written pages referenced *before* this job. A reference the job
-/// removes is gone from the index once the transaction commits, so this is the last chance
-/// to know its destination: without it a page that stops being `[[linked]]` (and so becomes
-/// hashtag-only) would keep its old classification (SB-2).
+/// Returns the destination pages whose reference edges this job added or removed. Only
+/// those, plus the pages the job wrote, can change tag-page classification; a destination
+/// whose edges are untouched (a widely used `#todo` on an edited page) needs no rescan
+/// (SB-2).
 pub(crate) fn write_job(conn: &mut Connection, job: &Job) -> Result<HashSet<PageId>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut work = ResolutionWork::default();
-    let written: Vec<PageId> = job.pages.iter().map(|p| p.page.clone()).collect();
-    let referenced_before = crate::query::dst_pages_of_sources(&tx, &written)?;
     {
         let projector = Projector {
             conn: &tx,
@@ -65,7 +63,7 @@ pub(crate) fn write_job(conn: &mut Connection, job: &Job) -> Result<HashSet<Page
         let mut blocks: Vec<(&PageJob, bool)> = order.iter().copied().zip(flips).collect();
         blocks.sort_by_key(|(p, _)| p.state.meta.deleted_at.is_some());
         for (p, flip) in &blocks {
-            projector.project_blocks(&p.state, p.delta.as_ref(), *flip)?;
+            projector.project_blocks(&p.state, p.delta.as_ref(), *flip, &mut work)?;
         }
         for p in order {
             if let Some((snap, frontier)) = &p.snapshot {
@@ -99,10 +97,10 @@ pub(crate) fn write_job(conn: &mut Connection, job: &Job) -> Result<HashSet<Page
                 )?;
             }
         }
-        projector.reresolve(&work)?;
+        projector.reresolve(&mut work)?;
     }
     tx.commit()?;
-    Ok(referenced_before)
+    Ok(work.changed)
 }
 
 #[derive(Default)]
@@ -121,6 +119,8 @@ pub(crate) struct Shared {
     /// How many whole-graph classifications this writer has run. Only the first commit
     /// needs one; later commits update the pages they can affect (SB-2).
     tag_scans: std::sync::atomic::AtomicU64,
+    /// How many per-page classifications the incremental path ran (tests, SB-2).
+    tag_classifications: std::sync::atomic::AtomicU64,
 }
 
 impl Shared {
@@ -129,7 +129,7 @@ impl Shared {
     /// pages whose last reference went away can change; everything else keeps its entry, so
     /// no commit has to re-tokenize the whole graph. The first commit (before there is a
     /// set) classifies once. A failure leaves the previous set in place.
-    fn publish_tag_pages(&self, conn: &Connection, job: &Job, referenced_before: &HashSet<PageId>) {
+    fn publish_tag_pages(&self, conn: &Connection, job: &Job, changed_refs: &HashSet<PageId>) {
         let mut slot = match self.tag_pages.lock() {
             Ok(slot) => slot,
             Err(_) => return,
@@ -145,16 +145,9 @@ impl Shared {
         };
         let written: Vec<PageId> = job.pages.iter().map(|p| p.page.clone()).collect();
         let mut affected: HashSet<PageId> = written.iter().cloned().collect();
-        // A destination the job stopped referencing may now be hashtag-only: `alpha` with
-        // both `#alpha` and `[[alpha]]` was a page, and removing the link must promote it.
-        affected.extend(referenced_before.iter().cloned());
-        match crate::query::dst_pages_of_sources(conn, &written) {
-            Ok(referenced) => affected.extend(referenced),
-            Err(e) => {
-                eprintln!("utopia: tag pages: {e}");
-                return;
-            }
-        }
+        // Only destinations whose reference edges changed can flip classification. The
+        // pages a job wrote are included above; unchanged refs on them are not rescanned.
+        affected.extend(changed_refs.iter().cloned());
         // A published page can only lose a reference through a page this commit wrote. If
         // it has no references at all now, it cannot be a tag page any more.
         for page in set.iter() {
@@ -173,6 +166,8 @@ impl Shared {
             }
         }
         for page in affected {
+            self.tag_classifications
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match crate::query::classify_tag_page(conn, &page) {
                 Ok(Some(true)) => {
                     set.insert(page);
@@ -336,6 +331,17 @@ impl Persister {
             Persister::Thread { shared, .. } => shared,
         };
         shared.tag_pages.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// How many per-page tag classifications the incremental path has run (tests, SB-2).
+    pub fn tag_classifications(&self) -> u64 {
+        let shared = match self {
+            Persister::Inline { shared } => shared,
+            Persister::Thread { shared, .. } => shared,
+        };
+        shared
+            .tag_classifications
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// How many whole-graph tag classifications this writer has run (tests, SB-2).

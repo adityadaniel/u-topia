@@ -5,7 +5,10 @@
 //! free text). In page mode it has a useful empty state — today, yesterday and the pages
 //! opened last (QJ-1) — labelled rows with an icon per type (QJ-2), the typed letters in
 //! semibold (QJ-4), a footer of key hints (QJ-3), and, after a leading `>`, the actions
-//! from [`crate::actions::CATALOG`] with their keys (QJ-5).
+//! from [`crate::actions::CATALOG`] with their keys (QJ-5). A query also lists block hits
+//! grouped under their page or day (SR-2), with scope and age chips (SR-3), the matched
+//! words washed (SR-1) and a preview of the selected block (SR-4); page mode starts on the
+//! first page, search on the first block (SR-5).
 //!
 //! All of this is view state. Rows come from the index (`Store::search_titles`,
 //! `Store::tag_pages`) when the query changes, never while painting (rule 3), and nothing
@@ -16,18 +19,19 @@ use std::ops::Range;
 
 use chrono::NaiveDate;
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Context, Entity, EventEmitter, FontWeight,
-    HighlightStyle, MouseButton, MouseDownEvent, ScrollHandle, StyledText, Subscription, Window,
+    anchored, deferred, div, point, prelude::*, px, AnyElement, App, Context, Corner, Entity,
+    EventEmitter, FontWeight, HighlightStyle, MouseButton, MouseDownEvent, ScrollHandle,
+    StyledText, Subscription, Window,
 };
 use utopia_core::title::normalize_title;
 use utopia_core::{BlockId, PageId};
-use utopia_store::{BlockHit, TitleHit};
+use utopia_store::{BlockGroup, BlockHit, BlockPreview, SearchAge, SearchScope, TitleHit};
 
 use crate::actions::{active_keys, pretty_keys, ActionDoc, CATALOG};
 use crate::app_state::AppState;
 use crate::editor::BlockEditor;
 use crate::line_input::{LineInput, LineInputEvent};
-use crate::theme::{theme, Theme, CAPTION_SIZE, CONTROL_SIZE};
+use crate::theme::{quiet_control, quiet_menu, theme, Theme, CAPTION_SIZE, CONTROL_SIZE};
 
 /// How many pages the empty state offers after today and yesterday (QJ-1).
 pub const RECENT_ROWS: usize = 8;
@@ -44,9 +48,97 @@ pub enum QjItem {
         label: &'static str,
     },
     Create(String),
-    Block(BlockHit),
     /// An action from [`CATALOG`], listed after a leading `>` (QJ-5).
     Command(&'static ActionDoc),
+}
+
+/// One line in the scrollable list. Page/day/command/create rows come from `results`;
+/// block hits are appended under their page group (SR-2), and the Create row stays last
+/// (QJ-2). Arrow keys step over group headers.
+#[derive(Debug, Clone)]
+enum Row {
+    Item(usize),
+    Group { group: usize },
+    Block { group: usize, hit: usize },
+}
+
+impl Row {
+    fn selectable(&self) -> bool {
+        !matches!(self, Row::Group { .. })
+    }
+}
+
+/// Whether the selected scope may list a page title (SR-3): Journal is days only, Pages
+/// is ordinary pages only, To-dos is blocks only, All is everything.
+fn scope_keeps_page(scope: SearchScope, daily: bool) -> bool {
+    match scope {
+        SearchScope::All => true,
+        SearchScope::Journal => daily,
+        SearchScope::Pages => !daily,
+        SearchScope::Todos => false,
+    }
+}
+
+/// A block row's text with the matched terms on a soft accent wash (SR-1). The anchors
+/// come from the store, which computed them against this same plain text.
+fn marked(text: &str, anchors: &[(usize, usize)], th: &Theme) -> StyledText {
+    let highlights: Vec<(Range<usize>, HighlightStyle)> = anchors
+        .iter()
+        .filter(|(a, b)| {
+            a < b && *b <= text.len() && text.is_char_boundary(*a) && text.is_char_boundary(*b)
+        })
+        .map(|&(a, b)| {
+            (
+                a..b,
+                HighlightStyle {
+                    background_color: Some(th.accent.opacity(0.16)),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    StyledText::new(text.to_string()).with_highlights(highlights)
+}
+
+/// The page/day header of a result group: an icon on the top line, the name and the block
+/// count. `items_start` keeps the icon with the first line when a long title wraps (SR-2).
+fn group_header(group: usize, g: &BlockGroup, th: &Theme) -> gpui::Stateful<gpui::Div> {
+    let icon = if g.daily { "◷" } else { "▤" };
+    div()
+        .id(("search-group", group))
+        .debug_selector(move || format!("search-group-{group}"))
+        .flex()
+        .items_start()
+        .gap_2()
+        .px_3()
+        .pt_2()
+        .pb_1()
+        .child(
+            div()
+                .debug_selector(move || format!("search-group-icon-{group}"))
+                .w(px(14.))
+                .flex_none()
+                .text_color(th.muted)
+                .child(icon),
+        )
+        .child(
+            div()
+                .debug_selector(move || format!("search-group-title-{group}"))
+                .flex_1()
+                .min_w_0()
+                .text_color(th.text)
+                .child(g.title.clone()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .px_2()
+                .rounded_md()
+                .bg(th.chip_bg)
+                .text_size(px(CAPTION_SIZE))
+                .text_color(th.muted)
+                .child(format!("{}", g.hits.len())),
+        )
 }
 
 /// What a result row is. The palette draws one glyph and one type label per kind (QJ-2).
@@ -55,7 +147,6 @@ enum RowKind {
     Page,
     Day,
     Tag,
-    Block,
     Command,
     Create,
 }
@@ -67,7 +158,6 @@ impl RowKind {
             RowKind::Page => "page",
             RowKind::Day => "day",
             RowKind::Tag => "tag",
-            RowKind::Block => "block",
             RowKind::Command => "command",
             RowKind::Create => "create",
         }
@@ -79,7 +169,6 @@ impl RowKind {
             RowKind::Page => "Page",
             RowKind::Day => "Day",
             RowKind::Tag => "Tag",
-            RowKind::Block => "",
             RowKind::Command => "",
             RowKind::Create => "",
         }
@@ -124,6 +213,10 @@ pub struct JumpPalette {
     editor: Entity<BlockEditor>,
     pub input: Entity<LineInput>,
     results: Vec<QjItem>,
+    /// Block hits under their page or day (SR-2).
+    groups: Vec<BlockGroup>,
+    /// The combined draw/selection order: page rows, then grouped blocks, then Create.
+    rows: Vec<Row>,
     /// Ids among `results` that exist only because of a `#tag` (QJ-2).
     tags: HashSet<PageId>,
     /// The pages opened last, newest first, when this palette offers the empty state
@@ -136,6 +229,11 @@ pub struct JumpPalette {
     scroll: ScrollHandle,
     title: &'static str,
     mode: PaletteMode,
+    scope: SearchScope,
+    age: SearchAge,
+    age_menu: bool,
+    /// The selected block in full (SR-4), read when the selection moves.
+    preview: Option<BlockPreview>,
     _sub: Subscription,
 }
 
@@ -175,12 +273,18 @@ impl JumpPalette {
             editor,
             input,
             results: Vec::new(),
+            groups: Vec::new(),
+            rows: Vec::new(),
             tags: HashSet::new(),
             recent,
             selected: 0,
             scroll: ScrollHandle::new(),
             title,
             mode,
+            scope: SearchScope::default(),
+            age: SearchAge::default(),
+            age_menu: false,
+            preview: None,
             _sub: sub,
         };
         me.search("", cx);
@@ -188,62 +292,84 @@ impl JumpPalette {
     }
 
     fn search(&mut self, q: &str, cx: &mut Context<Self>) {
-        match self.mode {
-            PaletteMode::Capture | PaletteMode::Text => {
-                self.results.clear();
-                self.tags.clear();
-                cx.notify();
-                return;
-            }
-            PaletteMode::Search => {
-                let hits = if q.trim().is_empty() {
-                    Vec::new()
-                } else {
-                    self.app
-                        .read(cx)
-                        .store
-                        .search_blocks(q, 30)
-                        .unwrap_or_default()
-                };
-                self.results = hits.into_iter().map(QjItem::Block).collect();
-                self.tags.clear();
-                self.select_first();
-                cx.notify();
-                return;
-            }
-            PaletteMode::Pages => {}
-        }
-        // QJ-5: a leading `>` lists the command catalog instead of pages.
-        if let Some(rest) = q.strip_prefix('>') {
-            self.results = commands(rest, |d| active_keys(cx, d))
-                .into_iter()
-                .map(QjItem::Command)
-                .collect();
-            self.tags.clear();
-            self.select_first();
+        self.results.clear();
+        self.groups.clear();
+        self.rows.clear();
+        self.tags.clear();
+        self.preview = None;
+        if matches!(self.mode, PaletteMode::Capture | PaletteMode::Text) {
             cx.notify();
             return;
         }
-        // QJ-1: with nothing typed, offer today, yesterday and the pages opened last.
-        if q.trim().is_empty() {
-            self.results = self.empty_state(cx);
-            self.select_first();
-            self.rank_tags(cx);
+        // QJ-5: a leading `>` lists the command catalog instead of pages (page mode only).
+        if self.mode == PaletteMode::Pages {
+            if let Some(rest) = q.strip_prefix('>') {
+                self.results = commands(rest, |d| active_keys(cx, d))
+                    .into_iter()
+                    .map(QjItem::Command)
+                    .collect();
+                self.rebuild_rows();
+                self.select_initial();
+                cx.notify();
+                return;
+            }
+            // QJ-1: with nothing typed, offer today, yesterday and the pages opened last.
+            if q.trim().is_empty() {
+                self.results = self
+                    .empty_state(cx)
+                    .into_iter()
+                    .filter(|r| match r {
+                        QjItem::Day { .. } => scope_keeps_page(self.scope, true),
+                        QjItem::Page(h) => scope_keeps_page(self.scope, h.daily),
+                        _ => true,
+                    })
+                    .collect();
+                self.rebuild_rows();
+                self.select_initial();
+                self.rank_tags(cx);
+                cx.notify();
+                return;
+            }
+        }
+        // Search mode has no empty state: with nothing typed there is nothing to find.
+        if self.mode == PaletteMode::Search && q.trim().is_empty() {
             cx.notify();
             return;
         }
+        self.search_query(q, cx);
+        self.rebuild_rows();
+        self.select_initial();
+        self.rank_tags(cx);
+        self.load_preview(cx);
+        cx.notify();
+    }
+
+    /// Page titles and grouped block hits for a non-empty query (SR-5: pages first).
+    fn search_query(&mut self, q: &str, cx: &mut Context<Self>) {
         let store = &self.app.read(cx).store;
-        let hits = store.search_titles(q, 12).unwrap_or_default();
+        let all_hits = store.search_titles(q, 12).unwrap_or_default();
         let key = normalize_title(q);
-        let exact = hits.iter().any(|h| {
+        let exact = all_hits.iter().any(|h| {
             normalize_title(&h.title) == key
                 || h.alias.as_deref().map(normalize_title) == Some(key.clone())
         }) || store.find_page(q).ok().flatten().is_some();
-        let mut results: Vec<QjItem> = hits.into_iter().map(QjItem::Page).collect();
-        if !key.is_empty() && !exact {
+        // The chips filter title rows as well as block groups (SR-3).
+        let mut results: Vec<QjItem> = all_hits
+            .into_iter()
+            .filter(|h| scope_keeps_page(self.scope, h.daily))
+            .map(QjItem::Page)
+            .collect();
+        // Block search lists existing blocks; only quick jump creates a page (SR-5).
+        // Journal and To-dos cannot create a page, and Pages must not create a daily one.
+        let date_like =
+            utopia_core::date::parse_unambiguous_date(&key, store.date_format()).is_some();
+        let can_create = self.mode == PaletteMode::Pages
+            && matches!(self.scope, SearchScope::All | SearchScope::Pages)
+            && (self.scope == SearchScope::All || !date_like);
+        if can_create && !key.is_empty() && !exact {
             results.push(QjItem::Create(q.trim().to_string()));
         }
-        // A date typed in any accepted form jumps straight to its day.
+        // A date typed in any accepted form jumps straight to its day (if in scope).
         if let Ok(Some(p)) = store.find_page(q) {
             if !results
                 .iter()
@@ -251,23 +377,66 @@ impl JumpPalette {
             {
                 if let Ok(Some(row)) = store.page_row(&p) {
                     let daily = row.is_daily();
-                    results.insert(
-                        0,
-                        QjItem::Page(TitleHit {
-                            page: p,
-                            title: row.title,
-                            alias: None,
-                            daily,
-                            score: i64::MAX,
-                        }),
-                    );
+                    if scope_keeps_page(self.scope, daily) {
+                        results.insert(
+                            0,
+                            QjItem::Page(TitleHit {
+                                page: p,
+                                title: row.title,
+                                alias: None,
+                                daily,
+                                score: i64::MAX,
+                            }),
+                        );
+                    }
                 }
             }
         }
+        self.groups = store
+            .search_groups_filtered(q, self.scope, self.age, 30)
+            .unwrap_or_default();
         self.results = results;
-        self.select_first();
-        self.rank_tags(cx);
-        cx.notify();
+    }
+
+    /// Page rows first, then each page's block group, then Create last (QJ-2, SR-2).
+    fn rebuild_rows(&mut self) {
+        self.rows.clear();
+        for (i, item) in self.results.iter().enumerate() {
+            if !matches!(item, QjItem::Create(_)) {
+                self.rows.push(Row::Item(i));
+            }
+        }
+        for gi in 0..self.groups.len() {
+            self.rows.push(Row::Group { group: gi });
+            for hi in 0..self.groups[gi].hits.len() {
+                self.rows.push(Row::Block { group: gi, hit: hi });
+            }
+        }
+        if let Some(i) = self
+            .results
+            .iter()
+            .position(|r| matches!(r, QjItem::Create(_)))
+        {
+            self.rows.push(Row::Item(i));
+        }
+    }
+
+    /// Cmd+K starts on the first page, Cmd+Shift+F on the first block (SR-5); if there
+    /// is no row of that kind, the first selectable one. A new query also scrolls back
+    /// to the top so the selection and Enter agree.
+    fn select_initial(&mut self) {
+        let first_block = self
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Block { .. }));
+        let first_selectable = self.rows.iter().position(Row::selectable);
+        self.selected = if self.mode == PaletteMode::Search {
+            first_block.or(first_selectable)
+        } else {
+            first_selectable
+        }
+        .unwrap_or_default();
+        self.scroll.scroll_to_item(self.selected);
     }
 
     /// The empty state (QJ-1): today, yesterday, then the pages opened last, newest
@@ -340,18 +509,22 @@ impl JumpPalette {
 
     /// A new query starts again at the top, scrolled back to it, so ↑/↓ and Enter agree
     /// on which row is the current one.
-    fn select_first(&mut self) {
-        self.selected = 0;
-        self.scroll.scroll_to_item(0);
-    }
-
     fn step(&mut self, d: isize, cx: &mut Context<Self>) {
-        let n = self.results.len() as isize;
-        if n > 0 {
-            self.selected = ((self.selected as isize + d).rem_euclid(n)) as usize;
-            // The catalog is taller than the palette: keep the row Enter would run visible.
-            self.scroll.scroll_to_item(self.selected);
-            cx.notify();
+        let n = self.rows.len();
+        if n == 0 {
+            return;
+        }
+        let mut i = self.selected;
+        for _ in 0..n {
+            i = (i as isize + d).rem_euclid(n as isize) as usize;
+            if self.rows[i].selectable() {
+                self.selected = i;
+                // Keep the row Enter would open/run visible, past the group headers.
+                self.scroll.scroll_to_item(i);
+                self.load_preview(cx);
+                cx.notify();
+                return;
+            }
         }
     }
 
@@ -363,35 +536,44 @@ impl JumpPalette {
             }
             return;
         }
-        let Some(item) = self.results.get(ix).cloned() else {
-            if self.mode == PaletteMode::Search {
+        let Some(row) = self.rows.get(ix).cloned() else {
+            // Nothing matched: only quick jump may create, and only when the scope allows
+            // it (the Create row is what carries that decision; SR-3).
+            if self.mode == PaletteMode::Search || !self.offers_create() {
                 return;
             }
-            // Nothing matched yet: treat the query as a title (dates resolve first).
             let q = self.input.read(cx).text().to_string();
             if q.trim().is_empty() || q.starts_with('>') {
                 return;
             }
             return self.create(&q, sidebar, cx);
         };
-        match item {
-            QjItem::Page(h) => cx.emit(QuickJumpEvent::Chosen {
-                page: h.page,
-                sidebar,
-                focus: None,
-            }),
-            QjItem::Day { date, .. } => cx.emit(QuickJumpEvent::ChosenDay { date, sidebar }),
-            QjItem::Block(b) => cx.emit(QuickJumpEvent::Chosen {
-                page: b.page,
-                sidebar,
-                focus: Some(b.block),
-            }),
-            QjItem::Command(d) => {
-                if self.command_ready(d, cx) {
-                    cx.emit(QuickJumpEvent::RunCommand(d.action));
+        match row {
+            Row::Item(i) => match self.results[i].clone() {
+                QjItem::Page(h) => cx.emit(QuickJumpEvent::Chosen {
+                    page: h.page,
+                    sidebar,
+                    focus: None,
+                }),
+                QjItem::Day { date, .. } => cx.emit(QuickJumpEvent::ChosenDay { date, sidebar }),
+                QjItem::Command(d) => {
+                    if self.command_ready(d, cx) {
+                        cx.emit(QuickJumpEvent::RunCommand(d.action));
+                    }
                 }
+                QjItem::Create(t) => self.create(&t, sidebar, cx),
+            },
+            Row::Block { group, hit } => {
+                let Some(b) = self.groups.get(group).and_then(|g| g.hits.get(hit)) else {
+                    return;
+                };
+                cx.emit(QuickJumpEvent::Chosen {
+                    page: b.page.clone(),
+                    sidebar,
+                    focus: Some(b.block.clone()),
+                });
             }
-            QjItem::Create(t) => self.create(&t, sidebar, cx),
+            Row::Group { .. } => {}
         }
     }
 
@@ -423,6 +605,341 @@ impl JumpPalette {
         d.context.is_none() || self.editor.read(cx).target.is_some()
     }
 
+    /// Results by page, for the scope tests and the preview (SR-2, SR-3).
+    pub fn groups(&self) -> &[BlockGroup] {
+        &self.groups
+    }
+
+    /// The selected block's preview (SR-4), `None` when a page row is selected.
+    pub fn preview(&self) -> Option<&BlockPreview> {
+        self.preview.as_ref()
+    }
+
+    /// Whether the list offers "Create page" (quick jump only; SR-5).
+    pub fn offers_create(&self) -> bool {
+        self.results.iter().any(|r| matches!(r, QjItem::Create(_)))
+    }
+
+    /// Page titles currently listed, for the scope tests (SR-3).
+    pub fn page_titles(&self) -> Vec<String> {
+        self.results
+            .iter()
+            .filter_map(|r| match r {
+                QjItem::Page(h) => Some(h.title.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn scope(&self) -> SearchScope {
+        self.scope
+    }
+
+    pub fn age(&self) -> SearchAge {
+        self.age
+    }
+
+    fn selected_hit(&self) -> Option<&BlockHit> {
+        match self.rows.get(self.selected) {
+            Some(Row::Block { group, hit }) => self.groups.get(*group)?.hits.get(*hit),
+            _ => None,
+        }
+    }
+
+    /// Read the preview for the current selection. Store work stays out of `render` (rule
+    /// 10); page mode is a jump list, so it does not preview blocks.
+    fn load_preview(&mut self, cx: &mut Context<Self>) {
+        if self.mode != PaletteMode::Search {
+            self.preview = None;
+            return;
+        }
+        let block = self.selected_hit().map(|h| h.block.clone());
+        self.preview = block.and_then(|b| {
+            let app = self.app.read(cx);
+            match app.store.preview_block(&b) {
+                Ok(p) => p,
+                Err(e) => {
+                    // Rule 11: a preview that cannot be read logs and leaves the pane empty.
+                    eprintln!("utopia: {e}");
+                    None
+                }
+            }
+        });
+    }
+
+    /// The state of a previewed block as a short label (SR-4).
+    fn state_label(kind: utopia_core::BlockKind, checked: bool) -> &'static str {
+        use utopia_core::BlockKind::*;
+        match kind {
+            Todo if checked => "Done",
+            Todo => "To-do",
+            Heading(1) => "Heading 1",
+            Heading(2) => "Heading 2",
+            Heading(_) => "Heading 3",
+            Quote => "Quote",
+            Code => "Code",
+            Numbered => "Numbered",
+            Bullet => "Bullet",
+        }
+    }
+
+    /// The right half: the selected block's path, text, state and first children (SR-4).
+    fn preview_pane(
+        &self,
+        p: &BlockPreview,
+        th: &Theme,
+        width: f32,
+        height: f32,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mut crumbs: Vec<String> = vec![p.page_title.clone()];
+        crumbs.extend(p.path.iter().map(|(_, t)| {
+            let mut s: String = t.chars().take(40).collect();
+            if t.chars().count() > 40 {
+                s.push('…');
+            }
+            s
+        }));
+        let body = utopia_core::inline::plain_text(&p.text);
+        let anchors = self
+            .selected_hit()
+            .map(|h| h.anchors.as_slice())
+            .unwrap_or(&[]);
+        let mut pane = div()
+            .id("search-preview")
+            .debug_selector(|| "search-preview".into())
+            .w(px(width))
+            .flex_none()
+            .max_h(px(height))
+            .overflow_y_scroll()
+            .pl_3()
+            .border_l_1()
+            .border_color(th.line)
+            .flex()
+            .flex_col()
+            .gap_2();
+        pane = pane.child(
+            div()
+                .debug_selector(|| "search-preview-path".into())
+                .text_size(px(CAPTION_SIZE))
+                .text_color(th.muted)
+                .line_clamp(2)
+                .child(crumbs.join(" › ")),
+        );
+        let label = Self::state_label(p.kind, p.checked);
+        let muted_state = p.kind == utopia_core::BlockKind::Bullet
+            || (p.kind == utopia_core::BlockKind::Todo && p.checked);
+        let fg = if muted_state { th.muted } else { th.accent };
+        let mut state = div().flex().items_center().gap_2().child(
+            div()
+                .debug_selector(|| "search-preview-state".into())
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .bg(th.chip_bg)
+                .text_size(px(CAPTION_SIZE))
+                .text_color(fg)
+                .child(label),
+        );
+        if let Some(when) = chrono::DateTime::from_timestamp_millis(p.updated_at) {
+            state = state.child(
+                div()
+                    .text_size(px(CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(format!("Edited {}", when.format("%b %-d, %Y"))),
+            );
+        }
+        pane = pane
+            .child(state)
+            .child(
+                div()
+                    .text_color(th.text)
+                    .line_clamp(6)
+                    .child(marked(&body, anchors, th)),
+            )
+            .child(
+                div()
+                    .text_size(px(CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(match p.child_count {
+                        0 => "No children".to_string(),
+                        1 => "1 child".to_string(),
+                        n => format!("{n} children"),
+                    }),
+            );
+        for (i, c) in p.children.iter().enumerate() {
+            let lead = match (c.kind, c.checked) {
+                (utopia_core::BlockKind::Todo, true) => "☑",
+                (utopia_core::BlockKind::Todo, false) => "☐",
+                _ => "•",
+            };
+            pane = pane.child(
+                div()
+                    .debug_selector(move || format!("search-preview-child-{i}"))
+                    .flex()
+                    .gap_2()
+                    .items_start()
+                    .child(div().flex_none().text_color(th.muted).child(lead))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(if c.checked { th.muted } else { th.text })
+                            .line_clamp(2)
+                            .child(utopia_core::inline::plain_text(&c.text)),
+                    ),
+            );
+        }
+        if p.child_count > p.children.len() {
+            pane = pane.child(
+                div()
+                    .text_size(px(CAPTION_SIZE))
+                    .text_color(th.muted)
+                    .child(format!("+{} more", p.child_count - p.children.len())),
+            );
+        }
+        pane
+    }
+
+    /// The scope and age chips under the field (SR-3).
+    fn scope_bar(&self, th: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let mut bar = div()
+            .id("search-scopes")
+            .debug_selector(|| "search-scopes".into())
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_1();
+        for &s in SearchScope::ALL {
+            let selected = s == self.scope;
+            let key = s.label().to_lowercase().replace(' ', "-");
+            bar = bar.child(
+                quiet_control(
+                    gpui::ElementId::Name(format!("search-scope-{key}").into()),
+                    s.label(),
+                    th,
+                )
+                .debug_selector(move || format!("search-scope-{key}"))
+                .when(selected, |d| d.bg(th.chip_bg).text_color(th.accent))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.scope = s;
+                    this.age_menu = false;
+                    this.refilter(cx);
+                })),
+            );
+        }
+        let menu_open = self.age_menu;
+        bar.child(div().flex_1()).child(
+            div()
+                .relative()
+                .child(
+                    quiet_menu("search-age", self.age.label(), th)
+                        .debug_selector(|| "search-age".into())
+                        .when(menu_open, |d| d.bg(th.chip_bg).text_color(th.accent))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.age_menu = !this.age_menu;
+                            cx.notify();
+                        })),
+                )
+                .children(menu_open.then(|| {
+                    deferred(
+                        anchored()
+                            .anchor(Corner::TopRight)
+                            .offset(point(px(0.), px(6.)))
+                            .child(self.age_popup(th, cx)),
+                    )
+                    .with_priority(1)
+                })),
+        )
+    }
+
+    /// The "Any time" menu, drawn deferred so opening it never moves the chips or results.
+    fn age_popup(&self, th: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let mut menu = div()
+            .id("search-age-popup")
+            .debug_selector(|| "search-age-popup".into())
+            .w(px(170.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .bg(th.surface)
+            .border_1()
+            .border_color(th.line)
+            .rounded_md()
+            .shadow_md()
+            // The results list is underneath: stop the mouse-down here or a row would
+            // choose itself before the menu item's click runs (found by the scope test).
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        for &a in SearchAge::ALL {
+            let selected = a == self.age;
+            let key = a.label().to_lowercase().replace(' ', "-");
+            menu = menu.child(
+                quiet_control(
+                    gpui::ElementId::Name(format!("search-age-item-{key}").into()),
+                    a.label(),
+                    th,
+                )
+                .debug_selector(move || format!("search-age-{key}"))
+                .w_full()
+                .justify_start()
+                .when(selected, |d| d.bg(th.chip_bg).text_color(th.accent))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.age = a;
+                    this.age_menu = false;
+                    this.refilter(cx);
+                })),
+            );
+        }
+        menu
+    }
+
+    /// Re-run the same query under a new chip (SR-3). The typed text stays in the field.
+    fn refilter(&mut self, cx: &mut Context<Self>) {
+        let q = self.input.read(cx).text().to_string();
+        self.search(&q, cx);
+    }
+
+    /// One grouped block hit (SR-2): indented under its page header, its matched words
+    /// washed (SR-1), and selectable like any other row.
+    fn block_row(
+        &self,
+        i: usize,
+        group: usize,
+        hit: usize,
+        th: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(b) = self.groups.get(group).and_then(|g| g.hits.get(hit)) else {
+            return div().into_any_element();
+        };
+        let text = utopia_core::inline::plain_text(&b.text);
+        div()
+            .id(("search-hit", i))
+            .debug_selector(move || format!("search-hit-{group}-{hit}"))
+            .px_3()
+            .py_1()
+            .pl(px(46.))
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|d| d.bg(th.hover))
+            .when(i == self.selected, |d| d.bg(th.hover))
+            .child(
+                div()
+                    .debug_selector(move || format!("search-hit-text-{group}-{hit}"))
+                    .text_color(th.text)
+                    .line_clamp(2)
+                    .child(marked(&text, &b.anchors, th)),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                    let beside = e.modifiers.shift || e.modifiers.platform;
+                    this.choose(i, beside, w, cx)
+                }),
+            )
+            .into_any_element()
+    }
+
     /// What a row says, how it is labelled and what it is (QJ-2). `bound` is the keys in
     /// force for a command row, which is what the palette shows instead of the default.
     fn row_parts(&self, item: &QjItem, bound: Option<&str>) -> (RowKind, String, String) {
@@ -445,14 +962,6 @@ impl JumpPalette {
             }
             QjItem::Day { title, label, .. } => (RowKind::Day, title.clone(), label.to_string()),
             QjItem::Create(t) => (RowKind::Create, format!("Create \"{t}\""), String::new()),
-            QjItem::Block(b) => (
-                RowKind::Block,
-                utopia_core::inline::plain_text(&b.text)
-                    .chars()
-                    .take(80)
-                    .collect(),
-                b.page_title.clone(),
-            ),
             // The keys actually bound, not the catalog default: a rebinding in Settings
             // applies at once, so the row must not advertise the chord it replaced (§9.1).
             QjItem::Command(d) => (
@@ -596,9 +1105,6 @@ fn row_icon(i: usize, kind: RowKind, th: &Theme) -> AnyElement {
             .font_weight(FontWeight::SEMIBOLD)
             .child("#")
             .into_any_element(),
-        RowKind::Block => slot
-            .child(div().w(px(7.)).h(px(1.)).bg(th.faint))
-            .into_any_element(),
         RowKind::Command => slot
             .text_size(px(CAPTION_SIZE))
             .text_color(th.muted)
@@ -614,10 +1120,30 @@ fn row_icon(i: usize, kind: RowKind, th: &Theme) -> AnyElement {
 }
 
 impl Render for JumpPalette {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let query = self.input.read(cx).text().to_string();
         let needle = query.strip_prefix('>').unwrap_or(&query).to_string();
+        // Page mode keeps the compact quick-jump width (QJ-1..5); search widens for the
+        // preview (SR-4). Either way it must fit the window, which is 720 px at minimum.
+        let wide = self.mode == PaletteMode::Search;
+        let wanted: f32 = if wide { 860. } else { 520. };
+        let viewport = window.viewport_size();
+        let width = wanted.min(f32::from(viewport.width) - 24.).max(280.);
+        let max_h = (f32::from(viewport.height) - 100.).clamp(220., 440.);
+        let pane_h = (max_h - 150.).clamp(120., 290.);
+        let preview_w = (width * 0.4).clamp(240., 340.);
+        // The commands replace the page rows, so the page scope chips would be a lie.
+        let show_scopes = matches!(self.mode, PaletteMode::Pages | PaletteMode::Search)
+            && !(self.mode == PaletteMode::Pages && query.starts_with('>'));
+        let scopes = show_scopes.then(|| self.scope_bar(&th, cx));
+        let preview = (self.mode == PaletteMode::Search)
+            .then(|| {
+                self.preview
+                    .as_ref()
+                    .map(|p| self.preview_pane(p, &th, preview_w, pane_h))
+            })
+            .flatten();
         // The keys in force, read once per frame rather than per row: a rebinding in
         // Settings replaces the default, and the palette must show what actually works.
         let bound: Vec<Option<String>> = self
@@ -630,18 +1156,27 @@ impl Render for JumpPalette {
             .collect();
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut create: Option<AnyElement> = None;
-        for (i, item) in self.results.iter().enumerate() {
-            let el = self.row(
-                i,
-                item,
-                &needle,
-                bound.get(i).and_then(|k| k.as_deref()),
-                cx,
-            );
-            if matches!(item, QjItem::Create(_)) {
-                create = Some(el);
-            } else {
-                rows.push(el);
+        for (i, row) in self.rows.clone().into_iter().enumerate() {
+            match row {
+                Row::Item(item_ix) => {
+                    let item = &self.results[item_ix];
+                    let el = self.row(
+                        i,
+                        item,
+                        &needle,
+                        bound.get(item_ix).and_then(|k| k.as_deref()),
+                        cx,
+                    );
+                    if matches!(item, QjItem::Create(_)) {
+                        create = Some(el);
+                    } else {
+                        rows.push(el);
+                    }
+                }
+                Row::Group { group } => {
+                    rows.push(group_header(group, &self.groups[group], &th).into_any_element())
+                }
+                Row::Block { group, hit } => rows.push(self.block_row(i, group, hit, &th, cx)),
             }
         }
         // "Create page" is last, above a hairline, in the accent colour (QJ-2).
@@ -662,8 +1197,8 @@ impl Render for JumpPalette {
         };
         div()
             .debug_selector(|| "jump-palette".into())
-            .w(px(520.))
-            .max_h(px(440.))
+            .w(px(width))
+            .max_h(px(max_h))
             .flex()
             .flex_col()
             .bg(th.surface)
@@ -682,6 +1217,7 @@ impl Render for JumpPalette {
             )
             .child(
                 div()
+                    .debug_selector(|| "search-input".into())
                     .px_2()
                     .py_1()
                     .border_1()
@@ -689,17 +1225,28 @@ impl Render for JumpPalette {
                     .rounded_md()
                     .child(self.input.clone()),
             )
+            .children(scopes)
             .child(
                 div()
-                    .id("jump-results")
-                    .debug_selector(|| "jump-results".into())
+                    .id("jump-results-row")
                     .flex()
-                    .flex_col()
-                    .max_h(px(320.))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .children(rows)
-                    .children(create_row),
+                    .gap_2()
+                    .max_h(px(pane_h))
+                    .child(
+                        div()
+                            .id("jump-results")
+                            .debug_selector(|| "jump-results".into())
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .max_h(px(pane_h))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll)
+                            .children(rows)
+                            .children(create_row),
+                    )
+                    .children(preview),
             )
             .child(
                 div()
