@@ -124,6 +124,97 @@ fn ac_12_3_switching_transport_pulls_the_new_transport_from_zero() {
     assert!(seen.contains(&"from the relay".to_string()), "{seen:?}");
 }
 
+/// A relay whose reported protocol version can change in place, as a binary upgrade that
+/// keeps the database (and its revision) would.
+struct UpgradedRelay {
+    inner: RelayTransport,
+    version: u32,
+    pushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl utopia_sync::Transport for UpgradedRelay {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        match self.inner.manifest(if_none_match)? {
+            Some(mut m) => {
+                m.protocol_version = self.version;
+                Ok(Some(m))
+            }
+            None => Ok(None),
+        }
+    }
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        self.pushes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.push(page, req)
+    }
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.inner.pull(page, since_seq)
+    }
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// §12.6: an in-place protocol upgrade keeps the relay's rev, so a conditional manifest
+/// answers 304 and skips the version check. A round with something to push must see the
+/// new version before it writes.
+#[test]
+fn ac_12_6_a_protocol_upgrade_is_seen_before_pushing() {
+    let relay = Relay::new();
+    let mut a = Store::open_in_memory().unwrap();
+    a.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = a.create_page("Protocol").unwrap();
+    write(&mut a, &page, "first");
+    let pushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut ca = SyncClient::new(
+        UpgradedRelay {
+            inner: RelayTransport::new(relay.clone(), "g1"),
+            version: 1,
+            pushes: pushes.clone(),
+        },
+        &a,
+    )
+    .unwrap();
+    ca.sync_once(&mut a).unwrap();
+    let pushed = pushes.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(pushed > 0);
+    let rev = relay.manifest("g1").rev;
+
+    // The relay is upgraded in place: same database and revision, another protocol.
+    ca.transport_mut().version = 2;
+    assert_eq!(relay.manifest("g1").rev, rev);
+    write(&mut a, &page, "second");
+    let result = ca.sync_once(&mut a);
+    assert!(
+        matches!(result, Err(utopia_sync::SyncError::ProtocolVersion(2))),
+        "the new protocol is seen before writing: {result:?}"
+    );
+    assert_eq!(
+        pushes.load(std::sync::atomic::Ordering::SeqCst),
+        pushed,
+        "nothing was pushed to the unsupported relay"
+    );
+}
+
 /// A relay that refuses the first push for one page and accepts any later one.
 struct RefuseFirstBatch {
     inner: RelayTransport,

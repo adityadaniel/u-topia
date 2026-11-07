@@ -386,6 +386,17 @@ fn cursor_key(page: &PageId) -> String {
     format!("cursor:{page}")
 }
 
+/// Refuse a relay that speaks another protocol before this client writes to it (§12.6).
+/// `None` is a 304: there was no manifest to check.
+fn check_protocol(m: &Option<Manifest>) -> Result<()> {
+    match m {
+        Some(m) if m.protocol_version != PROTOCOL_VERSION => {
+            Err(SyncError::ProtocolVersion(m.protocol_version))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The network half of a round (§12.3 steps 1–2, 5): touches only the transport, so it
 /// can run on a background thread while the UI keeps editing.
 pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incoming> {
@@ -394,14 +405,20 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
     // first and take the cursor space afterwards. A conditional request is only safe when
     // the stored rev belongs to the space this transport already has; otherwise it is
     // another relay's (or folder's) counter and must not answer 304.
+    //
+    // It is also only safe on a read-only round: a relay's 304 compares the rev alone, so
+    // an in-place protocol upgrade that keeps the rev would answer 304, skip the version
+    // check below, and let this client push to an unsupported relay. A round with pushes
+    // or snapshots therefore fetches the manifest unconditionally first (§12.6).
+    let writes = !out.pushes.is_empty() || !out.snapshots.is_empty();
     let known = t.cursor_space();
-    let if_none_match = out.rev.as_ref().filter(|r| r.space == known).map(|r| r.rev);
+    let if_none_match = if writes {
+        None
+    } else {
+        out.rev.as_ref().filter(|r| r.space == known).map(|r| r.rev)
+    };
     let first = t.manifest(if_none_match)?;
-    if let Some(m) = &first {
-        if m.protocol_version != PROTOCOL_VERSION {
-            return Err(SyncError::ProtocolVersion(m.protocol_version));
-        }
-    }
+    check_protocol(&first)?;
     let space = t.cursor_space();
     // Batches of one page are causally ordered (`prepare` splits a page's outbox by
     // `MAX_PUSH_BYTES`). Once one is refused, a later batch must not reach the relay
@@ -479,7 +496,10 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
         // Failing to re-read it must not throw away the acks this round just earned: the
         // rows stay marked sent, no cursor moves, and the next round pulls normally.
         match t.manifest(None) {
-            Ok(m) => m,
+            Ok(m) => {
+                check_protocol(&m)?;
+                m
+            }
             Err(e) => {
                 let f = Failure::object(&e);
                 if f.is_terminal() {
