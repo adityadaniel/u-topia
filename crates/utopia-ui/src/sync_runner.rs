@@ -232,21 +232,30 @@ impl SyncRunner {
 
     /// The round's store work failed, so nothing left the device: the transport comes home
     /// and the next poll backs off like any other failed round (§12.6). A local failure is
-    /// never terminal, so this cannot halt.
+    /// never terminal, so this cannot halt. Only a `Preparing` round can fail this way.
     pub fn round_failed(&mut self, transport: BoxTransport, status: SyncStatus) {
+        if !matches!(self.phase, SyncPhase::Preparing) {
+            return;
+        }
         self.interval = back_off(self.interval);
         self.last = Some(status);
         self.phase = SyncPhase::Idle { transport };
     }
 
-    /// The prepared pushes leave for the background thread.
+    /// The prepared pushes leave for the background thread. Only `Preparing → Exchanging`;
+    /// the transport is not in the runner at this point, so an out-of-order call must not
+    /// clobber `Idle { transport }`.
     pub fn exchange(&mut self) {
-        self.phase = SyncPhase::Exchanging;
+        if matches!(self.phase, SyncPhase::Preparing) {
+            self.phase = SyncPhase::Exchanging;
+        }
     }
 
-    /// The exchange returned; the UI thread imports it next.
+    /// The exchange returned; the UI thread imports it next. Only `Exchanging → Applying`.
     pub fn exchange_returned(&mut self) {
-        self.phase = SyncPhase::Applying;
+        if matches!(self.phase, SyncPhase::Exchanging) {
+            self.phase = SyncPhase::Applying;
+        }
     }
 
     /// The round is over: remember what to show and how soon to poll again. A refusal or a
@@ -258,6 +267,9 @@ impl SyncRunner {
         report: &Result<SyncReport, SyncError>,
         status: SyncStatus,
     ) {
+        if !matches!(self.phase, SyncPhase::Applying) {
+            return;
+        }
         if let Err(e) = report {
             if let Some(reason) = RefusalReason::of(e) {
                 self.interval = SLOW;
@@ -576,5 +588,46 @@ mod tests {
             SyncStatus::Synced { at_ms: 0 },
         );
         assert!(runner.begin_round().is_some(), "the transport came home");
+    }
+
+    /// The phase setters must only move a round forward. `exchange()` on an idle runner used
+    /// to overwrite `Idle { transport }`, dropping the transport and leaving sync dead with
+    /// the dot stuck on "syncing".
+    #[test]
+    fn phase_transitions_only_apply_in_order() {
+        let engine = utopia_sync::SyncEngine::new(&utopia_store::Store::open_in_memory().unwrap())
+            .expect("engine");
+        let transport: BoxTransport = Box::new(utopia_sync::relay::RelayTransport::new(
+            utopia_sync::relay::Relay::new(),
+            "g",
+        ));
+        let mut runner = SyncRunner::new(engine, transport);
+        runner.exchange();
+        assert!(
+            matches!(runner.phase, SyncPhase::Idle { .. }),
+            "exchange() without a round must not take the transport out of Idle"
+        );
+        runner.exchange_returned();
+        assert!(
+            matches!(runner.phase, SyncPhase::Idle { .. }),
+            "exchange_returned() without an exchange must not move the phase"
+        );
+        runner.end_round(
+            Box::new(utopia_sync::relay::RelayTransport::new(
+                utopia_sync::relay::Relay::new(),
+                "g",
+            )),
+            &Ok(SyncReport::default()),
+            SyncStatus::Synced { at_ms: 0 },
+        );
+        assert!(
+            matches!(runner.phase, SyncPhase::Idle { .. }) && runner.last.is_none(),
+            "end_round() without an apply must not invent a round"
+        );
+        // The transport was never dropped, so a round still starts.
+        assert!(
+            runner.begin_round().is_some(),
+            "the transport is still home"
+        );
     }
 }
