@@ -1,5 +1,70 @@
 # Sync engine: outbox lifecycle and the per-page pull cursor
 
+## Status
+
+Made explicit on `fix/sync-engine-outbox` (`crates/utopia-sync`, plus the relay's push path
+in `crates/utopia-syncd`):
+
+- **Per-page round outcome.** `Incoming.pages: BTreeMap<PageId, PageExchange>` holds each
+  page's acknowledged outbox rows (`sent`), its counters and at most one pull.
+  `Incoming.failed: Vec<Failure>` holds retryable failures that did not stop the round,
+  `Failure { page, kind }` separates terminal (401/403, foreign protocol) from retryable
+  ones, and `SyncReport.failed` carries them to the runner and the status line. `apply`
+  records a page's acks and cursor only after its payload is stored.
+- **Cursor with a transport.** `Cursor { space, pos }` lives in
+  `sync_state["cursor:<page>"]` (JSON). `CursorSpace { transport, kind }` names the
+  transport that measured the number (`relay:<base>#<graph>`, `memory:<relay>#<graph>`,
+  `folder:<root>`) and how to compare it: `Seq` = a monotonic relay sequence (pull when
+  `head > local`), `Revision` = the folder's file digest (pull when `head != local`).
+  A cursor from another space is not compared, so the page is pulled once from zero.
+  `Transport::cursor_space()` is required; `Encrypted` delegates, `Box<dyn>` forwards.
+- **Folder revisions, not counts.** `FolderTransport`'s manifest/pull `head_seq` and graph
+  `rev` are FNV-1a digests over each page's update files (relative path, length, mtime) and
+  over the sorted page list, so a peer that drops two files and adds two others moves the
+  revision even though the file count is unchanged.
+- **Conditional manifest, tagged rev, write-safe.** `exchange` asks with the rev of the
+  last fully applied manifest (`ManifestRev { space, rev }`), so the `If-None-Match`/304
+  path is reachable; a rev from another space is not sent, and `rev` is stored only when no
+  page failed, so a failed page is retried against a fresh manifest. A round with pushes or
+  snapshots fetches the manifest unconditionally first, because a relay's 304 compares only
+  the rev: an in-place protocol upgrade that keeps the rev would otherwise skip the version
+  check and let this client write to an unsupported relay.
+- **Causally ordered batches.** `prepare` splits a page's outbox by `MAX_PUSH_BYTES`. Once
+  one batch for a page is refused, the later batches of that page are skipped for the round
+  (other pages still push), so the relay never holds later updates without their
+  predecessors.
+- **Relay store identity.** `Manifest.instance` (additive, `serde(default)`) is a random id
+  per relay database, sent by `utopia-syncd` and the reference `Relay`; it is part of
+  `CursorSpace` (`relay:<instance>#<graph>`). A wiped relay therefore gets a new space and
+  is pulled again instead of being mistaken for the old one. A relay that predates the
+  field falls back to a normalized URL (`scheme://host[:port]/path`, default port dropped).
+- **A partial round has a status.** `SyncStatus::Partial { failed, queued }` (distinct pages
+  that failed, outbox rows still queued) instead of `Offline { queued }` for a reachable
+  relay that could not take one page; the FFI `SyncSummary` carries `failed` too.
+- **Compaction is guarded by the same space.** `apply` only queues a snapshot when the
+  page's stored cursor `covers` the manifest head in this round's space, so a cursor from
+  another relay/folder can never cover entries this client never imported.
+- **Legacy positions are retired.** The first `SyncEngine::new` deletes the pre-`cursor:`
+  `seq:<page>` keys; an old bare `rev` fails to decode, so the first round pulls every page
+  once (idempotently). Nothing is left behind.
+
+Issues, as numbered below:
+
+| # | Issue | State |
+|---|---|---|
+| 1 | All-or-nothing exchange loses acks / head-of-line | **Fixed**: pushes, snapshots and blobs are per page/object; a refused page no longer loses other pages' acks or stops the pulls, a failed manifest reread after the pushes no longer drops their acks, and a page's later batches are skipped once one is refused (a multi-batch page cannot reach the relay out of causal order). Tested by `ac_12_3_a_refused_page_keeps_the_other_acks_and_the_pulls`, `ac_12_3_a_failed_second_manifest_keeps_the_acks` and `ac_12_3_a_refused_batch_stops_the_pages_later_batches`. |
+| 2 | Permanent 413 after a lost ack | **Fixed** at the relay: `syncd` dedupes inside the push transaction and counts only new bytes against the quota, so a replayed batch is a duplicate, not a 413. Tested by `ac_12_6_a_replayed_batch_is_a_duplicate_even_at_the_quota` and, end to end over HTTP with the response dropped, `ac_12_6_a_lost_ack_is_replayed_not_rejected_by_quota`. A genuinely full quota still retries on the backoff (no `Halted` state; see 9). |
+| 3 | Cursor means different things per transport | **Fixed**: cursors are tagged with `CursorSpace`, the folder reports a revision digest, and a relay carries an instance id. Tested by `ac_12_3_a_folder_revision_with_an_unchanged_file_count_still_pulls`, `ac_12_3_switching_transport_pulls_the_new_transport_from_zero`, `ac_12_3_switching_relay_at_the_same_revision_still_pulls`, `ac_12_6_a_wiped_relay_is_a_new_cursor_space`, and `ac_12_3_legacy_seq_positions_are_removed`. The stored `rev` is tagged with the same space. |
+| 4 | Poison page halts every round | **Fixed** for the halt: a pull that fails (E2E `open`, corrupt payload) is recorded per page and the other pages' cursors and the manifest progress are kept; the poisoned page is retried alone, and a partial round reads `Partial` rather than "Offline — 0 queued". Tested by `ac_12_6_one_unreadable_page_does_not_halt_the_others` and `ac_12_6_a_partial_round_has_its_own_status`. **Left**: no persistent "this relay holds mixed payloads" flag beyond `SyncReport.failed`/`SyncStatus::Partial`. |
+| 5 | Partial apply | **Fixed**: `apply` imports first and records acks/cursors per page only when the payload was stored; a batch import that fails drops every page's cached shard so the per-page retry really re-imports and commits; the manifest rev is not remembered on a failed round. Tested by `ac_12_3_a_failed_import_does_not_mark_the_page_synced`, `ac_12_3_a_failed_batch_import_still_stores_the_readable_pages` (reopened from disk, corrupt page first and last), and `ac_12_3_a_page_can_be_pulled_and_still_queued_for_its_push`. |
+| 6 | Conditional manifest is dead code | **Fixed**: the `If-None-Match`/304 path is used on read-only rounds, with a space-tagged rev, and tested by `ac_12_3_an_unchanged_manifest_is_asked_for_conditionally` and `ac_12_3_switching_relay_at_the_same_revision_still_pulls`. A round that writes fetches unconditionally, so an in-place protocol upgrade is caught before pushing (`ac_12_6_a_protocol_upgrade_is_seen_before_pushing`). |
+| 7 | Outbox echoes remote ops | **Left**: the outbox payload is still `export_since(persisted)`, so a merge queued after an import pushes the imported ops back too. Fixing it means carrying the committing delta's frontier into `flush`/`outbox`, which is the store commit pipeline (a different machine, `store-commit-pipeline.md`), and every relay dedupes by change id, so it costs bandwidth only. |
+| 8 | `SyncClient::queued` skips `sync_index` | **Fixed**: it flushes first (and takes `&mut Store`). Tested by `ac_12_3_queued_counts_edits_still_waiting_for_the_writer`. |
+| 9 | PRD §12.6 vs code | **Partly left**: a literal HTTP 409 is still a transport error (no shipped relay sends one; duplicates come back as a 200 body), 4xx/5xx are still one variant with no jitter, and "corrupt local snapshot → quarantine, read-only" is not implemented. Those belong to the runner's backoff/health machine (`sync-runner-round.md`) and to snapshot compaction (`sync-compaction-snapshots.md`); the `Halted` variant sketched below was not added. |
+
+The per-page outcome and the cursor are now explicit; a separate `SyncHealth`/`Halt` state
+was left to the runner machine, which owns the poll loop and the visible status.
+
 ## What it controls
 
 Which local updates get pushed and re-pushed, the "N changes queued" number, which pages get
@@ -11,32 +76,42 @@ pulled and from which `seq`, and whether the manifest is re-fetched (PRD `§12.3
 
 | Piece | Location | Set | Cleared |
 |---|---|---|---|
-| Queued vs sent | `outbox.sent_at` (`schema.rs:97-105`) | `outbox_mark_sent` (`lib.rs:903-910`, read conn, one autocommit per row) | never deleted |
-| In flight | nowhere — the lifetime of the `Outgoing` value on the background thread (`sync/lib.rs:159-170`) | `prepare :286-320` | `exchange` returns |
-| Acks | `Incoming.sent/accepted/duplicates` (`:175-177`) | `exchange :203-209` per page | dropped on any `?` in `exchange` |
-| Pull cursor | `sync_state["seq:<page>"]` (`:189-191`) | `apply :367-369` from `resp.head_seq` | never; not namespaced by transport or relay |
-| Manifest rev | `sync_state["rev"]` | `apply :370-372` | never |
-| Client id | `sync_state["client_id"]` | once `:258-265` | – |
+| Queued vs sent | `outbox.sent_at` (`schema.rs:97-105`) | `outbox_mark_sent` (`lib.rs`, per page from `apply`, one autocommit per row) | never deleted |
+| In flight | nowhere — the lifetime of the `Outgoing` value on the background thread (`sync/lib.rs`) | `prepare` | `exchange` returns |
+| Acks | `PageExchange.sent/accepted/duplicates` in `Incoming.pages` | `exchange`, per page | applied by `apply` (or dropped for a page whose import failed) |
+| Pull cursor | `sync_state["cursor:<page>"]`, JSON `Cursor { space, pos }` (`lib.rs:343-345`) | `apply` from `resp.head_seq`, tagged with the transport's `CursorSpace` | never; a different transport's space is ignored, not compared |
+| Manifest rev | `sync_state["rev"]`, JSON `ManifestRev { space, rev }` | `apply` only when no page failed | never; another space's rev is not sent as `If-None-Match` |
+| Relay identity | the relay database's `Manifest.instance` (syncd `relay_meta`, the reference relay's field) | `syncd`/`Relay` at store creation | nothing client-side: it is part of `CursorSpace`/`ManifestRev` |
+| Client id | `sync_state["client_id"]` | once (`prepare`/`new`) | – |
 | Enqueue flag | `pending[..].2` sticky per page (`store lib.rs:372`); payload = everything since `persisted` (`:290, :311`) | – | – |
 
 Readers: `SyncStatus::from_result` → `workspace.rs:516, 562`; `SyncClient::queued`
-(`:434`); FFI `:291`.
+(flushes first); FFI `:291`.
 
 ## States
 
 Per outbox row: **Queued** (`sent_at IS NULL`) → **In flight** (unrecorded) → **Sent**.
-There is no **Acked-but-unmarked** state, yet it occurs (below). Per page cursor: **Never
-pulled** (no key) → **At seq N**.
+An ack lives in `PageExchange.sent` until `apply` records it together with the page's
+cursor; a page whose import fails keeps both queued. Per page cursor:
+**Never pulled** (no key, or a key from another `CursorSpace`) → **At head H** (relay seq or
+folder revision). A page can be **Failed** for one round (retryable `Failure`) while every
+other page advances; the round's visible state is then `Synced`, `Partial { failed, queued }`
+or `Offline { queued }`.
 
 ## Events and transitions
 
-- `prepare` (`:278-328`): `sync_index`; read `outbox_pending(10_000)`; batch per page under
-  `MAX_PUSH_BYTES`; read cursors; drain `pending_snapshots`; pick ≤8 blobs each way.
-- `exchange` (`:195-248`): manifest (always `manifest(None)`, `:197`); version check; push
-  each page (`:203-209`); snapshots; blobs; second manifest only if something was sent
-  (`:224-231`); pull pages with `head_seq > local` (`:235-238`); collect compaction wants.
-- `apply` (`:332-386`): mark sent, mark blobs, store verified blobs, `import_batch`, write
-  cursors and rev, `synced_at`, queue snapshots.
+- `prepare` (`utopia-sync/src/lib.rs`): `sync_index`; read `outbox_pending(10_000)`; batch
+  per page under `MAX_PUSH_BYTES`; read `cursor:<page>` values; drain `pending_snapshots`;
+  pick ≤8 blobs each way.
+- `exchange`: conditional manifest with the last applied rev on a read-only round, an
+  unconditional one when the round writes; version check; push each page's batches in order
+  (a retryable failure marks the page and its later batches are skipped; other pages
+  continue); snapshots; blobs; second manifest only if something was sent; pull pages whose
+  `head_seq` is not covered by a cursor in the same `CursorSpace` (each pull isolated);
+  collect compaction wants.
+- `apply`: mark blobs, store verified blobs, import all pulls in one batch (falling back to
+  per-page imports to isolate a corrupt one), then per page record acks and cursor,
+  `synced_at`, and queue snapshots. `rev` is stored only if no page failed.
 
 ## Impossible or unhandled combinations (evidence)
 
@@ -92,15 +167,19 @@ stateDiagram-v2
     state OutboxRow {
         [*] --> Queued : writer inserts (sent_at NULL)
         Queued --> InFlight : prepare reads it (nothing written)
-        InFlight --> Sent : exchange Ok -> apply -> outbox_mark_sent
-        InFlight --> Queued : any ? in exchange (ack lost, re-pushed, relay dedupes)
-        Queued --> Queued : 413 after lost ack (quota counts duplicates) -> forever
+        InFlight --> Acked : exchange records PageExchange.sent
+        Acked --> Sent : apply records it once the page's payload is stored
+        Acked --> Queued : apply could not store the page (nothing recorded)
+        InFlight --> Failed : retryable push failure (recorded, round carries on)
+        Failed --> Queued : next round retries on the backoff
     }
     state PageCursor {
         [*] --> NeverPulled
-        NeverPulled --> AtSeq : apply writes seq:<page> = head_seq
-        AtSeq --> AtSeq : pull when head_seq > local
-        AtSeq --> Stuck : transport switched (count vs seq) or folder file count shrank
+        NeverPulled --> AtHead : apply writes cursor:<page> in this CursorSpace
+        AtHead --> AtHead : pull when the head is not covered
+        AtHead --> NeverPulled : transport/relay changed (CursorSpace differs)
+        AtHead --> Retrying : pull or import failed (cursor kept)
+        Retrying --> AtHead : next round retries only that page
     }
 ```
 
@@ -123,3 +202,9 @@ enum Halt { NeedsAuth, Unsupported(u32), QuotaExceeded, PoisonPage(PageId) }
 
 `apply` would then persist cursors for every page that succeeded, and `Halted` would stop
 the poll loop instead of retrying a 413 every minute.
+
+Built here: (1) as `Incoming.pages`/`PageExchange` plus a failure list and per-page apply;
+(2) as `Cursor`/`CursorSpace` (folder digest, relay instance id) and a space-tagged
+`ManifestRev`; the relay-side dedupe fix makes a lost-ack 413 impossible, and a partial
+round now has `SyncStatus::Partial`. The sketched `SyncHealth`/`Halt` was left to the
+runner machine (`sync-runner-round.md`), which owns the poll loop.

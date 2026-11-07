@@ -2,16 +2,18 @@
 //! WebDAV mount) holding `pages/<page>/<client>/<seq>.upd`. Files are only ever created,
 //! never overwritten, so file-sync tools cannot destroy data. No server, no account.
 //!
-//! The folder has no global order, so a page's `seq` is its file count and a pull returns
-//! every file of the page; imports are idempotent, so re-reading is safe. Snapshot
-//! compaction is skipped here: other devices' files are never deleted.
+//! The folder has no global order, so a page's `head_seq` is a digest of its update files
+//! (a *revision*, not a monotonic sequence: a peer can drop two files and add two others,
+//! leaving a plain file count unchanged) and a pull returns every file of the page.
+//! Imports are idempotent, so re-reading is safe. Snapshot compaction is skipped here:
+//! other devices' files are never deleted.
 
 use std::path::{Path, PathBuf};
 
 use utopia_core::PageId;
 
 use crate::wire::{Manifest, ManifestPage, PullResponse, PushRequest, PushResponse, UpdateOut};
-use crate::{Result, SyncError, Transport, PROTOCOL_VERSION};
+use crate::{CursorKind, CursorSpace, Result, SyncError, Transport, PROTOCOL_VERSION};
 
 pub struct FolderTransport {
     root: PathBuf,
@@ -52,6 +54,34 @@ impl FolderTransport {
         Ok(self.root.join("pages").join(page.as_str()))
     }
 
+    /// One step of the 64-bit FNV-1a hash used for revisions.
+    fn fold(mut hash: u64, bytes: &[u8]) -> u64 {
+        for b in bytes {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        hash
+    }
+
+    /// A page's revision: every update file's relative path, length and mtime. The path set
+    /// changes when a file is added or removed even if the count stays the same.
+    fn revision(root: &Path, files: &[PathBuf]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325;
+        for f in files {
+            let rel = f.strip_prefix(root).unwrap_or(f);
+            hash = Self::fold(hash, rel.to_string_lossy().as_bytes());
+            let meta = std::fs::metadata(f).ok();
+            let len = meta.as_ref().map_or(0, |m| m.len());
+            hash = Self::fold(hash, &len.to_le_bytes());
+            let mtime = meta
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos() as u64);
+            hash = Self::fold(hash, &mtime.to_le_bytes());
+        }
+        hash
+    }
+
     /// Every update file of a page, sorted (client, seq).
     fn files(dir: &Path) -> Result<Vec<PathBuf>> {
         let mut out = Vec::new();
@@ -75,6 +105,15 @@ impl FolderTransport {
 }
 
 impl Transport for FolderTransport {
+    fn cursor_space(&self) -> CursorSpace {
+        // A folder has no global order: its `head_seq` is a digest of the file list, so
+        // it is a revision, not a monotonic sequence.
+        CursorSpace::new(
+            format!("folder:{}", self.root.display()),
+            CursorKind::Revision,
+        )
+    }
+
     fn manifest(&mut self, if_none_match: Option<u64>) -> Result<Option<Manifest>> {
         let mut pages = Vec::new();
         let mut rev: u64 = 0;
@@ -86,20 +125,22 @@ impl Transport for FolderTransport {
             if !safe(&id) {
                 continue;
             }
-            let n = Self::files(&entry.path())?.len() as u64;
-            rev = rev
-                .wrapping_mul(31)
-                .wrapping_add(n)
-                .wrapping_add(id.len() as u64);
+            let head = Self::revision(&entry.path(), &Self::files(&entry.path())?);
             pages.push(ManifestPage {
                 page_id: id,
-                head_seq: n,
+                head_seq: head,
                 frontier: String::new(),
-                snapshot_seq: n,
+                snapshot_seq: head,
                 tail_bytes: 0,
                 updated_at: 0,
                 deleted: false,
             });
+        }
+        // The graph revision must move whenever any page's revision or name does.
+        pages.sort_by(|a, b| a.page_id.cmp(&b.page_id));
+        for p in &pages {
+            rev = Self::fold(rev, p.page_id.as_bytes());
+            rev = Self::fold(rev, &p.head_seq.to_le_bytes());
         }
         if Some(rev) == if_none_match {
             return Ok(None);
@@ -108,6 +149,8 @@ impl Transport for FolderTransport {
             rev,
             protocol_version: PROTOCOL_VERSION,
             pages,
+            // A folder is identified by its path (the cursor space); it has no store id.
+            instance: String::new(),
         }))
     }
 
@@ -127,7 +170,7 @@ impl Transport for FolderTransport {
             std::fs::rename(&tmp, &path).map_err(io)?;
             accepted += 1;
         }
-        let head = Self::files(&self.page_dir(page)?)?.len() as u64;
+        let head = Self::revision(&self.page_dir(page)?, &Self::files(&self.page_dir(page)?)?);
         Ok(PushResponse {
             accepted,
             head_seq: head,
@@ -148,7 +191,7 @@ impl Transport for FolderTransport {
         }
         Ok(PullResponse {
             snapshot: None,
-            head_seq: updates.len() as u64,
+            head_seq: Self::revision(&self.page_dir(page)?, &files),
             updates,
         })
     }

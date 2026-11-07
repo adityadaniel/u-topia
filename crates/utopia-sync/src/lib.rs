@@ -22,8 +22,9 @@ pub mod relay;
 /// The v1 wire format, shared with the relay server.
 pub use utopia_proto as wire;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use utopia_core::PageId;
 use utopia_doc::Frontier;
@@ -59,9 +60,160 @@ pub enum SyncError {
 
 pub type Result<T, E = SyncError> = std::result::Result<T, E>;
 
+/// A failure that stopped one page in a round that kept running (§12.3). The page's
+/// outbox rows stay queued and the next round retries them; the other pages are
+/// already done and stay done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// The page that failed; `None` for the manifest or an attachment.
+    pub page: Option<PageId>,
+    pub kind: FailureKind,
+}
+
+/// Why one page failed, flattened so a report can be compared and shown without
+/// carrying a whole [`SyncError`] (which may wrap a store error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailureKind {
+    Unauthorized,
+    ProtocolVersion(u32),
+    /// Retryable: transport, store or payload problem.
+    Transport(String),
+    Store(String),
+}
+
+impl FailureKind {
+    pub fn of(e: &SyncError) -> Self {
+        match e {
+            SyncError::Unauthorized => FailureKind::Unauthorized,
+            SyncError::ProtocolVersion(v) => FailureKind::ProtocolVersion(*v),
+            SyncError::Transport(m) => FailureKind::Transport(m.clone()),
+            SyncError::Store(e) => FailureKind::Store(e.to_string()),
+        }
+    }
+}
+
+impl Failure {
+    pub fn page(page: &PageId, e: &SyncError) -> Self {
+        Self {
+            page: Some(page.clone()),
+            kind: FailureKind::of(e),
+        }
+    }
+
+    pub fn object(e: &SyncError) -> Self {
+        Self {
+            page: None,
+            kind: FailureKind::of(e),
+        }
+    }
+
+    /// Bad credentials and an unsupported protocol will fail every later call too, so the
+    /// round stops instead of marking the rest of the pages failed (§12.6).
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.kind,
+            FailureKind::Unauthorized | FailureKind::ProtocolVersion(_)
+        )
+    }
+
+    /// The failure as an error, for callers that need a round's error: a round that moved
+    /// nothing is still an [`Err`] (Offline, NeedsAuth, …) even when it was per page.
+    pub fn to_error(&self) -> SyncError {
+        match &self.kind {
+            FailureKind::Unauthorized => SyncError::Unauthorized,
+            FailureKind::ProtocolVersion(v) => SyncError::ProtocolVersion(*v),
+            FailureKind::Transport(m) => SyncError::Transport(m.clone()),
+            // A store failure is local, but it is still retryable and still leaves the
+            // outbox queued; the message says where it came from.
+            FailureKind::Store(m) => SyncError::Transport(format!("store: {m}")),
+        }
+    }
+}
+
+/// How a transport's `head_seq` values are compared with a stored [`Cursor`]
+/// (§12.3 step 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorKind {
+    /// A monotonic relay sequence: pull when `head > local`.
+    Seq,
+    /// A content revision (the folder transport's file digest): pull when `head != local`.
+    Revision,
+}
+
+/// Which transport measured a `head_seq`, and how to compare it. A cursor is only
+/// compared with a `head_seq` from the same space, so switching from a folder to a relay
+/// (or to another relay) pulls everything once instead of comparing a file count with a
+/// relay sequence (or a fresh relay's `3` with an old one's `500`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorSpace {
+    /// This transport's identity, e.g. `relay:https://host#graph` or `folder:/path`.
+    pub transport: String,
+    pub kind: CursorKind,
+}
+
+impl CursorSpace {
+    pub fn new(transport: impl Into<String>, kind: CursorKind) -> Self {
+        Self {
+            transport: transport.into(),
+            kind,
+        }
+    }
+}
+
+/// The pull position of one page (§12.3 step 4), tagged with the space it lives in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cursor {
+    pub space: CursorSpace,
+    pub pos: u64,
+}
+
+/// The manifest revision last fully applied, tagged with the cursor space that issued it
+/// (§12.3 step 1). A rev from another relay or folder must never answer "not modified":
+/// two relays can be at the same counter while holding different pages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestRev {
+    pub space: CursorSpace,
+    pub rev: u64,
+}
+
+impl ManifestRev {
+    pub fn encode(&self) -> String {
+        // A plain struct of a string, an enum tag and a u64 cannot fail to serialize.
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn decode(raw: &str) -> Option<Self> {
+        serde_json::from_str(raw).ok()
+    }
+}
+
+impl Cursor {
+    pub fn encode(&self) -> String {
+        // A plain struct of a string, an enum tag and a u64 cannot fail to serialize.
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn decode(raw: &str) -> Option<Self> {
+        serde_json::from_str(raw).ok()
+    }
+
+    /// Whether `head` in `space` is already covered by this cursor.
+    pub fn covers(&self, space: &CursorSpace, head: u64) -> bool {
+        &self.space == space
+            && match space.kind {
+                CursorKind::Seq => head <= self.pos,
+                CursorKind::Revision => head == self.pos,
+            }
+    }
+}
+
 impl<T: Transport + ?Sized> Transport for Box<T> {
     fn manifest(&mut self, if_none_match: Option<u64>) -> Result<Option<Manifest>> {
         (**self).manifest(if_none_match)
+    }
+    fn cursor_space(&self) -> CursorSpace {
+        (**self).cursor_space()
     }
     fn push(&mut self, page: &PageId, req: PushRequest) -> Result<PushResponse> {
         (**self).push(page, req)
@@ -84,6 +236,9 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
 pub trait Transport {
     /// `GET manifest` with `If-None-Match: rev`; `None` means 304 Not Modified.
     fn manifest(&mut self, if_none_match: Option<u64>) -> Result<Option<Manifest>>;
+    /// The space this transport's `head_seq` values are measured in. Two transports of
+    /// different kinds (or different relays) never share a cursor.
+    fn cursor_space(&self) -> CursorSpace;
     /// `POST pages/{pid}/updates`.
     fn push(&mut self, page: &PageId, req: PushRequest) -> Result<PushResponse>;
     /// `GET pages/{pid}/updates?since={seq}`.
@@ -109,6 +264,8 @@ pub struct SyncReport {
     pub snapshots: usize,
     pub blobs_up: usize,
     pub blobs_down: usize,
+    /// Pages that failed while the rest of the round carried on; empty on a clean round.
+    pub failed: Vec<Failure>,
 }
 
 impl SyncReport {
@@ -124,6 +281,7 @@ impl SyncReport {
                 self.imported.push(p);
             }
         }
+        self.failed.extend(other.failed);
     }
 
     /// Whether anything moved in either direction.
@@ -135,21 +293,42 @@ impl SyncReport {
 /// Status shown in the sidebar (§9.2, §9.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncStatus {
-    Synced { at_ms: i64 },
-    Offline { queued: usize },
+    Synced {
+        at_ms: i64,
+    },
+    /// The relay was reachable and the round applied what it could, but some pages failed:
+    /// not "Offline" (the network is up), and not plain "Synced" either (§12.6).
+    Partial {
+        failed: usize,
+        queued: usize,
+    },
+    Offline {
+        queued: usize,
+    },
     NeedsAuth,
     Unsupported,
 }
 
 impl SyncStatus {
     pub fn from_result(r: &Result<SyncReport>, store: &Store) -> Self {
+        let queued = || store.outbox_pending(usize::MAX >> 1).map_or(0, |v| v.len());
         match r {
-            Ok(_) => SyncStatus::Synced { at_ms: store.now() },
+            Ok(r) if r.failed.is_empty() => SyncStatus::Synced { at_ms: store.now() },
+            Ok(r) => {
+                let failed = r
+                    .failed
+                    .iter()
+                    .map(|f| f.page.clone())
+                    .collect::<BTreeSet<_>>()
+                    .len();
+                SyncStatus::Partial {
+                    failed,
+                    queued: queued(),
+                }
+            }
             Err(SyncError::Unauthorized) => SyncStatus::NeedsAuth,
             Err(SyncError::ProtocolVersion(_)) => SyncStatus::Unsupported,
-            Err(_) => SyncStatus::Offline {
-                queued: store.outbox_pending(usize::MAX >> 1).map_or(0, |v| v.len()),
-            },
+            Err(_) => SyncStatus::Offline { queued: queued() },
         }
     }
 }
@@ -159,9 +338,10 @@ impl SyncStatus {
 pub struct Outgoing {
     /// `(page, outbox seqs, request)`, each request at most [`MAX_PUSH_BYTES`].
     pub pushes: Vec<(PageId, Vec<i64>, PushRequest)>,
-    /// Highest relay `seq` already imported, per page.
-    pub local_seqs: BTreeMap<PageId, u64>,
-    pub rev: Option<u64>,
+    /// Where each page was pulled to, tagged with the transport that measured it.
+    pub cursors: BTreeMap<PageId, Cursor>,
+    /// The last manifest this client fully applied, in the space that issued it.
+    pub rev: Option<ManifestRev>,
     pub snapshots: Vec<(PageId, u64, Vec<u8>)>,
     /// Attachments to upload: `(sha256, bytes)`.
     pub blob_puts: Vec<(String, Vec<u8>)>,
@@ -169,73 +349,191 @@ pub struct Outgoing {
     pub blob_wants: Vec<String>,
 }
 
-/// What came back from the relay; applied on the store's thread.
+/// What one exchange did to one page (§12.3 steps 2–4): the one place the round's
+/// per-page outcome lives, instead of three loose lists on [`Incoming`].
 #[derive(Debug, Clone, Default)]
-pub struct Incoming {
+pub struct PageExchange {
+    /// Outbox rows this page's pushes were acknowledged for (accepted or duplicate).
     pub sent: Vec<i64>,
     pub accepted: usize,
     pub duplicates: usize,
+    /// This page's pull result when the relay was ahead of the local cursor.
+    pub pull: Option<PullResponse>,
+}
+
+/// What came back from the relay; applied on the store's thread.
+#[derive(Debug, Clone, Default)]
+pub struct Incoming {
+    /// Per-page outcome, keyed by page.
+    pub pages: BTreeMap<PageId, PageExchange>,
     pub snapshots_sent: usize,
     pub manifest: Option<Manifest>,
-    pub pulls: Vec<(PageId, PullResponse)>,
+    /// The space the `head_seq` values above were measured in.
+    pub cursor_space: Option<CursorSpace>,
     /// Pages whose server tail is long enough to compact.
     pub compact: Vec<(PageId, u64)>,
     /// Uploaded attachment hashes.
     pub blobs_put: Vec<String>,
     /// Downloaded attachments, not yet verified.
     pub blobs_got: Vec<(String, Vec<u8>)>,
+    /// Retryable failures that did not stop the round (one page, or one attachment).
+    /// Their outbox rows and cursors are left untouched, so the next round retries only
+    /// them.
+    pub failed: Vec<Failure>,
 }
 
-fn seq_key(page: &PageId) -> String {
-    format!("seq:{page}")
+fn cursor_key(page: &PageId) -> String {
+    format!("cursor:{page}")
+}
+
+/// Refuse a relay that speaks another protocol before this client writes to it (§12.6).
+/// `None` is a 304: there was no manifest to check.
+fn check_protocol(m: &Option<Manifest>) -> Result<()> {
+    match m {
+        Some(m) if m.protocol_version != PROTOCOL_VERSION => {
+            Err(SyncError::ProtocolVersion(m.protocol_version))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The network half of a round (§12.3 steps 1–2, 5): touches only the transport, so it
 /// can run on a background thread while the UI keeps editing.
 pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incoming> {
     let mut inc = Incoming::default();
-    let first = t.manifest(None)?;
-    if let Some(m) = &first {
-        if m.protocol_version != PROTOCOL_VERSION {
-            return Err(SyncError::ProtocolVersion(m.protocol_version));
+    // The transport's identity can come from its own manifest (a relay store id), so ask
+    // first and take the cursor space afterwards. A conditional request is only safe when
+    // the stored rev belongs to the space this transport already has; otherwise it is
+    // another relay's (or folder's) counter and must not answer 304.
+    //
+    // It is also only safe on a read-only round: a relay's 304 compares the rev alone, so
+    // an in-place protocol upgrade that keeps the rev would answer 304, skip the version
+    // check below, and let this client push to an unsupported relay. A round with pushes
+    // or snapshots therefore fetches the manifest unconditionally first (§12.6).
+    let writes = !out.pushes.is_empty() || !out.snapshots.is_empty();
+    let known = t.cursor_space();
+    let if_none_match = if writes {
+        None
+    } else {
+        out.rev.as_ref().filter(|r| r.space == known).map(|r| r.rev)
+    };
+    let first = t.manifest(if_none_match)?;
+    check_protocol(&first)?;
+    let space = t.cursor_space();
+    // Batches of one page are causally ordered (`prepare` splits a page's outbox by
+    // `MAX_PUSH_BYTES`). Once one is refused, a later batch must not reach the relay
+    // without its predecessors: a peer could pull it, advance its cursor over an update
+    // Loro only holds pending, and lose it on restart. Other pages still go through.
+    let mut refused: BTreeSet<PageId> = BTreeSet::new();
+    for (page, seqs, req) in out.pushes {
+        if refused.contains(&page) {
+            continue;
+        }
+        match t.push(&page, req) {
+            Ok(resp) => {
+                // Duplicates are success: the relay already has them (§12.6, 409).
+                let done = inc.pages.entry(page).or_default();
+                done.sent.extend(seqs);
+                done.accepted += resp.accepted;
+                done.duplicates += resp.duplicate;
+            }
+            Err(e) => {
+                // One page the relay refuses must not cost the other pages their acks, nor
+                // the pulls below their chance to run (§12.3).
+                let f = Failure::page(&page, &e);
+                if f.is_terminal() {
+                    return Err(e);
+                }
+                refused.insert(page);
+                inc.failed.push(f);
+            }
         }
     }
-    for (page, seqs, req) in out.pushes {
-        let resp = t.push(&page, req)?;
-        // Duplicates are success: the relay already has them (§12.6, 409).
-        inc.sent.extend(seqs);
-        inc.accepted += resp.accepted;
-        inc.duplicates += resp.duplicate;
-    }
     for (page, covers, payload) in out.snapshots {
-        t.put_snapshot(&page, covers, payload)?;
-        inc.snapshots_sent += 1;
+        match t.put_snapshot(&page, covers, payload) {
+            Ok(()) => inc.snapshots_sent += 1,
+            Err(e) => {
+                let f = Failure::page(&page, &e);
+                if f.is_terminal() {
+                    return Err(e);
+                }
+                inc.failed.push(f);
+            }
+        }
     }
     for (hash, bytes) in out.blob_puts {
-        if t.put_blob(&hash, bytes)? {
-            inc.blobs_put.push(hash);
+        match t.put_blob(&hash, bytes) {
+            Ok(true) => inc.blobs_put.push(hash),
+            Ok(false) => {}
+            Err(e) => {
+                let f = Failure::object(&e);
+                if f.is_terminal() {
+                    return Err(e);
+                }
+                inc.failed.push(f);
+            }
         }
     }
     for hash in out.blob_wants {
-        if let Some(bytes) = t.get_blob(&hash)? {
-            inc.blobs_got.push((hash, bytes));
+        match t.get_blob(&hash) {
+            Ok(Some(bytes)) => inc.blobs_got.push((hash, bytes)),
+            Ok(None) => {}
+            Err(e) => {
+                let f = Failure::object(&e);
+                if f.is_terminal() {
+                    return Err(e);
+                }
+                inc.failed.push(f);
+            }
         }
     }
-    let manifest = if inc.sent.is_empty() && inc.snapshots_sent == 0 {
-        match first {
-            Some(m) if Some(m.rev) != out.rev => Some(m),
-            _ => None,
-        }
+    let manifest = if inc.pages.values().all(|p| p.sent.is_empty()) && inc.snapshots_sent == 0 {
+        // `first` is already `None` when the manifest was unchanged, and carries the newer
+        // rev otherwise.
+        first
     } else {
-        t.manifest(None)?
+        // What was pushed may have changed the manifest, so ask again unconditionally.
+        // Failing to re-read it must not throw away the acks this round just earned: the
+        // rows stay marked sent, no cursor moves, and the next round pulls normally.
+        match t.manifest(None) {
+            Ok(m) => {
+                check_protocol(&m)?;
+                m
+            }
+            Err(e) => {
+                let f = Failure::object(&e);
+                if f.is_terminal() {
+                    return Err(e);
+                }
+                inc.failed.push(f);
+                None
+            }
+        }
     };
     if let Some(m) = &manifest {
         for p in &m.pages {
             let page = PageId(p.page_id.clone());
-            let local = out.local_seqs.get(&page).copied().unwrap_or(0);
-            if p.head_seq > local {
-                let resp = t.pull(&page, local)?;
-                inc.pulls.push((page.clone(), resp));
+            // A cursor from another transport (or another relay) is not comparable with
+            // this manifest's `head_seq`: treat the page as never pulled (§12.3 step 4).
+            let local = out.cursors.get(&page).filter(|c| c.space == space);
+            let up_to_date = local.is_some_and(|c| c.covers(&space, p.head_seq));
+            if !up_to_date {
+                let since = local.map_or(0, |c| c.pos);
+                match t.pull(&page, since) {
+                    Ok(resp) => {
+                        inc.pages.entry(page.clone()).or_default().pull = Some(resp);
+                    }
+                    Err(e) => {
+                        // One page the relay serves but this device cannot read (an E2E
+                        // payload from a device without the passphrase, a corrupt update)
+                        // must not cost every other page its pull (§12.6).
+                        let f = Failure::page(&page, &e);
+                        if f.is_terminal() {
+                            return Err(e);
+                        }
+                        inc.failed.push(f);
+                    }
+                }
             }
             let tail = p.head_seq.saturating_sub(p.snapshot_seq);
             if p.tail_bytes > SNAPSHOT_TAIL_BYTES || tail > SNAPSHOT_TAIL_UPDATES {
@@ -243,6 +541,7 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
             }
         }
     }
+    inc.cursor_space = Some(space);
     inc.manifest = manifest;
     Ok(inc)
 }
@@ -263,6 +562,14 @@ impl SyncEngine {
                 id
             }
         };
+        // Retire the pre-`cursor:` positions once: a bare `seq:<page>` is a relay sequence
+        // with no transport tag and no file-count meaning, so it is not comparable with
+        // any head. Dropping it makes the first round pull every page once, idempotently
+        // (§12.3 step 4).
+        let stale = store.sync_delete_prefixed("seq")?;
+        if stale > 0 {
+            eprintln!("utopia-sync: dropped {stale} pre-cursor sync position(s)");
+        }
         Ok(Self {
             client_id,
             pending_snapshots: Vec::new(),
@@ -278,7 +585,9 @@ impl SyncEngine {
     pub fn prepare(&mut self, store: &mut Store) -> Result<Outgoing> {
         store.sync_index()?;
         let mut out = Outgoing {
-            rev: store.sync_get("rev")?.and_then(|r| r.parse().ok()),
+            rev: store
+                .sync_get("rev")?
+                .and_then(|raw| ManifestRev::decode(&raw)),
             snapshots: std::mem::take(&mut self.pending_snapshots),
             ..Default::default()
         };
@@ -318,8 +627,15 @@ impl SyncEngine {
                 out.pushes.push((page, seqs, PushRequest { updates }));
             }
         }
-        for (k, v) in store.sync_seqs()? {
-            out.local_seqs.insert(PageId(k), v);
+        for (k, raw) in store.sync_prefixed("cursor")? {
+            match Cursor::decode(&raw) {
+                Some(c) => {
+                    out.cursors.insert(PageId(k), c);
+                }
+                // A hand-edited or older value is ignored: the page is pulled again, which
+                // imports idempotently (§12.3 step 4).
+                None => eprintln!("utopia-sync: ignoring unreadable cursor for page {k}"),
+            }
         }
         out.blob_puts = store.blobs_to_upload(BLOBS_PER_ROUND)?;
         out.blob_wants = store.missing_blobs()?;
@@ -329,8 +645,11 @@ impl SyncEngine {
 
     /// Mark pushes sent, import pulled updates (idempotent), record positions, and queue
     /// compaction snapshots for pages this client is fully caught up on.
+    ///
+    /// A page's acks and its cursor are recorded only after its payload is stored: an
+    /// import that fails leaves that page queued and unadvanced, so the next round retries
+    /// it instead of believing it synced (§12.3 steps 3–4).
     pub fn apply(&mut self, store: &mut Store, inc: Incoming) -> Result<SyncReport> {
-        store.outbox_mark_sent(&inc.sent)?;
         store.mark_blobs_uploaded(&inc.blobs_put)?;
         let mut blobs_in = 0;
         for (hash, bytes) in &inc.blobs_got {
@@ -342,42 +661,99 @@ impl SyncEngine {
             }
         }
         let mut report = SyncReport {
-            pushed: inc.accepted,
-            duplicates: inc.duplicates,
+            pushed: inc.pages.values().map(|p| p.accepted).sum(),
+            duplicates: inc.pages.values().map(|p| p.duplicates).sum(),
             snapshots: inc.snapshots_sent,
-            pulled_pages: inc.pulls.len(),
+            pulled_pages: inc.pages.values().filter(|p| p.pull.is_some()).count(),
             blobs_up: inc.blobs_put.len(),
             blobs_down: blobs_in,
+            failed: inc.failed,
             ..Default::default()
         };
+        // One batch on the happy path, so a round keeps the merge ordering it had before
+        // per-page outcomes existed: every remote update is in memory before a page is
+        // deduped.
         let mut batch: Vec<(PageId, Vec<u8>)> = Vec::new();
-        let mut heads: Vec<(PageId, u64)> = Vec::new();
-        for (page, resp) in inc.pulls {
-            if let Some(snap) = resp.snapshot {
-                batch.push((page.clone(), snap));
+        let mut pulled: BTreeMap<PageId, Vec<Vec<u8>>> = BTreeMap::new();
+        for (page, done) in &inc.pages {
+            let Some(resp) = &done.pull else { continue };
+            let mut payloads: Vec<Vec<u8>> = Vec::new();
+            if let Some(snap) = &resp.snapshot {
+                payloads.push(snap.clone());
             }
-            for u in resp.updates {
-                batch.push((page.clone(), u.payload));
-            }
-            heads.push((page, resp.head_seq));
+            payloads.extend(resp.updates.iter().map(|u| u.payload.clone()));
+            batch.extend(payloads.iter().map(|b| (page.clone(), b.clone())));
+            pulled.insert(page.clone(), payloads);
         }
+        // Pages whose pulled payload could not be stored.
+        let mut unstored: Vec<PageId> = Vec::new();
         if !batch.is_empty() {
-            report.imported = store.import_batch(&batch)?;
+            match store.import_batch(&batch) {
+                Ok(imported) => report.imported = imported,
+                Err(_) => {
+                    // Isolate the page that cannot be stored; every other page's payload is
+                    // still applied (imports are idempotent, so a few are read twice).
+                    for (page, payloads) in &pulled {
+                        let one: Vec<(PageId, Vec<u8>)> =
+                            payloads.iter().map(|b| (page.clone(), b.clone())).collect();
+                        match store.import_batch(&one) {
+                            Ok(imported) => {
+                                for p in imported {
+                                    if !report.imported.contains(&p) {
+                                        report.imported.push(p);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                unstored.push(page.clone());
+                                report.failed.push(Failure {
+                                    page: Some(page.clone()),
+                                    kind: FailureKind::Store(e.to_string()),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
-        for (page, head) in &heads {
-            store.sync_set(&seq_key(page), &head.to_string())?;
+        for (page, done) in inc.pages {
+            if unstored.contains(&page) {
+                continue;
+            }
+            store.outbox_mark_sent(&done.sent)?;
+            if let (Some(resp), Some(space)) = (&done.pull, &inc.cursor_space) {
+                let cursor = Cursor {
+                    space: space.clone(),
+                    pos: resp.head_seq,
+                };
+                store.sync_set(&cursor_key(&page), &cursor.encode())?;
+            }
         }
-        if let Some(m) = &inc.manifest {
-            store.sync_set("rev", &m.rev.to_string())?;
+        // Only a manifest whose pulls were all applied may be remembered: with a page
+        // still failed, the next round must fetch the manifest again and retry it.
+        if let (Some(m), Some(space)) = (&inc.manifest, &inc.cursor_space) {
+            if report.failed.is_empty() {
+                let rev = ManifestRev {
+                    space: space.clone(),
+                    rev: m.rev,
+                };
+                store.sync_set("rev", &rev.encode())?;
+            }
         }
         store.sync_set("synced_at", &store.now().to_string())?;
         for (page, head) in inc.compact {
-            let local: u64 = store
-                .sync_get(&seq_key(&page))?
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            // Only a client that has imported everything up to head may cover it.
-            if local >= head && store.page_exists(&page)? {
+            let local = store
+                .sync_get(&cursor_key(&page))?
+                .and_then(|raw| Cursor::decode(&raw));
+            // Only a cursor written by this very transport may cover a head it measured:
+            // another space's position (a previous relay, a folder, a wiped store) says
+            // nothing about what this client pulled, and a snapshot over unseen updates
+            // would delete them from the relay (§12.6, rule 5).
+            let covered = match (&local, &inc.cursor_space) {
+                (Some(c), Some(space)) => c.covers(space, head),
+                _ => false,
+            };
+            if covered && store.page_exists(&page)? {
                 let full = store.export_since(&page, &Frontier::default())?;
                 self.pending_snapshots.push((page, head, full));
             }
@@ -387,6 +763,10 @@ impl SyncEngine {
 
     /// Prepare → exchange → apply until nothing moves (imports may create local ops,
     /// e.g. re-merges, which must be pushed in turn).
+    ///
+    /// A retryable failure on one page does not fail the round: its rows stay queued and
+    /// the rest of the round is applied. A round in which nothing at all moved is still an
+    /// [`Err`], so "offline" keeps meaning offline (§12.6).
     pub fn sync_once<T: Transport + ?Sized>(
         &mut self,
         store: &mut Store,
@@ -397,15 +777,28 @@ impl SyncEngine {
             let out = self.prepare(store)?;
             let had_work = !out.pushes.is_empty() || !out.snapshots.is_empty();
             let inc = exchange(t, out)?;
+            let failed = !inc.failed.is_empty();
             let pass = self.apply(store, inc)?;
             let quiet = pass.imported.is_empty()
                 && !had_work
                 && self.pending_snapshots.is_empty()
                 && pass.blobs_up == 0
                 && pass.blobs_down == 0;
+            let stopped = failed || !pass.failed.is_empty();
             report.absorb(pass);
-            if quiet {
+            // Retrying a page that just failed inside the same round only re-spends the
+            // same bandwidth; the next round owns it.
+            if quiet || stopped {
                 break;
+            }
+        }
+        if let Some(f) = report.failed.first() {
+            let moved = report.pushed + report.duplicates > 0
+                || !report.imported.is_empty()
+                || report.snapshots > 0
+                || report.blobs_up + report.blobs_down > 0;
+            if !moved {
+                return Err(f.to_error());
             }
         }
         Ok(report)
@@ -431,7 +824,12 @@ impl<T: Transport> SyncClient<T> {
     }
 
     /// Number of local updates not yet accepted by the relay.
-    pub fn queued(store: &Store) -> Result<usize> {
+    ///
+    /// Flushes first: in the UI's debounced mode an edit lives in memory for up to 250 ms,
+    /// and a count read straight from the index would say "nothing queued" while the
+    /// keystrokes are still unsent (§9.3). `prepare` does the same before pushing.
+    pub fn queued(store: &mut Store) -> Result<usize> {
+        store.sync_index()?;
         Ok(store.outbox_pending(usize::MAX >> 1)?.len())
     }
 

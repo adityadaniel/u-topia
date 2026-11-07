@@ -120,6 +120,63 @@ fn manifest_is_conditional_and_pushes_are_idempotent() {
     assert_eq!((r.accepted, r.duplicate), (0, 1));
 }
 
+/// Serve a relay on an address chosen earlier; the `Arc<Db>` is one store instance.
+fn serve_on(rt: &tokio::runtime::Runtime, addr: std::net::SocketAddr, cfg: Config) -> Arc<Db> {
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let app = router(db.clone(), cfg);
+    let listener = rt.block_on(tokio::net::TcpListener::bind(addr)).unwrap();
+    rt.spawn(async move { axum::serve(listener, app).await.unwrap() });
+    db
+}
+
+/// §12.6: a relay whose database was wiped keeps its URL but not its sequence. The
+/// manifest's instance id is what tells the two apart, so the client pulls again instead
+/// of trusting a cursor from the old store.
+#[test]
+fn ac_12_6_a_wiped_relay_is_a_new_cursor_space() {
+    let mut rt = tokio::runtime::Runtime::new().unwrap();
+    let addr = {
+        let l = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        l.local_addr().unwrap()
+    };
+    let base = format!("http://{addr}");
+    let first = serve_on(&rt, addr, Config::default());
+    let mut a = Store::open_in_memory().unwrap();
+    a.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let mut ca = SyncClient::new(HttpTransport::new(&base, "graph-1", None).unwrap(), &a).unwrap();
+    let page = a.create_page("Shared").unwrap();
+    for i in 0..5 {
+        write(&mut a, &page, &format!("before {i}"));
+    }
+    ca.sync_once(&mut a).unwrap();
+    assert!(!first.manifest("graph-1").unwrap().instance.is_empty());
+    drop(ca);
+    drop(first);
+    drop(rt);
+
+    // The relay's database is wiped and served again on the same address.
+    rt = tokio::runtime::Runtime::new().unwrap();
+    let second = serve_on(&rt, addr, Config::default());
+    let (mut b, mut cb) = {
+        let mut s = Store::open_in_memory().unwrap();
+        let c = SyncClient::new(HttpTransport::new(&base, "graph-1", None).unwrap(), &s).unwrap();
+        s.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+        (s, c)
+    };
+    let same = b.create_page("Shared").unwrap();
+    assert_eq!(same, page);
+    write(&mut b, &same, "after the wipe");
+    cb.sync_once(&mut b).unwrap();
+
+    let mut ca = SyncClient::new(HttpTransport::new(&base, "graph-1", None).unwrap(), &a).unwrap();
+    ca.sync_once(&mut a).unwrap();
+    let seen = texts(&mut a, &page);
+    assert!(seen.contains(&"after the wipe".to_string()), "{seen:?}");
+    assert!(!second.manifest("graph-1").unwrap().instance.is_empty());
+}
+
 #[test]
 fn auth_is_enforced() {
     let server = serve(Config {
@@ -131,13 +188,80 @@ fn auth_is_enforced() {
     assert!(matches!(ca.sync_once(&mut a), Err(SyncError::Unauthorized)));
     assert_eq!(ca.sync_status(&mut a), SyncStatus::NeedsAuth);
     assert!(
-        SyncClient::<HttpTransport>::queued(&a).unwrap() > 0,
+        SyncClient::<HttpTransport>::queued(&mut a).unwrap() > 0,
         "edits stay queued"
     );
     let (mut b, mut cb) = device(&server, Some("secret"));
     b.create_page("Allowed").unwrap();
     cb.sync_once(&mut b).unwrap();
-    assert_eq!(SyncClient::<HttpTransport>::queued(&b).unwrap(), 0);
+    assert_eq!(SyncClient::<HttpTransport>::queued(&mut b).unwrap(), 0);
+}
+
+/// §12.3 step 2: the same new change id twice in one request is accepted once, counted as
+/// a duplicate and charged to the quota once — a second insert would break the UNIQUE
+/// index and fail the whole request.
+#[test]
+fn ac_12_3_a_change_id_repeated_in_one_batch_is_a_duplicate() {
+    use utopia_sync::{PushRequest, UpdateIn};
+    let db = Db::open_in_memory().unwrap();
+    let one = UpdateIn {
+        id: "client:1".into(),
+        client_seq: 1,
+        frontier: String::new(),
+        payload: vec![7u8; 100],
+    };
+    let req = PushRequest {
+        updates: vec![one.clone(), one],
+    };
+    let r = db
+        .push("graph-1", "page-1", "owner", req, 10_000)
+        .expect("a repeated change id is a duplicate, not a constraint violation");
+    assert_eq!((r.accepted, r.duplicate), (1, 1));
+    assert_eq!(
+        db.graph_bytes("graph-1").unwrap(),
+        100,
+        "the payload is stored and charged once"
+    );
+}
+
+/// §12.6: a batch the relay stored but whose response was lost is re-pushed. Dedupe runs
+/// before quota, so its own bytes cannot make it a permanent 413.
+#[test]
+fn ac_12_6_a_replayed_batch_is_a_duplicate_even_at_the_quota() {
+    use utopia_sync::{PushRequest, UpdateIn};
+    let db = Db::open_in_memory().unwrap();
+    let req = PushRequest {
+        updates: vec![UpdateIn {
+            id: "client:1".into(),
+            client_seq: 1,
+            frontier: String::new(),
+            payload: vec![7u8; 1000],
+        }],
+    };
+    let first = db
+        .push("graph-1", "page-1", "owner", req.clone(), 1500)
+        .unwrap();
+    assert_eq!(first.accepted, 1);
+    let used = db.graph_bytes("graph-1").unwrap();
+    assert_eq!(used, 1000);
+    // The response was lost: the same batch is pushed again when no new byte fits.
+    let again = db
+        .push("graph-1", "page-1", "owner", req, used)
+        .expect("a duplicate batch needs no new space");
+    assert_eq!((again.accepted, again.duplicate), (0, 1));
+    // Genuinely new bytes are still refused.
+    let new = PushRequest {
+        updates: vec![UpdateIn {
+            id: "client:2".into(),
+            client_seq: 2,
+            frontier: String::new(),
+            payload: vec![7u8; 10],
+        }],
+    };
+    assert!(matches!(
+        db.push("graph-1", "page-1", "owner", new, used),
+        Err(utopia_syncd::ApiError::QuotaExceeded)
+    ));
 }
 
 #[test]
@@ -155,6 +279,103 @@ fn quota_rejects_and_keeps_outbox() {
         "{err}"
     );
     assert!(matches!(ca.sync_status(&mut a), SyncStatus::Offline { queued } if queued > 0));
+}
+
+/// A client that hands the push to the relay and then loses the response, as a dropped
+/// connection would.
+struct LostAck {
+    inner: HttpTransport,
+    lost: bool,
+}
+
+impl Transport for LostAck {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.inner.manifest(if_none_match)
+    }
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        let resp = self.inner.push(page, req);
+        if self.lost {
+            self.lost = false;
+            return Err(SyncError::Transport(
+                "connection reset after the push".into(),
+            ));
+        }
+        resp
+    }
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.inner.pull(page, since_seq)
+    }
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// §12.6, end to end over HTTP: a batch the relay stored whose response was lost is
+/// re-pushed; the replay is a duplicate, so a quota that is nearly full cannot turn it
+/// into a permanent 413.
+#[test]
+fn ac_12_6_a_lost_ack_is_replayed_not_rejected_by_quota() {
+    let mut a = Store::open_in_memory().unwrap();
+    a.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = a.create_page("Lost ack").unwrap();
+    write(&mut a, &page, &"x".repeat(2000));
+    let payload_bytes: usize = a
+        .outbox_pending(100)
+        .unwrap()
+        .iter()
+        .map(|row| row.3.len())
+        .sum();
+    assert!(payload_bytes > 512, "{payload_bytes}");
+    // Room for one copy of the batch, not for a second.
+    let server = serve(Config {
+        tokens: Vec::new(),
+        quota_bytes: (payload_bytes + 512) as u64,
+    });
+    let mut ca = SyncClient::new(
+        LostAck {
+            inner: HttpTransport::new(&server.base, "graph-1", None).unwrap(),
+            lost: true,
+        },
+        &a,
+    )
+    .unwrap();
+    let first = ca.sync_once(&mut a);
+    assert!(
+        first.is_err(),
+        "the lost response fails that round: {first:?}"
+    );
+
+    // The next round re-pushes the very same batch.
+    assert!(matches!(ca.sync_status(&mut a), SyncStatus::Synced { .. }));
+    assert_eq!(
+        server.db.graph_bytes("graph-1").unwrap() as usize,
+        payload_bytes,
+        "the relay stored the batch once"
+    );
+    assert_eq!(
+        SyncClient::<HttpTransport>::queued(&mut a).unwrap(),
+        0,
+        "the replay was acknowledged"
+    );
 }
 
 #[test]
