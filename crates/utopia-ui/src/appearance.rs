@@ -361,6 +361,31 @@ impl Prefs {
                 Vec::new()
             }
         };
+        // The branch this preference came from stored the sidebar pins under
+        // `pinned_pages`; the left sidebar's group (SB-3) and the right sidebar's tab (RS-3)
+        // now share `pinned`, so fold the old list in rather than dropping it.
+        let mut pinned = pinned;
+        match rest.remove("pinned_pages") {
+            None => {}
+            Some(Value::Array(items)) => {
+                for item in items {
+                    match item {
+                        Value::String(id) if !id.is_empty() => {
+                            let id = PageId(id);
+                            if !pinned.contains(&id) {
+                                pinned.push(id);
+                            }
+                        }
+                        other => warnings.push(format!(
+                            "{FILE}: ignoring pinned page {other}; page ids are strings"
+                        )),
+                    }
+                }
+            }
+            Some(v) => warnings.push(format!(
+                "{FILE}: pinned_pages should be a list of page ids, not {v}; ignoring it"
+            )),
+        }
         (
             Self {
                 font,
@@ -636,6 +661,38 @@ mod tests {
             })
         );
         assert_eq!(Prefs::from_json(&json), (p, vec![]));
+    }
+
+    /// Merge fix: the branch before the merge stored the sidebar pins under
+    /// `pinned_pages`, and the two lists were merged into one `pinned`. A file written by
+    /// that build must keep its pins instead of silently coming up with none.
+    #[test]
+    fn legacy_pinned_pages_are_migrated() {
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned_pages": ["a", "b"]}"#);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(p.pinned, [PageId("a".into()), PageId("b".into())]);
+        let v: Value = serde_json::from_str(&p.to_json()).unwrap();
+        assert_eq!(v["pinned"], serde_json::json!(["a", "b"]));
+        assert!(
+            v.get("pinned_pages").is_none(),
+            "the legacy key is migrated, not left behind: {v}"
+        );
+
+        // Both keys (a file already saved after the merge): the shared list wins and the
+        // legacy entries it lacks are added once, in pin order.
+        let (p, warnings) =
+            Prefs::from_json(r#"{"version": 1, "pinned": ["a"], "pinned_pages": ["a", "b", 3]}"#);
+        assert_eq!(p.pinned, [PageId("a".into()), PageId("b".into())]);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the junk entry is reported: {warnings:?}"
+        );
+
+        // Junk in the legacy key is reported, not a panic (rule 11).
+        let (p, warnings) = Prefs::from_json(r#"{"version": 1, "pinned_pages": "a"}"#);
+        assert!(p.pinned.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     /// PG-1: attribute blocks default to compact rows, and a value this version does not
