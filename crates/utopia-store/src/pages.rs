@@ -32,12 +32,31 @@ impl Store {
 
     /// Whether `id` was ever used by a page on this device (live or tombstoned).
     fn id_taken(&self, id: &PageId) -> Result<bool> {
-        Ok(self.page_exists(id)?
+        Ok(self.claims_id(id)
             || self.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM page WHERE id=?1)",
                 [id.as_str()],
                 |r| r.get(0),
             )?)
+    }
+
+    /// Whether an in-memory shard for `id` counts as the page existing. A shard that was
+    /// built but never queued claims nothing: a page whose identity never applied must not
+    /// make the next create issue a fresh ULID for a title no page ever used (§10.3).
+    fn claims_id(&self, id: &PageId) -> bool {
+        self.docs.get(id).is_some_and(|e| e.has_snapshot)
+            || self.pending.iter().any(|(p, _, _)| p == id)
+    }
+
+    /// Build a page's shard with its identity metadata and put it in `docs`, ready to be
+    /// queued. Nothing enters `docs` before the metadata applied, so a failed build cannot
+    /// leave a shard that looks like an existing page (§10.3, `id_taken`).
+    fn install_new_page(&mut self, id: &PageId, meta: PageMetaPatch) -> Result<()> {
+        let now = self.now();
+        let mut entry = self.fresh_entry(id);
+        entry.doc.apply(&Command::SetPageMeta(meta), now)?;
+        self.docs.insert(id.clone(), entry);
+        Ok(())
     }
 
     /// Resolve `title` to a page, creating it if nothing matches (`CreatePage`, App. C).
@@ -61,15 +80,14 @@ impl Store {
             id = PageId::fresh();
         }
         let now = self.now();
-        let entry = self.new_doc(&id);
-        entry.doc.apply(
-            &Command::SetPageMeta(PageMetaPatch {
+        self.install_new_page(
+            &id,
+            PageMetaPatch {
                 title: Some(title),
                 kind: Some(PageKind::Page),
                 created_at: Some(now),
                 ..Default::default()
-            }),
-            now,
+            },
         )?;
         self.queue(&[(id.clone(), None)], true)?;
         self.flush()?;
@@ -96,15 +114,14 @@ impl Store {
             id = PageId::fresh();
         }
         let now = self.now();
-        let entry = self.new_doc(&id);
-        entry.doc.apply(
-            &Command::SetPageMeta(PageMetaPatch {
+        self.install_new_page(
+            &id,
+            PageMetaPatch {
                 kind: Some(PageKind::Daily),
                 daily_date: Some(Some(date)),
                 created_at: Some(now),
                 ..Default::default()
-            }),
-            now,
+            },
         )?;
         self.queue(&[(id.clone(), None)], true)?;
         self.flush()?;
@@ -811,5 +828,24 @@ impl Store {
             self.reconcile_merged(page)?;
         }
         Ok(changed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `docs/state-machines/draft-daily-page.md` issue 4: a shard built for a page whose
+    /// metadata never applied stayed in `docs`, so `id_taken` reported the title's
+    /// deterministic id taken and the next create issued a fresh ULID for a page that was
+    /// never tombstoned (rule 4). An in-memory shard that was never written claims nothing.
+    #[test]
+    fn fr_1_2_unwritten_shard_does_not_claim_its_id() {
+        let mut s = Store::open_in_memory().unwrap();
+        let id = PageId::for_title_key(&normalize_title("Ana"));
+        // The shape the error path used to leave behind: a built shard that was never
+        // queued for writing.
+        s.new_doc(&id);
+        assert_eq!(s.create_page("Ana").unwrap(), id);
     }
 }
