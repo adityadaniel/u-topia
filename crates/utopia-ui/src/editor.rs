@@ -208,6 +208,34 @@ pub fn completion_text(kind: AcKind, item: &AcItem, after_caret: &str) -> (Strin
     }
 }
 
+/// A host request that arrived while the input method owned the field (§13.5). None of
+/// these may run then: finishing the block reads and rewrites the buffer through the
+/// provisional glyphs, and starting another block replaces the buffer outright
+/// (`set_text`). They wait for the input method instead (`after_composition`).
+///
+/// `end` and a focus move do not wait: they take the marked text as committed
+/// (`accept_composition`), because the platform never hands another IME event to a field
+/// that has stopped being its input handler.
+#[derive(Debug, Clone, PartialEq)]
+enum Deferred {
+    /// Finish the block and carry on editing it; `finished: false` is the idle commit.
+    Commit { finished: bool },
+    /// `begin` elsewhere (another block, or another caret in this one).
+    Begin {
+        target: EditTarget,
+        caret: Option<usize>,
+        goal: Option<Goal>,
+    },
+}
+
+impl Deferred {
+    /// The idle commit is the only request that may not displace one already queued: it is
+    /// not a user action, just housekeeping that the next keystroke re-arms anyway.
+    fn is_idle(&self) -> bool {
+        matches!(self, Deferred::Commit { finished: false })
+    }
+}
+
 pub struct BlockEditor {
     app: Entity<AppState>,
     field: TextField,
@@ -219,6 +247,11 @@ pub struct BlockEditor {
     anchor: Option<utopia_store::DocCursor>,
     idle: Option<Task<()>>,
     edits: u64,
+    /// What a host asked for while the input method was composing (§13.5).
+    deferred: Option<Deferred>,
+    /// A store change arrived while the input method owned the buffer (§13.5):
+    /// `sync_from_store` could not look, so it looks once the composition ends.
+    pending_sync: bool,
     _sub: Subscription,
     _page_sub: Subscription,
 }
@@ -276,6 +309,8 @@ impl BlockEditor {
             anchor: None,
             idle: None,
             edits: 0,
+            deferred: None,
+            pending_sync: false,
             _sub: sub,
             _page_sub: page_sub,
         }
@@ -309,6 +344,16 @@ impl BlockEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.field.composing() {
+            // §13.5: starting somewhere else replaces the buffer with stored text, which
+            // would wipe the input method's live composition while it still addresses it.
+            self.defer(Deferred::Begin {
+                target,
+                caret,
+                goal,
+            });
+            return;
+        }
         if self.target.as_ref() != Some(&target) {
             self.commit(cx);
             let text = self.app.update(cx, |app, _| {
@@ -334,6 +379,13 @@ impl BlockEditor {
     /// Stop editing (Escape, navigation). Commits the block. Emits `Blurred` so the
     /// workspace can take focus back if nothing else claims it.
     pub fn end(&mut self, cx: &mut Context<Self>) {
+        if self.field.composing() {
+            // Every caller ends an edit because it is about to move focus (a page, the
+            // palette, the graph, another pane), and gpui gives the platform's input
+            // context no hint: the IME's commit can never reach a field that stopped being
+            // its input handler. Close the composition here instead (§13.5).
+            self.accept_composition(cx);
+        }
         self.commit(cx);
         let was_editing = self.target.take().is_some();
         self.ac = None;
@@ -345,17 +397,13 @@ impl BlockEditor {
 
     fn sync_from_store(&mut self, cx: &mut Context<Self>) {
         let Some(t) = self.target.clone() else { return };
-        if self.field.marked.is_some() {
+        if self.field.composing() {
+            // §13.5: the buffer is the input method's. Neither rewriting it under the
+            // composition nor dropping the change is acceptable, so look again later.
+            self.pending_sync = true;
             return;
         }
-        let text = self.app.update(cx, |app, _| {
-            app.store.page_state(&t.page).ok().and_then(|st| {
-                st.block(&t.block)
-                    .filter(|b| b.live)
-                    .map(|b| b.text.clone())
-            })
-        });
-        match text {
+        match self.stored_text(&t, cx) {
             Some(text) if text != self.field.text => {
                 // Changed underneath us (undo, rewrite, sync): keep the caret in range.
                 let anchored = self.anchor.clone().and_then(|a| {
@@ -368,14 +416,28 @@ impl BlockEditor {
                 cx.notify();
             }
             Some(_) => {}
-            None => {
-                // The block went away (undo of its creation, deletion, merge).
-                self.target = None;
-                self.ac = None;
-                cx.emit(EditorEvent::Blurred);
-                cx.notify();
-            }
+            None => self.detach(cx),
         }
+    }
+
+    /// The target's stored text, or `None` when the block went away (its creation undone,
+    /// deleted, merged). `Some("")` is a live empty block.
+    fn stored_text(&self, t: &EditTarget, cx: &mut Context<Self>) -> Option<String> {
+        self.app.update(cx, |app, _| {
+            app.store.page_state(&t.page).ok().and_then(|st| {
+                st.block(&t.block)
+                    .filter(|b| b.live)
+                    .map(|b| b.text.clone())
+            })
+        })
+    }
+
+    /// Stop editing: the block went away (undo of its creation, deletion, merge).
+    fn detach(&mut self, cx: &mut Context<Self>) {
+        self.target = None;
+        self.ac = None;
+        cx.emit(EditorEvent::Blurred);
+        cx.notify();
     }
 
     fn anchor_caret(&mut self, cx: &mut Context<Self>) {
@@ -446,7 +508,7 @@ impl BlockEditor {
 
     /// Type `text` at the caret (replacing any selection). `false` when not editing.
     pub fn insert_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.target.is_none() {
+        if self.target.is_none() || self.field.composing() {
             return false;
         }
         let sel = self.field.sel.clone();
@@ -492,7 +554,7 @@ impl BlockEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.target.is_none() || self.field.marked.is_some() || range != self.field.sel {
+        if self.target.is_none() || self.field.composing() || range != self.field.sel {
             return false;
         }
         if range.is_empty() {
@@ -528,17 +590,93 @@ impl BlockEditor {
         true
     }
 
-    fn after_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.field.marked.is_some() {
+    fn after_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.field.composing() {
             return;
         }
-        self.persist(cx);
-        self.anchor_caret(cx);
-        self.refresh_autocomplete(cx);
+        let persisted = self.settle(cx);
+        self.after_composition(window, cx, persisted);
     }
 
-    fn persist(&mut self, cx: &mut Context<Self>) {
-        let Some(t) = self.target.clone() else { return };
+    /// Persist what the buffer holds and look at the store again (§13.5), once the
+    /// composition is over whichever way it ended. `true` when the stored text changed.
+    fn settle(&mut self, cx: &mut Context<Self>) -> bool {
+        if std::mem::take(&mut self.pending_sync) {
+            // A store change landed while the input method owned the buffer. A block that
+            // merely changed keeps what the user just committed: the persist below is
+            // newer (block text is last-writer-wins). A block that went away first takes
+            // the composed text with it, into the tombstone, and then the edit ends.
+            let gone = self
+                .target
+                .clone()
+                .is_some_and(|t| self.stored_text(&t, cx).is_none());
+            if gone {
+                // Keep what the input method typed (rule 5): the block is tombstoned but
+                // still in the store, so an undo or the trash brings the characters back,
+                // and only emptying the trash loses them.
+                self.persist(cx);
+                self.detach(cx);
+                return false;
+            }
+        }
+        let changed = self.persist(cx);
+        self.anchor_caret(cx);
+        self.refresh_autocomplete(cx);
+        changed
+    }
+
+    /// Take the input method's marked text as committed (§13.5): `unmarkText` semantics by
+    /// hand, for the paths where the platform will not send one. Anything a host queued for
+    /// this field is stale — the host is moving focus, so a queued `begin` would put the
+    /// caret on a row the host has left.
+    fn accept_composition(&mut self, cx: &mut Context<Self>) {
+        self.field.end_composition();
+        self.deferred = None;
+        self.settle(cx);
+    }
+
+    /// The editor's handle lost focus (§13.5). The input method can no longer reach this
+    /// field, so a live composition must be closed here; without it a composition whose
+    /// owner moved focus without calling `end` would never end.
+    pub fn focus_lost(&mut self, cx: &mut Context<Self>) {
+        if self.field.composing() {
+            self.accept_composition(cx);
+        }
+    }
+
+    /// Queue a host request that must wait for the input method (§13.5). The latest request
+    /// wins — the user's last click or command is the one they meant — except that the idle
+    /// commit never displaces anything.
+    fn defer(&mut self, next: Deferred) {
+        if next.is_idle() && self.deferred.is_some() {
+            return;
+        }
+        self.deferred = Some(next);
+    }
+
+    /// The input method let go of the buffer (§13.5): do what a host asked for meanwhile.
+    fn after_composition(&mut self, window: &mut Window, cx: &mut Context<Self>, persisted: bool) {
+        match self.deferred.take() {
+            None => {}
+            // The composition's own edit re-armed the idle commit, so let that run 300 ms
+            // from now as it would without a composition, instead of committing (NFC,
+            // hashtags, page creation, undo seal) synchronously for every IME phrase.
+            Some(Deferred::Commit { finished: false }) if persisted => {}
+            Some(Deferred::Commit { finished }) => self.commit_block(finished, cx),
+            Some(Deferred::Begin {
+                target,
+                caret,
+                goal,
+            }) => self.begin(target, caret, goal, window, cx),
+        }
+    }
+
+    /// Write the buffer to the store; `true` when the block's text changed (which is also
+    /// when the idle commit is re-armed).
+    fn persist(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(t) = self.target.clone() else {
+            return false;
+        };
         let text = self.field.text.clone();
         let caret = self.field.cursor();
         let changed = self.app.update(cx, |app, cx| {
@@ -574,6 +712,7 @@ impl BlockEditor {
                 }
             }));
         }
+        changed
     }
 
     /// The caret is inside a `[[…]]`/`#[[…]]` still being typed. Auto-pairing closes the
@@ -596,6 +735,14 @@ impl BlockEditor {
 
     /// `finished: false` is the idle commit, which leaves the link being typed alone.
     fn commit_block(&mut self, finished: bool, cx: &mut Context<Self>) {
+        if self.field.composing() {
+            // §13.5: the buffer holds provisional glyphs, so expanding relative dates or
+            // re-reading the block after the store commit would run through text the
+            // store has never seen, and writing the result back would wipe the
+            // composition. The next commit attempt is the input method letting go.
+            self.defer(Deferred::Commit { finished });
+            return;
+        }
         let Some(t) = self.target.clone() else { return };
         self.idle = None;
         self.expand_relative_dates(&t, finished, cx);
@@ -766,6 +913,11 @@ impl BlockEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.field.composing() {
+            // §13.5: the text is the input method's until it commits; taking a suggestion
+            // now would replace a range of its provisional glyphs.
+            return;
+        }
         let Some(ac) = self.ac.take() else { return };
         let item = if create {
             if ac.kind == AcKind::Block || ac.query.trim().is_empty() {
@@ -895,7 +1047,15 @@ impl BlockEditor {
         self.set_kind(&t, next.0, next.1, cx);
     }
 
+    /// A structural host gesture (split, delete, move, zoom, paste outline): the host is
+    /// about to change the rows under the editor, so the input method's marked text is
+    /// taken as committed first (§13.5). Deferring the commit instead would let the host
+    /// remove the row being composed and then queue a `begin` on its neighbour, which the
+    /// focus change from that removal discards — the caret would not continue next door.
     fn emit_after_commit(&mut self, e: EditorEvent, cx: &mut Context<Self>) {
+        if self.field.composing() {
+            self.accept_composition(cx);
+        }
         self.commit(cx);
         cx.emit(e);
     }
@@ -903,6 +1063,10 @@ impl BlockEditor {
     // ---------------------------------------------------------------- actions
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.field.composing() {
+            // §13.5: Enter confirms a candidate in the input method; it never splits here.
+            return;
+        }
         if self.ac.as_ref().is_some_and(|a| !a.items.is_empty()) {
             return self.accept(false, None, window, cx);
         }
@@ -937,6 +1101,9 @@ impl BlockEditor {
     }
 
     fn soft_break(&mut self, _: &SoftBreak, window: &mut Window, cx: &mut Context<Self>) {
+        if self.field.composing() {
+            return;
+        }
         let sel = self.field.sel.clone();
         self.field.replace(sel, "\n");
         self.after_edit(window, cx);
@@ -954,18 +1121,18 @@ impl BlockEditor {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        // §13.5: Backspace belongs to the input method while it composes (it backs through
+        // the candidate); deleting here would remove glyphs it still addresses by offset.
+        if self.field.composing() {
+            return;
+        }
         if self.field.sel.is_empty() {
             if self.field.cursor() == 0 {
                 self.ac = None;
                 return self.emit_after_commit(EditorEvent::MergeBackward, cx);
             }
             // `(|)` → `|`: the closer was put there by the opener, so it goes with it.
-            let pair = self
-                .field
-                .marked
-                .is_none()
-                .then(|| utopia_core::text::empty_pair_at(&self.field.text, self.field.cursor()))
-                .flatten();
+            let pair = utopia_core::text::empty_pair_at(&self.field.text, self.field.cursor());
             match pair {
                 Some(r) => {
                     self.field.move_to(r.start);
@@ -984,6 +1151,10 @@ impl BlockEditor {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        // §13.5: see `backspace`.
+        if self.field.composing() {
+            return;
+        }
         if self.field.sel.is_empty() {
             let to = self.field.next_boundary();
             self.field.select_to(to);
@@ -1150,6 +1321,12 @@ impl BlockEditor {
     }
 
     fn mark(&mut self, delim: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // §13.5: reflowing the text around the selection would leave the marked range
+        // pointing at bytes it never covered, and the input method's next update would
+        // rewrite the wrong run. Styling waits until it commits.
+        if self.field.composing() {
+            return;
+        }
         let (text, sel) =
             utopia_core::text::toggle_mark(&self.field.text, self.field.sel.clone(), delim);
         self.field.text = text;
@@ -1200,6 +1377,11 @@ impl BlockEditor {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        // §13.5: cutting the composition would take the input method's own text; copy
+        // still works, the delete waits for it to commit.
+        if self.field.composing() {
+            return;
+        }
         if self.copy_text(cx) {
             let sel = self.field.sel.clone();
             self.field.replace(sel, "");
@@ -1211,6 +1393,10 @@ impl BlockEditor {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        // §13.5: the caret and selection belong to the input method while it composes.
+        if self.field.composing() {
+            return;
+        }
         let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) else {
             return;
         };
@@ -1391,7 +1577,7 @@ impl Render for BlockEditor {
             )
         } else {
             let mut hl = source_highlights(&text, &th);
-            if let Some(m) = &self.field.marked {
+            if let Some(m) = self.field.marked() {
                 hl.retain(|(r, _)| r.end <= m.start || r.start >= m.end);
                 hl.push((
                     m.clone(),
