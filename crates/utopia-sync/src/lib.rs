@@ -536,13 +536,11 @@ impl SyncEngine {
 
     /// Mark pushes sent, import pulled updates (idempotent), record positions, and queue
     /// compaction snapshots for pages this client is fully caught up on.
+    ///
+    /// A page's acks and its cursor are recorded only after its payload is stored: an
+    /// import that fails leaves that page queued and unadvanced, so the next round retries
+    /// it instead of believing it synced (§12.3 steps 3–4).
     pub fn apply(&mut self, store: &mut Store, inc: Incoming) -> Result<SyncReport> {
-        let sent: Vec<i64> = inc
-            .pages
-            .values()
-            .flat_map(|p| p.sent.iter().copied())
-            .collect();
-        store.outbox_mark_sent(&sent)?;
         store.mark_blobs_uploaded(&inc.blobs_put)?;
         let mut blobs_in = 0;
         for (hash, bytes) in &inc.blobs_got {
@@ -563,23 +561,60 @@ impl SyncEngine {
             failed: inc.failed,
             ..Default::default()
         };
+        // One batch on the happy path, so a round keeps the merge ordering it had before
+        // per-page outcomes existed: every remote update is in memory before a page is
+        // deduped.
         let mut batch: Vec<(PageId, Vec<u8>)> = Vec::new();
-        let mut heads: Vec<(PageId, u64)> = Vec::new();
-        for (page, done) in inc.pages {
-            let Some(resp) = done.pull else { continue };
-            if let Some(snap) = resp.snapshot {
-                batch.push((page.clone(), snap));
+        let mut pulled: BTreeMap<PageId, Vec<Vec<u8>>> = BTreeMap::new();
+        for (page, done) in &inc.pages {
+            let Some(resp) = &done.pull else { continue };
+            let mut payloads: Vec<Vec<u8>> = Vec::new();
+            if let Some(snap) = &resp.snapshot {
+                payloads.push(snap.clone());
             }
-            for u in resp.updates {
-                batch.push((page.clone(), u.payload));
-            }
-            heads.push((page, resp.head_seq));
+            payloads.extend(resp.updates.iter().map(|u| u.payload.clone()));
+            batch.extend(payloads.iter().map(|b| (page.clone(), b.clone())));
+            pulled.insert(page.clone(), payloads);
         }
+        // Pages whose pulled payload could not be stored.
+        let mut unstored: Vec<PageId> = Vec::new();
         if !batch.is_empty() {
-            report.imported = store.import_batch(&batch)?;
+            match store.import_batch(&batch) {
+                Ok(imported) => report.imported = imported,
+                Err(_) => {
+                    // Isolate the page that cannot be stored; every other page's payload is
+                    // still applied (imports are idempotent, so a few are read twice).
+                    for (page, payloads) in &pulled {
+                        let one: Vec<(PageId, Vec<u8>)> =
+                            payloads.iter().map(|b| (page.clone(), b.clone())).collect();
+                        match store.import_batch(&one) {
+                            Ok(imported) => {
+                                for p in imported {
+                                    if !report.imported.contains(&p) {
+                                        report.imported.push(p);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                unstored.push(page.clone());
+                                report.failed.push(Failure {
+                                    page: Some(page.clone()),
+                                    kind: FailureKind::Store(e.to_string()),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
-        for (page, head) in &heads {
-            store.sync_set(&seq_key(page), &head.to_string())?;
+        for (page, done) in inc.pages {
+            if unstored.contains(&page) {
+                continue;
+            }
+            store.outbox_mark_sent(&done.sent)?;
+            if let Some(resp) = &done.pull {
+                store.sync_set(&seq_key(&page), &resp.head_seq.to_string())?;
+            }
         }
         // Only a manifest whose pulls were all applied may be remembered: with a page
         // still failed, the next round must fetch the manifest again and retry it.
@@ -626,10 +661,11 @@ impl SyncEngine {
                 && self.pending_snapshots.is_empty()
                 && pass.blobs_up == 0
                 && pass.blobs_down == 0;
+            let stopped = failed || !pass.failed.is_empty();
             report.absorb(pass);
             // Retrying a page that just failed inside the same round only re-spends the
             // same bandwidth; the next round owns it.
-            if quiet || failed {
+            if quiet || stopped {
                 break;
             }
         }

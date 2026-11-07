@@ -91,6 +91,94 @@ impl utopia_sync::Transport for Flaky {
     }
 }
 
+/// A relay whose pull payloads for one page are corrupt: a shard the relay accepted but
+/// this device cannot import.
+struct Corrupt {
+    inner: RelayTransport,
+    page: PageId,
+}
+
+impl utopia_sync::Transport for Corrupt {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.inner.manifest(if_none_match)
+    }
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        self.inner.push(page, req)
+    }
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        let mut resp = self.inner.pull(page, since_seq)?;
+        if page == &self.page {
+            for u in &mut resp.updates {
+                u.payload = b"not a loro update".to_vec();
+            }
+        }
+        Ok(resp)
+    }
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// §12.3 steps 3–4: an import that fails must leave that page queued and its cursor
+/// unmoved, instead of recording the acks and losing the position.
+#[test]
+fn ac_12_3_a_failed_import_does_not_mark_the_page_synced() {
+    let relay = Relay::new();
+    let (mut a, _) = device(&relay);
+    let (mut b, mut cb) = device(&relay);
+    let broken = a.create_page("Broken").unwrap();
+    write(&mut a, &broken, "the relay's copy will not import");
+    let readable = b.create_page("Readable").unwrap();
+    write(&mut b, &readable, "written on b");
+    cb.sync_once(&mut b).unwrap();
+
+    let mut ca = SyncClient::new(
+        Corrupt {
+            inner: RelayTransport::new(relay.clone(), "g1"),
+            page: broken.clone(),
+        },
+        &a,
+    )
+    .unwrap();
+    let report = ca
+        .sync_once(&mut a)
+        .expect("the readable page still imports");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(report.failed[0].page.as_ref(), Some(&broken));
+    assert_eq!(texts(&mut a, &readable), vec!["written on b"]);
+    // The broken page's push was accepted, but its import failed: its rows stay queued.
+    let queued = a.outbox_pending(100).unwrap();
+    assert!(!queued.is_empty(), "the failed page is still queued");
+    assert!(
+        queued.iter().all(|(_, p, _, _)| p == &broken),
+        "the readable page's acks were recorded: {queued:?}"
+    );
+    assert_eq!(
+        a.sync_get("rev").unwrap(),
+        None,
+        "an unfinished manifest is fetched again next round"
+    );
+}
+
 /// An encrypted device: same relay, payloads sealed with the graph key.
 fn encrypted_device(
     relay: &std::sync::Arc<Relay>,
