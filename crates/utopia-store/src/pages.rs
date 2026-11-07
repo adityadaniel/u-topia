@@ -30,9 +30,15 @@ impl Store {
             .map(PageId))
     }
 
-    /// Whether `id` was ever used by a page on this device (live or tombstoned).
+    /// Whether `id` was ever used by a page on this device: live, tombstoned, an in-memory
+    /// shard that is queued or written, or a durable shard (`page_doc`).
     fn id_taken(&self, id: &PageId) -> Result<bool> {
         Ok(self.claims_id(id)
+            || self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM page_doc WHERE page_id=?1)",
+                [id.as_str()],
+                |r| r.get(0),
+            )?
             || self.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM page WHERE id=?1)",
                 [id.as_str()],
