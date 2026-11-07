@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS page_snapshot (
   PRIMARY KEY (graph_id, page_id)
 );
 CREATE TABLE IF NOT EXISTS graph_rev (graph_id TEXT PRIMARY KEY, rev INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS relay_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS blob (
   graph_id TEXT NOT NULL, hash TEXT NOT NULL,
   payload BLOB NOT NULL, received_at INTEGER NOT NULL,
@@ -99,9 +100,28 @@ impl Db {
 
     fn init(conn: Connection) -> ApiResult<Self> {
         conn.execute_batch(SCHEMA)?;
+        // One id per relay store, kept across restarts and replaced only by a wiped
+        // database, so a client can tell a restarted log from the one it pulled (§12.6).
+        conn.execute(
+            "INSERT OR IGNORE INTO relay_meta(key, value)
+             VALUES ('instance', lower(hex(randomblob(16))))",
+            [],
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// This relay store's instance id (stable for the life of the database).
+    fn instance(conn: &Connection) -> ApiResult<String> {
+        Ok(conn
+            .query_row(
+                "SELECT value FROM relay_meta WHERE key='instance'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
     }
 
     fn lock(&self) -> ApiResult<std::sync::MutexGuard<'_, Connection>> {
@@ -256,6 +276,7 @@ impl Db {
             rev: Self::rev(&conn, gid)?,
             protocol_version: PROTOCOL_VERSION,
             pages: pages.into_values().collect(),
+            instance: Self::instance(&conn)?,
         })
     }
 

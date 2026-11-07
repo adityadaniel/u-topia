@@ -149,6 +149,8 @@ impl Transport for FolderTransport {
             rev,
             protocol_version: PROTOCOL_VERSION,
             pages,
+            // A folder is identified by its path (the cursor space); it has no store id.
+            instance: String::new(),
         }))
     }
 

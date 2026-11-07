@@ -350,16 +350,15 @@ fn cursor_key(page: &PageId) -> String {
 /// can run on a background thread while the UI keeps editing.
 pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incoming> {
     let mut inc = Incoming::default();
-    let space = t.cursor_space();
-    // Ask conditionally with the rev of the last manifest this client fully applied: an
-    // unchanged relay answers 304/Nothing, so an idle round costs one small request instead
-    // of the whole manifest (§12.3 step 1).
+    // The transport's identity can come from its own manifest (a relay store id), so ask
+    // first and take the cursor space afterwards.
     let first = t.manifest(out.rev)?;
     if let Some(m) = &first {
         if m.protocol_version != PROTOCOL_VERSION {
             return Err(SyncError::ProtocolVersion(m.protocol_version));
         }
     }
+    let space = t.cursor_space();
     for (page, seqs, req) in out.pushes {
         match t.push(&page, req) {
             Ok(resp) => {
@@ -646,11 +645,16 @@ impl SyncEngine {
         for (page, head) in inc.compact {
             let local = store
                 .sync_get(&cursor_key(&page))?
-                .and_then(|raw| Cursor::decode(&raw))
-                .filter(|c| c.space.kind == CursorKind::Seq)
-                .map_or(0, |c| c.pos);
-            // Only a client that has imported everything up to head may cover it.
-            if local >= head && store.page_exists(&page)? {
+                .and_then(|raw| Cursor::decode(&raw));
+            // Only a cursor written by this very transport may cover a head it measured:
+            // another space's position (a previous relay, a folder, a wiped store) says
+            // nothing about what this client pulled, and a snapshot over unseen updates
+            // would delete them from the relay (§12.6, rule 5).
+            let covered = match (&local, &inc.cursor_space) {
+                (Some(c), Some(space)) => c.covers(space, head),
+                _ => false,
+            };
+            if covered && store.page_exists(&page)? {
                 let full = store.export_since(&page, &Frontier::default())?;
                 self.pending_snapshots.push((page, head, full));
             }

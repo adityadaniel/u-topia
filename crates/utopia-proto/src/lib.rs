@@ -28,6 +28,12 @@ pub struct Manifest {
     pub rev: u64,
     pub protocol_version: u32,
     pub pages: Vec<ManifestPage>,
+    /// Opaque id of the relay store that produced this manifest. A relay whose database
+    /// was wiped gets a new one, so a client never mistakes a restarted sequence for the
+    /// one it already pulled. Additive: relays that predate the field send nothing, and
+    /// clients that predate it ignore it (§12.6, §14.4).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instance: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -249,6 +249,117 @@ fn ac_12_3_an_unchanged_manifest_is_asked_for_conditionally() {
     );
 }
 
+/// Records snapshot uploads and can refuse every pull, so a round's compaction wants can
+/// be observed without letting a fresh pull make them legitimate.
+struct Counting {
+    inner: RelayTransport,
+    puts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fail_pulls: bool,
+}
+
+impl utopia_sync::Transport for Counting {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.inner.manifest(if_none_match)
+    }
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        self.inner.push(page, req)
+    }
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        if self.fail_pulls {
+            return Err(utopia_sync::SyncError::Transport("unreachable".into()));
+        }
+        self.inner.pull(page, since_seq)
+    }
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// §12.6 (rule 5): a compaction snapshot may only cover a head measured on the same
+/// transport. A cursor left behind by another relay, with the pull failing, must not
+/// truncate relay entries this client never imported.
+#[test]
+fn ac_12_6_a_foreign_cursor_cannot_compact_the_relay() {
+    use utopia_sync::{PushRequest, Transport, UpdateIn};
+    let relay = Relay::new();
+    let mut a = Store::open_in_memory().unwrap();
+    let page = a.create_page("Compaction").unwrap();
+    // Another device left a long log for this page (the relay never parses payloads).
+    let mut t = RelayTransport::new(relay.clone(), "g1");
+    for i in 0..201 {
+        t.push(
+            &page,
+            PushRequest {
+                updates: vec![UpdateIn {
+                    id: format!("other:{i}"),
+                    client_seq: i,
+                    frontier: String::new(),
+                    payload: vec![1, 2, 3],
+                }],
+            },
+        )
+        .unwrap();
+    }
+    let head = relay.manifest("g1").pages[0].head_seq;
+    assert!(head > 200, "the tail crosses the snapshot bound");
+    // A cursor from a relay this graph used before claims to cover that head.
+    a.sync_set(
+        &format!("cursor:{page}"),
+        &utopia_sync::Cursor {
+            space: utopia_sync::CursorSpace::new(
+                "relay:another-store#g1",
+                utopia_sync::CursorKind::Seq,
+            ),
+            pos: head + 1000,
+        }
+        .encode(),
+    )
+    .unwrap();
+
+    let puts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut ca = SyncClient::new(
+        Counting {
+            inner: RelayTransport::new(relay.clone(), "g1"),
+            puts: puts.clone(),
+            fail_pulls: true,
+        },
+        &a,
+    )
+    .unwrap();
+    // Both rounds fail every pull, so no pull can justify a snapshot.
+    let _ = ca.sync_once(&mut a);
+    let _ = ca.sync_once(&mut a);
+    assert_eq!(
+        puts.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no snapshot was queued from another transport's cursor"
+    );
+    assert!(
+        relay.log_len("g1", page.as_str()) > 200,
+        "the relay log is untouched"
+    );
+}
+
 /// A relay whose pull payloads for one page are corrupt: a shard the relay accepted but
 /// this device cannot import.
 struct Corrupt {

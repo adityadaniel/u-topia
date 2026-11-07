@@ -27,14 +27,30 @@ struct Graph {
 }
 
 /// Shared relay state; clone the `Arc` to give several clients the same server.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Relay {
     graphs: Mutex<BTreeMap<String, Graph>>,
+    /// This relay store's identity; a new `Relay` is a new store, as a wiped database is.
+    instance: String,
+}
+
+impl Default for Relay {
+    fn default() -> Self {
+        Self {
+            graphs: Mutex::new(BTreeMap::new()),
+            instance: ulid::Ulid::new().to_string(),
+        }
+    }
 }
 
 impl Relay {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// This relay's instance id, part of the client's cursor space.
+    pub fn instance(&self) -> &str {
+        &self.instance
     }
 
     fn with_graph<R>(&self, gid: &str, f: impl FnOnce(&mut Graph) -> R) -> R {
@@ -46,6 +62,7 @@ impl Relay {
         self.with_graph(gid, |g| Manifest {
             rev: g.rev,
             protocol_version: PROTOCOL_VERSION,
+            instance: self.instance.clone(),
             pages: g
                 .pages
                 .iter()
@@ -164,11 +181,7 @@ impl Transport for RelayTransport {
         // The in-process relay instance and graph: two separate relays with the same
         // graph name do not share a sequence.
         CursorSpace::new(
-            format!(
-                "memory:{:p}#{}",
-                std::sync::Arc::as_ptr(&self.relay),
-                self.graph
-            ),
+            format!("relay:{}#{}", self.relay.instance(), self.graph),
             CursorKind::Seq,
         )
     }

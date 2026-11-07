@@ -20,6 +20,9 @@ pub struct HttpTransport {
     base: String,
     graph: String,
     token: Option<String>,
+    /// The relay store's id, learned from its manifest (§12.6). `None` until the first
+    /// manifest, and forever with a relay that predates the field.
+    instance: Option<String>,
 }
 
 /// Graph ids travel in URLs; keep them to a safe alphabet.
@@ -70,6 +73,7 @@ impl HttpTransport {
             base: base.trim_end_matches('/').to_string(),
             graph: graph.to_string(),
             token,
+            instance: None,
         })
     }
 
@@ -99,12 +103,12 @@ impl HttpTransport {
 
 impl Transport for HttpTransport {
     fn cursor_space(&self) -> CursorSpace {
-        // The relay URL and graph id: a fresh relay starts its sequence at 1, so its
-        // cursors are only meaningful against the relay that produced them.
-        CursorSpace::new(
-            format!("relay:{}#{}", self.base, self.graph),
-            CursorKind::Seq,
-        )
+        // The relay store id once its manifest has been seen: the URL can change (a DHCP
+        // lease, a LAN port, a host rename) without the data changing, and a wiped store
+        // keeps its URL while its sequence restarts. A relay that predates the field is
+        // identified by its URL and graph.
+        let store = self.instance.clone().unwrap_or_else(|| self.base.clone());
+        CursorSpace::new(format!("relay:{store}#{}", self.graph), CursorKind::Seq)
     }
 
     fn manifest(&mut self, if_none_match: Option<u64>) -> Result<Option<Manifest>> {
@@ -116,7 +120,11 @@ impl Transport for HttpTransport {
         if resp.status() == 304 {
             return Ok(None);
         }
-        read_json(resp).map(Some)
+        let m: Manifest = read_json(resp)?;
+        if !m.instance.is_empty() {
+            self.instance = Some(m.instance.clone());
+        }
+        Ok(Some(m))
     }
 
     fn push(&mut self, page: &PageId, req: PushRequest) -> Result<PushResponse> {
