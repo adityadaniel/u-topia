@@ -558,6 +558,52 @@ fn ac_12_3_a_failed_import_does_not_mark_the_page_synced() {
     );
 }
 
+/// §12.3 steps 2–4: one page can be pulled successfully and still have its push refused.
+/// The pull's cursor advances; the refused rows stay queued.
+#[test]
+fn ac_12_3_a_page_can_be_pulled_and_still_queued_for_its_push() {
+    let relay = Relay::new();
+    let (mut a, _) = device(&relay);
+    let (mut b, mut cb) = device(&relay);
+    let page = a.create_page("Shared").unwrap();
+    write(&mut a, &page, "this push will be refused");
+    let same = b.create_page("Shared").unwrap();
+    assert_eq!(same, page);
+    write(&mut b, &same, "written on b");
+    cb.sync_once(&mut b).unwrap();
+
+    let mut ca = SyncClient::new(
+        Flaky {
+            inner: RelayTransport::new(relay.clone(), "g1"),
+            refuse: page.clone(),
+        },
+        &a,
+    )
+    .unwrap();
+    let report = ca.sync_once(&mut a).expect("the pull still runs");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert!(
+        texts(&mut a, &page).contains(&"written on b".to_string()),
+        "the pull was applied"
+    );
+    let cursor = utopia_sync::Cursor::decode(
+        &a.sync_get(&format!("cursor:{page}"))
+            .unwrap()
+            .expect("the pulled page has a cursor"),
+    )
+    .expect("cursor is JSON");
+    assert_eq!(
+        cursor.pos,
+        relay.manifest("g1").pages[0].head_seq,
+        "the cursor advanced to the pulled head"
+    );
+    let queued = a.outbox_pending(100).unwrap();
+    assert!(
+        !queued.is_empty() && queued.iter().all(|(_, p, _, _)| p == &page),
+        "the refused push's rows are still queued: {queued:?}"
+    );
+}
+
 /// §12.3 steps 3–4: when the batch import fails on one page, every other page must still
 /// be committed and reported. The corrupt page is tried both first and last in `PageId`
 /// order: when it is last, the readable page's shard is already in memory when the batch

@@ -254,6 +254,103 @@ fn quota_rejects_and_keeps_outbox() {
     assert!(matches!(ca.sync_status(&mut a), SyncStatus::Offline { queued } if queued > 0));
 }
 
+/// A client that hands the push to the relay and then loses the response, as a dropped
+/// connection would.
+struct LostAck {
+    inner: HttpTransport,
+    lost: bool,
+}
+
+impl Transport for LostAck {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.inner.manifest(if_none_match)
+    }
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        let resp = self.inner.push(page, req);
+        if self.lost {
+            self.lost = false;
+            return Err(SyncError::Transport(
+                "connection reset after the push".into(),
+            ));
+        }
+        resp
+    }
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.inner.pull(page, since_seq)
+    }
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// §12.6, end to end over HTTP: a batch the relay stored whose response was lost is
+/// re-pushed; the replay is a duplicate, so a quota that is nearly full cannot turn it
+/// into a permanent 413.
+#[test]
+fn ac_12_6_a_lost_ack_is_replayed_not_rejected_by_quota() {
+    let mut a = Store::open_in_memory().unwrap();
+    a.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let page = a.create_page("Lost ack").unwrap();
+    write(&mut a, &page, &"x".repeat(2000));
+    let payload_bytes: usize = a
+        .outbox_pending(100)
+        .unwrap()
+        .iter()
+        .map(|row| row.3.len())
+        .sum();
+    assert!(payload_bytes > 512, "{payload_bytes}");
+    // Room for one copy of the batch, not for a second.
+    let server = serve(Config {
+        tokens: Vec::new(),
+        quota_bytes: (payload_bytes + 512) as u64,
+    });
+    let mut ca = SyncClient::new(
+        LostAck {
+            inner: HttpTransport::new(&server.base, "graph-1", None).unwrap(),
+            lost: true,
+        },
+        &a,
+    )
+    .unwrap();
+    let first = ca.sync_once(&mut a);
+    assert!(
+        first.is_err(),
+        "the lost response fails that round: {first:?}"
+    );
+
+    // The next round re-pushes the very same batch.
+    assert!(matches!(ca.sync_status(&mut a), SyncStatus::Synced { .. }));
+    assert_eq!(
+        server.db.graph_bytes("graph-1").unwrap() as usize,
+        payload_bytes,
+        "the relay stored the batch once"
+    );
+    assert_eq!(
+        SyncClient::<HttpTransport>::queued(&mut a).unwrap(),
+        0,
+        "the replay was acknowledged"
+    );
+}
+
 #[test]
 fn snapshots_compact_the_log_and_bootstrap_new_devices() {
     let server = serve(Config::default());
