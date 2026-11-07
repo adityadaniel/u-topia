@@ -32,10 +32,12 @@ The background thread that keeps a WebSocket to the relay's `/events` endpoint a
 1. **Backoff only grows.** The only writes are `:110` and `:120`. After five disconnects over
    a session — even hours apart, each following a healthy connection — every reconnect waits
    60 s. A graceful server `Close` (`realtime.rs:67` → `Ok`) is treated the same as a failure.
-2. **401 is terminal here but not for polling.** The poll loop maps `Unauthorized` to
-   `NeedsAuth` and keeps polling at `SLOW` (`sync-runner-round.md`); the realtime thread
-   never restarts (`spawn_realtime` is called only from `workspace.rs:421`). If the relay
-   later accepts the token, polling recovers but notices never return.
+2. **401 is terminal here and, since the sync-runner fix, for polling too.** The poll loop
+   used to map `Unauthorized` to `NeedsAuth` and keep polling at `SLOW`, so it could recover
+   while notices never returned; `sync-runner-round.md` now halts it as well
+   (`SyncPhase::Halted`). Both halves therefore stop on a 401, and reviving either needs a
+   new `start_sync` — which is also the only place a restarted realtime thread could be
+   spawned (`spawn_realtime` is called only from `workspace.rs:421`).
 3. **Orphan thread when the engine fails.** `spawn_realtime` runs at `workspace.rs:421`
    before `enable_sync_with` at `:428`; if the latter returns false (`:474-479`) the thread
    loops forever setting a `nudge` nobody reads.
