@@ -3817,6 +3817,205 @@ fn ime_brackets_are_not_paired(cx: &mut TestAppContext) {
     assert_eq!(rows(&app, &page, cx)[0].0, "x (");
 }
 
+/// IME text is provisional until the input method commits it (§13.5). A host that
+/// finishes the block mid-composition — blur, Escape, navigation, the idle timer — must
+/// wait for the input method instead of taking the composition away with the buffer.
+#[gpui::test]
+fn ac_13_5_host_commit_waits_for_the_ime(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("ab");
+    cx.run_until_parked();
+    let editor = ws.update(cx, |w, _| w.editor());
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "にほ", None, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        text_and_caret(&ws, cx).0,
+        "abにほ",
+        "the provisional glyphs are shown"
+    );
+    // The host finishes the block (what Escape, a click elsewhere or the idle timer does).
+    editor.update(cx, |e, cx| e.end(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&app, &page, cx)[0].0,
+        "ab",
+        "nothing provisional is persisted"
+    );
+    assert_eq!(
+        text_and_caret(&ws, cx).0,
+        "abにほ",
+        "the composition still owns the buffer"
+    );
+    assert!(
+        ws.update(cx, |w, cx| w.editor().read(cx).target.is_some()),
+        "the block is still being edited; the end waits for the input method"
+    );
+    // The input method commits.
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_text_in_range(None, "にほ", window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&app, &page, cx)[0].0,
+        "abにほ",
+        "the committed composition is what persists"
+    );
+    assert!(
+        ws.update(cx, |w, cx| w.editor().read(cx).target.is_none()),
+        "the deferred end ran once the composition was committed"
+    );
+}
+
+/// Backspace, Delete, Paste, Cut and soft breaks belong to the input method while it is
+/// composing (§13.5): deleting from our side removes provisional glyphs the platform
+/// still addresses by offset, and persists them halfway through a composition.
+#[gpui::test]
+fn ac_13_5_destructive_actions_leave_ime_composition_alone(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("ab");
+    cx.run_until_parked();
+    let editor = ws.update(cx, |w, _| w.editor());
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "にほ", None, window, cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert_eq!(
+        text_and_caret(&ws, cx).0,
+        "abにほ",
+        "the input method's glyphs are not ours to delete"
+    );
+    assert_eq!(
+        rows(&app, &page, cx)[0].0,
+        "ab",
+        "and nothing was persisted"
+    );
+    let marked = editor.update_in(cx, |e, window, cx| e.marked_text_range(window, cx));
+    assert_eq!(marked, Some(2..4), "the platform still composes にほ");
+}
+
+/// Cmd+B/Cmd+I/Cmd+` reflow the buffer around the selection (§13.5). Doing that under a
+/// live composition leaves the marked range pointing at bytes it never covered, so the
+/// platform's next update rewrites the wrong run of text.
+#[gpui::test]
+fn ac_13_5_mark_leaves_ime_composition_alone(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("ab");
+    cx.run_until_parked();
+    let editor = ws.update(cx, |w, _| w.editor());
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "にほ", None, window, cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-b");
+    cx.run_until_parked();
+    assert_eq!(
+        text_and_caret(&ws, cx).0,
+        "abにほ",
+        "bold does not rewrite the text the input method owns"
+    );
+    let marked = editor.update_in(cx, |e, window, cx| e.marked_text_range(window, cx));
+    assert_eq!(
+        marked,
+        Some(2..4),
+        "the marked range still covers exactly にほ"
+    );
+    assert_eq!(rows(&app, &page, cx)[0].0, "ab");
+}
+
+/// A store change that lands mid-composition is not dropped (§13.5): the editor re-reads
+/// once the input method lets go, so a block deleted or merged away under the composition
+/// ends the edit instead of taking the composed text into a tombstone.
+#[gpui::test]
+fn ac_13_5_ime_composition_ends_when_its_block_is_deleted(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    use utopia_core::Command;
+    let (app, ws, cx) = setup(cx);
+    let page = today_page(&app, cx);
+    cx.simulate_input("ab");
+    cx.run_until_parked();
+    let block = app.update(cx, |app, _| {
+        app.store.page_state(&page).unwrap().live_roots()[0].clone()
+    });
+    let editor = ws.update(cx, |w, _| w.editor());
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_and_mark_text_in_range(None, "にほ", None, window, cx)
+    });
+    cx.run_until_parked();
+    // A remote device (or an undo) tombstones the block while the IME is composing.
+    app.update(cx, |app, cx| {
+        app.store
+            .execute(
+                &page,
+                vec![Command::SetDeleted {
+                    ids: vec![block.clone()],
+                    deleted_at: Some(1),
+                }],
+                Default::default(),
+            )
+            .unwrap();
+        app.changed(vec![page.clone()], true, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        text_and_caret(&ws, cx).0,
+        "abにほ",
+        "the live composition is not thrown away"
+    );
+    // The input method commits; the block it was editing is gone.
+    editor.update_in(cx, |e, window, cx| {
+        e.replace_text_in_range(None, "にほ", window, cx)
+    });
+    cx.run_until_parked();
+    assert!(
+        ws.update(cx, |w, cx| w.editor().read(cx).target.is_none()),
+        "the edit ends: there is nowhere to put the text"
+    );
+    app.update(cx, |app, _| {
+        let st = app.store.page_state(&page).unwrap();
+        assert_eq!(
+            st.block(&block).unwrap().text,
+            "ab",
+            "a tombstoned block is never edited (rule 5)"
+        );
+    });
+}
+
+/// `utopia://search?q=` fills the palette's field, so the results must follow the text in
+/// it — the host is told about a programmatic change as it is about typing (§13.5).
+#[gpui::test]
+fn ac_13_5_line_input_set_text_notifies_the_host(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        let page = app.store.create_page("November Retro").unwrap();
+        let block = app.store.ensure_first_block(&page).unwrap();
+        app.store
+            .set_block_text(&page, &block, "november notes", None, None)
+            .unwrap();
+        app.store.create_page("Atlas").unwrap();
+        app.store.sync_index().unwrap();
+    });
+    ws.update_in(cx, |w, window, cx| w.search_for("november", window, cx));
+    cx.run_until_parked();
+    let jump = ws
+        .read_with(cx, |w, _| w.jump_palette())
+        .expect("search is open");
+    assert_eq!(
+        jump.read_with(cx, |j, _| j.page_titles()),
+        vec!["November Retro".to_string()],
+        "the results are for the text the field shows"
+    );
+}
+
 /// No page titled like a relative date, and the day's page linked instead.
 fn assert_tomorrow_linked(app: &Entity<AppState>, cx: &mut VisualTestContext) {
     app.update(cx, |app, _| {

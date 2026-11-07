@@ -83,7 +83,7 @@ impl LineInput {
     }
 
     fn after_edit(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        if self.field.marked.is_none() {
+        if !self.field.composing() {
             cx.emit(LineInputEvent::Changed(self.field.text.clone()));
         }
     }

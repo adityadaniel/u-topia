@@ -22,12 +22,42 @@ pub enum Goal {
     LastLine(Pixels),
 }
 
+/// Whether the platform input method owns a run of the buffer (§13.5).
+///
+/// While `Active` the text holds provisional glyphs the store has never seen, reported
+/// back to the platform as the marked range, and the input method addresses them by
+/// offset until it commits or unmarks them. Nothing else may persist, end the block or
+/// edit the buffer meanwhile: clearing the range behind the IME's back leaves it
+/// composing into offsets that no longer exist — the state a bare `Option<Range>` could
+/// not name, and could be put into by any caller that touched the field.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Composition {
+    #[default]
+    None,
+    Active {
+        range: Range<usize>,
+    },
+}
+
+impl Composition {
+    pub fn range(&self) -> Option<&Range<usize>> {
+        match self {
+            Composition::None => None,
+            Composition::Active { range } => Some(range),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        matches!(self, Composition::Active { .. })
+    }
+}
+
 #[derive(Default)]
 pub struct TextField {
     pub text: String,
     pub sel: Range<usize>,
     pub reversed: bool,
-    pub marked: Option<Range<usize>>,
+    pub composition: Composition,
     pub multiline: bool,
     pub selecting: bool,
     pub goal: Option<Goal>,
@@ -44,12 +74,36 @@ impl TextField {
         }
     }
 
+    /// The marked range, as the platform input method last reported it.
+    pub fn marked(&self) -> Option<&Range<usize>> {
+        self.composition.range()
+    }
+
+    /// True while the input method composes: the buffer is provisional and the input
+    /// method, not the host, owns every edit to it.
+    pub fn composing(&self) -> bool {
+        self.composition.is_active()
+    }
+
+    /// The input method inserted `range` of provisional glyphs (`setMarkedText:`).
+    pub fn begin_composition(&mut self, range: Range<usize>) {
+        self.composition = Composition::Active { range };
+    }
+
+    /// The input method let go of its text: it committed (`replace_text_in_range`) or
+    /// unmarked it. Returns whether it was composing.
+    pub fn end_composition(&mut self) -> bool {
+        std::mem::replace(&mut self.composition, Composition::None).is_active()
+    }
+
+    /// Replace the whole buffer with stored text. Only legal when the input method is not
+    /// composing (callers check [`TextField::composing`] first, §13.5).
     pub fn set_text(&mut self, text: &str, caret: usize) {
+        self.end_composition();
         self.text = text.to_string();
         let c = t::floor_char_boundary(&self.text, caret);
         self.sel = c..c;
         self.reversed = false;
-        self.marked = None;
     }
 
     pub fn cursor(&self) -> usize {
@@ -83,15 +137,16 @@ impl TextField {
         &self.text[self.sel.clone()]
     }
 
-    /// Replace `range` with `new`; caret lands after the insertion.
+    /// Replace `range` with `new`; caret lands after the insertion. Ends a composition:
+    /// this is the path the input method commits its text through (§13.5).
     pub fn replace(&mut self, range: Range<usize>, new: &str) {
+        self.end_composition();
         let start = t::floor_char_boundary(&self.text, range.start);
         let end = t::floor_char_boundary(&self.text, range.end.max(start));
         self.text.replace_range(start..end, new);
         let c = start + new.len();
         self.sel = c..c;
         self.reversed = false;
-        self.marked = None;
     }
 
     pub fn prev_boundary(&self) -> usize {
@@ -305,11 +360,11 @@ macro_rules! impl_field_input_handler {
                 _cx: &mut gpui::Context<Self>,
             ) -> Option<std::ops::Range<usize>> {
                 let f = $crate::field::FieldHost::field(self);
-                f.marked.as_ref().map(|r| f.range_to_utf16(r))
+                f.marked().map(|r| f.range_to_utf16(r))
             }
 
             fn unmark_text(&mut self, window: &mut gpui::Window, cx: &mut gpui::Context<Self>) {
-                $crate::field::FieldHost::field_mut(self).marked = None;
+                $crate::field::FieldHost::field_mut(self).end_composition();
                 $after(self, window, cx);
             }
 
@@ -324,7 +379,7 @@ macro_rules! impl_field_input_handler {
                 let range = range_utf16
                     .as_ref()
                     .map(|r| f.range_from_utf16(r))
-                    .or(f.marked.clone())
+                    .or_else(|| f.marked().cloned())
                     .unwrap_or(f.sel.clone());
                 let text = if f.multiline {
                     new_text.to_string()
@@ -343,19 +398,25 @@ macro_rules! impl_field_input_handler {
                 range_utf16: Option<std::ops::Range<usize>>,
                 new_text: &str,
                 new_selected_range_utf16: Option<std::ops::Range<usize>>,
-                _window: &mut gpui::Window,
+                window: &mut gpui::Window,
                 cx: &mut gpui::Context<Self>,
             ) {
                 let f = $crate::field::FieldHost::field_mut(self);
                 let range = range_utf16
                     .as_ref()
                     .map(|r| f.range_from_utf16(r))
-                    .or(f.marked.clone())
+                    .or_else(|| f.marked().cloned())
                     .unwrap_or(f.sel.clone());
                 let start = range.start.min(f.text.len());
                 let end = range.end.min(f.text.len()).max(start);
                 f.text.replace_range(start..end, new_text);
-                f.marked = (!new_text.is_empty()).then(|| start..start + new_text.len());
+                let composing = !new_text.is_empty();
+                if composing {
+                    f.begin_composition(start..start + new_text.len());
+                } else {
+                    // The input method emptied its text: the buffer is ours again.
+                    f.end_composition();
+                }
                 let sel = new_selected_range_utf16
                     .as_ref()
                     .map(|r| {
@@ -380,6 +441,9 @@ macro_rules! impl_field_input_handler {
                 f.reversed = false;
                 // Composition is provisional: nothing is persisted until it commits.
                 cx.notify();
+                if !composing {
+                    $after(self, window, cx);
+                }
             }
 
             fn bounds_for_range(
@@ -597,5 +661,30 @@ mod tests {
         f.set_text("one\ntwo\nthree", 6);
         assert_eq!(f.line_start(), 4);
         assert_eq!(f.line_end(), 7);
+    }
+
+    /// §13.5: whether the input method owns the buffer is one explicit mode, entered and
+    /// left only by the transitions that mean it, and reported to the platform as the
+    /// marked range in UTF-16.
+    #[test]
+    fn composition_is_an_explicit_mode() {
+        let mut f = TextField::new(true);
+        f.set_text("abにほ", 8);
+        assert!(!f.composing());
+        assert_eq!(f.marked(), None);
+        f.begin_composition(2..8);
+        assert!(f.composing());
+        assert_eq!(f.marked().cloned(), Some(2..8));
+        assert_eq!(f.range_to_utf16(f.marked().unwrap()), 2..4);
+        // The input method commits through `replace`: one transition out.
+        f.replace(2..8, "にほ");
+        assert!(!f.composing());
+        assert_eq!(f.text, "abにほ");
+        // A host replacing the whole buffer ends it too (only callers that have checked
+        // `composing` may, §13.5).
+        f.begin_composition(2..8);
+        f.set_text("ab", 2);
+        assert!(!f.composing());
+        assert_eq!(f.text, "ab");
     }
 }

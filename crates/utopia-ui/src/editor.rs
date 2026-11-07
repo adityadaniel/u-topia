@@ -329,7 +329,7 @@ impl BlockEditor {
 
     fn sync_from_store(&mut self, cx: &mut Context<Self>) {
         let Some(t) = self.target.clone() else { return };
-        if self.field.marked.is_some() {
+        if self.field.composing() {
             return;
         }
         let text = self.app.update(cx, |app, _| {
@@ -476,7 +476,7 @@ impl BlockEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.target.is_none() || self.field.marked.is_some() || range != self.field.sel {
+        if self.target.is_none() || self.field.composing() || range != self.field.sel {
             return false;
         }
         if range.is_empty() {
@@ -513,7 +513,7 @@ impl BlockEditor {
     }
 
     fn after_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.field.marked.is_some() {
+        if self.field.composing() {
             return;
         }
         self.persist(cx);
@@ -944,10 +944,7 @@ impl BlockEditor {
                 return self.emit_after_commit(EditorEvent::MergeBackward, cx);
             }
             // `(|)` → `|`: the closer was put there by the opener, so it goes with it.
-            let pair = self
-                .field
-                .marked
-                .is_none()
+            let pair = (!self.field.composing())
                 .then(|| utopia_core::text::empty_pair_at(&self.field.text, self.field.cursor()))
                 .flatten();
             match pair {
@@ -1375,7 +1372,7 @@ impl Render for BlockEditor {
             )
         } else {
             let mut hl = source_highlights(&text, &th);
-            if let Some(m) = &self.field.marked {
+            if let Some(m) = self.field.marked() {
                 hl.retain(|(r, _)| r.end <= m.start || r.start >= m.end);
                 hl.push((
                     m.clone(),
