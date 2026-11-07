@@ -1470,6 +1470,630 @@ fn background_sync_imports_and_pushes(cx: &mut TestAppContext) {
     assert_eq!(st.block(&st.live_roots()[0]).unwrap().text, "local words");
 }
 
+/// A transport that counts how many rounds reached the network, so a test can tell one
+/// polling loop from two (§12.3).
+struct CountingTransport {
+    inner: utopia_sync::relay::RelayTransport,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl utopia_sync::Transport for CountingTransport {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.manifest(if_none_match)
+    }
+
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        self.inner.push(page, req)
+    }
+
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.inner.pull(page, since_seq)
+    }
+
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// A transport that refuses the first `refusals` rounds with 401, then behaves like a real
+/// relay: the transient refusal a proxy hiccup or a restarting relay produces.
+struct FlakyTransport {
+    inner: utopia_sync::relay::RelayTransport,
+    refusals: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl utopia_sync::Transport for FlakyTransport {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        self.inner.cursor_space()
+    }
+
+    fn manifest(
+        &mut self,
+        if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.refusals.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.refusals
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(utopia_sync::SyncError::Unauthorized);
+        }
+        self.inner.manifest(if_none_match)
+    }
+
+    fn push(
+        &mut self,
+        page: &PageId,
+        req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        self.inner.push(page, req)
+    }
+
+    fn pull(
+        &mut self,
+        page: &PageId,
+        since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        self.inner.pull(page, since_seq)
+    }
+
+    fn put_snapshot(
+        &mut self,
+        page: &PageId,
+        covers_seq: u64,
+        payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        self.inner.put_snapshot(page, covers_seq, payload)
+    }
+}
+
+/// A transport that refuses every round with a fixed error.
+struct Refusing {
+    err: fn() -> utopia_sync::SyncError,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl utopia_sync::Transport for Refusing {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        utopia_sync::CursorSpace::new("test:refusing", utopia_sync::CursorKind::Seq)
+    }
+
+    fn manifest(
+        &mut self,
+        _if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err((self.err)())
+    }
+
+    fn push(
+        &mut self,
+        _page: &PageId,
+        _req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        Err((self.err)())
+    }
+
+    fn pull(
+        &mut self,
+        _page: &PageId,
+        _since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        Err((self.err)())
+    }
+
+    fn put_snapshot(
+        &mut self,
+        _page: &PageId,
+        _covers_seq: u64,
+        _payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        Err((self.err)())
+    }
+}
+
+/// §12.3, §13.3: one `SyncRunner` must have one polling loop. A second `enable_sync_with`
+/// replaces the runner; it must also retire the loop the previous runner started, or both
+/// loops poll the new runner (and the old loop writes its transport into it).
+#[gpui::test]
+fn enabling_sync_twice_keeps_one_poll_loop(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    let (_app, ws, cx) = setup(cx);
+    let relay = Relay::new();
+    let first = Arc::new(AtomicUsize::new(0));
+    let second = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(relay.clone(), "g"),
+                calls: first.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    // Replace the runner while the first loop is asleep.
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(relay.clone(), "g"),
+                calls: second.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    for _ in 0..4 {
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        first.load(Ordering::SeqCst) + second.load(Ordering::SeqCst),
+        2,
+        "one loop rounds at 5 s and 15 s in 20 s (5 s then a 10 s idle backoff); a second \
+         loop adds rounds"
+    );
+}
+
+/// §12.6: a round that fails on the device (the store, not the relay) must not be reported
+/// as the relay being offline — the network was never tried.
+#[gpui::test]
+fn a_local_store_error_is_not_reported_as_offline(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    use utopia_sync::SyncStatus;
+    let (app, ws, cx) = setup(cx);
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(Box::new(RelayTransport::new(Relay::new(), "g")), None, cx)
+    });
+    cx.simulate_input("local words");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    // `prepare` reads `sync_state`; without it the round dies before the network.
+    app.update(cx, |app, _| {
+        app.store
+            .conn()
+            .execute_batch("DROP TABLE sync_state")
+            .unwrap();
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    let status = ws.read_with(cx, |w, _| w.sync_status());
+    assert!(
+        !matches!(status, Some(SyncStatus::Offline { .. })),
+        "a local store error is not the relay being offline: {status:?}"
+    );
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Error,
+        "the dot still says something is wrong"
+    );
+}
+
+/// §12.6: a failing round backs off. A prepare failure used to keep the last good round's
+/// cadence, so a persistent local failure polled every 5 s.
+#[gpui::test]
+fn a_failed_round_backs_off(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    let (app, ws, cx) = setup(cx);
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(Box::new(RelayTransport::new(Relay::new(), "g")), None, cx)
+    });
+    // A round with work keeps the fast 5 s cadence.
+    cx.simulate_input("queued words");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    app.update(cx, |app, _| {
+        app.store
+            .conn()
+            .execute_batch("DROP TABLE sync_state")
+            .unwrap();
+    });
+    // This round fails on the device, so the next attempt is 10 s away, not 5 s.
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    // Make the store usable again; a loop without backoff retries at once (5 s).
+    app.update(cx, |app, _| {
+        app.store
+            .conn()
+            .execute_batch("CREATE TABLE sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert!(
+        !matches!(
+            ws.read_with(cx, |w, _| w.sync_status()),
+            Some(utopia_sync::SyncStatus::Synced { .. })
+        ),
+        "the failed round's 10 s backoff was ignored; it retried after 5 s"
+    );
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert!(
+        matches!(
+            ws.read_with(cx, |w, _| w.sync_status()),
+            Some(utopia_sync::SyncStatus::Synced { .. })
+        ),
+        "the round after the backoff recovers"
+    );
+}
+
+/// A relay that advertises one page and then hands back an update the store cannot import:
+/// the round fails after the network was reached.
+struct BadPull {
+    page: PageId,
+}
+
+impl utopia_sync::Transport for BadPull {
+    fn cursor_space(&self) -> utopia_sync::CursorSpace {
+        utopia_sync::CursorSpace::new("test:bad-pull", utopia_sync::CursorKind::Seq)
+    }
+
+    fn manifest(
+        &mut self,
+        _if_none_match: Option<u64>,
+    ) -> utopia_sync::Result<Option<utopia_sync::Manifest>> {
+        Ok(Some(utopia_sync::Manifest {
+            rev: 1,
+            protocol_version: utopia_sync::PROTOCOL_VERSION,
+            pages: vec![utopia_sync::ManifestPage {
+                page_id: self.page.to_string(),
+                head_seq: 1,
+                frontier: String::new(),
+                snapshot_seq: 0,
+                tail_bytes: 0,
+                updated_at: 0,
+                deleted: false,
+            }],
+            instance: "test-relay".into(),
+        }))
+    }
+
+    fn push(
+        &mut self,
+        _page: &PageId,
+        _req: utopia_sync::PushRequest,
+    ) -> utopia_sync::Result<utopia_sync::PushResponse> {
+        Ok(utopia_sync::PushResponse {
+            accepted: 0,
+            head_seq: 0,
+            duplicate: 0,
+        })
+    }
+
+    fn pull(
+        &mut self,
+        _page: &PageId,
+        _since_seq: u64,
+    ) -> utopia_sync::Result<utopia_sync::PullResponse> {
+        Ok(utopia_sync::PullResponse {
+            snapshot: None,
+            updates: vec![utopia_sync::UpdateOut {
+                seq: 1,
+                id: "garbage".into(),
+                frontier: String::new(),
+                payload: vec![0xff; 8],
+            }],
+            head_seq: 1,
+        })
+    }
+
+    fn put_snapshot(
+        &mut self,
+        _page: &PageId,
+        _covers_seq: u64,
+        _payload: Vec<u8>,
+    ) -> utopia_sync::Result<()> {
+        Ok(())
+    }
+}
+
+/// §13.3: replacing the runner while its round is in the background must not hand that
+/// round's result (or its transport) to the new runner. The old loop owns the exchange, so
+/// replacing the runner cancels it: it never reaches the relay, and what it would have
+/// imported never reaches the store; the new runner starts from `Idle` with no outcome of
+/// its own.
+#[gpui::test]
+fn replacing_the_runner_mid_exchange_discards_the_old_round(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    use utopia_sync::{SyncClient, SyncStatus};
+    use utopia_ui::sync_runner::SyncPhase;
+    let (app, ws, cx) = setup(cx);
+    let relay = Relay::new();
+    let old_calls = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(relay.clone(), "g"),
+                calls: old_calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    // One round must finish first: `sync_dot` is amber both while connecting and while an
+    // exchange is in flight, so the dot cannot name the moment on its own.
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert_eq!(old_calls.load(Ordering::SeqCst), 1, "one round ran");
+    assert!(matches!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(SyncStatus::Synced { .. })
+    ));
+    // Something the next round would import if its result were applied.
+    let mut other = Store::open_in_memory().unwrap();
+    let mut oc = SyncClient::new(RelayTransport::new(relay.clone(), "g"), &other).unwrap();
+    other.create_page("From the abandoned round").unwrap();
+    oc.sync_once(&mut other).unwrap();
+    // Step one task at a time until the runner is really `Exchanging`, i.e. the transport has
+    // been handed to the background exchange. (The exchange task itself is only queued.)
+    let mut started = false;
+    for _ in 0..500 {
+        if ws.read_with(cx, |w, _| {
+            matches!(w.sync_phase(), Some(SyncPhase::Exchanging))
+        }) {
+            started = true;
+            break;
+        }
+        cx.dispatcher.advance_clock_to_next_delayed();
+        if !cx.background_executor.tick() {
+            break;
+        }
+    }
+    assert!(started, "no round ever reached the exchange");
+    assert_eq!(
+        old_calls.load(Ordering::SeqCst),
+        1,
+        "the transport is handed over but the exchange has not run: the round is in flight"
+    );
+    // Replace the runner while that exchange is in flight, pointing it at another relay so
+    // anything the abandoned round pulled would be visible as a page only it could import.
+    let calls = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(Relay::new(), "g"),
+                calls: calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    assert_eq!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        None,
+        "the new runner has no round of its own yet"
+    );
+    for _ in 0..4 {
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        old_calls.load(Ordering::SeqCst),
+        1,
+        "the in-flight round was cancelled with its loop and never reached the relay"
+    );
+    assert!(calls.load(Ordering::SeqCst) >= 1, "the new runner polls");
+    assert!(matches!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(SyncStatus::Synced { .. })
+    ));
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Synced
+    );
+    assert!(
+        app.update(cx, |app, _| app
+            .store
+            .find_page("From the abandoned round")
+            .unwrap()
+            .is_none()),
+        "the abandoned round's result must not be applied"
+    );
+}
+
+/// §12.6: a store failure *after* the network was reached (an update the store cannot
+/// import) is still a local fault, not "the relay is offline". The round applies the rest
+/// and reports the page as failed, so it is `Partial` rather than `LocalError`; a failure
+/// that stops the whole round (in `prepare`) is `LocalError`, covered by
+/// `a_local_store_error_is_not_reported_as_offline`.
+#[gpui::test]
+fn a_store_failure_after_the_network_is_not_offline(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    use utopia_sync::SyncStatus;
+    let (app, ws, cx) = setup(cx);
+    let page = app.update(cx, |app, _| app.store.create_page("Remote").unwrap());
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(Box::new(BadPull { page }), None, cx)
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    let status = ws.read_with(cx, |w, _| w.sync_status());
+    assert!(
+        matches!(status, Some(SyncStatus::Partial { failed: 1, .. })),
+        "an import the store rejects is a failed page, not the relay: {status:?}"
+    );
+    assert!(
+        !matches!(status, Some(SyncStatus::Offline { .. })),
+        "a local fault is not offline: {status:?}"
+    );
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Error
+    );
+}
+
+/// §12.6: a refusal stops the fast polls. One retry per slow interval, not every 5 s — the
+/// relay refused this device, so hammering it is exactly wrong.
+#[gpui::test]
+fn a_refusal_retries_only_at_the_slow_cadence(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    let (_app, ws, cx) = setup(cx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(Refusing {
+                err: || utopia_sync::SyncError::Unauthorized,
+                calls: calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one refused round");
+    assert_eq!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(utopia_sync::SyncStatus::NeedsAuth)
+    );
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Error
+    );
+    // Well inside the slow interval: the refusal must not be retried at 5 s.
+    cx.executor().advance_clock(Duration::from_secs(30));
+    cx.run_until_parked();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a refused relay must not be polled every 5 s"
+    );
+}
+
+/// §12.6: a *transient* refusal (a proxy hiccup, a relay restarting before it has loaded its
+/// token file) must not end sync for the session. Polling retries at the slow cadence, so it
+/// heals by itself; a 401 that never clears just stays red.
+#[gpui::test]
+fn a_refusal_recovers_without_a_restart(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    let (_app, ws, cx) = setup(cx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let refusals = Arc::new(AtomicUsize::new(1));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(FlakyTransport {
+                inner: RelayTransport::new(Relay::new(), "g"),
+                refusals: refusals.clone(),
+                calls: calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert_eq!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(utopia_sync::SyncStatus::NeedsAuth),
+        "the first round was refused"
+    );
+    // The next attempt is a slow interval away, not immediate.
+    cx.executor().advance_clock(Duration::from_secs(30));
+    cx.run_until_parked();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no 5 s hammering");
+    // After the slow interval the relay answers again and sync resumes by itself.
+    cx.executor().advance_clock(Duration::from_secs(40));
+    cx.run_until_parked();
+    assert!(calls.load(Ordering::SeqCst) >= 2, "the slow retry happened");
+    assert!(
+        matches!(
+            ws.read_with(cx, |w, _| w.sync_status()),
+            Some(utopia_sync::SyncStatus::Synced { .. })
+        ),
+        "a transient 401 must not kill sync until the app is relaunched"
+    );
+    assert_eq!(
+        ws.update(cx, |w, _| w.sync_dot()),
+        utopia_ui::sync_runner::SyncDot::Synced
+    );
+}
+
+/// §12.6: starting sync again is the explicit way out of a refusal, and it must not need a
+/// new Workspace. The replacement runner polls immediately.
+#[gpui::test]
+fn restarting_sync_after_a_refusal_polls_again(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use utopia_sync::relay::{Relay, RelayTransport};
+    let (_app, ws, cx) = setup(cx);
+    let refused = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(Refusing {
+                err: || utopia_sync::SyncError::Unauthorized,
+                calls: refused.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert_eq!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(utopia_sync::SyncStatus::NeedsAuth)
+    );
+    // The user fixes the token; the app starts sync again on the same workspace.
+    let calls = Arc::new(AtomicUsize::new(0));
+    ws.update(cx, |w, cx| {
+        w.enable_sync_with(
+            Box::new(CountingTransport {
+                inner: RelayTransport::new(Relay::new(), "g"),
+                calls: calls.clone(),
+            }),
+            None,
+            cx,
+        )
+    });
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert!(calls.load(Ordering::SeqCst) >= 1, "the new runner polled");
+    assert!(matches!(
+        ws.read_with(cx, |w, _| w.sync_status()),
+        Some(utopia_sync::SyncStatus::Synced { .. })
+    ));
+}
+
 // ---------------------------------------------------------------- v1.1 (P1)
 
 fn kind_of(

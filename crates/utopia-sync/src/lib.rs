@@ -302,8 +302,15 @@ pub enum SyncStatus {
         failed: usize,
         queued: usize,
     },
+    /// The relay was not reached, or answered with a transport failure: everything is
+    /// still queued locally (§12.6).
     Offline {
         queued: usize,
+    },
+    /// The round failed on this device (the store, a shard, a projection). The network was
+    /// never tried, so saying "offline" would blame the relay for a local fault.
+    LocalError {
+        message: String,
     },
     NeedsAuth,
     Unsupported,
@@ -311,7 +318,9 @@ pub enum SyncStatus {
 
 impl SyncStatus {
     pub fn from_result(r: &Result<SyncReport>, store: &Store) -> Self {
-        let queued = || store.outbox_pending(usize::MAX >> 1).map_or(0, |v| v.len());
+        // A count, not the rows: this runs on the UI thread on every backoff round with no
+        // network, and payloads can be large (rule 10).
+        let queued = || store.outbox_count().unwrap_or(0);
         match r {
             Ok(r) if r.failed.is_empty() => SyncStatus::Synced { at_ms: store.now() },
             Ok(r) => {
@@ -328,6 +337,9 @@ impl SyncStatus {
             }
             Err(SyncError::Unauthorized) => SyncStatus::NeedsAuth,
             Err(SyncError::ProtocolVersion(_)) => SyncStatus::Unsupported,
+            Err(SyncError::Store(e)) => SyncStatus::LocalError {
+                message: e.to_string(),
+            },
             Err(_) => SyncStatus::Offline { queued: queued() },
         }
     }

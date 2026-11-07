@@ -1247,6 +1247,18 @@ impl Store {
         Ok(rows)
     }
 
+    /// How many changes are waiting for the relay, without loading their payloads (the
+    /// sidebar shows this count on the UI thread, §9.2, rule 10).
+    pub fn outbox_count(&self) -> Result<usize> {
+        self.read_barrier()?;
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM outbox WHERE sent_at IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     pub fn outbox_mark_sent(&self, seqs: &[i64]) -> Result<()> {
         let now = self.now();
         for s in seqs {
