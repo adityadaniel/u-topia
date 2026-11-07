@@ -311,6 +311,12 @@ pub struct PageView {
     /// regression test can prove a keystroke rebuild does not query the database.
     #[cfg(debug_assertions)]
     ref_children_queries: std::cell::Cell<usize>,
+    /// How many of those reads happened inside `render` (rule 10). Debug builds only.
+    #[cfg(debug_assertions)]
+    ref_children_frame_queries: std::cell::Cell<usize>,
+    /// True while `render` is rebuilding, so the debug counters can tell a handler read
+    /// from a frame read.
+    in_render: bool,
     /// Reference children already read, keyed by block and whether every child was asked
     /// for (the "+N more" row). Cleared when the index version or the limit changes, so a
     /// rebuild for an unrelated reason does not run the queries again (rule 10).
@@ -370,6 +376,9 @@ impl PageView {
                 // LR-5: the unlinked count is keyed by the index version, so it is refreshed
                 // here rather than in `render` (rule 10: no database work in a frame).
                 this.refresh_unlinked(cx);
+                // Rebuild now, while the index version is new: reference children are
+                // database reads, and a frame must only read the cache they fill.
+                this.rebuild(cx);
                 cx.notify();
             }),
             cx.subscribe_in(&editor, window, Self::on_editor_event),
@@ -402,6 +411,9 @@ impl PageView {
             ref_children_limit: crate::appearance::ref_children(cx),
             #[cfg(debug_assertions)]
             ref_children_queries: std::cell::Cell::new(0),
+            #[cfg(debug_assertions)]
+            ref_children_frame_queries: std::cell::Cell::new(0),
+            in_render: false,
             ref_children_cache: HashMap::new(),
             ref_children_cache_key: None,
             controls_menu: None,
@@ -456,6 +468,12 @@ impl PageView {
     #[cfg(debug_assertions)]
     pub fn ref_children_queries(&self) -> usize {
         self.ref_children_queries.get()
+    }
+
+    /// How many reference-children reads happened inside a frame (debug builds only).
+    #[cfg(debug_assertions)]
+    pub fn ref_children_frame_queries(&self) -> usize {
+        self.ref_children_frame_queries.get()
     }
 
     pub fn is_journal(&self) -> bool {
@@ -1254,8 +1272,14 @@ impl PageView {
                 HashMap::new()
             } else {
                 #[cfg(debug_assertions)]
-                self.ref_children_queries
-                    .set(self.ref_children_queries.get() + 1);
+                {
+                    self.ref_children_queries
+                        .set(self.ref_children_queries.get() + 1);
+                    if self.in_render {
+                        self.ref_children_frame_queries
+                            .set(self.ref_children_frame_queries.get() + 1);
+                    }
+                }
                 store
                     .ref_children(&missing_folded, self.ref_children_limit)
                     .unwrap_or_default()
@@ -1264,8 +1288,14 @@ impl PageView {
                 HashMap::new()
             } else {
                 #[cfg(debug_assertions)]
-                self.ref_children_queries
-                    .set(self.ref_children_queries.get() + 1);
+                {
+                    self.ref_children_queries
+                        .set(self.ref_children_queries.get() + 1);
+                    if self.in_render {
+                        self.ref_children_frame_queries
+                            .set(self.ref_children_frame_queries.get() + 1);
+                    }
+                }
                 store
                     .ref_children(&missing_opened, usize::MAX)
                     .unwrap_or_default()
@@ -4224,7 +4254,9 @@ impl Render for PageView {
             self.ref_children_limit = limit;
             self.dirty = true;
         }
+        self.in_render = true;
         self.rebuild_if_dirty(cx);
+        self.in_render = false;
         let th = theme(cx).clone();
         let view = cx.entity();
         // DN-3: the day the column is inside stays at the top of the column while a long
