@@ -337,6 +337,68 @@ fn ac_12_3_a_failed_import_does_not_mark_the_page_synced() {
     );
 }
 
+/// §12.3 steps 3–4: when the batch import fails on one page, every other page must still
+/// be committed and reported. The corrupt page is tried both first and last in `PageId`
+/// order: when it is last, the readable page's shard is already in memory when the batch
+/// fails, so a naive per-page retry would skip it as "already imported".
+#[test]
+fn ac_12_3_a_failed_batch_import_still_stores_the_readable_pages() {
+    let relay = Relay::new();
+    let (mut b, mut cb) = device(&relay);
+    let alpha = b.create_page("Alpha").unwrap();
+    let bravo = b.create_page("Bravo").unwrap();
+    write(&mut b, &alpha, "alpha from b");
+    write(&mut b, &bravo, "bravo from b");
+    cb.sync_once(&mut b).unwrap();
+    let (low, high) = if alpha < bravo {
+        (alpha.clone(), bravo.clone())
+    } else {
+        (bravo.clone(), alpha.clone())
+    };
+    for broken in [low, high] {
+        let readable = if broken == alpha {
+            bravo.clone()
+        } else {
+            alpha.clone()
+        };
+        let want = if readable == alpha {
+            "alpha from b"
+        } else {
+            "bravo from b"
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.utopia");
+        let mut a = Store::open(&path).unwrap();
+        a.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+        let mut ca = SyncClient::new(
+            Corrupt {
+                inner: RelayTransport::new(relay.clone(), "g1"),
+                page: broken.clone(),
+            },
+            &a,
+        )
+        .unwrap();
+        let report = ca.sync_once(&mut a).expect("the readable page imports");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].page.as_ref(), Some(&broken));
+        assert!(
+            report.imported.contains(&readable),
+            "the readable page is reported: {report:?}"
+        );
+        assert_eq!(texts(&mut a, &readable), vec![want]);
+        // Reopen from disk: the readable page must have been committed, not just left in
+        // the in-memory shard the failed batch import touched.
+        drop(ca);
+        drop(a);
+        let mut reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            texts(&mut reopened, &readable),
+            vec![want],
+            "committed to disk (corrupt page {broken:?})"
+        );
+    }
+}
+
 /// An encrypted device: same relay, payloads sealed with the graph key.
 fn encrypted_device(
     relay: &std::sync::Arc<Relay>,

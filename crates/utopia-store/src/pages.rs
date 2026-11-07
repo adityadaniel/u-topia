@@ -744,14 +744,21 @@ impl Store {
                 self.docs.remove(page);
             }
             let did = if self.page_exists(page)? {
-                self.load_doc(page)?.doc.import(bytes)?
+                self.load_doc(page)?.doc.import(bytes)
             } else {
-                match self.new_doc(page).doc.import(bytes) {
-                    Ok(did) => did,
-                    Err(e) => {
-                        self.docs.remove(page);
-                        return Err(e.into());
+                self.new_doc(page).doc.import(bytes)
+            };
+            let did = match did {
+                Ok(did) => did,
+                Err(e) => {
+                    // The shards imported so far were never committed (the loop below did
+                    // not run), so they exist only in memory. Drop every page of the batch
+                    // so a retry re-imports its payload instead of seeing an unchanged
+                    // version vector and skipping it (§12.3 steps 3–4).
+                    for (p, _) in batch {
+                        self.docs.remove(p);
                     }
+                    return Err(e.into());
                 }
             };
             if did && !changed.contains(page) {
