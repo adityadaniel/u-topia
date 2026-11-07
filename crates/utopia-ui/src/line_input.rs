@@ -71,10 +71,13 @@ impl LineInput {
         &self.field.text
     }
 
+    /// Set the whole text (a host-written value, e.g. a `utopia://search` query) and tell
+    /// the host, exactly as typing does, so a host mirroring `text()` never lags (§13.5).
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.field.set_text(text, text.len());
         self.field.move_to(0);
         self.field.select_to(text.len());
+        cx.emit(LineInputEvent::Changed(self.field.text.clone()));
         cx.notify();
     }
 
