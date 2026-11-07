@@ -91,6 +91,57 @@ impl utopia_sync::Transport for Flaky {
     }
 }
 
+/// An encrypted device: same relay, payloads sealed with the graph key.
+fn encrypted_device(
+    relay: &std::sync::Arc<Relay>,
+    passphrase: &str,
+) -> (
+    Store,
+    SyncClient<utopia_sync::e2e::Encrypted<RelayTransport>>,
+) {
+    use utopia_sync::e2e::{Encrypted, GraphKey};
+    let mut s = Store::open_in_memory().unwrap();
+    s.set_today(Some(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()));
+    let key = GraphKey::derive(passphrase, "g1").unwrap();
+    let t = Encrypted::new(RelayTransport::new(relay.clone(), "g1"), key, "g1");
+    let c = SyncClient::new(t, &s).unwrap();
+    (s, c)
+}
+
+/// §12.6: a page this device cannot read (here: plaintext left by a device without the
+/// passphrase) must not stop every other page's pull, nor lose their cursors.
+#[test]
+fn ac_12_6_one_unreadable_page_does_not_halt_the_others() {
+    let relay = Relay::new();
+    let (mut plain, mut cp) = device(&relay);
+    let poison = plain.create_page("Plaintext").unwrap();
+    write(&mut plain, &poison, "not for encrypted readers");
+    cp.sync_once(&mut plain).unwrap();
+
+    let (mut a, mut ca) = encrypted_device(&relay, "correct horse");
+    let sealed = a.create_page("Sealed").unwrap();
+    write(&mut a, &sealed, "readable by both encrypted devices");
+    let report = ca
+        .sync_once(&mut a)
+        .expect("the unreadable page does not fail the round");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(report.failed[0].page.as_ref(), Some(&poison));
+
+    let (mut b, mut cb) = encrypted_device(&relay, "correct horse");
+    let report = cb
+        .sync_once(&mut b)
+        .expect("the second device gets the readable page");
+    assert_eq!(
+        texts(&mut b, &sealed),
+        vec!["readable by both encrypted devices"]
+    );
+    assert_eq!(
+        report.failed.len(),
+        1,
+        "only the poison page failed: {report:?}"
+    );
+}
+
 /// §12.3 steps 2–5: a page the relay refuses must not cost the other pages their acks,
 /// nor stop the pull of what the relay does have.
 #[test]

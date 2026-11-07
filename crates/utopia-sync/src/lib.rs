@@ -427,8 +427,21 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, out: Outgoing) -> Result<Incom
             let page = PageId(p.page_id.clone());
             let local = out.local_seqs.get(&page).copied().unwrap_or(0);
             if p.head_seq > local {
-                let resp = t.pull(&page, local)?;
-                inc.pages.entry(page.clone()).or_default().pull = Some(resp);
+                match t.pull(&page, local) {
+                    Ok(resp) => {
+                        inc.pages.entry(page.clone()).or_default().pull = Some(resp);
+                    }
+                    Err(e) => {
+                        // One page the relay serves but this device cannot read (an E2E
+                        // payload from a device without the passphrase, a corrupt update)
+                        // must not cost every other page its pull (§12.6).
+                        let f = Failure::page(&page, &e);
+                        if f.is_terminal() {
+                            return Err(e);
+                        }
+                        inc.failed.push(f);
+                    }
+                }
             }
             let tail = p.head_seq.saturating_sub(p.snapshot_seq);
             if p.tail_bytes > SNAPSHOT_TAIL_BYTES || tail > SNAPSHOT_TAIL_UPDATES {
@@ -568,8 +581,12 @@ impl SyncEngine {
         for (page, head) in &heads {
             store.sync_set(&seq_key(page), &head.to_string())?;
         }
+        // Only a manifest whose pulls were all applied may be remembered: with a page
+        // still failed, the next round must fetch the manifest again and retry it.
         if let Some(m) = &inc.manifest {
-            store.sync_set("rev", &m.rev.to_string())?;
+            if report.failed.is_empty() {
+                store.sync_set("rev", &m.rev.to_string())?;
+            }
         }
         store.sync_set("synced_at", &store.now().to_string())?;
         for (page, head) in inc.compact {
