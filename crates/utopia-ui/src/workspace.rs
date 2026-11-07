@@ -830,9 +830,18 @@ impl Workspace {
         cx.notify();
     }
 
-    /// GR-5: "Around this page" in the right sidebar. The main page stays editable.
-    fn open_graph_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(origin) = self.main.read(cx).page.clone() else {
+    /// GR-5: "Around this page" in the right sidebar. The main page stays editable. The
+    /// origin is the graph's own: the control can be pressed on a graph opened from a
+    /// sidebar or split page, and switching to the main pane's page would silently show a
+    /// different neighbourhood than the one it names.
+    fn open_graph_panel(
+        &mut self,
+        origin: Option<PageId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let origin = origin.or_else(|| self.main.read(cx).page.clone());
+        let Some(origin) = origin else {
             return;
         };
         self.editor.update(cx, |e, cx| e.end(cx));
@@ -876,8 +885,9 @@ impl Workspace {
                 }
             }
             GraphEvent::OpenPanel => {
+                let origin = view.read(cx).origin();
                 self.graph = None;
-                self.open_graph_panel(window, cx);
+                self.open_graph_panel(origin, window, cx);
             }
             GraphEvent::Expand => {
                 self.graph_panel = None;

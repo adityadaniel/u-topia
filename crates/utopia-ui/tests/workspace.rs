@@ -2142,6 +2142,52 @@ fn graph_panel_sits_beside_the_page(cx: &mut TestAppContext) {
     assert!(ws.update(cx, |w, _| w.graph_view()).is_some());
 }
 
+/// GR-5 review: "Around this page" keeps the graph's own origin. Opening the graph from a
+/// sidebar page's menu and then moving it into the sidebar must stay around that page, not
+/// silently switch to whatever the main pane shows.
+#[gpui::test]
+fn graph_panel_keeps_the_sidebar_pages_origin(cx: &mut TestAppContext) {
+    let (app, ws, cx) = setup(cx);
+    let (a, b) = app.update(cx, |app, _| {
+        let a = app.store.create_page("Alpha Page").unwrap();
+        app.store.ensure_first_block(&a).unwrap();
+        let b = app.store.create_page("Beta Page").unwrap();
+        app.store.ensure_first_block(&b).unwrap();
+        (a, b)
+    });
+    ws.update_in(cx, |w, window, cx| {
+        w.open(a.clone(), None, None, false, window, cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(820.)));
+    // Beta beside Alpha, so its own page menu is the one we use.
+    ws.update_in(cx, |w, window, cx| {
+        w.open(b.clone(), None, None, true, window, cx)
+    });
+    cx.run_until_parked();
+    let menu = cx.debug_bounds("page-menu").expect("a page menu");
+    cx.simulate_click(menu.center(), Modifiers::default());
+    cx.run_until_parked();
+    let item = cx.debug_bounds("page-menu-graph").expect("Open in graph");
+    cx.simulate_click(item.center(), Modifiers::default());
+    cx.run_until_parked();
+    let graph = ws.update(cx, |w, _| w.graph_view()).expect("graph shown");
+    assert_eq!(graph.update(cx, |g, _| g.origin()), Some(b.clone()));
+    let local = cx
+        .debug_bounds("graph-local")
+        .expect("Around this page filter")
+        .center();
+    cx.simulate_click(local, Modifiers::default());
+    cx.run_until_parked();
+    let panel = ws.update(cx, |w, _| w.graph_panel()).expect("panel open");
+    assert_eq!(
+        panel.update(cx, |g, _| g.origin()),
+        Some(b),
+        "the panel stays around the page whose graph was opened"
+    );
+    assert_eq!(ws.update(cx, |w, cx| w.main_page(cx)), Some(a));
+}
+
 /// GR-5: the panel is a projection of the index, so a new link while it is open must show
 /// up even though the page id did not change.
 #[gpui::test]
