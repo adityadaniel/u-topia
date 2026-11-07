@@ -381,6 +381,16 @@ impl PageView {
                 this.rebuild(cx);
                 cx.notify();
             }),
+            // LR-4: "Children shown in references" is a setting (rule 9). Its change
+            // invalidates the children cache, so rebuild here, outside the frame.
+            cx.observe_global::<crate::appearance::Appearance>(|this, cx| {
+                let limit = crate::appearance::ref_children(cx);
+                if limit != this.ref_children_limit {
+                    this.ref_children_limit = limit;
+                    this.rebuild(cx);
+                    cx.notify();
+                }
+            }),
             cx.subscribe_in(&editor, window, Self::on_editor_event),
             cx.subscribe(&filter, |this, _, e: &LineInputEvent, cx| {
                 if let LineInputEvent::Changed(t) = e {
@@ -3664,9 +3674,12 @@ impl PageView {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             // The chip is inside the hit row, whose click opens the block.
                             cx.stop_propagation();
-                            this.expanded_children.insert(block.clone());
-                            this.dirty = true;
-                            cx.notify();
+                            if this.expanded_children.insert(block.clone()) {
+                                // LR-4: the opened children are a store read. Fill the cache
+                                // here, before the next frame, like an index update does.
+                                this.rebuild(cx);
+                                cx.notify();
+                            }
                         }))
                 });
 
@@ -4247,13 +4260,6 @@ fn push_with_embeds(
 
 impl Render for PageView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Settings -> Appearance can change this while a page is open. The rows carry the
-        // children, so a change means one rebuild (LR-4).
-        let limit = crate::appearance::ref_children(cx);
-        if limit != self.ref_children_limit {
-            self.ref_children_limit = limit;
-            self.dirty = true;
-        }
         self.in_render = true;
         self.rebuild_if_dirty(cx);
         self.in_render = false;
